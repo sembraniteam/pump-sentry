@@ -41,3 +41,7 @@ Transform on-chain velocity and liquidity signals into dynamic Take-Profit, Stop
     - Stop-Loss must never exceed -15.0%.
     - Take-Profit must never be set below +10.0%.
     - Maximum holding duration must never exceed 300 seconds.
+4. **Live Trading Circuit Breakers:**
+    - Maximum position allocation per trade must not exceed `MAX_SOL_EXPOSURE` (default: 0.1 SOL).
+    - If daily cumulative drawdown breaches `DAILY_LOSS_LIMIT_SOL` (default: -0.5 SOL), emit `action: PASS` and halt
+      further entries.
