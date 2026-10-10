@@ -41,6 +41,8 @@ pub struct Settings {
     pub inference_model: String,
     /// Inference deadline in milliseconds before heuristic fallback.
     pub inference_timeout_ms: u64,
+    /// Optional bearer token for providers that require auth.
+    pub inference_api_key: Option<String>,
     /// Buy/sell slippage guard in basis points.
     pub slippage_bps: u64,
     /// Jito tip budget per bundle in lamports.
@@ -78,6 +80,7 @@ impl Settings {
             ),
             inference_model: get_string(vars, "INFERENCE_MODEL", "llama3.2:1b"),
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300),
+            inference_api_key: vars.get("INFERENCE_API_KEY").cloned(),
             slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200),
             tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000),
             jito_endpoint: get_string(
@@ -135,6 +138,7 @@ mod tests {
         assert_eq!(s.dev_reputation, 0.0);
         assert_eq!(s.quote_usd, None);
         assert_eq!(s.inference_timeout_ms, 300);
+        assert_eq!(s.inference_api_key, None);
     }
 
     #[test]
@@ -146,6 +150,7 @@ mod tests {
             ("COMMITMENT", "finalized"),
             ("SLIPPAGE_BPS", "500"),
             ("JITO_TIP_LAMPORTS", "200000"),
+            ("INFERENCE_API_KEY", "secret"),
         ]));
         assert_eq!(s.start_balance, 250.5);
         assert_eq!(s.buy_velocity_5s, 42);
@@ -153,6 +158,7 @@ mod tests {
         assert_eq!(s.commitment, "finalized");
         assert_eq!(s.slippage_bps, 500);
         assert_eq!(s.tip_lamports, 200_000);
+        assert_eq!(s.inference_api_key.as_deref(), Some("secret"));
     }
 
     #[test]

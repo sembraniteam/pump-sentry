@@ -77,12 +77,14 @@ async fn main() {
         }
     };
 
-    let engine = match RiskEngine::builder()
+    let mut engine_builder = RiskEngine::builder()
         .endpoint(&settings.inference_endpoint)
         .model(&settings.inference_model)
-        .timeout(Duration::from_millis(settings.inference_timeout_ms))
-        .build()
-    {
+        .timeout(Duration::from_millis(settings.inference_timeout_ms));
+    if let Some(key) = &settings.inference_api_key {
+        engine_builder = engine_builder.api_key(key);
+    }
+    let engine = match engine_builder.build() {
         Ok(engine) => Some(engine),
         Err(e) => {
             warn!(error = %e, "bad inference endpoint; heuristic-only mode");

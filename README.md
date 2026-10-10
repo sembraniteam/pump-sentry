@@ -81,7 +81,8 @@ cargo run
 | `QUOTE_USD`                                                       | *(unset)*                     | Entry-quote override for tests; unset = reserve read or skip                        |
 | `LIQUIDITY_USD` / `BUY_VELOCITY_5S` / `DEV_REPUTATION`            | `0` / `0` / `0.0`             | Fallbacks: liquidity now live from reserves; velocity/dev still stubbed (PASS-safe) |
 | `SOL_USD` / `TICK_INTERVAL_MS`                                    | `150` / `1000`                | Curve pricing conversion / exit-poll interval                                       |
-| `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS` | local / `llama3.2:1b` / `300` | Risk-engine inference                                                               |
+| `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS` | local / `llama3.2:1b` / `300` | Risk-engine inference (OpenAI-compatible; Hermes Agent ready)                       |
+| `INFERENCE_API_KEY`                                               | *(unset)*                     | Bearer token for providers that require auth                                        |
 | `IS_LIVE` / `--live`                                              | *(unset)*                     | Live mode: mirror signals with real Jito-routed swaps (needs `SOLANA_PRIVATE_KEY`)  |
 | `SOLANA_PRIVATE_KEY`                                              | *(unset)*                     | Trading keypair, base58 (live mode refuses to start without it)                     |
 | `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`            | `200` / `100000` / frankfurt  | Live sizing guard, per-bundle tip, block-engine region                              |
