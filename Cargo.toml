@@ -33,3 +33,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Single explicit TLS crypto provider: the tree enables both `ring`
+# (via quinn/Solana) and `aws-lc-rs` (via reqwest), so rustls cannot
+# auto-select a process default and panics on first TLS use.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

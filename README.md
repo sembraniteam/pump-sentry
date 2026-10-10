@@ -100,7 +100,7 @@ way. Start on devnet-sized notionals and watch bundle UUIDs in logs.
 ## Testing
 
 ```sh
-cargo test --workspace
+cargo test --workspace                    # 114 tests: 17 auditor, 9 curve, 14 executor, 14 listener, 19 risk-engine, 15 simulator, 26 binary
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

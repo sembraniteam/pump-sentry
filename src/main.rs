@@ -29,6 +29,11 @@ use settings::Settings;
 
 #[tokio::main]
 async fn main() {
+    // Must run before any TLS use: the dependency tree enables both the
+    // `ring` and `aws-lc-rs` rustls providers, so auto-detection panics.
+    // `Err` only means another call already installed one — safe to ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
             "info,solana_snipe_bot=debug",
@@ -169,4 +174,16 @@ async fn main() {
     }
 
     warn!("streams ended; open positions need manual review");
+}
+
+#[cfg(test)]
+mod tests {
+    /// Guards the rustls dual-provider fix: without an explicitly
+    /// installed default, `get_default` panics when both `ring` and
+    /// `aws-lc-rs` features are enabled (see bot.log panic).
+    #[test]
+    fn crypto_provider_installs() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 }

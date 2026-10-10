@@ -10,6 +10,9 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // Same dual-provider rationale as the main binary (WSS below).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("info,listener=debug"))
         .init();
