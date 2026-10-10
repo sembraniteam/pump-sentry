@@ -11,8 +11,10 @@
 
 pub mod executor;
 pub mod instructions;
+pub mod jito;
 pub mod wallet;
 
-pub use executor::{BuyOrder, ExecutorError, SellOrder, SwapExecutor, SwapReceipt};
-pub use instructions::{PumpBuyArgs, PumpSellArgs, PumpSwapBuilder, user_ata};
+pub use executor::{BuyOrder, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, SwapReceipt};
+pub use instructions::{PumpBuyArgs, PumpSellArgs, PumpSwapBuilder, parse_pubkey, user_ata};
+pub use jito::{JITO_TIP_ACCOUNTS, JitoClient, JitoError};
 pub use wallet::{MIN_SOL_RESERVE_LAMPORTS, WalletGuard, WalletGuardError};

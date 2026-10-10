@@ -1375,8 +1375,12 @@ dependencies = [
 name = "executor"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bincode",
  "borsh",
  "bs58",
+ "reqwest 0.13.5",
+ "serde_json",
  "solana-client",
  "solana-commitment-config",
  "solana-hash",
@@ -5249,10 +5253,12 @@ version = "0.1.0"
 dependencies = [
  "auditor",
  "curve",
+ "executor",
  "listener",
  "risk-engine",
  "serde_json",
  "simulator",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -41,6 +41,12 @@ pub struct Settings {
     pub inference_model: String,
     /// Inference deadline in milliseconds before heuristic fallback.
     pub inference_timeout_ms: u64,
+    /// Buy/sell slippage guard in basis points.
+    pub slippage_bps: u64,
+    /// Jito tip budget per bundle in lamports.
+    pub tip_lamports: u64,
+    /// Jito block-engine base URL (region).
+    pub jito_endpoint: String,
 }
 
 impl Settings {
@@ -72,6 +78,13 @@ impl Settings {
             ),
             inference_model: get_string(vars, "INFERENCE_MODEL", "llama3.2:1b"),
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300),
+            slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200),
+            tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000),
+            jito_endpoint: get_string(
+                vars,
+                "JITO_ENDPOINT",
+                "https://frankfurt.mainnet.block-engine.jito.wtf",
+            ),
         }
     }
 }
@@ -131,11 +144,15 @@ mod tests {
             ("BUY_VELOCITY_5S", "42"),
             ("QUOTE_USD", "0.000001"),
             ("COMMITMENT", "finalized"),
+            ("SLIPPAGE_BPS", "500"),
+            ("JITO_TIP_LAMPORTS", "200000"),
         ]));
         assert_eq!(s.start_balance, 250.5);
         assert_eq!(s.buy_velocity_5s, 42);
         assert_eq!(s.quote_usd, Some(0.000001));
         assert_eq!(s.commitment, "finalized");
+        assert_eq!(s.slippage_bps, 500);
+        assert_eq!(s.tip_lamports, 200_000);
     }
 
     #[test]

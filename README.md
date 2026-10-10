@@ -3,8 +3,8 @@
 Paper-trading pipeline for Solana memecoins: listen for new Pump.fun
 launches → audit risk via RugCheck → read live bonding-curve reserves →
 price TP/SL with an LLM risk engine → simulate fills and auto-exit on
-TP/SL. The binary only paper-trades; live execution exists as an
-unwired crate (see below).
+TP/SL. Default mode is paper-only; `--live` adds real Jito-routed
+execution (see Live mode).
 
 ## Pipeline
 
@@ -27,7 +27,7 @@ Pump.fun logsSubscribe (WS)          crates/listener
 | `crates/curve`       | Bonding-curve reserve reader + polling ticker; live USD spot and liquidity from virtual reserves                     |
 | `crates/risk-engine` | LLM TP/SL (OpenAI-compatible chat, JSON mode, temp 0.1) with deterministic heuristic fallback after 300ms            |
 | `crates/simulator`   | Virtual portfolio, bonding-curve slippage fills, TP/SL/trailing/timeout exits, realized + mark-to-market PnL         |
-| `crates/executor`    | Live buy/sell (guarded wallet, exact ix builders, sign + confirm) — **moves real funds, NOT wired to the binary**    |
+| `crates/executor`    | Live buy/sell (guarded wallet, exact ix builders, Jito bundles) — only active with `--live`                          |
 
 Each crate has its own README with architecture details and examples.
 
@@ -50,6 +50,10 @@ cargo run -p listener --example watch
 
 # Run the paper pipeline (defaults: $100 virtual, confirmed commitment)
 cargo run
+
+# Run with real funds: every BUY signal also dispatches a Jito bundle,
+# every paper close also sells the tracked live amount
+IS_LIVE=true SOLANA_PRIVATE_KEY=<base58> cargo run -- --live
 ```
 
 With knobs:
@@ -78,6 +82,19 @@ cargo run
 | `LIQUIDITY_USD` / `BUY_VELOCITY_5S` / `DEV_REPUTATION`            | `0` / `0` / `0.0`             | Fallbacks: liquidity now live from reserves; velocity/dev still stubbed (PASS-safe) |
 | `SOL_USD` / `TICK_INTERVAL_MS`                                    | `150` / `1000`                | Curve pricing conversion / exit-poll interval                                       |
 | `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS` | local / `llama3.2:1b` / `300` | Risk-engine inference                                                               |
+| `IS_LIVE` / `--live`                                              | *(unset)*                     | Live mode: mirror signals with real Jito-routed swaps (needs `SOLANA_PRIVATE_KEY`)  |
+| `SOLANA_PRIVATE_KEY`                                              | *(unset)*                     | Trading keypair, base58 (live mode refuses to start without it)                     |
+| `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`            | `200` / `100000` / frankfurt  | Live sizing guard, per-bundle tip, block-engine region                              |
+
+## Live mode
+
+Without flags the bot is a pure simulator. With `--live` (or
+`IS_LIVE=true`) each paper open additionally sends a buy bundle (swap + tip in one transaction) and each paper close
+sells the tracked
+amount — the paper book stays the system of record while live legs are
+best-effort with loud errors. Sizing derives from the USD notional at
+curve spot with a `SLIPPAGE_BPS` guard; sells floor proceeds the same
+way. Start on devnet-sized notionals and watch bundle UUIDs in logs.
 
 ## Testing
 
@@ -90,23 +107,26 @@ cargo fmt --all -- --check
 ## Layout
 
 ```
-src/main.rs            # thin binary: wiring + run loop
+src/main.rs            # thin binary: wiring + run loop (+ --live gate)
 src/settings.rs        # env knobs (tested)
 src/pipeline.rs        # launch handling + tick exits (tested)
+src/live.rs            # live sizing + Jito dispatch sink (tested)
 crates/curve/          # bonding-curve reserves + price ticker
 crates/listener/       # WS event ingestion + Pump.fun parser
 crates/auditor/        # RugCheck client + policy
 crates/risk-engine/    # prompt schema + LLM/fallback engine
 crates/simulator/      # portfolio + slippage + PnL
-crates/executor/       # live swaps (unwired; see its README)
+crates/executor/       # live swaps via Jito (only with --live)
 ```
 
 ## Safety notes
 
-- This bot **cannot spend funds** by default: the binary runs the paper
-  pipeline only. `crates/executor` is intentionally unwired — wiring it
-  requires explicit review plus Jito routing, priority fees, and
-  `simulateTransaction` pre-flight (see its README TODOs).
+- Default mode **cannot spend funds**: without `--live` / `IS_LIVE=true`
+  the binary only mutates virtual cash. Live mode moves real SOL through
+  Jito bundles — enable it only with a dedicated wallet, small
+  `NOTIONAL_USD`, and reviewed parameters.
+- `crates/executor` refuses to build anything when the wallet guard
+  fails: missing key, or balance below trade + tip + 0.05 SOL reserve.
 - Auditing is fail-closed (transport errors skip the token), and unknown
   metrics default to `PASS`.
 - Remaining gap: `BUY_VELOCITY_5S` / `DEV_REPUTATION` are still env stubs

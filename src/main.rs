@@ -1,8 +1,14 @@
 //! Paper pipeline binary: listen → audit → reserves → risk → simulate.
 //!
-//! Wiring only — all logic lives in [`settings`] (knobs) and [`pipeline`]
-//! (launch handling, tick exits), both unit-tested.
+//! Default mode is paper trading (no funds move). With `--live` (or
+//! `IS_LIVE=true`) the same signals additionally dispatch real Jito-routed
+//! swaps through `crates/executor` — read its README before enabling.
+//!
+//! Wiring only — all logic lives in [`settings`] (knobs), [`pipeline`]
+//! (launch handling, tick exits), and [`live`] (live sizing/dispatch),
+//! all unit-tested.
 
+mod live;
 mod pipeline;
 mod settings;
 
@@ -10,12 +16,14 @@ use std::time::Duration;
 
 use auditor::RugCheckClient;
 use curve::{CurveTicker, PriceTick};
+use executor::{JitoClient, SwapExecutor, WalletGuard};
 use listener::{ListenerConfig, PumpFunListener};
 use risk_engine::RiskEngine;
 use simulator::PaperPortfolio;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use live::LiveTrader;
 use pipeline::Pipeline;
 use settings::Settings;
 
@@ -32,9 +40,19 @@ async fn main() {
         warn!("DEV_REPUTATION unset: heuristic defaults to PASS until the live feed lands (TODO)");
     }
 
+    // Mode gate: paper unless explicitly opted into live risk.
+    let live_mode = std::env::args().any(|a| a == "--live")
+        || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
+    if live_mode {
+        warn!("================================================================");
+        warn!("LIVE MODE: real SOL will move via Jito bundles. Ctrl-C to abort.");
+        warn!("================================================================");
+    }
+
+    let commitment = CurveTicker::parse_commitment(&settings.commitment);
     let ticker = match CurveTicker::new(
         &settings.http_url,
-        CurveTicker::parse_commitment(&settings.commitment),
+        commitment,
         Duration::from_millis(settings.tick_interval_ms),
         settings.sol_usd,
     ) {
@@ -74,12 +92,47 @@ async fn main() {
 
     let start_balance = settings.start_balance;
     let fee_bps = settings.fee_bps;
+
+    // Live stack (fatal on misconfiguration — never half-enable).
+    let live = if live_mode {
+        let wallet = match WalletGuard::load_from_env() {
+            Ok(wallet) => wallet,
+            Err(e) => {
+                eprintln!("live mode requires SOLANA_PRIVATE_KEY: {e}");
+                std::process::exit(1);
+            }
+        };
+        info!(payer = %wallet.pubkey(), "live wallet loaded");
+        let jito = match JitoClient::new(&settings.jito_endpoint) {
+            Some(jito) => jito,
+            None => {
+                eprintln!("bad JITO_ENDPOINT: {}", settings.jito_endpoint);
+                std::process::exit(1);
+            }
+        };
+        let executor = match SwapExecutor::new(&settings.http_url, commitment, wallet) {
+            Ok(executor) => executor.with_jito(jito),
+            Err(e) => {
+                eprintln!("bad executor config: {e}");
+                std::process::exit(1);
+            }
+        };
+        Some(LiveTrader::new(
+            executor,
+            settings.slippage_bps,
+            settings.tip_lamports,
+        ))
+    } else {
+        None
+    };
+
     let pipeline = Pipeline::shared(
         settings,
         RugCheckClient::new(),
         engine,
         ticker.clone(),
         PaperPortfolio::new(start_balance, fee_bps),
+        live,
     );
 
     // Ticker loop: poll watched curves → auto-close on TP/SL.
@@ -92,7 +145,11 @@ async fn main() {
             event = rx.recv() => {
                 let Some(event) = event else { break };
                 pipeline
-                    .on_launch(&event.mint.to_string(), &event.bonding_curve.to_string())
+                    .on_launch(
+                        &event.mint.to_string(),
+                        &event.bonding_curve.to_string(),
+                        &event.associated_bonding_curve.to_string(),
+                    )
                     .await;
                 let snap = stats.snapshot();
                 info!(logs = snap.logs_seen, candidates = snap.candidates,
