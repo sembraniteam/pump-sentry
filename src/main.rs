@@ -101,6 +101,10 @@ async fn main() {
             tick = tick_rx.recv() => {
                 let Some(tick) = tick else { break };
                 pipeline.on_tick(&tick).await;
+            },
+            _ = tokio::signal::ctrl_c() => {
+                info!("shutdown requested");
+                break;
             }
         }
     }

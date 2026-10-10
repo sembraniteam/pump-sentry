@@ -3,7 +3,8 @@
 Paper-trading pipeline for Solana memecoins: listen for new Pump.fun
 launches → audit risk via RugCheck → read live bonding-curve reserves →
 price TP/SL with an LLM risk engine → simulate fills and auto-exit on
-TP/SL. No real funds move; execution is out of scope by design.
+TP/SL. The binary only paper-trades; live execution exists as an
+unwired crate (see below).
 
 ## Pipeline
 
@@ -26,6 +27,7 @@ Pump.fun logsSubscribe (WS)          crates/listener
 | `crates/curve`       | Bonding-curve reserve reader + polling ticker; live USD spot and liquidity from virtual reserves                     |
 | `crates/risk-engine` | LLM TP/SL (OpenAI-compatible chat, JSON mode, temp 0.1) with deterministic heuristic fallback after 300ms            |
 | `crates/simulator`   | Virtual portfolio, bonding-curve slippage fills, TP/SL/trailing/timeout exits, realized + mark-to-market PnL         |
+| `crates/executor`    | Live buy/sell (guarded wallet, exact ix builders, sign + confirm) — **moves real funds, NOT wired to the binary**    |
 
 Each crate has its own README with architecture details and examples.
 
@@ -80,7 +82,7 @@ cargo run
 ## Testing
 
 ```sh
-cargo test --workspace                    # 91 tests: 17 auditor, 9 curve, 14 listener, 19 risk-engine, 15 simulator, 17 binary
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -96,13 +98,17 @@ crates/listener/       # WS event ingestion + Pump.fun parser
 crates/auditor/        # RugCheck client + policy
 crates/risk-engine/    # prompt schema + LLM/fallback engine
 crates/simulator/      # portfolio + slippage + PnL
+crates/executor/       # live swaps (unwired; see its README)
 ```
 
 ## Safety notes
 
-- This bot **cannot spend funds**: the simulator only mutates virtual cash.
+- This bot **cannot spend funds** by default: the binary runs the paper
+  pipeline only. `crates/executor` is intentionally unwired — wiring it
+  requires explicit review plus Jito routing, priority fees, and
+  `simulateTransaction` pre-flight (see its README TODOs).
 - Auditing is fail-closed (transport errors skip the token), and unknown
   metrics default to `PASS`.
-- `main.rs` marks the remaining gaps explicitly (`TODO(live-feeds)`,
-  `TODO(price-feed)`): real liquidity/velocity/reputation feeds and a
-  quote stream with exit polling are the next build steps.
+- Remaining gap: `BUY_VELOCITY_5S` / `DEV_REPUTATION` are still env stubs
+  until trade-tape and deployer-history feeds land. Liquidity, entry
+  pricing, and exit polling are already live from curve reserves.
