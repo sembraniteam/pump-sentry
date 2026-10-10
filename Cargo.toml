@@ -1,0 +1,30 @@
+[package]
+name = "solana-snipe-bot"
+description = "Solana memecoin snipe pipeline: Pump.fun event listener, RugCheck auditor, adaptive TP/SL risk engine, and paper-trading simulator"
+version = "0.1.0"
+edition = "2024"
+readme = "README.md"
+rust-version = "1.99.0"
+publish = false
+authors = ["Ahmad Rifa'i <develop.rifai@gmail.com>"]
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+debug = false
+incremental = false
+
+[dependencies]
+listener = { path = "crates/listener" }
+auditor = { path = "crates/auditor" }
+risk_engine = { package = "risk-engine", path = "crates/risk-engine" }
+simulator = { path = "crates/simulator" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
