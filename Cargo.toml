@@ -26,6 +26,8 @@ listener = { path = "crates/listener" }
 auditor = { path = "crates/auditor" }
 risk_engine = { package = "risk-engine", path = "crates/risk-engine" }
 simulator = { path = "crates/simulator" }
+curve = { path = "crates/curve" }
+serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

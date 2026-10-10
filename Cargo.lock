@@ -965,6 +965,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "curve"
+version = "0.1.0"
+dependencies = [
+ "solana-client",
+ "solana-commitment-config",
+ "solana-sdk",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "curve25519-dalek"
 version = "4.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5075,8 +5088,10 @@ name = "solana-snipe-bot"
 version = "0.1.0"
 dependencies = [
  "auditor",
+ "curve",
  "listener",
  "risk-engine",
+ "serde_json",
  "simulator",
  "tokio",
  "tracing",
