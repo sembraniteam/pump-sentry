@@ -8,29 +8,34 @@ use crate::types::{ExitReason, Position, Side};
 
 /// Execution-price model for paper fills.
 ///
-/// Quotes on thin bonding curves are never the fill: the bigger the
-/// notional relative to `liquidity_usd`, the worse the execution.
+/// Quotes on thin bonding curves are never the fill: every trade pays
+/// the venue fee plus constant-product price impact against its own size.
 #[derive(Debug, Clone, Copy)]
 pub enum FillModel {
     /// Fill exactly at the quote (for benchmarks / tests).
     Exact,
-    /// Linear impact: `slip_frac = impact_bps_per_1pct * size_frac * 1e-4`,
-    /// where `size_frac = notional_usd / liquidity_usd`, clamped to
-    /// `max_slip_frac`. E.g. `impact_bps_per_1pct = 50.0` means a trade
-    /// worth 1% of liquidity slips 50 bps against the trader.
-    LinearImpact {
-        /// Basis points of slippage per 1% of liquidity consumed.
-        impact_bps_per_1pct: f64,
-        /// Hard cap on the slip fraction (e.g. `0.10` = 10%).
+    /// Bonding-curve cost: `slip_frac = size_frac + fee_frac`, where
+    /// `size_frac = notional_usd / liquidity_usd` is the exact
+    /// first-order constant-product impact (dx/x per side) and
+    /// `fee_frac = fee_bps_per_side / 10_000` is the venue fee —
+    /// 125 bps on Pump.fun (0.95% protocol + 0.30% creator), identical on
+    /// buys and sells, so a flat round trip costs ~2.53% before impact.
+    /// Clamped to `max_slip_frac`. Calibrated 2026-10-11 against
+    /// pump.fun/docs/fees after the old 50bps/1% linear model understated
+    /// a $10-into-$4500 fill by ~13x (live round trips measured 2–4%).
+    BondingCurve {
+        /// Venue fee per side in basis points (125.0 on Pump.fun).
+        fee_bps_per_side: f64,
+        /// Hard cap on the slip fraction (e.g. `0.25` = 25%).
         max_slip_frac: f64,
     },
 }
 
 impl Default for FillModel {
     fn default() -> Self {
-        Self::LinearImpact {
-            impact_bps_per_1pct: 50.0,
-            max_slip_frac: 0.10,
+        Self::BondingCurve {
+            fee_bps_per_side: 125.0,
+            max_slip_frac: 0.25,
         }
     }
 }
@@ -46,16 +51,16 @@ impl FillModel {
         }
         let slip = match *self {
             FillModel::Exact => 0.0,
-            FillModel::LinearImpact {
-                impact_bps_per_1pct,
+            FillModel::BondingCurve {
+                fee_bps_per_side,
                 max_slip_frac,
             } => {
                 if !liquidity_usd.is_finite() || liquidity_usd <= 0.0 {
                     return quote;
                 }
                 let size_frac = notional_usd / liquidity_usd;
-                let raw = impact_bps_per_1pct * size_frac * 100.0 * 1e-4;
-                raw.clamp(0.0, max_slip_frac.max(0.0))
+                let fee_frac = (fee_bps_per_side.max(0.0) / 10_000.0).max(0.0);
+                (size_frac + fee_frac).clamp(0.0, max_slip_frac.max(0.0))
             }
         };
         match side {
@@ -155,19 +160,34 @@ mod tests {
     }
 
     #[test]
-    fn impact_scales_with_size_and_hurts_both_sides() {
-        let model = FillModel::LinearImpact {
-            impact_bps_per_1pct: 50.0,
-            max_slip_frac: 0.10,
+    fn impact_is_fee_plus_size_and_hurts_both_sides() {
+        let model = FillModel::BondingCurve {
+            fee_bps_per_side: 125.0,
+            max_slip_frac: 0.25,
         };
-        // 1% of liquidity -> 50 bps.
+        // 1% of liquidity: 1% impact + 1.25% fee = 2.25% against.
         let buy = model.fill_price(Side::Long, 1.0, 100.0, 10_000.0);
-        assert!((buy - 1.005).abs() < 1e-12, "buy={buy}");
+        assert!((buy - 1.0225).abs() < 1e-12, "buy={buy}");
         let sell = model.fill_price(Side::Short, 1.0, 100.0, 10_000.0);
-        assert!((sell - 0.995).abs() < 1e-12, "sell={sell}");
+        assert!((sell - 0.9775).abs() < 1e-12, "sell={sell}");
         // Cap binds on huge size.
         let capped = model.fill_price(Side::Long, 1.0, 10_000_000.0, 10_000.0);
-        assert!((capped - 1.10).abs() < 1e-12, "capped={capped}");
+        assert!((capped - 1.25).abs() < 1e-12, "capped={capped}");
+    }
+
+    #[test]
+    fn realistic_ticket_costs_match_live_band() {
+        // $10 into $4500 virtual liquidity: 0.22% impact + 1.25% fee.
+        let model = FillModel::default();
+        let buy = model.fill_price(Side::Long, 1.0, 10.0, 4_500.0);
+        let slip = buy - 1.0;
+        assert!((slip - 0.0147).abs() < 1e-4, "slip={slip}");
+        // Full round trip in token terms: ~2.9% gone, inside the 2–4%
+        // band measured live (old model said ~0.2%).
+        let qty = 10.0 / buy;
+        let sell_px = model.fill_price(Side::Short, 1.0, qty, 4_500.0);
+        let loss = 10.0 - qty * sell_px;
+        assert!((loss - 0.29).abs() < 0.01, "loss={loss}");
     }
 
     #[test]

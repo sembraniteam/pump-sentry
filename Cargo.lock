@@ -2177,6 +2177,7 @@ dependencies = [
  "solana-account-decoder",
  "solana-client",
  "solana-commitment-config",
+ "solana-message 4.6.0",
  "solana-sdk",
  "solana-transaction-status",
  "thiserror 2.0.21",

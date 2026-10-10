@@ -28,6 +28,21 @@ logsSubscribe (WebSocket, Mentions[pump_program])
 
 - Program: `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`
 - `create` discriminator: `[24, 30, 200, 40, 5, 28, 7, 119]`
+- `buy` discriminator: `[102, 6, 61, 18, 1, 218, 235, 234]`
+- `sell` discriminator: `[51, 230, 133, 164, 1, 127, 131, 173]`
+
+## Screening (`screen` module)
+
+Win-rate hardening on top of the event stream:
+
+- `extract_pump_swaps` classifies buy/sell instructions (trader = account
+  index 6) in any fetched transaction.
+- `EntryGate` is a pure watchlist state machine: entries get a time
+  window to gather distinct non-dev buyers; dev sells abort immediately (dev dump), quorum confirms, silence times out.
+- `screen_developer` checks dev-wallet history over RPC: rejects fresh
+  wallets (no history) and serial launchers, fail-closed on transport
+  errors. `judge_developer` holds the pure policy for unit tests.
+- `RpcScreener` bundles both behind one client for the pipeline.
 - Borsh args: `name: String, symbol: String, uri: String`
 - Accounts: `[0]=mint, [2]=bonding_curve, [3]=associated_bonding_curve,
   [7]=user` (min 8).
@@ -59,10 +74,10 @@ Connects to mainnet (`wss(s)://api.mainnet-beta.solana.com`, commitment
 ## API sketch
 
 ```rust
-let config = ListenerConfig::default();
-let (mut rx, stats, _handle) = PumpFunListener::subscribe(config).await?;
+let config = ListenerConfig::default ();
+let ( mut rx, stats, _handle) = PumpFunListener::subscribe(config).await?;
 while let Some(ev) = rx.recv().await {
-    println!("{} ({}) {}", ev.name, ev.symbol, ev.mint);
+println!("{} ({}) {}", ev.name, ev.symbol, ev.mint);
 }
 // Unbounded variant: PumpFunListener::subscribe_unbounded(config).await?
 ```

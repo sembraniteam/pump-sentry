@@ -12,6 +12,8 @@ execution (see Live mode).
 Pump.fun logsSubscribe (WS)          crates/listener
   → getTransaction → parse create ix → PumpTokenLaunchEvent
   → RugCheck report                  crates/auditor   (reject = skip, fail-closed)
+  → dev-wallet history               listener::screen (fresh/serial devs rejected)
+  → watchlist: buyer quorum          listener::screen (dev dump aborts, silence times out)
   → bonding-curve reserves           crates/curve     (live price + liquidity)
   → TP/SL profile                    crates/risk-engine (LLM ≤300ms, else heuristic)
   → paper position                   crates/simulator ($100 virtual, slippage-aware)
@@ -70,22 +72,24 @@ SOL_USD="150" TICK_INTERVAL_MS="1000" \
 cargo run
 ```
 
-| Env                                                               | Default                       | Meaning                                                                             |
-|-------------------------------------------------------------------|-------------------------------|-------------------------------------------------------------------------------------|
-| `WS_URL` / `HTTP_URL`                                             | mainnet-beta                  | RPC endpoints                                                                       |
-| `COMMITMENT`                                                      | `confirmed`                   | `processed` \| `confirmed` \| `finalized`                                           |
-| `START_BALANCE`                                                   | `100`                         | Virtual USD balance                                                                 |
-| `FEE_BPS`                                                         | `30`                          | Commission per side (bps)                                                           |
-| `NOTIONAL_USD`                                                    | `10`                          | Paper size per trade                                                                |
-| `TRAIL_PERCENT`                                                   | `5`                           | Trailing-stop giveback (%)                                                          |
-| `QUOTE_USD`                                                       | *(unset)*                     | Entry-quote override for tests; unset = reserve read or skip                        |
-| `LIQUIDITY_USD` / `BUY_VELOCITY_5S` / `DEV_REPUTATION`            | `0` / `0` / `0.0`             | Fallbacks: liquidity now live from reserves; velocity/dev still stubbed (PASS-safe) |
-| `SOL_USD` / `TICK_INTERVAL_MS`                                    | `150` / `1000`                | Curve pricing conversion / exit-poll interval                                       |
-| `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS` | local / `llama3.2:1b` / `300` | Risk-engine inference (OpenAI-compatible; Hermes Agent ready)                       |
-| `INFERENCE_API_KEY`                                               | *(unset)*                     | Bearer token for providers that require auth                                        |
-| `IS_LIVE` / `--live`                                              | *(unset)*                     | Live mode: mirror signals with real Jito-routed swaps (needs `SOLANA_PRIVATE_KEY`)  |
-| `SOLANA_PRIVATE_KEY`                                              | *(unset)*                     | Trading keypair, base58 (live mode refuses to start without it)                     |
-| `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`            | `200` / `100000` / frankfurt  | Live sizing guard, per-bundle tip, block-engine region                              |
+| Env                                                                     | Default                       | Meaning                                                                            |
+|-------------------------------------------------------------------------|-------------------------------|------------------------------------------------------------------------------------|
+| `WS_URL` / `HTTP_URL`                                                   | mainnet-beta                  | RPC endpoints                                                                      |
+| `COMMITMENT`                                                            | `confirmed`                   | `processed` \| `confirmed` \| `finalized`                                          |
+| `START_BALANCE`                                                         | `100`                         | Virtual USD balance                                                                |
+| `FEE_BPS`                                                               | `30`                          | Commission per side (bps)                                                          |
+| `NOTIONAL_USD`                                                          | `10`                          | Paper size per trade                                                               |
+| `TRAIL_PERCENT`                                                         | `5`                           | Trailing-stop giveback (%)                                                         |
+| `QUOTE_USD`                                                             | *(unset)*                     | Entry-quote override for tests; unset = reserve read or skip                       |
+| `GATE_WINDOW_SECS` / `GATE_MIN_BUYERS` / `GATE_POLL_MS`                 | `10` / `5` / `2000`           | Watchlist window, distinct-buyer quorum, observation cadence                       |
+| `DEV_MIN_AGE_SECS` / `DEV_MAX_PRIOR_LAUNCHES` / `DEV_SCREEN_SAMPLE_TXS` | `3600` / `1` / `20`           | Dev-wallet minimum age, tolerated prior launches, sampled transactions             |
+| `LIQUIDITY_USD`                                                         | `0`                           | Liquidity fallback when the reserve read fails (normally live from reserves)       |
+| `SOL_USD` / `TICK_INTERVAL_MS`                                          | `150` / `1000`                | Curve pricing conversion / exit-poll interval                                      |
+| `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine inference (OpenAI-compatible; Hermes Agent ready)                      |
+| `INFERENCE_API_KEY`                                                     | *(unset)*                     | Bearer token for providers that require auth                                       |
+| `IS_LIVE` / `--live`                                                    | *(unset)*                     | Live mode: mirror signals with real Jito-routed swaps (needs `SOLANA_PRIVATE_KEY`) |
+| `SOLANA_PRIVATE_KEY`                                                    | *(unset)*                     | Trading keypair, base58 (live mode refuses to start without it)                    |
+| `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`                  | `200` / `100000` / frankfurt  | Live sizing guard, per-bundle tip, block-engine region                             |
 
 ## Live mode
 
@@ -100,7 +104,7 @@ way. Start on devnet-sized notionals and watch bundle UUIDs in logs.
 ## Testing
 
 ```sh
-cargo test --workspace                    # 114 tests: 17 auditor, 9 curve, 14 executor, 14 listener, 19 risk-engine, 15 simulator, 26 binary
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -128,8 +132,9 @@ crates/executor/       # live swaps via Jito (only with --live)
   `NOTIONAL_USD`, and reviewed parameters.
 - `crates/executor` refuses to build anything when the wallet guard
   fails: missing key, or balance below trade + tip + 0.05 SOL reserve.
-- Auditing is fail-closed (transport errors skip the token), and unknown
-  metrics default to `PASS`.
-- Remaining gap: `BUY_VELOCITY_5S` / `DEV_REPUTATION` are still env stubs
-  until trade-tape and deployer-history feeds land. Liquidity, entry
-  pricing, and exit polling are already live from curve reserves.
+- Auditing and dev screening are fail-closed (transport errors skip the
+  token). Velocity below 5 measured buyers resolves to `PASS` — no demand,
+  no trade.
+- Entry gating: signals sit on a 10s watchlist until 5 distinct wallets
+  buy; dev dumps abort immediately, silence times out. Nothing is bought
+  on the create block anymore.

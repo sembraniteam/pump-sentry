@@ -15,8 +15,7 @@ evaluate_token →  fetch_report + policy invariants → Report | SecurityReject
 - `policy` — pure `assess(report, policy) -> Verdict::{Allow, Reject}`:
   score cap (default 400), no `danger` risks, no mint/freeze authority.
 - `client` — pooled `reqwest` client, 1500ms timeout, retries on
-  timeouts / connect errors / 5xx / 429 with exponential backoff
-  (200ms × 2^attempt, max 2s).
+  timeouts / connect errors / 5xx / 429 with exponential backoff (200ms × 2^attempt, max 2s).
 
 ## Use
 

@@ -25,10 +25,18 @@ pub struct Settings {
     pub trail_percent: f64,
     /// Liquidity fallback in USD (used only when the reserve read fails).
     pub liquidity_usd: f64,
-    /// Buy-velocity stub (buys / 5s) until the trade-tape feed lands.
-    pub buy_velocity_5s: u32,
-    /// Deployer-reputation stub until the history feed lands.
-    pub dev_reputation: f64,
+    /// Entry-gate window in seconds: buyer quorum must arrive in time.
+    pub gate_window_secs: u64,
+    /// Distinct non-dev buyers required to confirm an entry.
+    pub gate_min_buyers: u32,
+    /// Gate poll interval in milliseconds.
+    pub gate_poll_ms: u64,
+    /// Minimum dev-wallet age in seconds for the history screen.
+    pub dev_min_age_secs: u64,
+    /// Maximum tolerated prior Pump.fun launches by the dev.
+    pub dev_max_prior_launches: usize,
+    /// Recent dev transactions sampled for the launch count.
+    pub dev_screen_sample_txs: usize,
     /// Manual entry-quote override for tests.
     pub quote_usd: Option<f64>,
     /// SOL→USD conversion for curve pricing.
@@ -68,8 +76,12 @@ impl Settings {
             notional_usd: get_float(vars, "NOTIONAL_USD", 10.0),
             trail_percent: get_float(vars, "TRAIL_PERCENT", 5.0),
             liquidity_usd: get_float(vars, "LIQUIDITY_USD", 0.0),
-            buy_velocity_5s: get_int(vars, "BUY_VELOCITY_5S", 0),
-            dev_reputation: get_float(vars, "DEV_REPUTATION", 0.0),
+            gate_window_secs: get_int(vars, "GATE_WINDOW_SECS", 10),
+            gate_min_buyers: get_int(vars, "GATE_MIN_BUYERS", 5),
+            gate_poll_ms: get_int(vars, "GATE_POLL_MS", 2000),
+            dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600),
+            dev_max_prior_launches: get_int(vars, "DEV_MAX_PRIOR_LAUNCHES", 1),
+            dev_screen_sample_txs: get_int(vars, "DEV_SCREEN_SAMPLE_TXS", 20),
             quote_usd: vars.get("QUOTE_USD").and_then(|v| v.parse().ok()),
             sol_usd: get_float(vars, "SOL_USD", 150.0),
             tick_interval_ms: get_int(vars, "TICK_INTERVAL_MS", 1000),
@@ -131,11 +143,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_pass_safe() {
+    fn defaults_are_sane() {
         let s = Settings::from_map(&HashMap::new());
         assert_eq!(s.commitment, "confirmed");
         assert_eq!(s.start_balance, 100.0);
-        assert_eq!(s.dev_reputation, 0.0);
+        assert_eq!(s.gate_window_secs, 10);
+        assert_eq!(s.gate_min_buyers, 5);
+        assert_eq!(s.dev_min_age_secs, 3600);
         assert_eq!(s.quote_usd, None);
         assert_eq!(s.inference_timeout_ms, 300);
         assert_eq!(s.inference_api_key, None);
@@ -145,7 +159,7 @@ mod tests {
     fn overrides_apply() {
         let s = Settings::from_map(&vars(&[
             ("START_BALANCE", "250.5"),
-            ("BUY_VELOCITY_5S", "42"),
+            ("GATE_MIN_BUYERS", "5"),
             ("QUOTE_USD", "0.000001"),
             ("COMMITMENT", "finalized"),
             ("SLIPPAGE_BPS", "500"),
@@ -153,7 +167,7 @@ mod tests {
             ("INFERENCE_API_KEY", "secret"),
         ]));
         assert_eq!(s.start_balance, 250.5);
-        assert_eq!(s.buy_velocity_5s, 42);
+        assert_eq!(s.gate_min_buyers, 5);
         assert_eq!(s.quote_usd, Some(0.000001));
         assert_eq!(s.commitment, "finalized");
         assert_eq!(s.slippage_bps, 500);

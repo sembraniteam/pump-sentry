@@ -12,12 +12,13 @@ mod live;
 mod pipeline;
 mod settings;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use auditor::RugCheckClient;
 use curve::{CurveTicker, PriceTick};
 use executor::{JitoClient, SwapExecutor, WalletGuard};
-use listener::{ListenerConfig, PumpFunListener};
+use listener::{DevScreenConfig, ListenerConfig, PumpFunListener, RpcScreener};
 use risk_engine::RiskEngine;
 use simulator::PaperPortfolio;
 use tokio::sync::mpsc;
@@ -41,9 +42,6 @@ async fn main() {
         .init();
 
     let settings = Settings::from_env();
-    if settings.dev_reputation == 0.0 {
-        warn!("DEV_REPUTATION unset: heuristic defaults to PASS until the live feed lands (TODO)");
-    }
 
     // Mode gate: paper unless explicitly opted into live risk.
     let live_mode = std::env::args().any(|a| a == "--live")
@@ -133,6 +131,25 @@ async fn main() {
         None
     };
 
+    let screener = match RpcScreener::new(
+        &settings.http_url,
+        commitment,
+        DevScreenConfig {
+            min_age_secs: settings.dev_min_age_secs,
+            max_prior_launches: settings.dev_max_prior_launches,
+            sample_txs: settings.dev_screen_sample_txs,
+            sig_limit: 100,
+        },
+    ) {
+        Ok(screener) => screener,
+        Err(e) => {
+            eprintln!("bad screener config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let gate_interval = Duration::from_millis(settings.gate_poll_ms);
+
     let pipeline = Pipeline::shared(
         settings,
         RugCheckClient::new(),
@@ -140,11 +157,22 @@ async fn main() {
         ticker.clone(),
         PaperPortfolio::new(start_balance, fee_bps),
         live,
+        screener,
     );
 
     // Ticker loop: poll watched curves → auto-close on TP/SL.
     let (tick_tx, mut tick_rx) = mpsc::channel::<PriceTick>(1024);
     tokio::spawn(async move { ticker.run(tick_tx).await });
+
+    // Gate loop: poll the watchlist for buyer quorum → confirmed entries.
+    let gate_pipeline = Arc::clone(&pipeline);
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(gate_interval);
+        loop {
+            timer.tick().await;
+            gate_pipeline.poll_gates().await;
+        }
+    });
 
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
     loop {
@@ -156,11 +184,14 @@ async fn main() {
                         &event.mint.to_string(),
                         &event.bonding_curve.to_string(),
                         &event.associated_bonding_curve.to_string(),
+                        &event.user.to_string(),
                     )
                     .await;
                 let snap = stats.snapshot();
+                let pending = pipeline.pending_count().await;
                 info!(logs = snap.logs_seen, candidates = snap.candidates,
-                    parse_ok = snap.parse_ok, dropped = snap.dropped_full, "listener stats");
+                    parse_ok = snap.parse_ok, dropped = snap.dropped_full,
+                    watchlist = pending, "listener stats");
             },
             tick = tick_rx.recv() => {
                 let Some(tick) = tick else { break };

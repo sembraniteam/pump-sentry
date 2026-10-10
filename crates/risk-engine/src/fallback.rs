@@ -15,21 +15,33 @@ pub const HIGH_MOMENTUM_VELOCITY: u32 = 30;
 pub const HIGH_MOMENTUM_LIQUIDITY_USD: f64 = 25_000.0;
 /// Skill thresholds, named for readability and testability.
 pub const MODERATE_MOMENTUM_VELOCITY: u32 = 10;
+/// Live-data hardening (deliberate deviation from the skill, 2026-10-11):
+/// with no evidence of demand the skill's scalp branch bought dead
+/// tokens at a 0% win rate, so anything below this velocity is a PASS.
+pub const MIN_BUY_VELOCITY: u32 = 5;
 
-/// Instant heuristic evaluation, exactly per the skill's decision table:
+/// Instant heuristic evaluation.
 ///
-/// - `dev_reputation < 0.35` or `rugcheck_score > 350` → PASS.
+/// Decision table (skill `adaptive-risk-prompting` as hardened by live
+/// results — scalp TP/SL widened from 18/−4 because bonding-curve
+/// spread+impact (~2–4%) stopped out −4% in milliseconds):
+///
+/// - `dev_reputation < 0.35`, `rugcheck_score > 350`, or
+///   `velocity < 5` → PASS.
 /// - High momentum (`velocity > 30`, `liq > $25k`) → TP 75, SL −8,
 ///   trailing, 180s.
-/// - Moderate (`velocity >= 10`) → TP 30, SL −6, no trail, 90s.
-/// - Otherwise (low-liquidity scalp) → TP 18, SL −4, no trail, 45s.
+/// - Moderate (`velocity >= 10`) → TP 30, SL −8, no trail, 90s.
+/// - Otherwise (confirmed but thin demand) → TP 40, SL −10, no trail, 45s.
 pub fn evaluate_heuristic_fallback(
     liq_usd: f64,
     buy_velocity_5s: u32,
     dev_rep: f64,
     rugcheck_score: u32,
 ) -> RiskProfile {
-    if dev_rep < DEV_REPUTATION_FLOOR || rugcheck_score > RUGCHECK_SCORE_CAP {
+    if dev_rep < DEV_REPUTATION_FLOOR
+        || rugcheck_score > RUGCHECK_SCORE_CAP
+        || buy_velocity_5s < MIN_BUY_VELOCITY
+    {
         return RiskProfile {
             action: Action::Pass,
             tp_percent: 0.0,
@@ -51,15 +63,15 @@ pub fn evaluate_heuristic_fallback(
         RiskProfile {
             action: Action::Buy,
             tp_percent: 30.0,
-            sl_percent: -6.0,
+            sl_percent: -8.0,
             trailing_stop: false,
             timeout_seconds: 90,
         }
     } else {
         RiskProfile {
             action: Action::Buy,
-            tp_percent: 18.0,
-            sl_percent: -4.0,
+            tp_percent: 40.0,
+            sl_percent: -10.0,
             trailing_stop: false,
             timeout_seconds: 45,
         }
@@ -112,17 +124,34 @@ mod tests {
     #[test]
     fn boundary_velocity_10_is_moderate() {
         let p = evaluate_heuristic_fallback(1_000.0, 10, 0.9, 100);
-        assert_eq!((p.tp_percent, p.sl_percent), (30.0, -6.0));
+        assert_eq!((p.tp_percent, p.sl_percent), (30.0, -8.0));
     }
 
     #[test]
-    fn low_velocity_is_scalp() {
+    fn no_demand_is_pass() {
+        // The 0%-win-rate killer: stubbed/zero velocity must never buy.
+        for v in [0, 1, 4] {
+            let p = evaluate_heuristic_fallback(5_000.0, v, 0.9, 100);
+            assert_eq!(p.action, Action::Pass, "velocity={v}");
+            assert_eq!(p.timeout_seconds, 0);
+        }
+    }
+
+    #[test]
+    fn thin_demand_buys_wide() {
         let p = evaluate_heuristic_fallback(5_000.0, 9, 0.9, 100);
         assert_eq!(
             (p.tp_percent, p.sl_percent, p.timeout_seconds),
-            (18.0, -4.0, 45)
+            (40.0, -10.0, 45)
         );
         assert!(!p.trailing_stop);
+    }
+
+    #[test]
+    fn boundary_velocity_5_is_thin_buy() {
+        let p = evaluate_heuristic_fallback(5_000.0, 5, 0.9, 100);
+        assert_eq!(p.action, Action::Buy);
+        assert_eq!((p.tp_percent, p.sl_percent), (40.0, -10.0));
     }
 
     #[test]

@@ -61,8 +61,10 @@ impl RiskProfile {
     }
 }
 
-/// System instruction sent to the model (skill prompt specification).
-pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.";
+/// System instruction sent to the model (skill prompt specification
+/// plus the decision bands, so the model follows the same table as the
+/// heuristic fallback).
+pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.35 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 30 with liquidity above $25000): TP 60 to 120, SL -8, trailing true, timeout 180. Moderate momentum (velocity 10 to 30): TP 25 to 45, SL -8, trailing false, timeout 90. Thin demand (velocity 5 to 9): TP 30 to 50, SL -10, trailing false, timeout 45. Bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8.";
 
 impl TokenMetrics {
     /// Render the skill's `INPUT PAYLOAD` as a compact JSON string.
