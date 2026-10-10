@@ -414,7 +414,7 @@ mod tests {
         let decision = engine.evaluate(&metrics()).await;
         assert_eq!(decision.source, DecisionSource::Fallback);
         // Heuristic for these metrics: high momentum.
-        assert_eq!(decision.profile.tp_percent, 75.0);
+        assert_eq!(decision.profile.tp_percent, 60.0);
         assert_eq!(decision.profile.action, Action::Buy);
     }
 

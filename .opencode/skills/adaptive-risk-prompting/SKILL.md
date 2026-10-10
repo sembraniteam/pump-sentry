@@ -5,6 +5,7 @@ license: MIT
 compatibility: opencode
 metadata:
   domain: quantitative-risk
+  protocol: openai-compatible-json
 ---
 
 ## Purpose
@@ -38,15 +39,16 @@ OUTPUT SCHEMA:
 }
 
 RULES:
-- If dev_reputation < 0.35 OR rugcheck_score > 350 -> "action": "PASS".
-- High Momentum (velocity > 30, liq > $25k) -> TP: 60.0 to 120.0, SL: -8.0, trailing: true, timeout: 180.
-- Moderate Momentum (velocity 10-30, liq $10k-$25k) -> TP: 25.0 to 45.0, SL: -6.0, trailing: false, timeout: 90.
-- Low Liquidity Scalp (liq < $10k) -> TP: 15.0 to 25.0, SL: -4.0, trailing: false, timeout: 45.
+- If dev_reputation < 0.40 OR rugcheck_score > 350 -> "action": "PASS".
+- If buy_velocity_5s < 5 (no confirmed momentum/dead launch) -> "action": "PASS".
+- High Momentum (velocity > 25, liq > $20k) -> TP: 45.0 to 100.0, SL: -10.0, trailing: true, timeout: 180.
+- Moderate Momentum (velocity 5-25, liq >= $10k) -> TP: 30.0 to 50.0, SL: -8.0, trailing: false, timeout: 90.
+- Otherwise (low liquidity or stagnant volume) -> "action": "PASS" (Never buy dead tokens).
 ```
 
 ## Deterministic Heuristic Fallback (Rust)
 
-Executes instantly if HTTP inference times out (>300ms):
+Executes instantly if HTTP inference times out:
 
 ```rust
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -64,7 +66,8 @@ pub fn evaluate_heuristic_fallback(
     dev_rep: f64,
     rugcheck_score: u32,
 ) -> RiskProfile {
-    if dev_rep < 0.35 || rugcheck_score > 350 {
+    // 1. Hard safety and minimum momentum filter
+    if dev_rep < 0.40 || rugcheck_score > 350 || buy_velocity_5s < 5 {
         return RiskProfile {
             action: "PASS".into(),
             tp_percent: 0.0,
@@ -74,29 +77,32 @@ pub fn evaluate_heuristic_fallback(
         };
     }
 
-    if buy_velocity_5s > 30 && liq_usd > 25_000.0 {
+    // 2. High momentum breakout
+    if buy_velocity_5s > 25 && liq_usd > 20_000.0 {
         RiskProfile {
             action: "BUY".into(),
-            tp_percent: 75.0,
-            sl_percent: -8.0,
+            tp_percent: 60.0,
+            sl_percent: -10.0,
             trailing_stop: true,
             timeout_seconds: 180,
         }
-    } else if buy_velocity_5s >= 10 {
+    // 3. Moderate confirmed volume
+    } else if buy_velocity_5s >= 5 && liq_usd >= 10_000.0 {
         RiskProfile {
             action: "BUY".into(),
-            tp_percent: 30.0,
-            sl_percent: -6.0,
+            tp_percent: 35.0,
+            sl_percent: -8.0,
             trailing_stop: false,
             timeout_seconds: 90,
         }
+    // 4. Default: Reject unproven liquidity/velocity
     } else {
         RiskProfile {
-            action: "BUY".into(),
-            tp_percent: 18.0,
-            sl_percent: -4.0,
+            action: "PASS".into(),
+            tp_percent: 0.0,
+            sl_percent: 0.0,
             trailing_stop: false,
-            timeout_seconds: 45,
+            timeout_seconds: 0,
         }
     }
 }

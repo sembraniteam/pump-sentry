@@ -16,12 +16,11 @@ evaluate(metrics)
 - `schema` — `TokenMetrics` → skill `INPUT PAYLOAD`; `RiskProfile`
   (`BUY|PASS`, `tp_percent`, `sl_percent`, `trailing_stop`,
   `timeout_seconds`) + `is_valid()` guard.
-- `fallback` — skill decision table hardened by live results (0% win
-  rate on no-demand buys): PASS when `dev_reputation < 0.35`,
-  `rugcheck_score > 350`, or `velocity < 5`; high momentum (vel > 30, liq > $25k) → TP 75 / SL −8 / trail / 180s;
-  moderate (vel ≥ 10) → TP 30 / SL −8 / 90s; thin demand (vel 5–9) → TP 40 /
-  SL −10 / 45s. Bonding-curve spread (~2–4%) makes tighter stops
-  instant losses.
+- `fallback` — skill decision table verbatim: PASS when `dev_reputation
+  < 0.40`, `rugcheck_score > 350`, or `velocity < 5`; high momentum (vel > 25,
+  liq > $20k) → TP 60 / SL −10 / trail / 180s; moderate (vel ≥ 5, liq ≥ $10k) → TP 35 / SL −8 / 90s; otherwise PASS
+  (never
+  buy dead tokens).
 - `engine` — `RiskEngine` (pooled HTTP client, `FALLBACK_TIMEOUT` =
   300ms). Model output is schema-validated; anything unusable resolves
   to the heuristic, so `evaluate` never fails on model trouble.

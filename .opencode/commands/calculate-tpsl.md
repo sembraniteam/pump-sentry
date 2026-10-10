@@ -13,8 +13,9 @@ Calculate dynamic risk targets using:
 ### Processing Rules:
 
 1. Send prompt to configured LLM inference provider (OpenAI-compatible / Hermes Agent).
-2. Enforce limits: Max SL = -15%, Min TP = +15%, Max Timeout = 300s.
-3. If inference > 300ms, use deterministic fallback.
+2. Enforce limits: Max SL = -15%, Min SL = -8.0% (to absorb AMM spread), Min TP = +30.0%, Max Timeout = 300s.
+3. If buy velocity < 5 or liquidity < $10k, action MUST be PASS.
+4. If inference > 1500ms, use deterministic fallback.
 
 ### Expected Output Format:
 

@@ -897,7 +897,7 @@ mod tests {
         let id = portfolio.position_ids()[0];
         let position = portfolio.position(id).expect("position");
         assert_eq!(position.entry_price, 2.0);
-        assert_eq!((position.tp_percent, position.sl_percent), (40.0, -10.0));
+        assert_eq!((position.tp_percent, position.sl_percent), (35.0, -8.0));
         drop(portfolio);
         assert_eq!(pipe.pending_count().await, 0);
         assert_eq!(pipe.reserves.watched.lock().expect("lock").len(), 1);
@@ -923,7 +923,7 @@ mod tests {
         let portfolio = pipe.portfolio.lock().await;
         let id = portfolio.position_ids()[0];
         let position = portfolio.position(id).expect("position");
-        assert_eq!((position.tp_percent, position.sl_percent), (75.0, -8.0));
+        assert_eq!((position.tp_percent, position.sl_percent), (60.0, -10.0));
         assert!(position.trailing_stop);
     }
 
@@ -1048,7 +1048,8 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_uses_quote_override_when_tick_fails() {
-        let settings = settings(&[("QUOTE_USD", "3.0"), ("LIQUIDITY_USD", "5000")]);
+        // Override liquidity must itself clear the $10k moderate floor.
+        let settings = settings(&[("QUOTE_USD", "3.0"), ("LIQUIDITY_USD", "15000")]);
         let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
         let pipe = pipeline_screened(
             settings,
@@ -1082,7 +1083,7 @@ mod tests {
             .await;
         pipe.poll_gates().await;
 
-        // +50% over the 2.0 entry clears the 40% TP.
+        // +50% over the 2.0 entry clears the 35% TP.
         pipe.on_tick(&tick("MINT", 3.0)).await;
 
         let portfolio = pipe.portfolio.lock().await;

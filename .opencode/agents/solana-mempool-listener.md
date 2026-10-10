@@ -6,24 +6,24 @@ top_p: 0.95
 steps: 15
 color: "#38bdf8"
 permission:
-  read: allow
-  edit: allow
-  glob: allow
-  grep: allow
-  list: allow
-  bash:
-    "cargo check*": allow
-    "cargo test*": allow
-    "cargo clippy*": allow
-    "*": ask
-  task: deny
-  external_directory: deny
-  todowrite: allow
-  webfetch: allow
-  websearch: deny
-  skill:
-    "solana-geyser-pumpfun": allow
-    "*": deny
+   read: allow
+   edit: allow
+   glob: allow
+   grep: allow
+   list: allow
+   bash:
+      "cargo check*": allow
+      "cargo test*": allow
+      "cargo clippy*": allow
+      "*": ask
+   task: deny
+   external_directory: deny
+   todowrite: allow
+   webfetch: allow
+   websearch: deny
+   skill:
+      "solana-geyser-pumpfun": allow
+      "*": deny
 ---
 
 You are a Solana Systems and Network Engineer specializing in high-throughput, low-latency stream processing in Rust.
@@ -47,3 +47,6 @@ Solana.
 4. **Resilience:**
     - Implement automatic exponential backoff reconnection for WebSocket and gRPC streams with randomized jitter (100ms
       base, 5s max cap).
+5. **Momentum & Velocity Tracking:**
+    - Support tracking subsequent buy instructions on newly deployed mints over an initial observation window (3–5
+      seconds) to feed genuine on-chain `buy_velocity_5s` metrics into the pipeline.
