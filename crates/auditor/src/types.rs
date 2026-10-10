@@ -54,7 +54,7 @@ pub struct RiskItem {
     /// Risk contribution in points.
     #[serde(default)]
     pub score: u32,
-    /// Severity: `info`, `warn`, or `danger`.
+    /// Severity: `warn` or `danger`.
     #[serde(default)]
     pub level: String,
 }
