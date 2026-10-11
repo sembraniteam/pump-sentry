@@ -7,11 +7,14 @@ Lets the pipeline prove profitability before risking real funds.
 
 ```
 PaperPortfolio::new(100.0, fee_bps)
-  ├─ open_position(mint, side, quote, notional, liquidity, tp/sl/trail/timeout)
+  ├─ open_position_params(OpenPositionParams{...})   // + moonbag share
   │    └─ FillModel quotes → execution price; cash −= notional + fee
   ├─ check_exit(&mut position, price, now) → TP / SL / trailing / timeout
   ├─ close_position(id, quote, liquidity, reason) → ClosedTrade{gross,fees,net}
+  │    └─ partial TP close scales out, ratchets the runner to breakeven,
+  │       disarms moonbag, and lifts the time-stop (runners ride trailing)
   └─ snapshot(quotes) → {cash, locked, equity, realized, unrealized}
+       (open legs valued at exit proceeds: fill-model price minus exit fee)
 ```
 
 - `types` — `Position`, `ClosedTrade`, `Side::{Long,Short}`,
@@ -27,12 +30,16 @@ PaperPortfolio::new(100.0, fee_bps)
 ## Use
 
 ```rust
-use simulator::{ExitReason, FillModel, PaperPortfolio, Side, check_exit};
+use simulator::{ExitReason, FillModel, OpenPositionParams, PaperPortfolio, Side, check_exit};
 use std::collections::HashMap;
 
 let mut pf = PaperPortfolio::new(100.0, 30.0); // $100, 0.30%/side
-let id = pf.open_position("MINT", Side::Long, 1.0, 40.0, 50_000.0,
-75.0, - 8.0, true, 5.0, 180, 1_700_000_000) ?;
+let id = pf.open_position_params( & OpenPositionParams {
+mint: "MINT", side: Side::Long, quote: 1.0, notional_usd: 40.0,
+liquidity_usd: 50_000.0, tp_percent: 75.0, sl_percent: - 8.0,
+trailing: true, trail_percent: 5.0, timeout_seconds: 180,
+moonbag_percent: 0.0, now_secs: 1_700_000_000,
+}) ?;
 
 // Poll loop: evaluate triggers, close on fire.
 let reason = check_exit(pf.position_mut(id).unwrap(), 1.80, 1_700_000_010)
