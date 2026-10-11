@@ -16,10 +16,13 @@ WalletGuard::load_from_env (SOLANA_PRIVATE_KEY, zeroized buffer)
 - `wallet` — skill `solana-wallet-guard`: env-only secrets (64-byte
   secret or 32-byte seed), `MIN_SOL_RESERVE_LAMPORTS` floor, pre-flight
   solvency check with saturating math.
-- `instructions` — skill `solana-pumpfun-swap`: buy
-  `[102,6,61,18,1,218,235,234]` / sell `[51,230,133,164,1,127,131,173]`,
-  exact 12-account order, Borsh `(amount, limit)` args, ATA derivation.
-  SPL program IDs cross-checked against the `spl-token` crates in tests.
+- `instructions` — skill `solana-pumpfun-swap` + live mainnet replays:
+  buy `[102,6,61,18,1,218,235,234]` / sell `[51,230,133,164,1,127,131,173]`,
+  Borsh `(amount, limit[, track_volume])` args, program-bound ATA derivation (classic vs Token-2022 per mint owner).
+  Legacy 12-account core, plus an
+  extended 16/14-account mayhem shape when the creator is known (creator
+  vault + volume/fee-config routing, positions byte-verified). SPL program
+  IDs cross-checked against the `spl-token` crates in tests.
 - `executor` — `SwapExecutor::{buy,sell}` over standard RPC confirmation,
   plus `buy_jito` / `sell_jito` over Jito bundles when configured with
   `with_jito` (skill `jito-mev-execution`; wired into the live binary via
@@ -53,6 +56,7 @@ let receipt = executor.buy(&BuyOrder {
     amount_tokens: 1_000_000,      // base units
     max_sol_cost: 10_000_000,      // lamports
     tip_lamports: 0,               // Jito tip (used by buy_jito/sell_jito)
+    creator: None,                 // Some(..) selects the extended mayhem shape
 }).await?;
 println!("confirmed: {}", receipt.signature);
 ```
@@ -73,11 +77,24 @@ Verified live 2026-10-11: dummy bundle accepted by the mainnet block
 engine (`result` UUID, no `-32602`), proving base64 decode with the
 `{"encoding": "base64"}` param through the crate's exact wire path.
 
+## Notes for live use
+
+- Compute budget + priority fee attach via
+  `with_compute_budget(limit, micro_lamports)` (`PRIORITY_FEE_MICRO_LAMPORTS`,
+  `COMPUTE_UNIT_LIMIT`; both off by default).
+- `sendBundle` carries `{"encoding": "base64"}` (live-verified; without it
+  the engine refuses every bundle with `-32602`).
+- Every dispatch runs `simulateTransaction` preflight first: definitive
+  failures refuse before fees burn; transport trouble proceeds with a log.
+- Fee recipient resolves live from the Global account (override with
+  `FEE_RECIPIENT` / `with_fee_recipient`); tip accounts refresh hourly
+  from `getTipAccounts` with static fallback.
+- Unconfirmed buys are tracked as pending and re-polled, never assumed
+  unfilled; sells retry with cooldown + attempt budget, then escalate.
+
 ## TODO before mainnet
 
-- Priority-fee / compute-budget instructions under congestion.
 - Mainnet tip calibration for `tip_lamports` under real bundle competition.
-- Layout acceptance: replay one recent mainnet buy/sell per side through
-  `simulateTransaction` before first funding (guards program upgrades).
-- Fee-recipient rotation: confirm whether the program still pays the
-  single hardcoded recipient or selects among several (read Global).
+- Mayhem `[16]/[17]` buyback-routing sourcing (see `instructions` docs);
+  the ignored `mainnet_layout_acceptance` probe is the gate.
+- `sell_v2` discriminator/layout (currently unobserved on-chain).
