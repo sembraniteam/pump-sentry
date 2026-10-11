@@ -44,6 +44,10 @@ pub const PUMP_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 17
 /// deliberately unhandled — dev dumps routed through it are invisible to
 /// the gate (documented residual blindness, fail-open on that path).
 pub const PUMP_BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
+/// `sell_v2` instruction discriminator (docs-sourced, NOT mainnet-
+/// observed: no verified sample yet, so no classifier is built on it).
+/// Present so future detection work has one canonical value to confirm.
+pub const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 /// `migrate` instruction discriminator (skill solana-raydium-migration).
 pub const PUMP_MIGRATE_DISCRIMINATOR: [u8; 8] = [155, 234, 231, 146, 236, 158, 162, 30];
 /// Global volume accumulator: every swap's volume tracking roots here.
