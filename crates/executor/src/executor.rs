@@ -139,7 +139,8 @@ pub struct SwapExecutor {
     /// Explicit fee-recipient override (`None` = resolve from Global at
     /// preflight, canonical constant as fallback; the program rotates
     /// recipients so hardcoding fails closed into fee misdirection).
-    fee_recipient_override: Option<Pubkey>,}
+    fee_recipient_override: Option<Pubkey>,
+}
 
 /// Global account layout: 8-byte Anchor discriminator, then
 /// `initialized`, `authority`, `fee_recipient` — the recipient slot is
@@ -364,7 +365,9 @@ impl SwapExecutor {
         // Program-bound ATA: Token-2022 mints derive a DIFFERENT address
         // than the classic helper (verified live).
         let ata = user_ata_with_program(&payer, &order.mint, &token_program);
-        let mut ixs = self.maybe_create_ata_ix(&payer, &order.mint, &ata).await;
+        let mut ixs = self
+            .maybe_create_ata_ix(&payer, &order.mint, &ata, &token_program)
+            .await;
         let fee_recipient = self.fee_recipient().await;
         ixs.push(PumpSwapBuilder::build_swap_ix(
             SwapKind::Buy { amount: order.amount_tokens, max_sol_cost: order.max_sol_cost, track_volume: true },
@@ -445,21 +448,23 @@ impl SwapExecutor {
         )])
     }
 
-    /// Create-ATA prefix when the user's token account for `mint` does not
-    /// exist yet (fresh wallet or first touch of the mint). Empty when the
-    /// account already exists or is unreadable within budget (the swap
-    /// then fails on-chain as before — no worse than today).
+    /// Create-ATA prefix when the user's token account for `mint` is not
+    /// known to exist (fresh wallet or first touch of the mint). The
+    /// idempotent variant makes the prefix safe on all paths: an existing
+    /// ATA succeeds silently, and a race between the existence check and
+    /// execution cannot fail the bundle.
     async fn maybe_create_ata_ix(
         &self,
         payer: &Pubkey,
         mint: &Pubkey,
         ata: &Pubkey,
+        token_program: &Pubkey,
     ) -> Vec<solana_instruction::Instruction> {
         match tokio::time::timeout(Duration::from_secs(10), self.rpc.get_account(ata)).await {
             Ok(Ok(_)) => Vec::new(),
             _ => {
                 use crate::instructions::build_create_ata_ix;
-                vec![build_create_ata_ix(payer, payer, mint, ata)]
+                vec![build_create_ata_ix(payer, payer, mint, ata, token_program)]
             }
         }
     }

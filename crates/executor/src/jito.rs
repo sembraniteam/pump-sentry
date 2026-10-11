@@ -15,7 +15,7 @@ use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Designated Jito tip accounts (skill `jito-mev-execution`).
 pub const JITO_TIP_ACCOUNTS: [&str; 4] = [
@@ -171,9 +171,12 @@ impl JitoClient {
 
     /// Query the engine's `getTipAccounts`. `None` on any failure or when
     /// the response carries no usable pubkeys.
+    ///
+    /// Posts to the SAME bundles endpoint: Jito routes JSON-RPC by the
+    /// `method` field, not the path — posting to the bare base URL
+    /// returns nothing (verified live) and silently pins the static
+    /// fallback forever.
     async fn fetch_tip_accounts(&self) -> Option<Vec<String>> {
-        // `getTipAccounts` lives on the same base URL (not /bundles).
-        let base = self.endpoint.trim_end_matches("/api/v1/bundles");
         let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -182,7 +185,7 @@ impl JitoClient {
         });
         let res = match tokio::time::timeout(
             Duration::from_millis(2000),
-            self.client.post(base).json(&payload).send(),
+            self.client.post(&self.endpoint).json(&payload).send(),
         )
         .await
         {
@@ -198,6 +201,16 @@ impl JitoClient {
             .filter(|s| Pubkey::from_str_const(s.as_str()).to_string() == *s)
             .collect();
         if accounts.is_empty() {
+            return None;
+        }
+        // Trust-but-verify: a rotated-but-legitimate list still overlaps
+        // the compiled set; a disjoint list smells hijacked/stale and is
+        // rejected loudly rather than poisoning tips for an hour.
+        let overlaps = accounts
+            .iter()
+            .any(|a| JITO_TIP_ACCOUNTS.contains(&a.as_str()));
+        if !overlaps {
+            warn!("getTipAccounts returned a disjoint set; keeping previous list");
             return None;
         }
         debug!(count = accounts.len(), "refreshed Jito tip accounts");

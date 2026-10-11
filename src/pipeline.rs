@@ -798,7 +798,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             trail_percent,
             timeout_seconds: profile.timeout_seconds,
             moonbag_percent: profile.moonbag_percent,
-            now_secs: now_secs(),
+            now_secs: now,
         }) {
             Ok(id) => {
                 let snap = portfolio.snapshot(&HashMap::new());
@@ -1001,6 +1001,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let mut portfolio = self.portfolio.lock().await;
         let ids: Vec<u64> = portfolio.positions_for_mint(&tick.mint);
         let mut closed_fraction = 0.0f64;
+        // Breaker inputs collected under the portfolio guard, recorded
+        // after it is released (see below): the day-loss lock must never
+        // be acquired while the portfolio lock is held.
+        let mut closed_pnls: Vec<f64> = Vec::new();
+        let now = now_secs();
         if ids.is_empty() {
             drop(portfolio);
             // No paper activity: retry a previously failed live exit, if any.
@@ -1052,9 +1057,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     tick.observed_at,
                 ) {
                     Ok(trade) => {
-                        // Feed the day-loss breaker (exits keep working even
-                        // past the cap — only new entries halt).
-                        self.daily.lock().await.record(trade.net_pnl, now_secs());
+                        // Defer the day-loss feed: recording here would
+                        // acquire the breaker lock while the portfolio
+                        // guard is held (lock-order inversion vs opens).
+                        closed_pnls.push(trade.net_pnl);
                         let is_moonbag_exit = trade.fraction_closed < 1.0;
                         // Runner bookkeeping (stop ratchet, timeout lift,
                         // moonbag disarm) lives in settle(); nothing to do.
@@ -1079,6 +1085,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
 
         drop(portfolio);
+        // Feed the day-loss breaker with the guard released. Lock order
+        // is now uniform everywhere (breaker and portfolio are never held
+        // together), so concurrent opens and ticks cannot deadlock.
+        // Exits keep working even past the cap — only new entries halt.
+        for pnl in closed_pnls {
+            self.daily.lock().await.record(pnl, now);
+        }
         if closed_fraction > 0.0 {
             self.live_sell(&tick.mint, tick.price_usd, closed_fraction)
                 .await;
@@ -1694,6 +1707,9 @@ mod tests {
         stop.price_usd = 1.0; // -50% << -8% SL.
         pipe.on_tick(&stop).await;
         assert!(pipe.portfolio.lock().await.position(id).is_none());
+        // The exit loss still feeds the breaker even though recording now
+        // happens after the portfolio guard is released (lock-order fix).
+        assert!(pipe.daily.lock().await.day_net < -10.0);
     }
 
     #[tokio::test]

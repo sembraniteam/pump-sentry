@@ -7,7 +7,13 @@
 //! - [`screen_developer`]: RPC dev-wallet history (age + prior launches),
 //!   fail-closed on transport errors.
 
-use crate::parser::{PUMP_CREATE_DISCRIMINATOR, PUMP_PROGRAM_ID, decode_ix_data};
+use crate::parser::{
+    PUMP_CREATE_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID, decode_ix_data,
+};
+pub use ids::{
+    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR,
+    PUMP_SELL_DISCRIMINATOR, SYSTEM_PROGRAM_ID,
+};
 use migration::{MigrationDestination, MigrationMonitor, RAYDIUM_V4_PROGRAM_ID, RaydiumV4Pool};
 use solana_client::{
     client_error::ClientError, nonblocking::rpc_client::RpcClient,
@@ -30,7 +36,6 @@ use std::{
 };
 use thiserror::Error;
 use tracing::{debug, warn};
-pub use ids::{PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_SELL_DISCRIMINATOR, SYSTEM_PROGRAM_ID};
 /// Account index of the trader (`user`) in buy/sell instructions.
 pub const IDX_SWAP_USER: usize = 6;
 /// Account index of the trader in `buy_v2` instructions: the fee payer
@@ -64,6 +69,13 @@ pub enum SwapSide {
     Buy,
     /// Tokens sold for SOL.
     Sell,
+    /// Pump.fun instruction with an unmapped discriminator (the `sell_v2`
+    /// dev-dump path is the known case). Side and trader layout are
+    /// unproven: the wallet is the ix's first listed account
+    /// (best-effort attribution), the amount is always 0, and quorum
+    /// never counts these — they exist only for the dev fail-closed
+    /// rule in [`EntryGate::observe`].
+    Unknown,
 }
 
 /// One classified Pump.fun swap inside a transaction.
@@ -103,8 +115,11 @@ impl SwapRecord {
 /// Classify every Pump.fun buy/sell instruction in a fetched transaction.
 /// Covers legacy `buy`/`sell` plus `buy_v2` (v2/mayhem-curve buys use a
 /// different discriminator and a 27-account layout with the trader at
-/// index 13). Non-pump instructions, undecodable data, and short account
-/// lists are skipped. Never panics.
+/// index 13). Instructions with unmapped discriminators surface as
+/// [`SwapSide::Unknown`] (never quorum-counted; only the dev
+/// fail-closed rule consumes them); `create`/`migrate` lifecycle ixs
+/// stay ignored. Non-pump instructions, undecodable data, and short
+/// account lists are skipped. Never panics.
 pub fn extract_pump_swaps(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
     sig: &str,
@@ -133,7 +148,7 @@ pub fn extract_pump_swaps(
             return;
         };
         // (side, trader account index): v2 buys share the side but not
-        // the layout. `sell_v2` is unknown and stays unhandled.
+        // the layout.
         let (side, user_idx) = if raw.starts_with(&PUMP_BUY_DISCRIMINATOR) {
             (SwapSide::Buy, IDX_SWAP_USER)
         } else if raw.starts_with(&PUMP_SELL_DISCRIMINATOR) {
@@ -141,6 +156,31 @@ pub fn extract_pump_swaps(
         } else if raw.starts_with(&PUMP_BUY_V2_DISCRIMINATOR) {
             (SwapSide::Buy, IDX_BUY_V2_USER)
         } else {
+            // Unmapped Pump.fun instruction (the `sell_v2` dev-dump path
+            // is the known case): the trader layout is unproven, so never
+            // attribute a side or an amount. `create`/`migrate` are benign
+            // lifecycle ixs and stay ignored; anything else is recorded
+            // against the first listed account so the gate can fail
+            // closed when it names the dev wallet.
+            if raw.starts_with(&PUMP_CREATE_DISCRIMINATOR)
+                || raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
+                || raw.starts_with(&PUMP_MIGRATE_DISCRIMINATOR)
+            {
+                return;
+            }
+            let Some(wallet) = accounts
+                .first()
+                .and_then(|idx| keys.get(usize::from(*idx)).copied())
+            else {
+                return;
+            };
+            out.push(SwapRecord {
+                signature: sig.to_string(),
+                slot: fetched.slot,
+                wallet,
+                side: SwapSide::Unknown,
+                amount_base_units: 0,
+            });
             return;
         };
         let Some(account) = accounts.get(user_idx) else {
@@ -197,7 +237,9 @@ pub fn count_dev_creates(
         let Some(raw) = decode_ix_data(data_b58) else {
             return;
         };
-        if !raw.starts_with(&PUMP_CREATE_DISCRIMINATOR) {
+        if !raw.starts_with(&PUMP_CREATE_DISCRIMINATOR)
+            && !raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
+        {
             return;
         }
         let author = accounts
@@ -322,6 +364,20 @@ impl EntryGate {
                 SwapSide::Sell => {
                     if swap.wallet == entry.dev {
                         let reason = format!("dev dump by {} in {}", swap.wallet, swap.signature);
+                        self.pending.remove(mint);
+                        return GateOutcome::Abort { reason };
+                    }
+                }
+                SwapSide::Unknown => {
+                    // Fail closed on the residual blindness: an unmapped
+                    // pump ix naming the dev wallet smells like a
+                    // `sell_v2` dump through an unverified layout. Stranger
+                    // unknowns never count toward quorum and never abort.
+                    if swap.wallet == entry.dev {
+                        let reason = format!(
+                            "possible dev dump via unknown pump ix by {} in {}",
+                            swap.wallet, swap.signature
+                        );
                         self.pending.remove(mint);
                         return GateOutcome::Abort { reason };
                     }
@@ -1678,12 +1734,44 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_pump_and_garbage() {
-        let mut foreign = buy_ix(5, 6); // program idx 5 = key(5), not pump
-        let _ = &mut foreign;
-        let mut bad_discr = buy_ix(0, 6);
-        bad_discr.data = bs58::encode([0u8; 24]).into_string();
-        let tx = swap_tx(vec![foreign, bad_discr]);
+    fn ignores_non_pump_program() {
+        let foreign = buy_ix(5, 6); // program idx 5 = key(5), not pump
+        let tx = swap_tx(vec![foreign]);
+        assert!(extract_pump_swaps(&tx, "sig").is_empty());
+    }
+
+    #[test]
+    fn unknown_pump_ix_is_recorded_but_never_counts() {
+        // Unmapped discriminators (e.g. sell_v2) surface as `Unknown`
+        // against the ix's first listed account — never dropped
+        // silently, never quorum-counted, amount always 0.
+        let mut unknown = buy_ix(0, 6);
+        unknown.data = bs58::encode([0u8; 24]).into_string();
+        let tx = swap_tx(vec![unknown]);
+        let records = extract_pump_swaps(&tx, "sig");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].side, SwapSide::Unknown);
+        // buy_ix lists account 20 first → key(20) in the fabricated tx.
+        assert_eq!(records[0].wallet, Pubkey::new_from_array([20; 32]));
+        assert_eq!(records[0].amount_base_units, 0);
+    }
+
+    #[test]
+    fn create_and_migrate_ixs_stay_ignored() {
+        // Benign lifecycle ixs must not become `Unknown` records (a dev
+        // migration touching the curve must never abort the gate).
+        let mut mk = |disc: &[u8; 8]| {
+            let mut ix = buy_ix(0, 6);
+            let mut data = disc.to_vec();
+            data.extend_from_slice(&[9u8; 16]);
+            ix.data = bs58::encode(data).into_string();
+            ix
+        };
+        let tx = swap_tx(vec![
+            mk(&PUMP_CREATE_DISCRIMINATOR),
+            mk(&PUMP_CREATE_V2_DISCRIMINATOR),
+            mk(&PUMP_MIGRATE_DISCRIMINATOR),
+        ]);
         assert!(extract_pump_swaps(&tx, "sig").is_empty());
     }
 
@@ -1747,6 +1835,44 @@ mod tests {
         };
         match gate.observe("MINT", &[dump], 1003) {
             GateOutcome::Abort { reason } => assert!(reason.contains("dev dump")),
+            other => panic!("expected abort, got {other:?}"),
+        }
+        assert_eq!(gate.pending_count(), 0);
+    }
+
+    #[test]
+    fn gate_aborts_on_dev_unknown_ix_but_ignores_strangers() {
+        let mut gate = EntryGate::new(60, 2);
+        let dev = Pubkey::new_from_array([7; 32]);
+        assert!(gate.submit("MINT", &dev.to_string(), 1000));
+        // Unknown ix from a stranger: no quorum credit, no abort.
+        let strange = SwapRecord {
+            signature: "u1".to_string(),
+            slot: 1001,
+            wallet: Pubkey::new_from_array([11; 32]),
+            side: SwapSide::Unknown,
+            amount_base_units: 0,
+        };
+        assert_eq!(gate.observe("MINT", &[strange], 1001), GateOutcome::Wait);
+        // One real buyer is still below quorum of 2 (unknown added none).
+        let buy = SwapRecord {
+            signature: "s2".to_string(),
+            slot: 1002,
+            wallet: Pubkey::new_from_array([12; 32]),
+            side: SwapSide::Buy,
+            amount_base_units: 1_000,
+        };
+        assert_eq!(gate.observe("MINT", &[buy], 1002), GateOutcome::Wait);
+        // Unknown ix naming the dev wallet: fail-closed abort.
+        let dev_unknown = SwapRecord {
+            signature: "u2".to_string(),
+            slot: 1003,
+            wallet: dev,
+            side: SwapSide::Unknown,
+            amount_base_units: 0,
+        };
+        match gate.observe("MINT", &[dev_unknown], 1003) {
+            GateOutcome::Abort { reason } => assert!(reason.contains("unknown pump")),
             other => panic!("expected abort, got {other:?}"),
         }
         assert_eq!(gate.pending_count(), 0);

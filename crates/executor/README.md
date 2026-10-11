@@ -9,7 +9,9 @@ parameter, and dry-run instruction inspection before mainnet use.
 ```
 WalletGuard::load_from_env (SOLANA_PRIVATE_KEY, zeroized buffer)
   → assert_solvency(balance ≥ trade + tip + 0.05 SOL reserve)
-  → PumpSwapBuilder::build_buy_ix / build_sell_ix (skill discriminators)
+  → PumpSwapBuilder::build_swap_ix (explicit SwapAccounts: live fee
+    recipient + per-mint token program + creator; legacy build_buy_ix /
+    build_sell_ix wrappers are deprecated — mayhem routing needs the full shape)
   → sign + send_and_confirm_transaction
 ```
 

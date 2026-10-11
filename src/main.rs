@@ -183,6 +183,17 @@ async fn main() {
 
     let gate_interval = Duration::from_millis(settings.gate_poll_ms);
 
+    // Zero poll intervals panic (`tokio::time::interval(ZERO)`) or spin
+    // the RPC hot: fail closed instead of crashing or burning quota.
+    if settings.gate_poll_ms == 0 {
+        eprintln!("bad GATE_POLL_MS=0: gate poll interval must be positive");
+        std::process::exit(1);
+    }
+    if settings.tick_interval_ms == 0 {
+        eprintln!("bad TICK_INTERVAL_MS=0: tick interval must be positive");
+        std::process::exit(1);
+    }
+
     let alerts = settings.discord_alerts.then(|| match &settings.discord_channel {
         Some(channel) => {
             info!(%channel, "discord alerts routed to channel");
@@ -244,7 +255,15 @@ async fn main() {
     // In-flight units run as JoinSet tasks so Ctrl-C never cancels a
     // half-applied launch/exit mid-await (paper-open without live mirror
     // and similar partial commits). Shutdown drains them bounded.
+    //
+    // Concurrency is bounded by a semaphore: every event fans out to
+    // RPC-heavy work, and an unbounded spawn lets a Pump.fun burst open
+    // thousands of concurrent RPCs (rate-limit + FD exhaustion). Tasks
+    // hold a permit for their whole run, so at most 32 dispatch at once;
+    // the rest wait without touching the network.
     let mut in_flight = tokio::task::JoinSet::new();
+    const MAX_IN_FLIGHT: usize = 32;
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let stats_task = Arc::clone(&stats);
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
     loop {
@@ -257,7 +276,9 @@ async fn main() {
                 let Some(event) = event else { break };
                 let pipeline = Arc::clone(&pipeline);
                 let stats = Arc::clone(&stats_task);
+                let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
+                    let Ok(_permit) = permits.acquire_owned().await else { return };
                     pipeline
                         .on_launch(
                             &event.mint.to_string(),
@@ -279,14 +300,18 @@ async fn main() {
             tick = tick_rx.recv() => {
                 let Some(tick) = tick else { break };
                 let pipeline = Arc::clone(&pipeline);
+                let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
+                    let Ok(_permit) = permits.acquire_owned().await else { return };
                     pipeline.on_tick(&tick).await;
                 });
             }
             pool = pool_rx.recv() => {
                 let Some(pool) = pool else { break };
                 let pipeline = Arc::clone(&pipeline);
+                let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
+                    let Ok(_permit) = permits.acquire_owned().await else { return };
                     pipeline.on_pool_tick(&pool).await;
                 });
             }

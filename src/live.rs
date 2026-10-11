@@ -5,11 +5,14 @@
 //! (unit-tested); only [`LiveTrader::buy`] / [`sell`](LiveTrader::sell)
 //! touch the network.
 
-use executor::{BuyOrder, ConfirmOutcome, ExecutorError, SellOrder, SwapExecutor, parse_pubkey};
+use executor::{BuyOrder, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, parse_pubkey};
 use std::time::Duration;
 use thiserror::Error;
 
-/// Pump.fun mint decimals (base-unit scale).
+/// Pump.fun mint decimals (base-unit scale). Protocol-fixed: the Pump.fun
+/// program mints every token (classic and Token-2022 flows alike) at 6
+/// decimals, so sizing reads one constant instead of parsing per-mint
+/// account layouts at dispatch time.
 pub const TOKEN_DECIMALS: u32 = 6;
 /// Lamports per SOL.
 pub const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
@@ -87,8 +90,10 @@ pub struct LiveBuyPlan {
 /// Size a buy from USD notional at spot: tokens from `notional/price`,
 /// spend cap from `notional/sol` plus `slippage_bps` (clamped to 10_000 =
 /// 100% like the sell floor, so a misconfigured `SLIPPAGE_BPS` cannot
-/// authorize unbounded overspend). `None` on non-positive inputs or zero
-/// quantity.
+/// authorize unbounded overspend). `None` on non-positive inputs, zero
+/// quantity, or amounts that do not fit `u64` (`as`-casts saturate
+/// silently past the max — a garbage print must fail closed, never size
+/// a jumbo order).
 pub fn plan_buy(
     notional_usd: f64,
     price_usd: f64,
@@ -105,7 +110,11 @@ pub fn plan_buy(
         return None;
     }
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
-    let amount_tokens = (notional_usd / price_usd * scale).floor() as u64;
+    let amount_f = (notional_usd / price_usd * scale).floor();
+    if !amount_f.is_finite() || amount_f <= 0.0 || amount_f > u64::MAX as f64 {
+        return None;
+    }
+    let amount_tokens = amount_f as u64;
     if amount_tokens == 0 {
         return None;
     }
@@ -113,16 +122,22 @@ pub fn plan_buy(
     if !lamports.is_finite() || lamports <= 0.0 {
         return None;
     }
-    let max_sol_cost =
-        (lamports * (10_000.0 + slippage_bps.min(10_000) as f64) / 10_000.0).ceil() as u64;
+    let max_f =
+        (lamports * (10_000.0 + slippage_bps.min(10_000) as f64) / 10_000.0).ceil();
+    if !max_f.is_finite() || max_f <= 0.0 || max_f > u64::MAX as f64 {
+        return None;
+    }
     Some(LiveBuyPlan {
         amount_tokens,
-        max_sol_cost,
+        max_sol_cost: max_f as u64,
     })
 }
 
 /// Floor for a sell: expected proceeds minus `slippage_bps`. `None` on
-/// degenerate inputs.
+/// degenerate inputs — and on a zero floor: `min_sol_output = 0`
+/// authorizes the slot leader to fill at any price (sandwich drain), so
+/// full-slippage configs and sub-lamport dust fail closed instead of
+/// dispatching unprotected.
 pub fn plan_sell_floor(
     amount_tokens: u64,
     price_usd: f64,
@@ -135,9 +150,18 @@ pub fn plan_sell_floor(
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
         return None;
     }
+    if slippage_bps >= 10_000 {
+        return None;
+    }
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
     let lamports = amount_tokens as f64 / scale * price_usd / sol_usd * LAMPORTS_PER_SOL;
-    let floor = (lamports * (10_000.0 - slippage_bps.min(10_000) as f64) / 10_000.0).floor() as u64;
+    if !lamports.is_finite() || lamports <= 0.0 {
+        return None;
+    }
+    let floor = (lamports * (10_000.0 - slippage_bps as f64) / 10_000.0).floor() as u64;
+    if floor == 0 {
+        return None;
+    }
     Some(floor)
 }
 
@@ -156,10 +180,13 @@ pub struct LiveTrader {
 }
 
 /// Buy awaiting confirmation: reserved for the recheck loop, never treated
-/// as a fill until the chain says so.
+/// as a fill until the chain says so. Carries BOTH identifiers: the
+/// base58 `signature` (what `confirm_signature` polls — a bundle UUID
+/// never parses as one) and the engine `bundle_id` (for logs/cards).
 #[derive(Debug, Clone)]
 struct PendingBuy {
     position: LivePosition,
+    signature: String,
     bundle_id: String,
     attempts: u32,
 }
@@ -222,7 +249,7 @@ impl LiveTrader {
         for entry in snapshot {
             let outcome = match self
                 .executor
-                .confirm_signature(&entry.bundle_id, LIVE_CONFIRM_TIMEOUT)
+                .confirm_signature(&entry.signature, LIVE_CONFIRM_TIMEOUT)
                 .await
             {
                 Ok(ConfirmOutcome::Confirmed) => RecheckOutcome::Confirmed,
@@ -290,9 +317,9 @@ impl LiveTrader {
         match self
             .executor
             .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
-            .await?
+            .await
         {
-            ConfirmOutcome::Confirmed => Ok((
+            Ok(ConfirmOutcome::Confirmed) => Ok((
                 LivePosition {
                     mint: mint.to_string(),
                     curve: curve.to_string(),
@@ -302,36 +329,75 @@ impl LiveTrader {
                 },
                 receipt.bundle_id,
             )),
-            ConfirmOutcome::FailedOnChain => Err(LiveError::Unconfirmed(format!(
+            Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
                 "buy bundle {} errored on-chain; no fill",
                 receipt.bundle_id
             ))),
-            ConfirmOutcome::Timeout => {
+            Ok(ConfirmOutcome::Timeout) => {
                 // A timed-out bundle may still land late: track it for the
                 // recheck loop instead of assuming no fill (an untracked bag
                 // would never get exit automation).
-                let position = LivePosition {
-                    mint: mint.to_string(),
-                    curve: curve.to_string(),
-                    assoc_curve: assoc_curve.to_string(),
-                    amount_tokens: plan.amount_tokens,
-                    creator: creator.map(|c| c.to_string()),
-                };
-                if let Ok(mut guard) = self.pending.lock() {
-                    guard.insert(
-                        mint.to_string(),
-                        PendingBuy {
-                            position: position.clone(),
-                            bundle_id: receipt.bundle_id.clone(),
-                            attempts: 1,
-                        },
-                    );
-                }
+                Self::track_pending(
+                    &self.pending,
+                    mint,
+                    LivePosition {
+                        mint: mint.to_string(),
+                        curve: curve.to_string(),
+                        assoc_curve: assoc_curve.to_string(),
+                        amount_tokens: plan.amount_tokens,
+                        creator: creator.map(|c| c.to_string()),
+                    },
+                    &receipt,
+                );
                 Err(LiveError::Unconfirmed(format!(
                     "buy bundle {} unconfirmed after {:?}; tracked as pending, rechecking",
                     receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
                 )))
             }
+            Err(e) => {
+                // Transport failure mid-confirm: the fill is just as
+                // unknown as a timeout (the bundle may already have
+                // landed), so track it identically. Only a proven
+                // on-chain failure means no fill.
+                Self::track_pending(
+                    &self.pending,
+                    mint,
+                    LivePosition {
+                        mint: mint.to_string(),
+                        curve: curve.to_string(),
+                        assoc_curve: assoc_curve.to_string(),
+                        amount_tokens: plan.amount_tokens,
+                        creator: creator.map(|c| c.to_string()),
+                    },
+                    &receipt,
+                );
+                Err(LiveError::Unconfirmed(format!(
+                    "buy bundle {} confirmRPC failed ({e}); tracked as pending, rechecking",
+                    receipt.bundle_id
+                )))
+            }
+        }
+    }
+
+    /// Record an unconfirmed buy for the recheck loop. Used for timeouts
+    /// AND transport errors alike: in both cases the fill is unknown, and
+    /// only a proven on-chain failure (`FailedOnChain`) means no fill.
+    fn track_pending(
+        pending: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+        mint: &str,
+        position: LivePosition,
+        receipt: &JitoReceipt,
+    ) {
+        if let Ok(mut guard) = pending.lock() {
+            guard.insert(
+                mint.to_string(),
+                PendingBuy {
+                    position,
+                    signature: receipt.signature.clone(),
+                    bundle_id: receipt.bundle_id.clone(),
+                    attempts: 1,
+                },
+            );
         }
     }
 
@@ -372,16 +438,23 @@ impl LiveTrader {
         match self
             .executor
             .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
-            .await?
+            .await
         {
-            ConfirmOutcome::Confirmed => Ok(receipt.bundle_id),
-            ConfirmOutcome::FailedOnChain => Err(LiveError::Unconfirmed(format!(
+            Ok(ConfirmOutcome::Confirmed) => Ok(receipt.bundle_id),
+            Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
                 "sell bundle {} errored on-chain; still holding",
                 receipt.bundle_id
             ))),
-            ConfirmOutcome::Timeout => Err(LiveError::Unconfirmed(format!(
+            Ok(ConfirmOutcome::Timeout) => Err(LiveError::Unconfirmed(format!(
                 "sell bundle {} unconfirmed after {:?}; still holding",
                 receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
+            ))),
+            // Transport failure mid-confirm: the bundle may already have
+            // landed, so report it as unconfirmed-but-holding (same retry
+            // path as a timeout) rather than a dispatch error.
+            Err(e) => Err(LiveError::Unconfirmed(format!(
+                "sell bundle {} confirm RPC failed ({e}); still holding",
+                receipt.bundle_id
             ))),
         }
     }
@@ -415,6 +488,23 @@ mod tests {
         // 1e6 units (1 token) at $2, SOL $150 → 13_333_333 lamports − 2%.
         let floor = plan_sell_floor(1_000_000, 2.0, 150.0, 200).expect("floor");
         assert_eq!(floor, 13_066_666);
+    }
+
+    #[test]
+    fn buy_plan_rejects_overflow() {
+        // 1e36 base units does not fit u64: fail closed, never saturate.
+        assert_eq!(plan_buy(1e20, 1e-10, 150.0, 200), None);
+        // Oversized spend cap (amount fits, cap does not): same treatment.
+        assert_eq!(plan_buy(1e13, 1e6, 150.0, 200), None);
+    }
+
+    #[test]
+    fn sell_floor_rejects_zero_floor() {
+        // 100% slippage authorizes any fill price: rejected outright.
+        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_000), None);
+        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_001), None);
+        // Sub-lamport dust floors to 0: no unprotected dispatch.
+        assert_eq!(plan_sell_floor(1, 1e-9, 1e9, 200), None);
     }
 
     #[test]

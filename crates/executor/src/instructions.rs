@@ -180,37 +180,40 @@ impl PumpSwapBuilder {
             AccountMeta::new(*accts.payer, true),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ];
-        // Index 8/9: the only layout difference between the sides.
-        // Buy: token program then rent. Sell: ATA program then token.
-        // (A prior revision had buy as rent-then-token, contradicting the
-        // skill and public Pump.fun account order; fixed with a lock test.)
-        // `token_program` is caller-resolved per mint: v2/mayhem mints live
-        // under Token-2022 and naming the classic program fails on-chain.
-        // Index 8/9: the only layout difference between the sides.
-        // Buy: token program then rent. Sell: ATA program then token.
-        // (A prior revision had buy as rent-then-token, contradicting the
-        // skill and public Pump.fun account order; fixed with a lock test.)
-        // `token_program` is caller-resolved per mint: v2/mayhem mints live
-        // under Token-2022 and naming the classic program fails on-chain.
-        // The extended mayhem shape (creator known) replaces index 9, so
-        // the legacy tail is only pushed for the legacy shape below.
-        accounts.push(AccountMeta::new_readonly(
-            match kind {
-                SwapKind::Buy { .. } => *accts.token_program,
-                SwapKind::Sell { .. } => ASSOCIATED_TOKEN_PROGRAM_ID,
-            },
-            false,
-        ));
-        // Extended mayhem shape when the creator is known: creator vault
-        // at 9 (buy) or 8 (sell, replacing the ATA program), then volume
-        // accumulators and fee-config routing. Positions verified against
-        // live mayhem transactions (constants + PDA derivations byte-exact;
-        // see module docs). Without a creator the legacy 12-account core
-        // is emitted (classic curves only).
+        // Tail layouts, exactly one arm runs (no overwrite-after-push):
+        // - legacy buy (no creator):  token program, rent, event, program
+        // - legacy sell (no creator): ATA program, token program, event, program
+        // - extended buy (creator):   token program, creator vault,
+        //   event, program, global-vol, user-vol, fee-config, fee-program
+        // - extended sell (creator):  creator vault, token program,
+        //   event, program, fee-config, fee-program
+        //
+        // Verified: legacy pair (skill + IDL + unit lock tests) and the
+        // extended BUY (positions 0..16 byte-equal to a frozen mainnet
+        // mayhem buy). The extended SELL mirrors the published SDK order
+        // but has NO frozen-sample proof yet — treat as experimental
+        // (simulation gates it before any funds move).
         match (kind, accts.creator) {
-            (SwapKind::Buy { .. }, Some(creator)) => {
-                accounts.push(AccountMeta::new(creator_vault_pda(creator), false));
+            (SwapKind::Buy { .. }, None) => {
                 accounts.extend_from_slice(&[
+                    AccountMeta::new_readonly(*accts.token_program, false),
+                    AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
+                    AccountMeta::new_readonly(EVENT_AUTHORITY, false),
+                    AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),
+                ]);
+            }
+            (SwapKind::Sell { .. }, None) => {
+                accounts.extend_from_slice(&[
+                    AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false),
+                    AccountMeta::new_readonly(*accts.token_program, false),
+                    AccountMeta::new_readonly(EVENT_AUTHORITY, false),
+                    AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),
+                ]);
+            }
+            (SwapKind::Buy { .. }, Some(creator)) => {
+                accounts.extend_from_slice(&[
+                    AccountMeta::new_readonly(*accts.token_program, false),
+                    AccountMeta::new(creator_vault_pda(creator), false),
                     AccountMeta::new_readonly(EVENT_AUTHORITY, false),
                     AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),
                     AccountMeta::new(GLOBAL_VOLUME_ACCUMULATOR, false),
@@ -220,28 +223,13 @@ impl PumpSwapBuilder {
                 ]);
             }
             (SwapKind::Sell { .. }, Some(creator)) => {
-                accounts.push(AccountMeta::new_readonly(*accts.token_program, false));
-                // Creator vault takes index 8 in the extended sell layout.
-                accounts[8] = AccountMeta::new(creator_vault_pda(creator), false);
                 accounts.extend_from_slice(&[
+                    AccountMeta::new(creator_vault_pda(creator), false),
+                    AccountMeta::new_readonly(*accts.token_program, false),
                     AccountMeta::new_readonly(EVENT_AUTHORITY, false),
                     AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),
                     AccountMeta::new_readonly(FEE_CONFIG_ACCOUNT, false),
                     AccountMeta::new_readonly(FEE_CONFIG_PROGRAM, false),
-                ]);
-            }
-            (SwapKind::Buy { .. }, None) => {
-                accounts.push(AccountMeta::new_readonly(RENT_SYSVAR_ID, false));
-                accounts.extend_from_slice(&[
-                    AccountMeta::new_readonly(EVENT_AUTHORITY, false),
-                    AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),
-                ]);
-            }
-            (SwapKind::Sell { .. }, None) => {
-                accounts.push(AccountMeta::new_readonly(*accts.token_program, false));
-                accounts.extend_from_slice(&[
-                    AccountMeta::new_readonly(EVENT_AUTHORITY, false),
-                    AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),
                 ]);
             }
         }
@@ -251,6 +239,15 @@ impl PumpSwapBuilder {
 
     /// Buy instruction: spends SOL for `amount` tokens, capped at
     /// `max_sol_cost` lamports.
+    ///
+    /// Deprecated: bakes in the canonical fee recipient, classic token
+    /// program, no creator, and untracked volume. Prefer
+    /// [`PumpSwapBuilder::build_swap_ix`] with an explicit
+    /// [`SwapAccounts`] (live recipient + per-mint program + creator).
+    #[deprecated(
+        since = "0.1.0",
+        note = "use build_swap_ix with explicit SwapAccounts; this wrapper cannot express mayhem routing"
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn build_buy_ix(
         payer: &Pubkey,
@@ -278,6 +275,13 @@ impl PumpSwapBuilder {
 
     /// Sell instruction: sells `amount` tokens for at least
     /// `min_sol_output` lamports.
+    ///
+    /// Deprecated: same legacy defaults as [`PumpSwapBuilder::build_buy_ix`];
+    /// prefer [`PumpSwapBuilder::build_swap_ix`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use build_swap_ix with explicit SwapAccounts; this wrapper cannot express mayhem routing"
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn build_sell_ix(
         payer: &Pubkey,
@@ -367,11 +371,19 @@ pub fn compute_budget_ixs(unit_limit: u32, unit_price_micro_lamports: u64) -> Ve
     }
     out
 }
-/// Build a create-associated-token-account instruction (canonical
-/// 7-account layout, empty data). Prepended when the user's ATA for a
-/// mint does not exist yet — otherwise the swap fails on-chain after
-/// burning fees.
-pub fn build_create_ata_ix(payer: &Pubkey, owner: &Pubkey, mint: &Pubkey, ata: &Pubkey) -> Instruction {
+/// Build an idempotent create-associated-token-account instruction
+/// (canonical 7-account layout, `CreateIdempotent` discriminator).
+/// Prepended when the user's ATA for a mint does not exist yet —
+/// otherwise the swap fails on-chain after burning fees. Idempotent
+/// form doubles as race insurance: even if the ATA lands between the
+/// existence check and execution, the prefix succeeds silently.
+pub fn build_create_ata_ix(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    ata: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
     Instruction {
         program_id: ASSOCIATED_TOKEN_PROGRAM_ID,
         accounts: vec![
@@ -380,10 +392,16 @@ pub fn build_create_ata_ix(payer: &Pubkey, owner: &Pubkey, mint: &Pubkey, ata: &
             AccountMeta::new_readonly(*owner, false),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            // Per-mint program: a Token-2022 mint created through the
+            // classic program fails inside its InitializeAccount CPI
+            // (`IncorrectProgramId`, verified live).
+            AccountMeta::new_readonly(*token_program, false),
             AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
         ],
-        data: vec![],
+        // Idempotent variant (`1`, not `0`): safe to prepend even when
+        // the ATA already exists (no duplicate-create failure) and
+        // immune to check-vs-land races between preflight and execution.
+        data: vec![1],
     }
 }
 
@@ -563,6 +581,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn buy_layout_and_accounts() {
         let (payer, mint, curve, assoc, ata) = keys();
         let ix = PumpSwapBuilder::build_buy_ix(&payer, &mint, &curve, &assoc, &ata, 1_000, 500);
@@ -606,6 +625,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn sell_layout_and_accounts() {
         let (payer, mint, curve, assoc, ata) = keys();
         let ix = PumpSwapBuilder::build_sell_ix(&payer, &mint, &curve, &assoc, &ata, 700, 300);

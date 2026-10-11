@@ -98,6 +98,10 @@ pub struct Settings {
     /// channel routing to the host Hermes configuration. Set to address
     /// `--to discord:<channel-id>` for a specific channel.
     pub discord_channel: Option<String>,
+    /// Parse failures seen by [`Settings::from_map`] (raw value → default
+    /// used). Surfaced first by [`Settings::warnings`] so env typos never
+    /// hide silently behind defaults.
+    pub parse_notes: Vec<String>,
 }
 
 impl Settings {
@@ -107,42 +111,43 @@ impl Settings {
     }
 
     /// Build knobs from an explicit map (test-friendly, no global state).
-    pub fn from_map(vars: &HashMap<String, String>) -> Self {        Self {
+    pub fn from_map(vars: &HashMap<String, String>) -> Self {        let mut notes = Vec::new();
+        Self {
             ws_url: get_string(vars, "WS_URL", "wss://api.mainnet-beta.solana.com"),
             http_url: get_string(vars, "HTTP_URL", "https://api.mainnet-beta.solana.com"),
             commitment: get_string(vars, "COMMITMENT", "confirmed"),
-            start_balance: get_float(vars, "START_BALANCE", 100.0),
-            fee_bps: get_float(vars, "FEE_BPS", 30.0),
-            notional_usd: get_float(vars, "NOTIONAL_USD", 10.0),
-            trail_percent: get_float(vars, "TRAIL_PERCENT", 5.0),
-            runner_trail_percent: get_float(vars, "RUNNER_TRAIL_PERCENT", 20.0),
-            liquidity_usd: get_float(vars, "LIQUIDITY_USD", 0.0),
-            gate_window_secs: get_int(vars, "GATE_WINDOW_SECS", 10),
-            gate_min_buyers: get_int(vars, "GATE_MIN_BUYERS", 5),
-            gate_poll_ms: get_int(vars, "GATE_POLL_MS", 2000),
-            max_open_positions: get_int(vars, "MAX_OPEN_POSITIONS", 3),
-            max_daily_loss_usd: get_float(vars, "MAX_DAILY_LOSS_USD", 0.0),
-            mint_cooldown_secs: get_int(vars, "MINT_COOLDOWN_SECS", 3600),
-            dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600),
-            dev_max_prior_launches: get_int(vars, "DEV_MAX_PRIOR_LAUNCHES", 1),
-            dev_screen_sample_txs: get_int(vars, "DEV_SCREEN_SAMPLE_TXS", 20),
-            quote_usd: vars.get("QUOTE_USD").and_then(|v| v.parse().ok()),
-            sol_usd: get_float(vars, "SOL_USD", 150.0),
-            tick_interval_ms: get_int(vars, "TICK_INTERVAL_MS", 1000),
+            start_balance: get_float(vars, "START_BALANCE", 100.0, &mut notes),
+            fee_bps: get_float(vars, "FEE_BPS", 30.0, &mut notes),
+            notional_usd: get_float(vars, "NOTIONAL_USD", 10.0, &mut notes),
+            trail_percent: get_float(vars, "TRAIL_PERCENT", 5.0, &mut notes),
+            runner_trail_percent: get_float(vars, "RUNNER_TRAIL_PERCENT", 20.0, &mut notes),
+            liquidity_usd: get_float(vars, "LIQUIDITY_USD", 0.0, &mut notes),
+            gate_window_secs: get_int(vars, "GATE_WINDOW_SECS", 10, &mut notes),
+            gate_min_buyers: get_int(vars, "GATE_MIN_BUYERS", 5, &mut notes),
+            gate_poll_ms: get_int(vars, "GATE_POLL_MS", 2000, &mut notes),
+            max_open_positions: get_int(vars, "MAX_OPEN_POSITIONS", 3, &mut notes),
+            max_daily_loss_usd: get_float(vars, "MAX_DAILY_LOSS_USD", 0.0, &mut notes),
+            mint_cooldown_secs: get_int(vars, "MINT_COOLDOWN_SECS", 3600, &mut notes),
+            dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600, &mut notes),
+            dev_max_prior_launches: get_int(vars, "DEV_MAX_PRIOR_LAUNCHES", 1, &mut notes),
+            dev_screen_sample_txs: get_int(vars, "DEV_SCREEN_SAMPLE_TXS", 20, &mut notes),
+            quote_usd: parse_quote_usd(vars, &mut notes),
+            sol_usd: get_float(vars, "SOL_USD", 150.0, &mut notes),
+            tick_interval_ms: get_int(vars, "TICK_INTERVAL_MS", 1000, &mut notes),
             inference_endpoint: get_string(
                 vars,
                 "INFERENCE_ENDPOINT",
                 "http://127.0.0.1:11434/v1/chat/completions",
             ),
             inference_model: get_string(vars, "INFERENCE_MODEL", "llama3.2:1b"),
-            inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300),
+            inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300, &mut notes),
             inference_api_key: vars.get("INFERENCE_API_KEY").cloned(),
-            slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200),
+            slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200, &mut notes),
             strategy_mode: get_string(vars, "STRATEGY_MODE", "adaptive"),
-            runner_moonbag_percent: get_float(vars, "RUNNER_MOONBAG_PERCENT", 20.0),
-            priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0),
-            compute_unit_limit: get_int(vars, "COMPUTE_UNIT_LIMIT", 0),
-            tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000),
+            runner_moonbag_percent: get_float(vars, "RUNNER_MOONBAG_PERCENT", 20.0, &mut notes),
+            priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0, &mut notes),
+            compute_unit_limit: get_int(vars, "COMPUTE_UNIT_LIMIT", 0, &mut notes),
+            tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000, &mut notes),
             fee_recipient: vars
                 .get("FEE_RECIPIENT")
                 .map(|v| v.trim().to_string())
@@ -152,22 +157,25 @@ impl Settings {
                 "JITO_ENDPOINT",
                 "https://frankfurt.mainnet.block-engine.jito.wtf",
             ),
-            discord_alerts: get_bool(vars, "DISCORD_ALERTS", true),
+            discord_alerts: get_bool(vars, "DISCORD_ALERTS", true, &mut notes),
             discord_channel: vars
                 .get("DISCORD_CHANNEL")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
+            parse_notes: notes,
         }
     }
 
-    /// Human-readable warnings for suspicious values (typos fall back to
-    /// defaults silently in `from_map`, so surface them here; `main`
-    /// prints these at startup). Empty when everything looks sane.
+    /// Human-readable warnings for suspicious values. Parse failures are
+    /// recorded by `from_map` (see `parse_notes`) and surface first, so
+    /// typos never hide silently behind defaults; `main` prints these at
+    /// startup and refuses zero poll intervals outright. Empty when
+    /// everything looks sane.
     pub fn warnings(&self) -> Vec<String> {
-        let mut out = Vec::new();
+        let mut out = self.parse_notes.clone();
         if self.slippage_bps > 10_000 {
             out.push(format!(
-                "SLIPPAGE_BPS={} exceeds 100%; buy guard will overspend massively",
+                "SLIPPAGE_BPS={} exceeds 100%; clamped to 100% at sizing (check the value — likely a typo)",
                 self.slippage_bps
             ));
         }
@@ -216,6 +224,38 @@ impl Settings {
         if self.sol_usd <= 0.0 || !self.sol_usd.is_finite() {
             out.push(format!("SOL_USD={} is not positive; pricing is garbage", self.sol_usd));
         }
+        if self.start_balance <= 0.0 || !self.start_balance.is_finite() {
+            out.push(format!(
+                "START_BALANCE={} is not positive finite; the paper book starts broke",
+                self.start_balance
+            ));
+        }
+        if !self.trail_percent.is_finite() || self.trail_percent <= 0.0 {
+            out.push(format!(
+                "TRAIL_PERCENT={} must be positive finite; trailing exits would never fire",
+                self.trail_percent
+            ));
+        }
+        if !self.liquidity_usd.is_finite() || self.liquidity_usd < 0.0 {
+            out.push(format!(
+                "LIQUIDITY_USD={} is invalid; the reserve-failure fallback is garbage",
+                self.liquidity_usd
+            ));
+        }
+        if self.gate_poll_ms == 0 {
+            out.push("GATE_POLL_MS=0 must be positive; startup refuses this".to_string());
+        }
+        if self.tick_interval_ms == 0 {
+            out.push("TICK_INTERVAL_MS=0 must be positive; startup refuses this".to_string());
+        }
+        if self.inference_timeout_ms == 0 {
+            out.push(
+                "INFERENCE_TIMEOUT_MS=0; every inference falls back to the heuristic".to_string(),
+            );
+        }
+        if self.tip_lamports == 0 {
+            out.push("JITO_TIP_LAMPORTS=0; bundles carry no tip and may never land".to_string());
+        }
         if self.quote_usd.is_some() {
             out.push(
                 "QUOTE_USD override is set: entries fall back to a manual price when the feed fails (paper-only by construction)".to_string(),
@@ -231,22 +271,83 @@ fn get_string(vars: &HashMap<String, String>, key: &str, default: &str) -> Strin
         .unwrap_or_else(|| default.to_string())
 }
 
-fn get_float(vars: &HashMap<String, String>, key: &str, default: f64) -> f64 {
-    vars.get(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+fn get_float(
+    vars: &HashMap<String, String>,
+    key: &str,
+    default: f64,
+    notes: &mut Vec<String>,
+) -> f64 {
+    match vars.get(key) {
+        None => default,
+        Some(v) => match v.parse() {
+            Ok(x) => x,
+            Err(_) => {
+                notes.push(format!(
+                    "{key}='{v}' is not a number; using default {default}"
+                ));
+                default
+            }
+        },
+    }
 }
 
-fn get_int<T: std::str::FromStr>(vars: &HashMap<String, String>, key: &str, default: T) -> T {
-    vars.get(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+fn get_int<T: std::str::FromStr + std::fmt::Display>(
+    vars: &HashMap<String, String>,
+    key: &str,
+    default: T,
+    notes: &mut Vec<String>,
+) -> T {
+    match vars.get(key) {
+        None => default,
+        Some(v) => match v.parse() {
+            Ok(x) => x,
+            Err(_) => {
+                notes.push(format!(
+                    "{key}='{v}' is not an integer; using default {default}"
+                ));
+                default
+            }
+        },
+    }
 }
 
-fn get_bool(vars: &HashMap<String, String>, key: &str, default: bool) -> bool {
-    vars.get(key)
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(default)
+fn get_bool(
+    vars: &HashMap<String, String>,
+    key: &str,
+    default: bool,
+    notes: &mut Vec<String>,
+) -> bool {
+    match vars.get(key).map(|v| v.to_ascii_lowercase()) {
+        None => default,
+        Some(v) if matches!(v.as_str(), "true" | "1" | "yes") => true,
+        Some(v) if matches!(v.as_str(), "false" | "0" | "no" | "") => false,
+        Some(v) => {
+            notes.push(format!("{key}='{v}' unrecognized; using default {default}"));
+            default
+        }
+    }
+}
+
+/// Manual entry-quote override: only a positive finite price is honored.
+/// Anything else is ignored with a note (a NaN/negative override would
+/// otherwise price paper opens — and live mirrors — at garbage).
+fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Option<f64> {
+    let raw = vars.get("QUOTE_USD")?;
+    match raw.parse::<f64>() {
+        Ok(q) if q.is_finite() && q > 0.0 => Some(q),
+        Ok(q) => {
+            notes.push(format!(
+                "QUOTE_USD={q} is not a positive finite price; ignoring the override"
+            ));
+            None
+        }
+        Err(_) => {
+            notes.push(format!(
+                "QUOTE_USD='{raw}' is not a number; ignoring the override"
+            ));
+            None
+        }
+    }
 }
 
 /// Local unix seconds; `0` when the clock is unavailable (never panics).
@@ -285,6 +386,7 @@ mod tests {
         assert_eq!(s.strategy_mode, "adaptive");
         assert_eq!(s.runner_moonbag_percent, 20.0);
         assert_eq!(s.runner_trail_percent, 20.0);
+        assert!(s.parse_notes.is_empty());
     }
 
     #[test]
@@ -317,6 +419,43 @@ mod tests {
         assert_eq!(s.start_balance, 100.0);
         assert_eq!(s.tick_interval_ms, 1000);
         assert_eq!(s.quote_usd, None);
+    }
+
+    #[test]
+    fn invalid_values_warn_loudly() {
+        // Formerly silent fallbacks: every typo must surface in warnings.
+        let s = Settings::from_map(&vars(&[
+            ("START_BALANCE", "bogus"),
+            ("GATE_POLL_MS", "zero"),
+            ("QUOTE_USD", "-5"),
+            ("DISCORD_ALERTS", "perhaps"),
+        ]));
+        let w = s.warnings().join("\n");
+        assert!(w.contains("START_BALANCE='bogus'"), "{w}");
+        assert!(w.contains("GATE_POLL_MS='zero'"), "{w}");
+        assert!(w.contains("QUOTE_USD=-5"), "{w}");
+        assert!(w.contains("DISCORD_ALERTS='perhaps'"), "{w}");
+    }
+
+    #[test]
+    fn degenerate_values_warn() {
+        let s = Settings::from_map(&vars(&[
+            ("GATE_POLL_MS", "0"),
+            ("TICK_INTERVAL_MS", "0"),
+            ("TRAIL_PERCENT", "0"),
+            ("INFERENCE_TIMEOUT_MS", "0"),
+            ("JITO_TIP_LAMPORTS", "0"),
+            ("SLIPPAGE_BPS", "20000"),
+            ("QUOTE_USD", "0.000001"),
+        ]));
+        let w = s.warnings().join("\n");
+        assert!(w.contains("GATE_POLL_MS=0"), "{w}");
+        assert!(w.contains("TICK_INTERVAL_MS=0"), "{w}");
+        assert!(w.contains("TRAIL_PERCENT=0"), "{w}");
+        assert!(w.contains("INFERENCE_TIMEOUT_MS=0"), "{w}");
+        assert!(w.contains("JITO_TIP_LAMPORTS=0"), "{w}");
+        assert!(w.contains("SLIPPAGE_BPS=20000"), "{w}");
+        assert!(w.contains("QUOTE_USD override is set"), "{w}");
     }
 
     #[test]

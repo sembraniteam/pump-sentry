@@ -491,7 +491,7 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
     let mut ixs = Vec::new();
     if rpc.get_account(&buyer_ata).await.is_err() {
         ixs.push(executor::instructions::build_create_ata_ix(
-            &buyer, &buyer, &ev.mint, &buyer_ata,
+            &buyer, &buyer, &ev.mint, &buyer_ata, &token_program,
         ));
     }
     let swap = PumpSwapBuilder::build_swap_ix(
