@@ -15,6 +15,7 @@ mod settings;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alert::Alerter;
 use auditor::RugCheckClient;
 use curve::{CurveTicker, PriceTick};
 use executor::{JitoClient, SwapExecutor, WalletGuard};
@@ -150,6 +151,11 @@ async fn main() {
 
     let gate_interval = Duration::from_millis(settings.gate_poll_ms);
 
+    let alerts = settings.discord_alerts.then(Alerter::new);
+    if alerts.is_none() {
+        info!("discord alerts disabled (DISCORD_ALERTS=false)");
+    }
+
     let pipeline = Pipeline::shared(
         settings,
         RugCheckClient::new(),
@@ -158,6 +164,7 @@ async fn main() {
         PaperPortfolio::new(start_balance, fee_bps),
         live,
         screener,
+        alerts,
     );
 
     // Ticker loop: poll watched curves → auto-close on TP/SL.
@@ -185,6 +192,7 @@ async fn main() {
                         &event.bonding_curve.to_string(),
                         &event.associated_bonding_curve.to_string(),
                         &event.user.to_string(),
+                        event.slot,
                     )
                     .await;
                 let snap = stats.snapshot();

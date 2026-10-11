@@ -148,6 +148,7 @@ mod tests {
             best_price: 1.0,
             opened_at: 1000,
             timeout_seconds: 0,
+            moonbag_percent: 0.0,
         }
     }
 

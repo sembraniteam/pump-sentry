@@ -43,6 +43,7 @@ pub fn evaluate_heuristic_fallback(
             sl_percent: 0.0,
             trailing_stop: false,
             timeout_seconds: 0,
+            moonbag_percent: 0.0,
         };
     }
 
@@ -53,6 +54,7 @@ pub fn evaluate_heuristic_fallback(
             sl_percent: -10.0,
             trailing_stop: true,
             timeout_seconds: 180,
+            moonbag_percent: 20.0,
         }
     } else if liq_usd >= MODERATE_MOMENTUM_LIQUIDITY_USD {
         RiskProfile {
@@ -61,6 +63,7 @@ pub fn evaluate_heuristic_fallback(
             sl_percent: -8.0,
             trailing_stop: false,
             timeout_seconds: 90,
+            moonbag_percent: 0.0,
         }
     } else {
         RiskProfile {
@@ -69,6 +72,7 @@ pub fn evaluate_heuristic_fallback(
             sl_percent: 0.0,
             trailing_stop: false,
             timeout_seconds: 0,
+            moonbag_percent: 0.0,
         }
     }
 }
@@ -108,6 +112,7 @@ mod tests {
         assert_eq!(p.sl_percent, -10.0);
         assert!(p.trailing_stop);
         assert_eq!(p.timeout_seconds, 180);
+        assert_eq!(p.moonbag_percent, 20.0);
     }
 
     #[test]
@@ -120,6 +125,7 @@ mod tests {
     fn boundary_velocity_5_is_moderate() {
         let p = evaluate_heuristic_fallback(10_000.0, 5, 0.9, 100);
         assert_eq!((p.tp_percent, p.sl_percent), (35.0, -8.0));
+        assert_eq!(p.moonbag_percent, 0.0);
     }
 
     #[test]

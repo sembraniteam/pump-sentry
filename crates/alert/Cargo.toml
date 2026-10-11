@@ -1,0 +1,19 @@
+[package]
+name = "alert"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+description = "Non-blocking Discord trade alerts via Hermes CLI"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "alert"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["process", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

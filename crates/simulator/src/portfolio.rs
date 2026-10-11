@@ -32,10 +32,59 @@ pub enum PortfolioError {
     /// No open position with this id.
     #[error("position not found: {0}")]
     PositionNotFound(PositionId),
+    /// Close fraction must satisfy `0 < fraction <= 1` (e.g. `0.8`: exit
+    /// 80%, keep a 20% moonbag runner).
+    #[error("invalid close fraction: {0}")]
+    InvalidFraction(f64),
 }
 
-/// Point-in-time accounting snapshot.
-#[derive(Debug, Clone)]
+/// Pro-rata slice of a position being settled. Owns its data so the
+/// ledger can price it while the open position is borrowed separately.
+struct CloseSlice {
+    id: PositionId,
+    mint: String,
+    side: Side,
+    entry_price: f64,
+    quantity: f64,
+    entry_notional: f64,
+    entry_fee: f64,
+    opened_at: u64,
+    fraction: f64,
+}
+
+impl CloseSlice {
+    /// Whole position (full close).
+    fn whole(position: &Position) -> Self {
+        Self {
+            id: position.id,
+            mint: position.mint.clone(),
+            side: position.side,
+            entry_price: position.entry_price,
+            quantity: position.quantity,
+            entry_notional: position.entry_notional,
+            entry_fee: position.entry_fee,
+            opened_at: position.opened_at,
+            fraction: 1.0,
+        }
+    }
+
+    /// `fraction` share (`0 < fraction < 1`; caller validates).
+    fn part(position: &Position, fraction: f64) -> Self {
+        Self {
+            id: position.id,
+            mint: position.mint.clone(),
+            side: position.side,
+            entry_price: position.entry_price,
+            quantity: position.quantity * fraction,
+            entry_notional: position.entry_notional * fraction,
+            entry_fee: position.entry_fee * fraction,
+            opened_at: position.opened_at,
+            fraction,
+        }
+    }
+}
+
+/// Point-in-time accounting snapshot.#[derive(Debug, Clone)]
 pub struct PortfolioSnapshot {
     /// Free cash in USD.
     pub cash: f64,
@@ -80,7 +129,7 @@ impl PaperPortfolio {
         }
     }
 
-    /// Override the fill model (default: linear bonding-curve impact).
+    /// Override the fill model (default: bonding-curve cost model).
     pub fn with_fill_model(mut self, fill: FillModel) -> Self {
         self.fill = fill;
         self
@@ -121,7 +170,8 @@ impl PaperPortfolio {
     /// Execution uses the fill model against `liquidity_usd`; entry fee is
     /// charged on the executed notional. Cash is debited `notional + fee`.
     /// `trail_percent` is the giveback that fires the trailing stop when
-    /// `trailing` is set (ignored otherwise).
+    /// `trailing` is set (ignored otherwise). `moonbag_percent` (0–100,
+    /// clamped) is the share kept riding after a TakeProfit scale-out.
     #[allow(clippy::too_many_arguments)]
     pub fn open_position(
         &mut self,
@@ -135,6 +185,7 @@ impl PaperPortfolio {
         trailing: bool,
         trail_percent: f64,
         timeout_seconds: u64,
+        moonbag_percent: f64,
         now_secs: u64,
     ) -> Result<PositionId, PortfolioError> {
         if !quote.is_finite() || quote <= 0.0 {
@@ -182,6 +233,7 @@ impl PaperPortfolio {
                 best_price: entry_price,
                 opened_at: now_secs,
                 timeout_seconds,
+                moonbag_percent: moonbag_percent.clamp(0.0, 100.0),
             },
         );
         Ok(id)
@@ -190,6 +242,8 @@ impl PaperPortfolio {
     /// Close a position at `quote` (exit also runs through the fill model).
     ///
     /// Proceeds = exit notional − exit fee are credited back to cash.
+    /// Equivalent to [`PaperPortfolio::close_partial_position`] with
+    /// `fraction = 1.0`.
     pub fn close_position(
         &mut self,
         id: PositionId,
@@ -198,50 +252,128 @@ impl PaperPortfolio {
         reason: ExitReason,
         now_secs: u64,
     ) -> Result<ClosedTrade, PortfolioError> {
+        self.settle(id, 1.0, quote, liquidity_usd, reason, now_secs)
+    }
+
+    /// Close `fraction` of a position (`0 < fraction <= 1`, e.g. `0.8`
+    /// exits 80% and leaves a 20% moonbag runner with identical entry
+    /// terms). The closed slice is accounted proportionally (notional,
+    /// quantity, entry fee); the remainder keeps running with its
+    /// original TP/trailing state, except a TakeProfit scale-out ratchets
+    /// its stop to breakeven (`max(sl, 0.0)` — never loosened).
+    /// `fraction == 1.0` removes the position exactly like
+    /// [`PaperPortfolio::close_position`].
+    pub fn close_partial_position(
+        &mut self,
+        id: PositionId,
+        fraction: f64,
+        quote: f64,
+        liquidity_usd: f64,
+        reason: ExitReason,
+        now_secs: u64,
+    ) -> Result<ClosedTrade, PortfolioError> {
+        if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
+            return Err(PortfolioError::InvalidFraction(fraction));
+        }
+        self.settle(id, fraction, quote, liquidity_usd, reason, now_secs)
+    }
+
+    /// Shared settlement: price the `fraction` slice through the fill
+    /// model, credit cash, shrink or remove the position, record history.
+    fn settle(
+        &mut self,
+        id: PositionId,
+        fraction: f64,
+        quote: f64,
+        liquidity_usd: f64,
+        reason: ExitReason,
+        now_secs: u64,
+    ) -> Result<ClosedTrade, PortfolioError> {
         if !quote.is_finite() || quote <= 0.0 {
             return Err(PortfolioError::InvalidPrice(quote));
         }
-        let position = self
-            .positions
-            .remove(&id)
-            .ok_or(PortfolioError::PositionNotFound(id))?;
+        if fraction >= 1.0 {
+            let position = self
+                .positions
+                .remove(&id)
+                .ok_or(PortfolioError::PositionNotFound(id))?;
+            let trade = self.book(
+                &CloseSlice::whole(&position),
+                quote,
+                liquidity_usd,
+                reason,
+                now_secs,
+            );
+            self.history.push(trade.clone());
+            return Ok(trade);
+        }
+        let slice = {
+            let position = self
+                .positions
+                .get(&id)
+                .ok_or(PortfolioError::PositionNotFound(id))?;
+            CloseSlice::part(position, fraction)
+        };
+        let trade = self.book(&slice, quote, liquidity_usd, reason, now_secs);
+        if let Some(open) = self.positions.get_mut(&id) {
+            open.quantity -= slice.quantity;
+            open.entry_notional -= slice.entry_notional;
+            open.entry_fee -= slice.entry_fee;
+            // Moonbag protection: a TakeProfit scale-out ratchets the
+            // runner's stop to breakeven (never loosens an already
+            // tighter stop). Other reasons leave stops untouched.
+            if reason == ExitReason::TakeProfit {
+                open.sl_percent = open.sl_percent.max(0.0);
+            }
+        }
+        self.history.push(trade.clone());
+        Ok(trade)
+    }
 
+    /// Price one slice and credit its proceeds to cash.
+    fn book(
+        &mut self,
+        slice: &CloseSlice,
+        quote: f64,
+        liquidity_usd: f64,
+        reason: ExitReason,
+        now_secs: u64,
+    ) -> ClosedTrade {
         let exit_price =
             self.fill
-                .fill_price(position.side, quote, position.entry_notional, liquidity_usd);
-        let exit_notional = position.quantity.abs() * exit_price;
+                .fill_price(slice.side, quote, slice.entry_notional, liquidity_usd);
+        let exit_notional = slice.quantity.abs() * exit_price;
         let exit_fee = self.fee_for(exit_notional);
 
-        let gross_pnl = (exit_price - position.entry_price) * position.quantity;
-        let fees = position.entry_fee + exit_fee;
+        let gross_pnl = (exit_price - slice.entry_price) * slice.quantity;
+        let fees = slice.entry_fee + exit_fee;
         let net_pnl = gross_pnl - fees;
-        let net_pnl_percent = if position.entry_notional > 0.0 {
-            net_pnl / position.entry_notional * 100.0
+        let net_pnl_percent = if slice.entry_notional > 0.0 {
+            net_pnl / slice.entry_notional * 100.0
         } else {
             0.0
         };
 
         // Cash locked at entry was notional + entry fee; return value minus exit fee.
-        self.cash += position.entry_notional + gross_pnl - exit_fee;
+        self.cash += slice.entry_notional + gross_pnl - exit_fee;
 
-        let trade = ClosedTrade {
-            id,
-            mint: position.mint,
-            side: position.side,
-            entry_price: position.entry_price,
+        ClosedTrade {
+            id: slice.id,
+            mint: slice.mint.clone(),
+            side: slice.side,
+            entry_price: slice.entry_price,
             exit_price,
-            quantity: position.quantity,
+            quantity: slice.quantity,
             gross_pnl,
             fees,
             net_pnl,
             net_pnl_percent,
             reason,
-            opened_at: position.opened_at,
+            fraction_closed: slice.fraction,
+            opened_at: slice.opened_at,
             closed_at: now_secs,
-            hold_seconds: now_secs.saturating_sub(position.opened_at),
-        };
-        self.history.push(trade.clone());
-        Ok(trade)
+            hold_seconds: now_secs.saturating_sub(slice.opened_at),
+        }
     }
 
     /// Mutable access for [`check_exit`](crate::check_exit)-style polling.
@@ -313,6 +445,7 @@ mod tests {
                 false,
                 0.0,
                 0,
+                0.0,
                 1000,
             )
             .expect("open");
@@ -344,6 +477,7 @@ mod tests {
                 false,
                 0.0,
                 0,
+                0.0,
                 0,
             )
             .expect("open");
@@ -373,16 +507,43 @@ mod tests {
                 false,
                 0.0,
                 0,
+                0.0,
                 0
             ),
             Err(PortfolioError::InsufficientFunds { .. })
         ));
         assert!(matches!(
-            pf.open_position("M", Side::Long, 0.0, 10.0, 1e9, 1.0, -1.0, false, 0.0, 0, 0),
+            pf.open_position(
+                "M",
+                Side::Long,
+                0.0,
+                10.0,
+                1e9,
+                1.0,
+                -1.0,
+                false,
+                0.0,
+                0,
+                0.0,
+                0
+            ),
             Err(PortfolioError::InvalidPrice(_))
         ));
         assert!(matches!(
-            pf.open_position("M", Side::Long, 1.0, -5.0, 1e9, 1.0, -1.0, false, 0.0, 0, 0),
+            pf.open_position(
+                "M",
+                Side::Long,
+                1.0,
+                -5.0,
+                1e9,
+                1.0,
+                -1.0,
+                false,
+                0.0,
+                0,
+                0.0,
+                0
+            ),
             Err(PortfolioError::InvalidNotional(_))
         ));
         assert!(matches!(
@@ -406,6 +567,7 @@ mod tests {
                 false,
                 0.0,
                 0,
+                0.0,
                 0,
             )
             .expect("open");
@@ -429,6 +591,7 @@ mod tests {
             false,
             0.0,
             0,
+            0.0,
             0,
         )
         .expect("open");
@@ -457,6 +620,7 @@ mod tests {
                 false,
                 0.0,
                 0,
+                0.0,
                 0,
             )
             .expect("open");
@@ -489,6 +653,7 @@ mod tests {
                     false,
                     0.0,
                     0,
+                    0.0,
                     i,
                 )
                 .expect("open");
@@ -503,5 +668,133 @@ mod tests {
     #[test]
     fn move_percent_degenerate_is_zero() {
         assert_eq!(move_percent(Side::Long, 0.0, 1.0), 0.0);
+    }
+
+    fn open_40_at_1(pf: &mut PaperPortfolio) -> PositionId {
+        pf.open_position(
+            "MINT",
+            Side::Long,
+            1.0,
+            40.0,
+            1e9,
+            75.0,
+            -8.0,
+            false,
+            0.0,
+            0,
+            0.0,
+            1000,
+        )
+        .expect("open")
+    }
+
+    #[test]
+    fn partial_80_20_split_matches_full_close_totals() {
+        let mut pf = funded();
+        let id = open_40_at_1(&mut pf);
+        // Scale out 80% at 2x: 32 of 40 notional, gross +32.
+        let part = pf
+            .close_partial_position(id, 0.8, 2.0, 1e9, ExitReason::TakeProfit, 1100)
+            .expect("partial");
+        assert_eq!(part.fraction_closed, 0.8);
+        assert_eq!(part.quantity, 32.0);
+        assert_eq!(part.gross_pnl, 32.0);
+        assert_eq!(part.net_pnl, 32.0);
+        assert_eq!(part.net_pnl_percent, 100.0);
+        assert_eq!(pf.cash(), 60.0 + 32.0 + 32.0);
+
+        // Moonbag runner keeps TP but its stop ratchets to breakeven.
+        let open = pf.position(id).expect("runner");
+        assert_eq!((open.quantity, open.entry_notional), (8.0, 8.0));
+        assert_eq!((open.tp_percent, open.sl_percent), (75.0, 0.0));
+
+        // Exiting the runner settles exactly like an equivalent full close.
+        let rest = pf
+            .close_partial_position(id, 1.0, 2.0, 1e9, ExitReason::TakeProfit, 1200)
+            .expect("rest");
+        assert_eq!(rest.fraction_closed, 1.0);
+        assert!(pf.position(id).is_none());
+        assert_eq!(pf.cash(), 140.0);
+        assert_eq!(pf.realized_pnl(), 40.0);
+        assert_eq!(pf.history().len(), 2);
+    }
+
+    #[test]
+    fn tp_scale_out_ratchets_runner_to_breakeven() {
+        let mut pf = funded();
+        let id = open_40_at_1(&mut pf);
+        assert_eq!(pf.position(id).expect("p").sl_percent, -8.0);
+        pf.close_partial_position(id, 0.8, 2.0, 1e9, ExitReason::TakeProfit, 1)
+            .expect("partial");
+        // Runner can no longer lose: stop moved from -8% to entry.
+        assert_eq!(pf.position(id).expect("runner").sl_percent, 0.0);
+    }
+
+    #[test]
+    fn ratchet_never_loosens_and_ignores_other_reasons() {
+        let mut pf = funded();
+        // Already-tight stop survives a TP scale-out untouched.
+        let id = open_40_at_1(&mut pf);
+        pf.position_mut(id).expect("p").sl_percent = 5.0;
+        pf.close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::TakeProfit, 1)
+            .expect("partial");
+        assert_eq!(pf.position(id).expect("p").sl_percent, 5.0);
+
+        // Manual scale-outs never move stops.
+        let id2 = open_40_at_1(&mut pf);
+        pf.close_partial_position(id2, 0.5, 2.0, 1e9, ExitReason::Manual, 1)
+            .expect("partial");
+        assert_eq!(pf.position(id2).expect("p").sl_percent, -8.0);
+    }
+
+    #[test]
+    fn partial_short_splits_signed_quantity() {
+        let mut pf = funded();
+        let id = pf
+            .open_position(
+                "MINT",
+                Side::Short,
+                2.0,
+                40.0,
+                1e9,
+                75.0,
+                -8.0,
+                false,
+                0.0,
+                0,
+                0.0,
+                0,
+            )
+            .expect("open");
+        assert_eq!(pf.position(id).expect("p").quantity, -20.0);
+        let part = pf
+            .close_partial_position(id, 0.5, 1.0, 1e9, ExitReason::TakeProfit, 1)
+            .expect("partial");
+        // Price halved: short gains (1-2)*(-10) = +10 on half size.
+        assert_eq!(part.quantity, -10.0);
+        assert_eq!(part.gross_pnl, 10.0);
+        assert_eq!(pf.position(id).expect("p").quantity, -10.0);
+    }
+
+    #[test]
+    fn partial_rejects_bad_fractions_and_missing_ids() {
+        let mut pf = funded();
+        let id = open_40_at_1(&mut pf);
+        for bad in [0.0, -0.5, 1.5, f64::NAN, f64::INFINITY] {
+            assert!(
+                matches!(
+                    pf.close_partial_position(id, bad, 2.0, 1e9, ExitReason::Manual, 0),
+                    Err(PortfolioError::InvalidFraction(_))
+                ),
+                "fraction={bad}"
+            );
+        }
+        assert!(matches!(
+            pf.close_partial_position(999, 0.5, 2.0, 1e9, ExitReason::Manual, 0),
+            Err(PortfolioError::PositionNotFound(999))
+        ));
+        // Position untouched by rejected closes.
+        assert_eq!(pf.position(id).expect("p").quantity, 40.0);
+        assert_eq!(pf.cash(), 60.0);
     }
 }

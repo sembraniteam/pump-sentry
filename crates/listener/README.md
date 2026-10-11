@@ -43,6 +43,17 @@ Win-rate hardening on top of the event stream:
   wallets (no history) and serial launchers, fail-closed on transport
   errors. `judge_developer` holds the pure policy for unit tests.
 - `RpcScreener` bundles both behind one client for the pipeline.
+- `BundleDetector::evaluate_launch_slot` (skill `sybil-cluster-detection`):
+  3+ buys in the exact creation slot, or 2+ wallets sharing one genesis
+  funder, proves a developer bundle; over 15% creation-slot supply
+  escalates to reject. Pure function over `(slot, buyer, supply_pct)`
+  swaps plus `(buyer, funder)` ancestry pairs.
+- `RpcScreener::bundle_verdict` runs the full forensics at confirm time:
+  recent curve swaps with slots and supply shares (from decoded amounts
+  over curve total supply) plus genesis-funder tracing for the first few
+  distinct buyers. Funders resolve by walking each wallet's history to
+  its first transaction (bounded page walk, `createAccount` and
+  `transfer` shapes).
 - Borsh args: `name: String, symbol: String, uri: String`
 - Accounts: `[0]=mint, [2]=bonding_curve, [3]=associated_bonding_curve,
   [7]=user` (min 8).

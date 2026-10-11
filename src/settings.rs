@@ -57,6 +57,8 @@ pub struct Settings {
     pub tip_lamports: u64,
     /// Jito block-engine base URL (region).
     pub jito_endpoint: String,
+    /// Discord trade alerts via Hermes CLI (needs `hermes` on PATH).
+    pub discord_alerts: bool,
 }
 
 impl Settings {
@@ -100,6 +102,7 @@ impl Settings {
                 "JITO_ENDPOINT",
                 "https://frankfurt.mainnet.block-engine.jito.wtf",
             ),
+            discord_alerts: get_bool(vars, "DISCORD_ALERTS", true),
         }
     }
 }
@@ -119,6 +122,12 @@ fn get_float(vars: &HashMap<String, String>, key: &str, default: f64) -> f64 {
 fn get_int<T: std::str::FromStr>(vars: &HashMap<String, String>, key: &str, default: T) -> T {
     vars.get(key)
         .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn get_bool(vars: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    vars.get(key)
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(default)
 }
 

@@ -7,9 +7,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use alert::Alerter;
 use auditor::{RugCheckClient, RugCheckError, RugCheckReport};
 use curve::{CurveError, CurveTicker, PriceTick};
-use listener::{DevVerdict, EntryGate, GateOutcome, RpcScreener, ScreenError, SwapRecord};
+use listener::{
+    BundleAnalysis, BundleVerdict, DevVerdict, EntryGate, GateOutcome, RpcScreener, ScreenError,
+    SwapRecord,
+};
 use risk_engine::{Action, RiskEngine, TokenMetrics, evaluate_heuristic_fallback};
 use simulator::{ExitReason, PaperPortfolio, Side, check_exit};
 use tokio::sync::Mutex;
@@ -58,6 +62,7 @@ impl ReserveFeed for CurveTicker {
 /// inject a stub. Only used when the binary runs with `--live`.
 pub trait LiveSink {
     /// Buy `notional_usd` at `price_usd` (both USD) via Jito bundle.
+    /// Returns the tracked position plus the bundle UUID.
     async fn buy(
         &self,
         mint: &str,
@@ -66,7 +71,7 @@ pub trait LiveSink {
         notional_usd: f64,
         price_usd: f64,
         sol_usd: f64,
-    ) -> Result<LivePosition, LiveError>;
+    ) -> Result<(LivePosition, String), LiveError>;
 
     /// Sell a tracked position at `price_usd`; returns the bundle UUID.
     async fn sell(
@@ -86,7 +91,7 @@ impl LiveSink for LiveTrader {
         notional_usd: f64,
         price_usd: f64,
         sol_usd: f64,
-    ) -> Result<LivePosition, LiveError> {
+    ) -> Result<(LivePosition, String), LiveError> {
         self.buy(mint, curve, assoc_curve, notional_usd, price_usd, sol_usd)
             .await
     }
@@ -98,6 +103,19 @@ impl LiveSink for LiveTrader {
         sol_usd: f64,
     ) -> Result<String, LiveError> {
         self.sell(position, price_usd, sol_usd).await
+    }
+}
+
+/// Alert sink: fire-and-forget trade cards. The blanket impl covers
+/// [`Alerter`]; tests inject a recording stub.
+pub trait AlertSink {
+    /// Dispatch a preformatted card without blocking.
+    fn alert(&self, message: String);
+}
+
+impl AlertSink for Alerter {
+    fn alert(&self, message: String) {
+        self.send(message);
     }
 }
 
@@ -113,6 +131,12 @@ pub trait Screener {
         curve: &str,
         since_sig: Option<&str>,
     ) -> Result<(Vec<SwapRecord>, Option<String>), ScreenError>;
+    /// Bundle forensics at confirm time; `Err` means fail-closed drop.
+    async fn screen_bundle(
+        &self,
+        curve: &str,
+        creation_slot: u64,
+    ) -> Result<BundleAnalysis, ScreenError>;
 }
 
 impl Screener for RpcScreener {
@@ -134,6 +158,17 @@ impl Screener for RpcScreener {
             .await
             .map_err(ScreenError::Rpc)
     }
+
+    async fn screen_bundle(
+        &self,
+        curve: &str,
+        creation_slot: u64,
+    ) -> Result<BundleAnalysis, ScreenError> {
+        let curve = listener::parse_address(curve)?;
+        self.bundle_verdict(&curve, creation_slot)
+            .await
+            .map_err(ScreenError::Rpc)
+    }
 }
 
 /// Resolve an entry price and sizing liquidity from a reserve read.
@@ -152,7 +187,13 @@ pub fn resolve_entry(
 }
 
 /// Shared pipeline state for the event, gate, and ticker tasks.
-pub struct Pipeline<A = RugCheckClient, R = CurveTicker, L = LiveTrader, S = RpcScreener> {
+pub struct Pipeline<
+    A = RugCheckClient,
+    R = CurveTicker,
+    L = LiveTrader,
+    S = RpcScreener,
+    T = Alerter,
+> {
     /// Runtime knobs.
     pub settings: Settings,
     /// Token audit source.
@@ -171,6 +212,8 @@ pub struct Pipeline<A = RugCheckClient, R = CurveTicker, L = LiveTrader, S = Rpc
     pub screener: S,
     /// Watchlist state plus per-mint signal context (single lock).
     pub gate_state: Mutex<GateState>,
+    /// Trade cards; `None` silences alerting entirely.
+    pub alerts: Option<T>,
 }
 
 /// Watchlist entry context alongside [`EntryGate`] decisions.
@@ -182,6 +225,8 @@ pub struct PendingSignal {
     pub assoc_curve: String,
     /// RugCheck score captured at signal time.
     pub score: u32,
+    /// Creation slot for the bundle rule.
+    pub creation_slot: u64,
     /// Signature watermark for incremental curve reads.
     pub last_sig: Option<String>,
 }
@@ -194,7 +239,7 @@ pub struct GateState {
     pub meta: HashMap<String, PendingSignal>,
 }
 
-impl<A, R, L, S> Pipeline<A, R, L, S> {
+impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
     /// Assemble shared state behind [`Arc`] for task sharing.
     #[allow(clippy::too_many_arguments)]
     pub fn shared(
@@ -205,6 +250,7 @@ impl<A, R, L, S> Pipeline<A, R, L, S> {
         portfolio: PaperPortfolio,
         live: Option<L>,
         screener: S,
+        alerts: Option<T>,
     ) -> Arc<Self> {
         let gate = EntryGate::new(settings.gate_window_secs, settings.gate_min_buyers);
         Arc::new(Self {
@@ -220,6 +266,7 @@ impl<A, R, L, S> Pipeline<A, R, L, S> {
                 gate,
                 meta: HashMap::new(),
             }),
+            alerts,
         })
     }
 
@@ -229,11 +276,18 @@ impl<A, R, L, S> Pipeline<A, R, L, S> {
     }
 }
 
-impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> {
+impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
     /// Audit → dev screen → watchlist. Never opens here: real demand must
     /// show up in [`Pipeline::poll_gates`] first. Skips (with a log) on
     /// any fail-closed condition.
-    pub async fn on_launch(&self, mint: &str, curve: &str, assoc_curve: &str, dev: &str) {
+    pub async fn on_launch(
+        &self,
+        mint: &str,
+        curve: &str,
+        assoc_curve: &str,
+        dev: &str,
+        slot: u64,
+    ) {
         // 1. Audit — fail closed.
         let report = match self.auditor.evaluate_token(mint).await {
             Ok(report) => report,
@@ -274,6 +328,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
                 curve: curve.to_string(),
                 assoc_curve: assoc_curve.to_string(),
                 score: report.score,
+                creation_slot: slot,
                 last_sig: None,
             },
         );
@@ -321,7 +376,29 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
             match outcome {
                 GateOutcome::Confirm { buyers } => {
                     self.gate_state.lock().await.meta.remove(&mint);
-                    self.confirm_open(&mint, &signal, buyers).await;
+                    // Bundle forensics before money moves: reject drops,
+                    // suspect trades paper-only, safe runs the full flow.
+                    match self
+                        .screener
+                        .screen_bundle(&signal.curve, signal.creation_slot)
+                        .await
+                    {
+                        Ok(analysis)
+                            if analysis.verdict == BundleVerdict::RejectBundledMonopoly =>
+                        {
+                            info!(%mint, buys = analysis.creation_slot_buys, supply = format!("{:.1}%", analysis.total_cluster_supply_pct), "bundle REJECT");
+                        }
+                        Ok(analysis) if analysis.verdict == BundleVerdict::SuspectLowVolume => {
+                            info!(%mint, "bundle suspect: paper-only, live dispatch skipped");
+                            self.confirm_open(&mint, &signal, buyers, false).await;
+                        }
+                        Ok(_) => {
+                            self.confirm_open(&mint, &signal, buyers, true).await;
+                        }
+                        Err(e) => {
+                            warn!(%mint, error = %e, "bundle screen error; dropping (fail-closed)");
+                        }
+                    }
                 }
                 GateOutcome::Abort { reason } => {
                     self.gate_state.lock().await.meta.remove(&mint);
@@ -341,7 +418,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
 
     /// Open a confirmed signal: fresh pricing, risk with measured buyer
     /// velocity and screened developer trust, then paper + live dispatch.
-    async fn confirm_open(&self, mint: &str, signal: &PendingSignal, buyers: u32) {
+    async fn confirm_open(
+        &self,
+        mint: &str,
+        signal: &PendingSignal,
+        buyers: u32,
+        allow_live: bool,
+    ) {
         let tick_result = self.reserves.fetch_tick(mint, &signal.curve).await;
         if tick_result.is_err() {
             warn!(%mint, "reserve read failed; trying QUOTE_USD override");
@@ -382,12 +465,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
             entry_quote,
             liquidity_usd,
             &profile,
+            allow_live,
         )
         .await;
     }
 
     /// Open a paper position at a confirmed price, watch for exits, and
-    /// mirror to live dispatch when enabled.
+    /// mirror to live dispatch when enabled (and allowed: bundle
+    /// suspects stay paper-only).
+    #[allow(clippy::too_many_arguments)]
     async fn open_tracked(
         &self,
         mint: &str,
@@ -396,6 +482,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
         entry_quote: f64,
         liquidity_usd: f64,
         profile: &risk_engine::RiskProfile,
+        allow_live: bool,
     ) {
         let mut portfolio = self.portfolio.lock().await;
         match portfolio.open_position(
@@ -409,6 +496,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
             profile.trailing_stop,
             self.settings.trail_percent,
             profile.timeout_seconds,
+            profile.moonbag_percent,
             now_secs(),
         ) {
             Ok(id) => {
@@ -416,11 +504,20 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
                 info!(%mint, id, entry = format!("{entry_quote:.10}"),
                     tp = profile.tp_percent, sl = profile.sl_percent,
                     equity = format!("{:.2}", snap.equity), "paper position opened");
+                self.emit(Alerter::format_entry(
+                    mint,
+                    entry_quote,
+                    profile.tp_percent,
+                    profile.sl_percent,
+                    self.settings.notional_usd,
+                ));
                 drop(portfolio);
                 if let Err(e) = self.reserves.watch(mint, curve).await {
                     warn!(%mint, error = %e, "ticker watch failed; exits need manual review");
                 }
-                self.live_buy(mint, curve, assoc_curve, entry_quote).await;
+                if allow_live {
+                    self.live_buy(mint, curve, assoc_curve, entry_quote).await;
+                }
             }
             Err(e) => warn!(%mint, error = %e, "paper open failed"),
         }
@@ -441,29 +538,62 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
             )
             .await
         {
-            Ok(position) => {
+            Ok((position, bundle)) => {
+                let amount = position.amount_tokens;
                 self.live_positions
                     .lock()
                     .await
                     .insert(mint.to_string(), position);
                 warn!(%mint, "LIVE buy dispatched via Jito (real funds)");
+                self.emit(Alerter::format_live_buy(mint, &bundle, amount));
             }
             Err(e) => warn!(%mint, error = %e, "LIVE buy FAILED; paper position still open"),
         }
     }
 
-    /// Mirror a paper close with a real Jito-routed sell (live mode only).
-    /// No-ops when no live fill is tracked for the mint.
-    async fn live_sell(&self, mint: &str, price_usd: f64) {
+    /// Mirror paper closes with proportional Jito-routed sells (live mode
+    /// only). Sells `fraction_closed` of the tracked amount so moonbag
+    /// scale-outs mirror exactly; dust write-offs drop tracking with a
+    /// loud log. No-ops when nothing is tracked for the mint.
+    async fn live_sell(&self, mint: &str, price_usd: f64, fraction_closed: f64) {
         let Some(trader) = &self.live else { return };
-        let position = self.live_positions.lock().await.remove(mint);
-        let Some(position) = position else { return };
-        match trader
-            .sell(&position, price_usd, self.settings.sol_usd)
-            .await
-        {
-            Ok(bundle) => warn!(%mint, %bundle, "LIVE sell dispatched via Jito (real funds)"),
+        let probe = {
+            let mut guard = self.live_positions.lock().await;
+            let Some(tracked) = guard.get_mut(mint) else {
+                return;
+            };
+            let sell_amount =
+                ((tracked.amount_tokens as f64) * fraction_closed.clamp(0.0, 1.0)) as u64;
+            let probe = LivePosition {
+                mint: tracked.mint.clone(),
+                curve: tracked.curve.clone(),
+                assoc_curve: tracked.assoc_curve.clone(),
+                amount_tokens: sell_amount,
+            };
+            if sell_amount == 0 {
+                guard.remove(mint);
+                warn!(%mint, "LIVE dust write-off; manual review");
+                return;
+            }
+            tracked.amount_tokens -= sell_amount;
+            if tracked.amount_tokens == 0 {
+                guard.remove(mint);
+            }
+            probe
+        };
+        match trader.sell(&probe, price_usd, self.settings.sol_usd).await {
+            Ok(bundle) => {
+                warn!(%mint, %bundle, "LIVE sell dispatched via Jito (real funds)");
+                self.emit(Alerter::format_live_sell(mint, &bundle));
+            }
             Err(e) => warn!(%mint, error = %e, "LIVE sell FAILED; manual exit required"),
+        }
+    }
+
+    /// Fire a card when alerting is enabled; silent otherwise.
+    fn emit(&self, message: String) {
+        if let Some(alerts) = &self.alerts {
+            alerts.alert(message);
         }
     }
 
@@ -483,7 +613,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
         if tick.complete {
             warn!(mint = %tick.mint, "curve migrated; closing positions (spot stale)");
         }
-        let mut closed_any = false;
+        let mut closed_fraction = 0.0f64;
         for id in ids {
             let reason = if tick.complete {
                 Some(ExitReason::Manual)
@@ -494,19 +624,44 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
                 }
             };
             let Some(reason) = reason else { continue };
-            match portfolio.close_position(
+            // TakeProfit with a moonbag plan scales out once, leaving the
+            // runner; the runner is disarmed so the next TP exits fully.
+            let moonbag = portfolio
+                .position(id)
+                .map(|p| p.moonbag_percent)
+                .unwrap_or(0.0);
+            let exit_fraction = if reason == ExitReason::TakeProfit && moonbag > 0.0 {
+                (1.0 - moonbag / 100.0).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            match portfolio.close_partial_position(
                 id,
+                exit_fraction,
                 tick.price_usd,
                 tick.liquidity_usd,
                 reason,
                 tick.observed_at,
             ) {
                 Ok(trade) => {
+                    let is_moonbag_exit = trade.fraction_closed < 1.0;
+                    if is_moonbag_exit && let Some(open) = portfolio.position_mut(id) {
+                        open.moonbag_percent = 0.0;
+                    }
+                    let equity = portfolio.snapshot(&HashMap::new()).equity;
                     info!(mint = %tick.mint, id, reason = ?trade.reason,
                         net = format!("{:+.2}", trade.net_pnl),
                         pct = format!("{:+.2}%", trade.net_pnl_percent),
                         "paper position closed");
-                    closed_any = true;
+                    self.emit(Alerter::format_exit(
+                        &tick.mint,
+                        &format!("{:?}", trade.reason),
+                        trade.net_pnl,
+                        trade.net_pnl_percent,
+                        equity,
+                        is_moonbag_exit,
+                    ));
+                    closed_fraction = closed_fraction.max(trade.fraction_closed);
                 }
                 Err(e) => warn!(mint = %tick.mint, id, error = %e, "paper close failed"),
             }
@@ -517,8 +672,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener> Pipeline<A, R, L, S> 
             .into_iter()
             .any(|id| portfolio.position(id).is_some_and(|p| p.mint == tick.mint));
         drop(portfolio);
-        if closed_any {
-            self.live_sell(&tick.mint, tick.price_usd).await;
+        if closed_fraction > 0.0 {
+            self.live_sell(&tick.mint, tick.price_usd, closed_fraction)
+                .await;
         }
         if !still_open && self.reserves.unwatch(&tick.mint).await {
             info!(mint = %tick.mint, "unwatched (no open positions)");
@@ -568,7 +724,8 @@ mod tests {
 
     struct StubLiveInner {
         buys: StdMutex<Vec<(String, String, String, f64)>>,
-        sells: StdMutex<Vec<String>>,
+        sells: StdMutex<Vec<(String, u64)>>,
+
         fail_buys: std::sync::atomic::AtomicBool,
     }
 
@@ -587,7 +744,7 @@ mod tests {
             self.inner.buys.lock().expect("lock").clone()
         }
 
-        fn sells(&self) -> Vec<String> {
+        fn sells(&self) -> Vec<(String, u64)> {
             self.inner.sells.lock().expect("lock").clone()
         }
     }
@@ -601,7 +758,7 @@ mod tests {
             notional_usd: f64,
             _price_usd: f64,
             _sol_usd: f64,
-        ) -> Result<LivePosition, LiveError> {
+        ) -> Result<(LivePosition, String), LiveError> {
             if self
                 .inner
                 .fail_buys
@@ -615,12 +772,15 @@ mod tests {
                 assoc_curve.to_string(),
                 notional_usd,
             ));
-            Ok(LivePosition {
-                mint: mint.to_string(),
-                curve: curve.to_string(),
-                assoc_curve: assoc_curve.to_string(),
-                amount_tokens: 1_000,
-            })
+            Ok((
+                LivePosition {
+                    mint: mint.to_string(),
+                    curve: curve.to_string(),
+                    assoc_curve: assoc_curve.to_string(),
+                    amount_tokens: 1_000,
+                },
+                "bundle-stub".to_string(),
+            ))
         }
 
         async fn sell(
@@ -633,7 +793,7 @@ mod tests {
                 .sells
                 .lock()
                 .expect("lock")
-                .push(position.mint.clone());
+                .push((position.mint.clone(), position.amount_tokens));
             Ok("bundle-stub".to_string())
         }
     }
@@ -685,6 +845,24 @@ mod tests {
         }
     }
 
+    /// Recording alert sink for firing assertions.
+    #[derive(Clone, Default)]
+    struct StubAlerts {
+        inner: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl StubAlerts {
+        fn messages(&self) -> Vec<String> {
+            self.inner.lock().expect("lock").clone()
+        }
+    }
+
+    impl AlertSink for StubAlerts {
+        fn alert(&self, message: String) {
+            self.inner.lock().expect("lock").push(message);
+        }
+    }
+
     fn tick(mint: &str, price: f64) -> PriceTick {
         PriceTick {
             mint: mint.to_string(),
@@ -722,6 +900,8 @@ mod tests {
                     &format!("{mint}-sig{b}"),
                     &fixture_wallet(*b),
                     SwapSide::Buy,
+                    1000 + u64::from(*b),
+                    1_000_000,
                 )
                 .expect("fixture wallet")
             })
@@ -744,6 +924,15 @@ mod tests {
     struct StubScreenerInner {
         dev: StdMutex<DevOutcome>,
         swaps: StdMutex<HashMap<String, Vec<SwapRecord>>>,
+        bundle: StdMutex<BundleOutcome>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BundleOutcome {
+        Safe,
+        Suspect,
+        Reject,
+        Broken,
     }
 
     impl StubScreener {
@@ -752,6 +941,7 @@ mod tests {
                 inner: Arc::new(StubScreenerInner {
                     dev: StdMutex::new(DevOutcome::Pass),
                     swaps: StdMutex::new(HashMap::new()),
+                    bundle: StdMutex::new(BundleOutcome::Safe),
                 }),
             }
         }
@@ -808,6 +998,37 @@ mod tests {
                 .unwrap_or_default();
             Ok((swaps, Some("sig-stub".to_string())))
         }
+
+        async fn screen_bundle(
+            &self,
+            _curve: &str,
+            _creation_slot: u64,
+        ) -> Result<BundleAnalysis, ScreenError> {
+            match *self.inner.bundle.lock().expect("lock") {
+                BundleOutcome::Safe => Ok(BundleAnalysis {
+                    is_bundled: false,
+                    creation_slot_buys: 1,
+                    shared_funder_count: 0,
+                    total_cluster_supply_pct: 2.0,
+                    verdict: BundleVerdict::SafeOrganic,
+                }),
+                BundleOutcome::Suspect => Ok(BundleAnalysis {
+                    is_bundled: true,
+                    creation_slot_buys: 3,
+                    shared_funder_count: 0,
+                    total_cluster_supply_pct: 9.0,
+                    verdict: BundleVerdict::SuspectLowVolume,
+                }),
+                BundleOutcome::Reject => Ok(BundleAnalysis {
+                    is_bundled: true,
+                    creation_slot_buys: 5,
+                    shared_funder_count: 4,
+                    total_cluster_supply_pct: 22.0,
+                    verdict: BundleVerdict::RejectBundledMonopoly,
+                }),
+                BundleOutcome::Broken => Err(ScreenError::BadAddress("stub".to_string())),
+            }
+        }
     }
 
     fn pipeline_screened(
@@ -817,7 +1038,19 @@ mod tests {
         portfolio: PaperPortfolio,
         screener: StubScreener,
         live: Option<StubLive>,
-    ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener>> {
+    ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
+        pipeline_alerted(settings, outcome, reserves, portfolio, screener, live, None)
+    }
+
+    fn pipeline_alerted(
+        settings: Settings,
+        outcome: AuditOutcome,
+        reserves: StubReserves,
+        portfolio: PaperPortfolio,
+        screener: StubScreener,
+        live: Option<StubLive>,
+        alerts: Option<StubAlerts>,
+    ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
         Pipeline::shared(
             settings,
             StubAuditor { outcome },
@@ -826,6 +1059,7 @@ mod tests {
             portfolio,
             live,
             screener,
+            alerts,
         )
     }
 
@@ -866,7 +1100,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
 
         // Signal accepted, but no position until buyer quorum confirms.
@@ -887,7 +1121,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -916,7 +1150,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -940,7 +1174,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -951,7 +1185,10 @@ mod tests {
     #[tokio::test]
     async fn gate_aborts_on_dev_dump() {
         let mut swaps = buyer_swaps("MINT", &[11]);
-        swaps.push(SwapRecord::new("dump", &dev_wallet(), SwapSide::Sell).expect("fixture"));
+        swaps.push(
+            SwapRecord::new("dump", &dev_wallet(), SwapSide::Sell, 1003, 1_000_000)
+                .expect("fixture"),
+        );
         let screener = StubScreener::with_swaps("MINT", swaps);
         let reserves = StubReserves::with_tick(tick("MINT", 2.0));
         let pipe = pipeline_screened(
@@ -962,7 +1199,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -981,9 +1218,72 @@ mod tests {
             StubScreener::passing(),
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         assert_eq!(pipe.pending_count().await, 1);
+        pipe.poll_gates().await;
+
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn bundle_reject_drops_signal() {
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        *screener.inner.bundle.lock().expect("lock") = BundleOutcome::Reject;
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
+            .await;
+        pipe.poll_gates().await;
+
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn bundle_suspect_trades_paper_only() {
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        *screener.inner.bundle.lock().expect("lock") = BundleOutcome::Suspect;
+        let live = StubLive::working();
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
+            .await;
+        pipe.poll_gates().await;
+
+        // Paper opens (tightened risk = no real funds), live stays quiet.
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+        assert!(live.buys().is_empty());
+        assert!(pipe.live_positions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bundle_screen_error_drops_fail_closed() {
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        *screener.inner.bundle.lock().expect("lock") = BundleOutcome::Broken;
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
+            .await;
         pipe.poll_gates().await;
 
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -1001,7 +1301,7 @@ mod tests {
                 StubScreener::with_dev(dev),
                 None,
             );
-            pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+            pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
                 .await;
             assert!(pipe.portfolio.lock().await.position_ids().is_empty());
             assert_eq!(pipe.pending_count().await, 0);
@@ -1020,7 +1320,7 @@ mod tests {
                 StubScreener::passing(),
                 None,
             );
-            pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+            pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
                 .await;
             assert!(pipe.portfolio.lock().await.position_ids().is_empty());
             assert_eq!(pipe.pending_count().await, 0);
@@ -1039,7 +1339,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -1059,7 +1359,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
         let portfolio = pipe.portfolio.lock().await;
@@ -1079,7 +1379,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -1111,7 +1411,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -1133,7 +1433,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("A", "CURVE_A", "ASSOC_A", &dev_wallet())
+        pipe.on_launch("A", "CURVE_A", "ASSOC_A", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
         // Same portfolio, second mint opened directly at the same price.
@@ -1151,6 +1451,7 @@ mod tests {
                     false,
                     0.0,
                     0,
+                    0.0,
                     1000,
                 )
                 .expect("open B");
@@ -1182,6 +1483,7 @@ mod tests {
                 false,
                 0.0,
                 60,
+                0.0,
                 1000,
             )
             .expect("open");
@@ -1214,7 +1516,7 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -1240,7 +1542,7 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -1274,7 +1576,7 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
 
@@ -1296,12 +1598,12 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
         pipe.on_tick(&tick("MINT", 3.0)).await;
 
-        assert_eq!(live.sells(), vec!["MINT".to_string()]);
+        assert_eq!(live.sells(), vec![("MINT".to_string(), 1_000)]);
         assert!(pipe.live_positions.lock().await.is_empty());
     }
 
@@ -1318,10 +1620,171 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet())
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
             .await;
         pipe.poll_gates().await;
-        pipe.on_tick(&tick("MINT", 3.6)).await;
+        pipe.on_tick(&tick("MINT", 3.0)).await;
         assert!(pipe.live_positions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn alerts_fire_on_open_and_close() {
+        let alerts = StubAlerts::default();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_alerted(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            None,
+            Some(alerts.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
+            .await;
+        pipe.poll_gates().await;
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+
+        let cards = alerts.messages();
+        assert_eq!(cards.len(), 2);
+        assert!(cards[0].contains("[TRADE OPENED]"));
+        assert!(cards[0].contains("`MINT`"));
+        assert!(cards[1].contains("[POSITION CLOSED]"));
+        assert!(cards[1].contains("TakeProfit"));
+        assert!(cards[1].contains("`MINT`"));
+    }
+
+    #[tokio::test]
+    async fn alerts_fire_on_live_dispatch() {
+        let alerts = StubAlerts::default();
+        let live = StubLive::working();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_alerted(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            Some(live),
+            Some(alerts.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
+            .await;
+        pipe.poll_gates().await;
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+
+        let cards = alerts.messages();
+        assert_eq!(cards.len(), 4);
+        assert!(cards[1].contains("[LIVE BUY SENT]"));
+        assert!(cards[1].contains("bundle-stub"));
+        assert!(cards[3].contains("[LIVE SELL SENT]"));
+    }
+
+    #[tokio::test]
+    async fn tp_scales_out_moonbag_then_rides() {
+        // High-momentum confirm carries moonbag 20: TP exits 80%.
+        let buyers: Vec<u8> = (20..55).collect();
+        let alerts = StubAlerts::default();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &buyers));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_alerted(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            None,
+            Some(alerts.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
+            .await;
+        pipe.poll_gates().await;
+
+        // +70% clears the 60% TP: 80% out, 20% runner stays armed-off.
+        pipe.on_tick(&tick("MINT", 3.4)).await;
+
+        let portfolio = pipe.portfolio.lock().await;
+        assert_eq!(portfolio.history().len(), 1);
+        assert_eq!(portfolio.history()[0].fraction_closed, 0.8);
+        let id = portfolio.position_ids()[0];
+        let runner = portfolio.position(id).expect("runner");
+        assert_eq!((runner.quantity, runner.entry_notional), (1.0, 2.0));
+        assert_eq!(runner.moonbag_percent, 0.0);
+        // Scale-out ratchets the runner stop to breakeven.
+        assert_eq!(runner.sl_percent, 0.0);
+        drop(portfolio);
+        // Still watched (position open) and the card is flagged moonbag.
+        assert!(pipe.reserves.unwatched.lock().expect("lock").is_empty());
+        let cards = alerts.messages();
+        assert_eq!(cards.len(), 2);
+        assert!(cards[1].contains("MOONBAG PARTIAL EXIT"));
+
+        // Runner hits TP again: full exit this time, then unwatch.
+        pipe.on_tick(&tick("MINT", 4.0)).await;
+        let portfolio = pipe.portfolio.lock().await;
+        assert_eq!(portfolio.history().len(), 2);
+        assert_eq!(portfolio.history()[1].fraction_closed, 1.0);
+        assert!(portfolio.position_ids().is_empty());
+        drop(portfolio);
+        assert_eq!(
+            pipe.reserves.unwatched.lock().expect("lock").as_slice(),
+            ["MINT"]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_sell_mirrors_partial_fractions() {
+        let buyers: Vec<u8> = (20..55).collect();
+        let alerts = StubAlerts::default();
+        let live = StubLive::working();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &buyers));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_alerted(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            Some(live.clone()),
+            Some(alerts.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
+            .await;
+        pipe.poll_gates().await;
+
+        // Tracked 1000 base units: TP sells 800, runner keeps 200 tracked.
+        pipe.on_tick(&tick("MINT", 3.4)).await;
+        assert_eq!(live.sells(), vec![("MINT".to_string(), 800)]);
+        assert_eq!(pipe.live_positions.lock().await["MINT"].amount_tokens, 200);
+
+        pipe.on_tick(&tick("MINT", 4.0)).await;
+        assert_eq!(
+            live.sells(),
+            vec![("MINT".to_string(), 800), ("MINT".to_string(), 200)]
+        );
+        assert!(pipe.live_positions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn silenced_pipeline_sends_nothing() {
+        // No alerts attached: firing paths are skipped without error.
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_alerted(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            None,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), 5000)
+            .await;
+        pipe.poll_gates().await;
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+        assert_eq!(pipe.portfolio.lock().await.history().len(), 1);
     }
 }

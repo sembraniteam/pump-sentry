@@ -61,6 +61,9 @@ pub struct Position {
     pub opened_at: u64,
     /// Holding timeout in seconds (`0` = no timeout).
     pub timeout_seconds: u64,
+    /// Moonbag runner in percent (0–100): share kept riding after a TP
+    /// scale-out; 0 = full exits.
+    pub moonbag_percent: f64,
 }
 
 /// A finished round trip with final accounting.
@@ -88,6 +91,9 @@ pub struct ClosedTrade {
     pub net_pnl_percent: f64,
     /// What closed the position.
     pub reason: ExitReason,
+    /// Share of the position closed (1.0 = full exit, < 1.0 = scale-out
+    /// leaving a moonbag runner).
+    pub fraction_closed: f64,
     /// Open timestamp (unix seconds).
     pub opened_at: u64,
     /// Close timestamp (unix seconds).

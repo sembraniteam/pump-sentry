@@ -193,6 +193,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "alert"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5253,6 +5261,7 @@ dependencies = [
 name = "solana-snipe-bot"
 version = "0.1.0"
 dependencies = [
+ "alert",
  "auditor",
  "curve",
  "executor",

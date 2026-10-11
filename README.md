@@ -14,6 +14,7 @@ Pump.fun logsSubscribe (WS)          crates/listener
   → RugCheck report                  crates/auditor   (reject = skip, fail-closed)
   → dev-wallet history               listener::screen (fresh/serial devs rejected)
   → watchlist: buyer quorum          listener::screen (dev dump aborts, silence times out)
+  → bundle forensics at confirm      listener::screen (reject drops, suspect paper-only)
   → bonding-curve reserves           crates/curve     (live price + liquidity)
   → TP/SL profile                    crates/risk-engine (LLM ≤300ms, else heuristic)
   → paper position                   crates/simulator ($100 virtual, slippage-aware)
@@ -30,6 +31,7 @@ Pump.fun logsSubscribe (WS)          crates/listener
 | `crates/risk-engine` | LLM TP/SL (OpenAI-compatible chat, JSON mode, temp 0.1) with deterministic heuristic fallback after 300ms            |
 | `crates/simulator`   | Virtual portfolio, bonding-curve slippage fills, TP/SL/trailing/timeout exits, realized + mark-to-market PnL         |
 | `crates/executor`    | Live buy/sell (guarded wallet, exact ix builders, Jito bundles) — only active with `--live`                          |
+| `crates/alert`       | Discord trade cards via Hermes CLI (fire-and-forget detached tasks, warn-only failures)                          |
 
 Each crate has its own README with architecture details and examples.
 
@@ -84,6 +86,7 @@ cargo run
 | `GATE_WINDOW_SECS` / `GATE_MIN_BUYERS` / `GATE_POLL_MS`                 | `10` / `5` / `2000`           | Watchlist window, distinct-buyer quorum, observation cadence                       |
 | `DEV_MIN_AGE_SECS` / `DEV_MAX_PRIOR_LAUNCHES` / `DEV_SCREEN_SAMPLE_TXS` | `3600` / `1` / `20`           | Dev-wallet minimum age, tolerated prior launches, sampled transactions             |
 | `LIQUIDITY_USD`                                                         | `0`                           | Liquidity fallback when the reserve read fails (normally live from reserves)       |
+| `DISCORD_ALERTS`                                                      | `true`                        | Trade cards via `hermes send --to discord`; `false` silences                                             |
 | `SOL_USD` / `TICK_INTERVAL_MS`                                          | `150` / `1000`                | Curve pricing conversion / exit-poll interval                                      |
 | `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine inference (OpenAI-compatible; Hermes Agent ready)                      |
 | `INFERENCE_API_KEY`                                                     | *(unset)*                     | Bearer token for providers that require auth                                       |
@@ -104,7 +107,7 @@ way. Start on devnet-sized notionals and watch bundle UUIDs in logs.
 ## Testing
 
 ```sh
-cargo test --workspace
+cargo test --workspace                    # 155 tests: 4 alert, 17 auditor, 9 curve, 14 executor, 31 listener, 20 risk-engine, 21 simulator, 39 binary
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

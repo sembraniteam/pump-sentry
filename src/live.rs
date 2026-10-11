@@ -116,6 +116,7 @@ impl LiveTrader {
     }
 
     /// Buy `notional_usd` at `price_usd` via Jito bundle.
+    /// Returns the tracked position plus the bundle UUID.
     pub async fn buy(
         &self,
         mint: &str,
@@ -124,7 +125,7 @@ impl LiveTrader {
         notional_usd: f64,
         price_usd: f64,
         sol_usd: f64,
-    ) -> Result<LivePosition, LiveError> {
+    ) -> Result<(LivePosition, String), LiveError> {
         let plan =
             plan_buy(notional_usd, price_usd, sol_usd, self.slippage_bps).ok_or_else(|| {
                 LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
@@ -143,12 +144,15 @@ impl LiveTrader {
             })
             .await?;
         tracing::info!(%mint, bundle = %receipt.bundle_id, amount = plan.amount_tokens, "LIVE buy dispatched");
-        Ok(LivePosition {
-            mint: mint.to_string(),
-            curve: curve.to_string(),
-            assoc_curve: assoc_curve.to_string(),
-            amount_tokens: plan.amount_tokens,
-        })
+        Ok((
+            LivePosition {
+                mint: mint.to_string(),
+                curve: curve.to_string(),
+                assoc_curve: assoc_curve.to_string(),
+                amount_tokens: plan.amount_tokens,
+            },
+            receipt.bundle_id,
+        ))
     }
 
     /// Sell the full tracked amount at `price_usd` via Jito bundle.
