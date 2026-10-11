@@ -15,7 +15,11 @@ evaluate(metrics)
 
 - `schema` — `TokenMetrics` → skill `INPUT PAYLOAD`; `RiskProfile`
   (`BUY|PASS`, `tp_percent`, `sl_percent`, `trailing_stop`,
-  `timeout_seconds`) + `is_valid()` guard.
+  `timeout_seconds`, `moonbag_percent`) + `is_valid()` guard.
+- `strategy` — execution shapes over a BUY profile: `adaptive`
+  (verbatim), `scalp` (TP cut down into +25…+35%, full exits; sub-band
+  TPs pass through with a warning, never widened silently), `runner`
+  (forced moonbag + trailing). PASS is never rewritten.
 - `fallback` — skill decision table verbatim: PASS when `dev_reputation
   < 0.40`, `rugcheck_score > 350`, or `velocity < 5`; high momentum (vel > 25,
   liq > $20k) → TP 60 / SL −10 / trail / 180s; moderate (vel ≥ 5, liq ≥ $10k) → TP 35 / SL −8 / 90s; otherwise PASS
