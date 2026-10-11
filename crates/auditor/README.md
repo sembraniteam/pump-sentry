@@ -14,6 +14,10 @@ evaluate_token →  fetch_report + policy invariants → Report | SecurityReject
   (skill `solana-rugcheck-api` contract).
 - `policy` — pure `assess(report, policy) -> Verdict::{Allow, Reject}`:
   score cap (default 400), no `danger` risks, no mint/freeze authority.
+  Fail-closed on missing data: absent `token` info rejects (authorities
+  unverifiable). Note the layers differ by design: the auditor hard-gate
+  is 400 while the risk-engine heuristic triages at 350 (see
+  `risk-engine/src/fallback.rs`).
 - `client` — pooled `reqwest` client, 1500ms timeout, retries on
   timeouts / connect errors / 5xx / 429 with exponential backoff (200ms × 2^attempt, max 2s).
 
@@ -22,7 +26,7 @@ evaluate_token →  fetch_report + policy invariants → Report | SecurityReject
 ```rust
 use auditor::RugCheckClient;
 
-let auditor = RugCheckClient::new();
+let auditor = RugCheckClient::new()?;
 match auditor.evaluate_token("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU").await {
     Ok(report) => println!("allow, score={}", report.score),
     Err(auditor::RugCheckError::SecurityRejection(reason)) => println!("reject: {reason}"),
