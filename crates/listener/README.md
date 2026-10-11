@@ -52,8 +52,9 @@ Win-rate hardening on top of the event stream:
   recent curve swaps with slots and supply shares (from decoded amounts
   over curve total supply) plus genesis-funder tracing for the first few
   distinct buyers. Funders resolve by walking each wallet's history to
-  its first transaction (bounded page walk, `createAccount` and
-  `transfer` shapes).
+  its first transaction — uncapped page walk, `createAccount` and
+  `transfer` shapes — with every trace deadline-bound (20s) and fanned
+  out concurrently so one deep history cannot stall the gate.
 - Borsh args: `name: String, symbol: String, uri: String`
 - Accounts: `[0]=mint, [2]=bonding_curve, [3]=associated_bonding_curve,
   [7]=user` (min 8).

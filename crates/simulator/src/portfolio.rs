@@ -32,6 +32,12 @@ pub enum PortfolioError {
     /// No open position with this id.
     #[error("position not found: {0}")]
     PositionNotFound(PositionId),
+    /// Take-profit must be a positive percent (would fire instantly).
+    #[error("invalid take-profit: {0}")]
+    InvalidTakeProfit(f64),
+    /// Stop-loss must be a negative percent (would fire instantly).
+    #[error("invalid stop-loss: {0}")]
+    InvalidStopLoss(f64),
     /// Close fraction must satisfy `0 < fraction <= 1` (e.g. `0.8`: exit
     /// 80%, keep a 20% moonbag runner).
     #[error("invalid close fraction: {0}")]
@@ -84,7 +90,65 @@ impl CloseSlice {
     }
 }
 
-/// Point-in-time accounting snapshot.#[derive(Debug, Clone)]
+/// Opposite side: exits always trade against the entry direction.
+fn flip_side(side: Side) -> Side {
+    match side {
+        Side::Long => Side::Short,
+        Side::Short => Side::Long,
+    }
+}
+
+/// Mark-to-market quote for one mint: price plus the liquidity context
+/// needed to estimate exit costs.
+#[derive(Debug, Clone, Copy)]
+pub struct Mark {
+    /// Current price in USD per token.
+    pub price: f64,
+    /// Available liquidity in USD (fee-only estimate when unknown).
+    pub liquidity_usd: f64,
+}
+
+impl Mark {
+    /// Price without liquidity context (exit-cost estimate is fee-only).
+    pub fn price_only(price: f64) -> Self {
+        Self { price, liquidity_usd: f64::NAN }
+    }
+}
+
+/// All inputs for opening a position, bundled so callers cannot
+/// transpose arguments and new knobs don't grow the arity.
+/// Prefer [`PaperPortfolio::open_position_params`] for new code;
+/// [`PaperPortfolio::open_position`] is a thin shim over it.
+#[derive(Debug, Clone)]
+pub struct OpenPositionParams<'a> {
+    /// Token mint (base58).
+    pub mint: &'a str,
+    /// Direction (`Long` for spot snipes; `Short` exists for PnL-math generality).
+    pub side: Side,
+    /// Current quote in USD per token.
+    pub quote: f64,
+    /// Exposure in USD.
+    pub notional_usd: f64,
+    /// Pool liquidity in USD (slippage context).
+    pub liquidity_usd: f64,
+    /// Take-profit in percent (> 0).
+    pub tp_percent: f64,
+    /// Stop-loss in percent (< 0).
+    pub sl_percent: f64,
+    /// Whether the trailing stop is armed.
+    pub trailing: bool,
+    /// Trailing giveback in percent (ignored unless `trailing`).
+    pub trail_percent: f64,
+    /// Time-stop in seconds (0 = none).
+    pub timeout_seconds: u64,
+    /// Share kept riding after a TakeProfit scale-out (0–100, clamped).
+    pub moonbag_percent: f64,
+    /// Now in unix seconds (hold-time accounting).
+    pub now_secs: u64,
+}
+
+/// Point-in-time accounting snapshot.
+#[derive(Debug, Clone)]
 pub struct PortfolioSnapshot {
     /// Free cash in USD.
     pub cash: f64,
@@ -160,6 +224,16 @@ impl PaperPortfolio {
         &self.history
     }
 
+    /// Handles of open positions for one mint (no intermediate alloc
+    /// beyond the returned ids).
+    pub fn positions_for_mint(&self, mint: &str) -> Vec<PositionId> {
+        self.positions
+            .iter()
+            .filter(|(_, p)| p.mint == mint)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Fee for a notional at the configured rate.
     fn fee_for(&self, notional: f64) -> f64 {
         notional * self.fee_bps / 10_000.0
@@ -172,6 +246,10 @@ impl PaperPortfolio {
     /// `trail_percent` is the giveback that fires the trailing stop when
     /// `trailing` is set (ignored otherwise). `moonbag_percent` (0–100,
     /// clamped) is the share kept riding after a TakeProfit scale-out.
+    ///
+    /// Thin shim over [`Self::open_position_params`]; kept so existing
+    /// callers don't churn. New code should pass
+    /// [`OpenPositionParams`] directly.
     #[allow(clippy::too_many_arguments)]
     pub fn open_position(
         &mut self,
@@ -188,16 +266,47 @@ impl PaperPortfolio {
         moonbag_percent: f64,
         now_secs: u64,
     ) -> Result<PositionId, PortfolioError> {
+        self.open_position_params(&OpenPositionParams {
+            mint,
+            side,
+            quote,
+            notional_usd,
+            liquidity_usd,
+            tp_percent,
+            sl_percent,
+            trailing,
+            trail_percent,
+            timeout_seconds,
+            moonbag_percent,
+            now_secs,
+        })
+    }
+
+    /// Open a position from [`OpenPositionParams`] (preferred entry point).
+    pub fn open_position_params(
+        &mut self,
+        p: &OpenPositionParams<'_>,
+    ) -> Result<PositionId, PortfolioError> {
+        let quote = p.quote;
+        let notional_usd = p.notional_usd;
+        let tp_percent = p.tp_percent;
+        let sl_percent = p.sl_percent;
         if !quote.is_finite() || quote <= 0.0 {
             return Err(PortfolioError::InvalidPrice(quote));
         }
         if !notional_usd.is_finite() || notional_usd <= 0.0 {
             return Err(PortfolioError::InvalidNotional(notional_usd));
         }
+        if !tp_percent.is_finite() || tp_percent <= 0.0 {
+            return Err(PortfolioError::InvalidTakeProfit(tp_percent));
+        }
+        if !sl_percent.is_finite() || sl_percent >= 0.0 {
+            return Err(PortfolioError::InvalidStopLoss(sl_percent));
+        }
 
         let entry_price = self
             .fill
-            .fill_price(side, quote, notional_usd, liquidity_usd);
+            .fill_price(p.side, quote, notional_usd, p.liquidity_usd);
         let entry_fee = self.fee_for(notional_usd);
         let need = notional_usd + entry_fee;
         if need > self.cash {
@@ -208,32 +317,32 @@ impl PaperPortfolio {
         }
 
         // Quantity follows executed notional so slippage is accounted in size.
-        let quantity = match side {
+        let quantity = match p.side {
             Side::Long => notional_usd / entry_price,
             Side::Short => -(notional_usd / entry_price),
         };
 
         self.cash -= need;
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         self.positions.insert(
             id,
             Position {
                 id,
-                mint: mint.to_string(),
-                side,
+                mint: p.mint.to_string(),
+                side: p.side,
                 entry_price,
                 quantity,
                 entry_notional: notional_usd,
                 entry_fee,
                 tp_percent,
                 sl_percent,
-                trail_percent: trail_percent.max(0.0),
-                trailing_stop: trailing,
+                trail_percent: p.trail_percent.max(0.0),
+                trailing_stop: p.trailing,
                 best_price: entry_price,
-                opened_at: now_secs,
-                timeout_seconds,
-                moonbag_percent: moonbag_percent.clamp(0.0, 100.0),
+                opened_at: p.now_secs,
+                timeout_seconds: p.timeout_seconds,
+                moonbag_percent: p.moonbag_percent.clamp(0.0, 100.0),
             },
         );
         Ok(id)
@@ -339,9 +448,12 @@ impl PaperPortfolio {
         reason: ExitReason,
         now_secs: u64,
     ) -> ClosedTrade {
-        let exit_price =
-            self.fill
-                .fill_price(slice.side, quote, slice.entry_notional, liquidity_usd);
+        let exit_price = self.fill.fill_price(
+            flip_side(slice.side),
+            quote,
+            slice.quantity.abs() * quote,
+            liquidity_usd,
+        );
         let exit_notional = slice.quantity.abs() * exit_price;
         let exit_fee = self.fee_for(exit_notional);
 
@@ -388,16 +500,30 @@ impl PaperPortfolio {
 
     /// Mark-to-market snapshot. `quotes` maps mint → current price; missing
     /// mints are marked at entry (zero unrealized).
-    pub fn snapshot(&self, quotes: &HashMap<String, f64>) -> PortfolioSnapshot {
+    /// Mark-to-market snapshot. Each open position is valued at its
+    /// estimated exit proceeds (mark price through the fill model minus
+    /// exit commission), so `equity` already reflects the cost of
+    /// liquidating. Mints without marks contribute zero unrealized.
+    pub fn snapshot(&self, marks: &HashMap<String, Mark>) -> PortfolioSnapshot {
         let mut locked = 0.0;
         let mut unrealized = 0.0;
         for position in self.positions.values() {
             locked += position.entry_notional;
-            let mark = quotes
-                .get(&position.mint)
-                .copied()
-                .unwrap_or(position.entry_price);
-            unrealized += (mark - position.entry_price) * position.quantity;
+            let value = match marks.get(&position.mint) {
+                Some(mark) if mark.price.is_finite() => {                    let exit_size = position.quantity.abs() * mark.price;
+                    let slip = self.fill.slip_fraction(exit_size, mark.liquidity_usd);
+                    let exit_price = match position.side {
+                        Side::Long => mark.price * (1.0 - slip),
+                        Side::Short => mark.price * (1.0 + slip),
+                    };
+                    let gross = (exit_price - position.entry_price) * position.quantity;
+                    let exit_fee =
+                        self.fee_for(position.quantity.abs() * exit_price);
+                    position.entry_notional + gross - exit_fee
+                }
+                _ => position.entry_notional,
+            };
+            unrealized += value - position.entry_notional;
         }
         PortfolioSnapshot {
             cash: self.cash,
@@ -428,6 +554,53 @@ mod tests {
 
     fn funded() -> PaperPortfolio {
         PaperPortfolio::new(100.0, 0.0).with_fill_model(FillModel::Exact)
+    }
+
+    #[test]
+    fn open_position_params_matches_shim() {
+        // Locks the 12-arg shim to the struct path: same inputs must yield
+        // the same position, so future callers can migrate without drift.
+        let mut via_shim = funded();
+        let mut via_struct = funded();
+        let params = OpenPositionParams {
+            mint: "MINT",
+            side: Side::Long,
+            quote: 1.0,
+            notional_usd: 40.0,
+            liquidity_usd: 1_000_000.0,
+            tp_percent: 75.0,
+            sl_percent: -8.0,
+            trailing: false,
+            trail_percent: 0.0,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+            now_secs: 1000,
+        };
+        let a = via_shim
+            .open_position(
+                params.mint,
+                params.side,
+                params.quote,
+                params.notional_usd,
+                params.liquidity_usd,
+                params.tp_percent,
+                params.sl_percent,
+                params.trailing,
+                params.trail_percent,
+                params.timeout_seconds,
+                params.moonbag_percent,
+                params.now_secs,
+            )
+            .expect("shim open");
+        let b = via_struct
+            .open_position_params(&params)
+            .expect("struct open");
+        assert_eq!(a, b);
+        assert_eq!(
+            via_shim.position(a).expect("a").entry_price,
+            via_struct.position(b).expect("b").entry_price
+        );
+        assert_eq!(via_shim.cash(), via_struct.cash());
     }
 
     #[test]
@@ -595,14 +768,47 @@ mod tests {
             0,
         )
         .expect("open");
-        let mut quotes = HashMap::new();
-        quotes.insert("A".to_string(), 1.5);
-        let snap = pf.snapshot(&quotes);
+        let mut marks = HashMap::new();
+        marks.insert("A".to_string(), Mark { price: 1.5, liquidity_usd: 1e9 });
+        let snap = pf.snapshot(&marks);
         assert_eq!(snap.cash, 60.0);
         assert_eq!(snap.locked, 40.0);
         assert_eq!(snap.unrealized_pnl, 20.0);
         assert_eq!(snap.equity, 120.0);
         assert_eq!(snap.open_count, 1);
+    }
+
+    #[test]
+    fn snapshot_matches_realizable_close() {
+        // Default model + 1% commission: snapshot must predict exactly
+        // what close_position will realize at the same mark.
+        let mut pf = PaperPortfolio::new(100.0, 100.0);
+        let id = pf
+            .open_position("A", Side::Long, 1.0, 40.0, 5_000.0, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
+            .expect("open");
+        let mut marks = HashMap::new();
+        marks.insert("A".to_string(), Mark { price: 1.5, liquidity_usd: 5_000.0 });
+        let snap = pf.snapshot(&marks);
+        // Costs deducted: below the naive (mark-entry)*qty figure.
+        let naive = (1.5 - pf.position(id).expect("p").entry_price)
+            * pf.position(id).expect("p").quantity;
+        assert!(snap.unrealized_pnl < naive);
+        let trade = pf
+            .close_position(id, 1.5, 5_000.0, ExitReason::Manual, 1)
+            .expect("close");
+        // Unrealized excludes the sunk entry fee (0.4); realized nets it.
+        assert!((trade.net_pnl - (snap.unrealized_pnl - 0.4)).abs() < 1e-9);
+        assert!((pf.cash() - snap.equity).abs() < 1e-9);
+        // Missing marks and NaN marks contribute zero unrealized.
+        let mut pf2 = PaperPortfolio::new(100.0, 0.0);
+        pf2
+            .open_position("B", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
+            .expect("open");
+        let empty: HashMap<String, Mark> = HashMap::new();
+        assert_eq!(pf2.snapshot(&empty).unrealized_pnl, 0.0);
+        let mut nan_marks = HashMap::new();
+        nan_marks.insert("B".to_string(), Mark { price: f64::NAN, liquidity_usd: 5_000.0 });
+        assert_eq!(pf2.snapshot(&nan_marks).unrealized_pnl, 0.0);
     }
 
     #[test]
@@ -663,6 +869,22 @@ mod tests {
         assert!((pf.realized_pnl() + 2.0).abs() < 1e-9);
         assert_eq!(pf.win_rate(), Some(0.0));
         assert_eq!(pf.history().len(), 2);
+    }
+
+    #[test]
+    fn rejects_degenerate_tp_sl() {
+        let mut pf = funded();
+        for (tp, sl) in [(0.0, -8.0), (-5.0, -8.0), (75.0, 0.0), (75.0, 5.0)] {
+            assert!(
+                matches!(
+                    pf.open_position("M", Side::Long, 1.0, 10.0, 1e9, tp, sl, false, 0.0, 0, 0.0, 0),
+                    Err(PortfolioError::InvalidTakeProfit(_))
+                        | Err(PortfolioError::InvalidStopLoss(_))
+                ),
+                "tp={tp} sl={sl}"
+            );
+        }
+        assert_eq!(pf.cash(), 100.0);
     }
 
     #[test]

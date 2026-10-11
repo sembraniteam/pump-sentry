@@ -9,6 +9,14 @@ use crate::types::{RugCheckError, RugCheckReport};
 
 /// Tunable acceptance thresholds. [`AuditPolicy::default`] matches the
 /// skill: score cap 400, reject `danger`, reject live authorities.
+///
+/// Note on the 400 vs the risk-engine heuristic's 350
+/// (`risk-engine/src/fallback.rs::RUGCHECK_SCORE_CAP`): the two layers
+/// answer different questions. This policy is the hard on-chain gate —
+/// anything over 400 never reaches the watchlist. The 350 heuristic is
+/// the softer pre-LLM triage inside the risk engine (scores 351–400 can
+/// still be *observed* but never *bought* without a model override).
+/// Keep the strict ordering `heuristic cap <= policy cap` when tuning.
 #[derive(Debug, Clone)]
 pub struct AuditPolicy {
     /// Reports with `score > max_score` are rejected.
@@ -66,8 +74,9 @@ impl Verdict {
 
 /// Check a report against a policy, collecting every violation.
 ///
-/// Never fails on missing data: absent `token` info simply skips the
-/// authority checks.
+/// Fail-closed on missing data: an absent `token` section means the
+/// on-chain authority checks cannot run, so the report is rejected rather
+/// than waved through (a live mint authority is the classic rug).
 pub fn assess(report: &RugCheckReport, policy: &AuditPolicy) -> Verdict {
     let mut reasons = Vec::new();
 
@@ -96,6 +105,8 @@ pub fn assess(report: &RugCheckReport, policy: &AuditPolicy) -> Verdict {
         if policy.reject_freeze_authority && token.freeze_authority.is_some() {
             reasons.push("Freeze authority is enabled".to_string());
         }
+    } else {
+        reasons.push("Missing on-chain token info; authorities unverifiable".to_string());
     }
 
     if reasons.is_empty() {
@@ -197,10 +208,17 @@ mod tests {
     }
 
     #[test]
-    fn skips_authority_checks_without_token_info() {
+    fn rejects_without_token_info() {
+        // Fail-closed: no on-chain section means authorities cannot be
+        // verified, so the report is rejected instead of waved through.
         let mut report = clean_report();
         report.token = None;
-        assert_eq!(assess(&report, &AuditPolicy::default()), Verdict::Allow);
+        match assess(&report, &AuditPolicy::default()) {
+            Verdict::Reject { reasons } => {
+                assert!(reasons.iter().any(|r| r.contains("unverifiable")));
+            }
+            Verdict::Allow => panic!("expected rejection"),
+        }
     }
 
     #[test]

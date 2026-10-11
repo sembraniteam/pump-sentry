@@ -8,6 +8,12 @@ use crate::schema::{Action, RiskProfile, TokenMetrics};
 /// Skill thresholds, named for readability and testability.
 pub const DEV_REPUTATION_FLOOR: f64 = 0.40;
 /// Skill thresholds, named for readability and testability.
+///
+/// `RUGCHECK_SCORE_CAP` (350) vs the auditor's hard gate (400 in
+/// `auditor/src/policy.rs::AuditPolicy::default`): this is the softer
+/// pre-LLM triage — scores 351–400 are still *observed* but resolve to
+/// PASS here, so only the model path (or a threshold change) can buy
+/// them. Keep `RUGCHECK_SCORE_CAP <= AuditPolicy::max_score`.
 pub const RUGCHECK_SCORE_CAP: u32 = 350;
 /// Skill thresholds, named for readability and testability.
 pub const HIGH_MOMENTUM_VELOCITY: u32 = 25;
@@ -33,6 +39,19 @@ pub fn evaluate_heuristic_fallback(
     dev_rep: f64,
     rugcheck_score: u32,
 ) -> RiskProfile {
+    // NaN comparisons are all false (`NaN < x == false`), which would
+    // sail a non-reputation straight into the momentum branches.
+    // Fail closed on any non-finite input.
+    if !liq_usd.is_finite() || !dev_rep.is_finite() {
+        return RiskProfile {
+            action: Action::Pass,
+            tp_percent: 0.0,
+            sl_percent: 0.0,
+            trailing_stop: false,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+        };
+    }
     if dev_rep < DEV_REPUTATION_FLOOR
         || rugcheck_score > RUGCHECK_SCORE_CAP
         || buy_velocity_5s < MODERATE_MOMENTUM_VELOCITY
@@ -46,7 +65,6 @@ pub fn evaluate_heuristic_fallback(
             moonbag_percent: 0.0,
         };
     }
-
     if buy_velocity_5s > HIGH_MOMENTUM_VELOCITY && liq_usd > HIGH_MOMENTUM_LIQUIDITY_USD {
         RiskProfile {
             action: Action::Buy,
@@ -90,6 +108,14 @@ pub fn evaluate_metrics_fallback(metrics: &TokenMetrics) -> RiskProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_nan_inputs_fail_closed() {
+        for (liq, dev) in [(f64::NAN, 0.9), (10_000.0, f64::NAN), (f64::NAN, f64::NAN)] {
+            let p = evaluate_heuristic_fallback(liq, 100, dev, 0);
+            assert_eq!(p.action, Action::Pass, "liq={liq} dev={dev}");
+        }
+    }
 
     #[test]
     fn passes_on_bad_dev() {

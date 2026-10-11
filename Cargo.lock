@@ -1032,6 +1032,7 @@ dependencies = [
 name = "curve"
 version = "0.1.0"
 dependencies = [
+ "solana-account 4.7.0",
  "solana-client",
  "solana-commitment-config",
  "solana-sdk",
@@ -1387,6 +1388,8 @@ dependencies = [
  "bincode",
  "borsh",
  "bs58",
+ "ids",
+ "listener",
  "reqwest 0.13.5",
  "serde_json",
  "solana-client",
@@ -1394,9 +1397,13 @@ dependencies = [
  "solana-hash",
  "solana-instruction 3.5.1",
  "solana-keypair 3.1.2",
+ "solana-message 4.6.0",
  "solana-pubkey 4.4.0",
+ "solana-rpc-client-api",
+ "solana-signature",
  "solana-signer 3.0.1",
  "solana-transaction 4.3.0",
+ "solana-transaction-status",
  "spl-associated-token-account",
  "spl-token",
  "thiserror 2.0.21",
@@ -1980,6 +1987,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ids"
+version = "0.1.0"
+dependencies = [
+ "solana-pubkey 4.4.0",
+ "spl-associated-token-account",
+ "spl-token",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2180,8 +2196,12 @@ dependencies = [
  "base64 0.23.1",
  "borsh",
  "bs58",
+ "curve",
  "futures-util",
+ "ids",
+ "migration",
  "rustls",
+ "serde_json",
  "solana-account-decoder",
  "solana-client",
  "solana-commitment-config",
@@ -2265,6 +2285,21 @@ dependencies = [
  "keccak",
  "rand_core 0.6.4",
  "zeroize",
+]
+
+[[package]]
+name = "migration"
+version = "0.1.0"
+dependencies = [
+ "curve",
+ "ids",
+ "solana-client",
+ "solana-commitment-config",
+ "solana-pubkey 4.4.0",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -5265,7 +5300,9 @@ dependencies = [
  "auditor",
  "curve",
  "executor",
+ "futures-util",
  "listener",
+ "migration",
  "risk-engine",
  "rustls",
  "serde_json",

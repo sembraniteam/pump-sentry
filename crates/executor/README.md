@@ -20,7 +20,10 @@ WalletGuard::load_from_env (SOLANA_PRIVATE_KEY, zeroized buffer)
   `[102,6,61,18,1,218,235,234]` / sell `[51,230,133,164,1,127,131,173]`,
   exact 12-account order, Borsh `(amount, limit)` args, ATA derivation.
   SPL program IDs cross-checked against the `spl-token` crates in tests.
-- `executor` — `SwapExecutor::{buy,sell}` over standard RPC confirmation.
+- `executor` — `SwapExecutor::{buy,sell}` over standard RPC confirmation,
+  plus `buy_jito` / `sell_jito` over Jito bundles when configured with
+  `with_jito` (skill `jito-mev-execution`; wired into the live binary via
+  `src/live.rs`). `tip_lamports` on the order funds the Jito tip.
 
 ## Version note
 
@@ -49,7 +52,7 @@ let receipt = executor.buy(&BuyOrder {
     associated_bonding_curve: parse_pubkey("ASSOC")?,
     amount_tokens: 1_000_000,      // base units
     max_sol_cost: 10_000_000,      // lamports
-    tip_lamports: 0,               // reserved; not routed until Jito lands
+    tip_lamports: 0,               // Jito tip (used by buy_jito/sell_jito)
 }).await?;
 println!("confirmed: {}", receipt.signature);
 ```
@@ -60,8 +63,21 @@ println!("confirmed: {}", receipt.signature);
 cargo test -p executor
 ```
 
+Live acceptance probe (ignored by default; costs $0 — unfunded payer):
+
+```sh
+JITO_ACCEPTANCE=1 cargo test -p executor --test jito_acceptance -- --ignored --nocapture
+```
+
+Verified live 2026-10-11: dummy bundle accepted by the mainnet block
+engine (`result` UUID, no `-32602`), proving base64 decode with the
+`{"encoding": "base64"}` param through the crate's exact wire path.
+
 ## TODO before mainnet
 
-- Jito bundle routing for `tip_lamports` (skill `jito-mev-execution`).
 - Priority-fee / compute-budget instructions under congestion.
-- Simulation (`simulateTransaction`) pre-flight before sending.
+- Mainnet tip calibration for `tip_lamports` under real bundle competition.
+- Layout acceptance: replay one recent mainnet buy/sell per side through
+  `simulateTransaction` before first funding (guards program upgrades).
+- Fee-recipient rotation: confirm whether the program still pays the
+  single hardcoded recipient or selects among several (read Global).

@@ -10,7 +10,7 @@
 //! 32      8     real_sol_reserves      (u64)
 //! 40      8     token_total_supply     (u64)
 //! 48      1     complete               (bool)
-//! 49      32    creator                (u64, newer curves; ignored here)
+//! 49      32    creator                (Pubkey, newer curves; ignored here)
 //! ```
 //!
 //! Spot price follows the constant-product invariant: SOL per token =
@@ -23,6 +23,16 @@ pub const BONDING_CURVE_DISCRIMINATOR: [u8; 8] = [23, 183, 248, 55, 96, 216, 172
 
 /// Minimum account data length: 8 (disc) + 5×8 (u64) + 1 (bool).
 pub const BONDING_CURVE_MIN_LEN: usize = 49;
+
+/// Byte offset of the `token_total_supply` u64 (single source of truth;
+/// `migration` and `listener` must use this, never a literal range).
+pub const TOKEN_SUPPLY_OFFSET: usize = 40;
+/// Length of the `token_total_supply` u64 field.
+pub const TOKEN_SUPPLY_LEN: usize = 8;
+
+/// Byte offset of the `complete` graduation flag (single source of
+/// truth; same rule as above).
+pub const COMPLETE_FLAG_OFFSET: usize = 48;
 
 /// Pump.fun mint decimals.
 pub const PUMP_TOKEN_DECIMALS: u8 = 6;
@@ -83,6 +93,9 @@ impl BondingCurveReserves {
     }
 
     /// Spot price in SOL per whole token, or `None` on empty reserves.
+    /// f64 division keeps ~1e-16 relative precision at any magnitude,
+    /// which is what a price ratio needs (absolute lamport exactness
+    /// past 2^53 is irrelevant here).
     pub fn price_sol(&self, decimals: u8) -> Option<f64> {
         if self.virtual_token_reserves == 0 {
             return None;

@@ -31,6 +31,14 @@ pub struct Settings {
     pub gate_min_buyers: u32,
     /// Gate poll interval in milliseconds.
     pub gate_poll_ms: u64,
+    /// Maximum concurrent paper positions (portfolio heat cap).
+    pub max_open_positions: usize,
+    /// Maximum realized day-loss in USD before new entries halt (`0` =
+    /// disabled). UTC-day bucket; exits always keep working. Paper and
+    /// live entries share the gate (live only mirrors paper opens).
+    pub max_daily_loss_usd: f64,
+    /// Per-mint cooldown in seconds after a close (`0` disables).
+    pub mint_cooldown_secs: u64,
     /// Minimum dev-wallet age in seconds for the history screen.
     pub dev_min_age_secs: u64,
     /// Maximum tolerated prior Pump.fun launches by the dev.
@@ -53,12 +61,29 @@ pub struct Settings {
     pub inference_api_key: Option<String>,
     /// Buy/sell slippage guard in basis points.
     pub slippage_bps: u64,
+    /// Compute-unit price in micro-lamports for live transactions (`0` =
+    /// no priority fee; standard `SetComputeUnitPrice` instruction when
+    /// set). Raises landing odds under congestion at a per-tx cost.
+    pub priority_fee_micro_lamports: u64,
+    /// Compute-unit limit for live transactions (`0` = no limit
+    /// instruction; the runtime default applies). Set below the default
+    /// 1.4M only with a simulated margin — too low fails the tx.
+    pub compute_unit_limit: u32,
     /// Jito tip budget per bundle in lamports.
     pub tip_lamports: u64,
+    /// Override fee-recipient account for swap instructions (base58).
+    /// `None` uses the canonical recipient. Set when the program rotates
+    /// recipients; the IDL takes it as a caller-supplied account.
+    pub fee_recipient: Option<String>,
     /// Jito block-engine base URL (region).
     pub jito_endpoint: String,
     /// Discord trade alerts via Hermes CLI (needs `hermes` on PATH).
     pub discord_alerts: bool,
+    /// Optional Hermes Discord channel ID (numeric snowflake). Empty /
+    /// unset preserves the skill's exact `send --to discord` argv, leaving
+    /// channel routing to the host Hermes configuration. Set to address
+    /// `--to discord:<channel-id>` for a specific channel.
+    pub discord_channel: Option<String>,
 }
 
 impl Settings {
@@ -68,8 +93,7 @@ impl Settings {
     }
 
     /// Build knobs from an explicit map (test-friendly, no global state).
-    pub fn from_map(vars: &HashMap<String, String>) -> Self {
-        Self {
+    pub fn from_map(vars: &HashMap<String, String>) -> Self {        Self {
             ws_url: get_string(vars, "WS_URL", "wss://api.mainnet-beta.solana.com"),
             http_url: get_string(vars, "HTTP_URL", "https://api.mainnet-beta.solana.com"),
             commitment: get_string(vars, "COMMITMENT", "confirmed"),
@@ -81,6 +105,9 @@ impl Settings {
             gate_window_secs: get_int(vars, "GATE_WINDOW_SECS", 10),
             gate_min_buyers: get_int(vars, "GATE_MIN_BUYERS", 5),
             gate_poll_ms: get_int(vars, "GATE_POLL_MS", 2000),
+            max_open_positions: get_int(vars, "MAX_OPEN_POSITIONS", 3),
+            max_daily_loss_usd: get_float(vars, "MAX_DAILY_LOSS_USD", 0.0),
+            mint_cooldown_secs: get_int(vars, "MINT_COOLDOWN_SECS", 3600),
             dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600),
             dev_max_prior_launches: get_int(vars, "DEV_MAX_PRIOR_LAUNCHES", 1),
             dev_screen_sample_txs: get_int(vars, "DEV_SCREEN_SAMPLE_TXS", 20),
@@ -96,14 +123,67 @@ impl Settings {
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300),
             inference_api_key: vars.get("INFERENCE_API_KEY").cloned(),
             slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200),
+            priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0),
+            compute_unit_limit: get_int(vars, "COMPUTE_UNIT_LIMIT", 0),
             tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000),
+            fee_recipient: vars
+                .get("FEE_RECIPIENT")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             jito_endpoint: get_string(
                 vars,
                 "JITO_ENDPOINT",
                 "https://frankfurt.mainnet.block-engine.jito.wtf",
             ),
             discord_alerts: get_bool(vars, "DISCORD_ALERTS", true),
+            discord_channel: vars
+                .get("DISCORD_CHANNEL")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         }
+    }
+
+    /// Human-readable warnings for suspicious values (typos fall back to
+    /// defaults silently in `from_map`, so surface them here; `main`
+    /// prints these at startup). Empty when everything looks sane.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.slippage_bps > 10_000 {
+            out.push(format!(
+                "SLIPPAGE_BPS={} exceeds 100%; buy guard will overspend massively",
+                self.slippage_bps
+            ));
+        }
+        if self.notional_usd <= 0.0 || !self.notional_usd.is_finite() {
+            out.push(format!(
+                "NOTIONAL_USD={} is not positive; no position can open",
+                self.notional_usd
+            ));
+        }
+        if self.fee_bps < 0.0 || !self.fee_bps.is_finite() {
+            out.push(format!("FEE_BPS={} is invalid", self.fee_bps));
+        }
+        if self.max_open_positions == 0 {
+            out.push("MAX_OPEN_POSITIONS=0; the pipeline can never open".to_string());
+        }
+        if self.max_daily_loss_usd < 0.0 || !self.max_daily_loss_usd.is_finite() {
+            out.push(format!(
+                "MAX_DAILY_LOSS_USD={} is invalid; breaker disabled",
+                self.max_daily_loss_usd
+            ));
+        }
+        if self.gate_min_buyers == 0 {
+            out.push("GATE_MIN_BUYERS=0 behaves as 1 (quorum floor)".to_string());
+        }
+        if self.sol_usd <= 0.0 || !self.sol_usd.is_finite() {
+            out.push(format!("SOL_USD={} is not positive; pricing is garbage", self.sol_usd));
+        }
+        if self.quote_usd.is_some() {
+            out.push(
+                "QUOTE_USD override is set: entries fall back to a manual price when the feed fails (paper-only by construction)".to_string(),
+            );
+        }
+        out
     }
 }
 
@@ -158,6 +238,8 @@ mod tests {
         assert_eq!(s.start_balance, 100.0);
         assert_eq!(s.gate_window_secs, 10);
         assert_eq!(s.gate_min_buyers, 5);
+        assert_eq!(s.max_open_positions, 3);
+        assert_eq!(s.mint_cooldown_secs, 3600);
         assert_eq!(s.dev_min_age_secs, 3600);
         assert_eq!(s.quote_usd, None);
         assert_eq!(s.inference_timeout_ms, 300);

@@ -17,6 +17,9 @@ solana-client = "4.3.0"
 solana-commitment-config = "3"
 solana-account-decoder = "4.3.0"
 solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }
+migration = { path = "../migration" }
+curve = { path = "../curve" }
+ids = { path = "../ids" }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 borsh = { version = "1", features = ["derive"] }
@@ -33,6 +36,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # MessageHeader for screen unit tests (fabricated transactions).
 solana-message = "4"
+# RPC fixture replay in screen tests.
+serde_json = "1"
 
 [[example]]
 name = "watch"

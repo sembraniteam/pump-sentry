@@ -27,6 +27,9 @@ pub enum RiskEngineError {
     /// Endpoint URL is missing or invalid.
     #[error("invalid inference endpoint: {0}")]
     BadEndpoint(String),
+    /// HTTP client cannot initialize (TLS backend unusable).
+    #[error("failed to initialize HTTP client: {0}")]
+    HttpClient(String),
 }
 
 /// Where a [`RiskDecision`] came from.
@@ -139,7 +142,7 @@ impl RiskEngine {
             .timeout(b.timeout.saturating_add(Duration::from_millis(100)))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
-            .expect("Failed to initialize HTTP client");
+            .map_err(|e| RiskEngineError::HttpClient(e.to_string()))?;
         Ok(Self {
             client,
             endpoint: b.endpoint,

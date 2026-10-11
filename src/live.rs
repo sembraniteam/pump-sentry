@@ -5,7 +5,8 @@
 //! (unit-tested); only [`LiveTrader::buy`] / [`sell`](LiveTrader::sell)
 //! touch the network.
 
-use executor::{BuyOrder, ExecutorError, SellOrder, SwapExecutor, parse_pubkey};
+use executor::{BuyOrder, ConfirmOutcome, ExecutorError, SellOrder, SwapExecutor, parse_pubkey};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Pump.fun mint decimals (base-unit scale).
@@ -22,7 +23,20 @@ pub enum LiveError {
     /// Dispatch failed: {0}
     #[error("dispatch failed: {0}")]
     Dispatch(#[from] ExecutorError),
+    /// Bundle accepted but never confirmed (still holding / never filled).
+    #[error("unconfirmed live fill: {0}")]
+    Unconfirmed(String),
 }
+
+/// Fill-confirmation deadline per dispatch (bundles land in seconds or
+/// not at all; the gate loop must not stall on one token).
+pub const LIVE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
+/// Minimum spacing between live-sell retries for one mint.
+pub const SELL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+/// Failed live sells before tracking is dropped for manual exit.
+pub const SELL_MAX_ATTEMPTS: u32 = 5;
+/// Recheck rounds for an unconfirmed buy before giving up to manual review.
+pub const PENDING_MAX_ATTEMPTS: u32 = 5;
 
 /// Tracked live fill (amounts in token base units).
 #[derive(Debug, Clone)]
@@ -35,6 +49,30 @@ pub struct LivePosition {
     pub assoc_curve: String,
     /// Bought base units (for full-size exits).
     pub amount_tokens: u64,
+    /// Token creator (base58), when known: selects the extended mayhem
+    /// swap shape (creator vault + volume routing). `None` keeps the
+    /// legacy core (classic curves; rejected on mayhem curves).
+    pub creator: Option<String>,
+}
+
+/// Buy request: sizing inputs plus the optional creator, bundled so
+/// live-dispatch context cannot grow call arity again.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveBuyParams<'a> {
+    /// Token mint (base58).
+    pub mint: &'a str,
+    /// Bonding-curve address (base58).
+    pub curve: &'a str,
+    /// Curve ATA address (base58).
+    pub assoc_curve: &'a str,
+    /// Exposure in USD.
+    pub notional_usd: f64,
+    /// Execution price in USD per token.
+    pub price_usd: f64,
+    /// SOL price in USD (lamport conversion).
+    pub sol_usd: f64,
+    /// Token creator (base58), when the launch carried one.
+    pub creator: Option<&'a str>,
 }
 
 /// Planned buy: integer amounts ready for [`BuyOrder`].
@@ -47,8 +85,10 @@ pub struct LiveBuyPlan {
 }
 
 /// Size a buy from USD notional at spot: tokens from `notional/price`,
-/// spend cap from `notional/sol` plus `slippage_bps`. `None` on
-/// non-positive inputs or zero quantity.
+/// spend cap from `notional/sol` plus `slippage_bps` (clamped to 10_000 =
+/// 100% like the sell floor, so a misconfigured `SLIPPAGE_BPS` cannot
+/// authorize unbounded overspend). `None` on non-positive inputs or zero
+/// quantity.
 pub fn plan_buy(
     notional_usd: f64,
     price_usd: f64,
@@ -70,7 +110,11 @@ pub fn plan_buy(
         return None;
     }
     let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
-    let max_sol_cost = (lamports * (10_000.0 + slippage_bps as f64) / 10_000.0).ceil() as u64;
+    if !lamports.is_finite() || lamports <= 0.0 {
+        return None;
+    }
+    let max_sol_cost =
+        (lamports * (10_000.0 + slippage_bps.min(10_000) as f64) / 10_000.0).ceil() as u64;
     Some(LiveBuyPlan {
         amount_tokens,
         max_sol_cost,
@@ -103,6 +147,45 @@ pub struct LiveTrader {
     executor: SwapExecutor,
     slippage_bps: u64,
     tip_lamports: u64,
+    /// Buys accepted by the engine but unconfirmed when the deadline hit.
+    /// A timed-out bundle may still land late; dropping it here would leave
+    /// real tokens untracked (no exit automation). Entries are re-polled
+    /// via [`LiveTrader::recheck_pending`] until confirmed, failed, or
+    /// out of attempts (then manual review). Short critical sections only.
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+}
+
+/// Buy awaiting confirmation: reserved for the recheck loop, never treated
+/// as a fill until the chain says so.
+#[derive(Debug, Clone)]
+struct PendingBuy {
+    position: LivePosition,
+    bundle_id: String,
+    attempts: u32,
+}
+
+/// Outcome of one [`LiveTrader::recheck_pending`] round per mint.
+#[derive(Debug, Clone)]
+pub struct PendingRecheck {
+    /// Expected position (valid only when `outcome` is `Confirmed`).
+    pub position: LivePosition,
+    /// Engine bundle UUID.
+    pub bundle_id: String,
+    /// What the re-poll found.
+    pub outcome: RecheckOutcome,
+}
+
+/// Recheck verdict for one pending buy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecheckOutcome {
+    /// Landed after all: promote to tracked and automate exits.
+    Confirmed,
+    /// Errored on-chain: nothing held, drop silently-ish (log).
+    FailedOnChain,
+    /// Still unknown: keep pending for the next round.
+    StillUnknown,
+    /// Out of attempts: drop and escalate to manual review.
+    GiveUp,
 }
 
 impl LiveTrader {
@@ -112,20 +195,79 @@ impl LiveTrader {
             executor,
             slippage_bps,
             tip_lamports,
+            pending: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
+    }
+
+    /// True when at least one buy awaits confirmation.
+    pub fn has_pending(&self) -> bool {
+        self.pending
+            .lock()
+            .map(|g| !g.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Re-poll every pending buy once (one fresh confirmation window each).
+    /// Confirmed and failed entries leave the map; unknown ones stay until
+    /// [`PENDING_MAX_ATTEMPTS`] and then report [`RecheckOutcome::GiveUp`].
+    pub async fn recheck_pending(&self) -> Vec<PendingRecheck> {
+        let snapshot: Vec<PendingBuy> = self
+            .pending
+            .lock()
+            .map(|g| g.values().cloned().collect())
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(snapshot.len());
+        for entry in snapshot {
+            let outcome = match self
+                .executor
+                .confirm_signature(&entry.bundle_id, LIVE_CONFIRM_TIMEOUT)
+                .await
+            {
+                Ok(ConfirmOutcome::Confirmed) => RecheckOutcome::Confirmed,
+                Ok(ConfirmOutcome::FailedOnChain) => RecheckOutcome::FailedOnChain,
+                Ok(ConfirmOutcome::Timeout) | Err(_) => {
+                    let attempts = entry.attempts.saturating_add(1);
+                    if attempts >= PENDING_MAX_ATTEMPTS {
+                        RecheckOutcome::GiveUp
+                    } else {
+                        if let Ok(mut guard) = self.pending.lock()
+                            && let Some(stored) = guard.get_mut(&entry.position.mint)
+                        {
+                            stored.attempts = attempts;
+                        }
+                        RecheckOutcome::StillUnknown
+                    }
+                }
+            };
+            match outcome {
+                RecheckOutcome::StillUnknown => {}
+                _ => {
+                    if let Ok(mut guard) = self.pending.lock() {
+                        guard.remove(&entry.position.mint);
+                    }
+                }
+            }
+            out.push(PendingRecheck {
+                position: entry.position,
+                bundle_id: entry.bundle_id,
+                outcome,
+            });
+        }
+        out
     }
 
     /// Buy `notional_usd` at `price_usd` via Jito bundle.
     /// Returns the tracked position plus the bundle UUID.
-    pub async fn buy(
-        &self,
-        mint: &str,
-        curve: &str,
-        assoc_curve: &str,
-        notional_usd: f64,
-        price_usd: f64,
-        sol_usd: f64,
-    ) -> Result<(LivePosition, String), LiveError> {
+    pub async fn buy(&self, req: &LiveBuyParams<'_>) -> Result<(LivePosition, String), LiveError> {
+        let (mint, curve, assoc_curve, notional_usd, price_usd, sol_usd) = (
+            req.mint, req.curve, req.assoc_curve, req.notional_usd, req.price_usd, req.sol_usd,
+        );
+        let creator = match req.creator {
+            Some(c) => Some(parse_pubkey(c).map_err(|e| LiveError::BadOrder(e.to_string()))?),
+            None => None,
+        };
         let plan =
             plan_buy(notional_usd, price_usd, sol_usd, self.slippage_bps).ok_or_else(|| {
                 LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
@@ -141,18 +283,56 @@ impl LiveTrader {
                 amount_tokens: plan.amount_tokens,
                 max_sol_cost: plan.max_sol_cost,
                 tip_lamports: self.tip_lamports,
+                creator,
             })
             .await?;
         tracing::info!(%mint, bundle = %receipt.bundle_id, amount = plan.amount_tokens, "LIVE buy dispatched");
-        Ok((
-            LivePosition {
-                mint: mint.to_string(),
-                curve: curve.to_string(),
-                assoc_curve: assoc_curve.to_string(),
-                amount_tokens: plan.amount_tokens,
-            },
-            receipt.bundle_id,
-        ))
+        match self
+            .executor
+            .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
+            .await?
+        {
+            ConfirmOutcome::Confirmed => Ok((
+                LivePosition {
+                    mint: mint.to_string(),
+                    curve: curve.to_string(),
+                    assoc_curve: assoc_curve.to_string(),
+                    amount_tokens: plan.amount_tokens,
+                    creator: creator.map(|c| c.to_string()),
+                },
+                receipt.bundle_id,
+            )),
+            ConfirmOutcome::FailedOnChain => Err(LiveError::Unconfirmed(format!(
+                "buy bundle {} errored on-chain; no fill",
+                receipt.bundle_id
+            ))),
+            ConfirmOutcome::Timeout => {
+                // A timed-out bundle may still land late: track it for the
+                // recheck loop instead of assuming no fill (an untracked bag
+                // would never get exit automation).
+                let position = LivePosition {
+                    mint: mint.to_string(),
+                    curve: curve.to_string(),
+                    assoc_curve: assoc_curve.to_string(),
+                    amount_tokens: plan.amount_tokens,
+                    creator: creator.map(|c| c.to_string()),
+                };
+                if let Ok(mut guard) = self.pending.lock() {
+                    guard.insert(
+                        mint.to_string(),
+                        PendingBuy {
+                            position: position.clone(),
+                            bundle_id: receipt.bundle_id.clone(),
+                            attempts: 1,
+                        },
+                    );
+                }
+                Err(LiveError::Unconfirmed(format!(
+                    "buy bundle {} unconfirmed after {:?}; tracked as pending, rechecking",
+                    receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
+                )))
+            }
+        }
     }
 
     /// Sell the full tracked amount at `price_usd` via Jito bundle.
@@ -182,10 +362,28 @@ impl LiveTrader {
                 amount_tokens: position.amount_tokens,
                 min_sol_output: floor,
                 tip_lamports: self.tip_lamports,
+                creator: match &position.creator {
+                    Some(c) => Some(parse_pubkey(c).map_err(|e| LiveError::BadOrder(e.to_string()))?),
+                    None => None,
+                },
             })
             .await?;
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE sell dispatched");
-        Ok(receipt.bundle_id)
+        match self
+            .executor
+            .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
+            .await?
+        {
+            ConfirmOutcome::Confirmed => Ok(receipt.bundle_id),
+            ConfirmOutcome::FailedOnChain => Err(LiveError::Unconfirmed(format!(
+                "sell bundle {} errored on-chain; still holding",
+                receipt.bundle_id
+            ))),
+            ConfirmOutcome::Timeout => Err(LiveError::Unconfirmed(format!(
+                "sell bundle {} unconfirmed after {:?}; still holding",
+                receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
+            ))),
+        }
     }
 }
 

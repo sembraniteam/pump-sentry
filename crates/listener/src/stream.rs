@@ -10,11 +10,12 @@
 //! - Reconnects use exponential backoff (100ms base, 5s cap) with jitter.
 //! - No `.unwrap()` / `.expect()` / unchecked indexing anywhere.
 
-use crate::parser::{PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR, is_pump_create_ix, parse_pump_create};
+use crate::parser::{
+    PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR, decode_ix_data, is_pump_create_ix,
+    is_pump_create_v2_ix, parse_pump_create, parse_pump_create_v2,
+};
 use crate::types::{EVENT_CHANNEL_CAPACITY, ListenerConfig, ListenerEvent, ListenerStats};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt;
-use solana_account_decoder::UiAccountEncoding;
 use solana_client::{
     client_error::ClientError,
     nonblocking::{
@@ -26,8 +27,8 @@ use solana_client::{
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::{
-    EncodedTransaction, UiCompiledInstruction, UiInstruction, UiLoadedAddresses, UiMessage,
-    UiTransactionEncoding, option_serializer::OptionSerializer,
+    EncodedTransaction, UiCompiledInstruction, UiInstruction, UiMessage, UiTransactionEncoding,
+    option_serializer::OptionSerializer,
 };
 use std::{str::FromStr, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -84,23 +85,8 @@ pub enum ListenerError {
 /// Base 100ms, doubles per attempt, capped at 5s. Jitter adds 0–100ms derived
 /// from the current time (no extra RNG dependency, no blocking).
 pub fn backoff_duration(attempt: u32) -> Duration {
-    let capped_attempt = attempt.min(6);
-    // 100 * 2^attempt, computed with checked ops (no panic on overflow).
-    let mut exp_ms: u64 = 100;
-    let mut i: u32 = 0;
-    while i < capped_attempt {
-        exp_ms = exp_ms.checked_mul(2).unwrap_or(5_000);
-        if exp_ms >= 5_000 {
-            exp_ms = 5_000;
-            break;
-        }
-        i += 1;
-    }
-    if exp_ms > 5_000 {
-        exp_ms = 5_000;
-    }
-    let jitter = jitter_ms();
-    let total = exp_ms.saturating_add(jitter).min(5_000);
+    let exp_ms = 100u64.saturating_mul(1u64 << attempt.min(6)).min(5_000);
+    let total = exp_ms.saturating_add(jitter_ms()).min(5_000);
     Duration::from_millis(total)
 }
 
@@ -149,7 +135,15 @@ impl PumpFunListener {
                 info!("downstream closed; listener shutting down");
                 return Ok(());
             }
-            match self.run_once(&tx, &rpc, &semaphore).await {
+            let seen_before = self.stats.logs_seen();
+            let session_start = std::time::Instant::now();
+            let outcome = self.run_once(&tx, &rpc, &semaphore).await;
+            // A long healthy session resets the backoff: without this, one
+            // old outage keeps every later blip sleeping at the ~5s cap and
+            // the listener bleeds launches it should catch instantly.
+            let healthy = self.stats.logs_seen().saturating_sub(seen_before) > 1000
+                || session_start.elapsed() > std::time::Duration::from_secs(30);
+            match outcome {
                 Ok(()) => {
                     // Clean subscription end (server closed stream): reconnect.
                     warn!("log subscription ended; reconnecting");
@@ -158,7 +152,7 @@ impl PumpFunListener {
                     warn!(error = %e, attempt, "subscription error; backing off");
                 }
             }
-            attempt = attempt.saturating_add(1);
+            attempt = if healthy { 0 } else { attempt.saturating_add(1) };
             let wait = backoff_duration(attempt);
             debug!(?wait, attempt, "reconnect backoff");
             tokio::time::sleep(wait).await;
@@ -173,8 +167,14 @@ impl PumpFunListener {
         semaphore: &Arc<Semaphore>,
     ) -> Result<(), ListenerError> {
         let filter = RpcTransactionLogsFilter::Mentions(vec![PUMP_PROGRAM_ID_STR.to_string()]);
+        let Some(commitment) = self.config.commitment_config() else {
+            return Err(ListenerError::Config(format!(
+                "unknown commitment '{}'",
+                self.config.commitment
+            )));
+        };
         let sub_config = RpcTransactionLogsConfig {
-            commitment: Some(self.config.commitment_config()),
+            commitment: Some(commitment),
         };
 
         let client = PubsubClient::new(&self.config.ws_url).await?;
@@ -206,14 +206,28 @@ impl PumpFunListener {
             self.stats.inc_candidates();
 
             // Hand the RPC round-trip to a worker; never block the read loop.
+            // Throttled: when all fetch permits are out, drop with a metric
+            // instead of queueing unbounded worker tasks.
             let tx_clone = tx.clone();
             let rpc_clone = Arc::clone(rpc);
             let stats_clone = Arc::clone(&self.stats);
             let sem_clone = Arc::clone(semaphore);
-            let commitment = self.config.commitment_config();
+            let Some(commitment) = self.config.commitment_config() else {
+                // Validated at subscribe(); unreachable in practice, but
+                // never coerce silently.
+                debug!(signature = %sig_str, "unknown commitment; dropping candidate");
+                continue;
+            };
+            let permit = match sem_clone.try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    stats_clone.inc_dropped_throttled();
+                    debug!(signature = %sig_str, "fetch saturated; dropping candidate");
+                    continue;
+                }
+            };
             tokio::spawn(async move {
-                // Acquire a fetch permit (bounds RPC concurrency).
-                let _permit = sem_clone.acquire_owned().await;
+                let _permit = permit;
                 fetch_and_emit(
                     &sig_str,
                     slot_hint,
@@ -253,50 +267,47 @@ impl PumpFunListener {
         });
         Ok((rx, stats_out, handle))
     }
+}
 
-    /// Unbounded-channel variant (for sinks that manage their own buffering).
-    ///
-    /// The socket loop still never blocks: `send` on an unbounded channel
-    /// cannot fail with `Full`, only `Closed`.
-    pub async fn subscribe_unbounded(
-        config: ListenerConfig,
-    ) -> Result<
-        (
-            mpsc::UnboundedReceiver<ListenerEvent>,
-            Arc<ListenerStats>,
-            JoinHandle<()>,
-        ),
-        ListenerError,
-    > {
-        let listener = PumpFunListener::new(config)?;
-        let stats = listener.stats();
-        let stats_out = Arc::clone(&stats);
-        let (tx, rx) = mpsc::unbounded_channel::<ListenerEvent>();
-        let handle: JoinHandle<()> = tokio::spawn(async move {
-            if let Err(e) = listener.run_unbounded(tx).await {
-                warn!(error = %e, "listener (unbounded) exited with error");
-            }
-        });
-        Ok((rx, stats_out, handle))
+/// Fetch one transaction with a single retry for transient failures.
+/// Deterministic errors (unknown transaction, bad params, rejected
+/// encoding) return immediately without burning an extra RPC or holding
+/// a fetch permit through a sleep. Returns the underlying RPC error
+/// (callers count and log it).
+async fn fetch_tx_with_retry(
+    rpc: &RpcClient,
+    signature: &Signature,
+    tx_config: RpcTransactionConfig,
+) -> Result<
+    solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+    ClientError,
+> {
+    match rpc.get_transaction_with_config(signature, tx_config).await {
+        Ok(v) => Ok(v),
+        Err(e) if is_transient_fetch_error(&e) => {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            rpc.get_transaction_with_config(signature, tx_config).await
+        }
+        Err(e) => Err(e),
     }
+}
 
-    /// Run loop feeding an unbounded sender (same reconnect/backoff policy).
-    pub async fn run_unbounded(
-        self,
-        tx: mpsc::UnboundedSender<ListenerEvent>,
-    ) -> Result<(), ListenerError> {
-        // Bridge unbounded → bounded worker path by wrapping sends.
-        let (bounded_tx, mut bounded_rx) = mpsc::channel::<ListenerEvent>(EVENT_CHANNEL_CAPACITY);
-        let forward_stats = Arc::clone(&self.stats);
-        tokio::spawn(async move {
-            while let Some(ev) = bounded_rx.recv().await {
-                if tx.send(ev).is_err() {
-                    break;
-                }
-            }
-            drop(forward_stats);
-        });
-        self.run(bounded_tx).await
+/// True for failures worth one retry: transport-level trouble, not
+/// deterministic rejections. Retried: I/O errors and reqwest
+/// timeouts/connects. Returned at once: RPC response errors (unknown
+/// transaction, bad params), decode/body failures, signing/transaction
+/// errors. Mirrors the auditor's transient classification.
+fn is_transient_fetch_error(e: &ClientError) -> bool {
+    use solana_client::client_error::ClientErrorKind;
+    match e.kind() {
+        ClientErrorKind::Io(_) => true,
+        ClientErrorKind::Reqwest(e) => e.is_timeout() || e.is_connect(),
+        ClientErrorKind::Middleware(_)
+        | ClientErrorKind::RpcError(_)
+        | ClientErrorKind::SerdeJson(_)
+        | ClientErrorKind::SigningError(_)
+        | ClientErrorKind::TransactionError(_)
+        | ClientErrorKind::Custom(_) => false,
     }
 }
 
@@ -323,21 +334,33 @@ async fn fetch_and_emit(
 
     // NOTE: `Json` encoding yields the structured `accountKeys` /
     // compiled-instruction form the parser expects (base58 `data`,
-    // `loadedAddresses` split). Binary (`Base64`) responses are also
-    // tolerated by `extract_events` when the RPC returns them.
+    // `loadedAddresses` split). Binary payloads are rejected below
+    // (`UnsupportedEncoding`) — a node forcing binary drops launches.
+    // Version through v1: current Pump.fun launches are v1 envelopes and
+    // `Some(0)` makes the RPC refuse them (-32015); see `json_tx_config`.
     let tx_config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Json),
         commitment: Some(commitment),
-        max_supported_transaction_version: Some(0),
+        max_supported_transaction_version: Some(1),
     };
-    // Silence unused-import warning if UiAccountEncoding unused on some versions.
-    let _ = UiAccountEncoding::Base64;
 
-    let fetched = match rpc.get_transaction_with_config(&signature, tx_config).await {
-        Ok(v) => v,
-        Err(e) => {
+    // One retry for transient failures (429/5xx/ppconnect blips), then
+    // give up: a missed launch beats a wedged worker. Whole fetch is
+    // deadline-bound so hung RPCs cannot hold semaphore permits forever.
+    let fetched = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fetch_tx_with_retry(rpc, &signature, tx_config),
+    )
+    .await    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
             stats.inc_fetch_err();
             debug!(signature = %sig_str, error = %e, "getTransaction failed");
+            return;
+        }
+        Err(_) => {
+            stats.inc_fetch_err();
+            debug!(signature = %sig_str, "getTransaction timed out");
             return;
         }
     };
@@ -373,9 +396,11 @@ fn extract_events(
     stats: &Arc<ListenerStats>,
 ) -> Vec<crate::parser::PumpTokenLaunchEvent> {
     let mut out = Vec::new();
-    let slot = fetched.slot;
+    // Prefer the on-chain slot; fall back to the log-context slot when the
+    // fetch reports slot 0 (downstream bundle rules key on slots).
+    let slot = if fetched.slot == 0 { slot_hint } else { fetched.slot };
 
-    let (account_keys, top_ixs, inner_ixs) = match build_ix_lists(fetched) {
+    let (_account_keys, top_ixs, inner_ixs) = match build_ix_lists(fetched) {
         Ok(lists) => lists,
         Err(e) => {
             debug!(signature = %sig_str, error = %e, "unable to decode transaction");
@@ -384,18 +409,36 @@ fn extract_events(
         }
     };
 
-    // Top-level instructions: `data` is base58.
+    // Top-level instructions: `data` is base58 per the Json contract,
+    // decoded through the shared helper (base58 → base64 → url-safe) so
+    // top-level and inner instructions cannot drift (a node sending
+    // base64 at top level used to drop valid launches here).
     for (program_id, accounts, data_b58) in top_ixs {
         if program_id != PUMP_PROGRAM_ID {
             continue;
         }
-        let raw = match bs58::decode(&data_b58).into_vec() {
-            Ok(v) => v,
-            Err(_) => {
+        let raw = match decode_ix_data(&data_b58) {
+            Some(v) => v,
+            None => {
                 stats.inc_parse_err();
                 continue;
             }
         };
+        if is_pump_create_v2_ix(&raw) {
+            // v2 launches parse with the 14-account IDL layout and flow
+            // through identical downstream screening.
+            match parse_pump_create_v2(&raw, &accounts, sig_str.to_string(), slot) {
+                Ok(ev) => {
+                    stats.inc_parse_ok();
+                    out.push(ev);
+                }
+                Err(e) => {
+                    stats.inc_parse_err();
+                    debug!(signature = %sig_str, error = %e, "top-level v2 parse failed");
+                }
+            }
+            continue;
+        }
         if !is_pump_create_ix(&raw) {
             continue;
         }
@@ -423,6 +466,19 @@ fn extract_events(
                 continue;
             }
         };
+        if is_pump_create_v2_ix(&raw) {
+            match parse_pump_create_v2(&raw, &accounts, sig_str.to_string(), slot) {
+                Ok(ev) => {
+                    stats.inc_parse_ok();
+                    out.push(ev);
+                }
+                Err(e) => {
+                    stats.inc_parse_err();
+                    debug!(signature = %sig_str, error = %e, "inner v2 parse failed");
+                }
+            }
+            continue;
+        }
         if !is_pump_create_ix(&raw) {
             continue;
         }
@@ -438,11 +494,9 @@ fn extract_events(
         }
     }
 
-    // Silence unused slot_hint warning documentation: prefer on-chain slot,
-    // fall back to the log-context slot when the fetch reports slot 0.
-    if out.is_empty() {
-        let _ = (slot_hint, account_keys.len());
-    }
+    // Slot observability for the fallback above.
+    debug!(signature = %sig_str, slot, slot_hint, "extracted events");
+
     out
 }
 
@@ -483,6 +537,8 @@ fn build_ix_lists(
                         }
                     }
                 }
+            } else if meta.is_some() {
+                tracing::trace!("inner instructions absent (Skip/None); top-level only");
             }
             Ok((account_keys, top, inner))
         }
@@ -556,43 +612,22 @@ fn decode_compiled_ix(cix: &UiCompiledInstruction, account_keys: &[Pubkey]) -> O
 }
 
 /// Resolve one `UiInstruction` (inner) — only compiled form carries raw data.
+/// Parsed-form instructions are skipped with a trace (no data to decode).
 fn decode_ui_ix(cix: &UiInstruction, account_keys: &[Pubkey]) -> Option<DecodedIx> {
     match cix {
         UiInstruction::Compiled(c) => decode_compiled_ix(c, account_keys),
-        UiInstruction::Parsed(_) => None,
+        UiInstruction::Parsed(_) => {
+            tracing::trace!("skipping parsed-form inner instruction");
+            None
+        }
     }
 }
-
-/// Decode instruction data trying base58 first, then base64 (standard).
-/// Returns `None` when both fail. Never panics.
-fn decode_ix_data(s: &str) -> Option<Vec<u8>> {
-    if let Ok(v) = bs58::decode(s).into_vec()
-        && !v.is_empty()
-    {
-        return Some(v);
-    }
-    if let Ok(v) = BASE64_STANDARD.decode(s)
-        && !v.is_empty()
-    {
-        return Some(v);
-    }
-    // Tolerate unpadded / url-safe base64 as a last resort.
-    if let Ok(v) = base64::engine::general_purpose::URL_SAFE.decode(s)
-        && !v.is_empty()
-    {
-        return Some(v);
-    }
-    None
-}
-
-/// Reference the loaded-addresses type so version drift is caught at compile
-/// time (function is never called at runtime).
-#[allow(dead_code)]
-fn _assert_loaded_addresses_shape(_: &UiLoadedAddresses) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
 
     #[test]
     fn backoff_caps_at_5s() {
@@ -624,5 +659,31 @@ mod tests {
             commitment: "confirmed".to_string(),
         };
         assert!(PumpFunListener::new(cfg).is_err());
+    }
+
+    #[test]
+    fn replay_real_create_v2_fixture() {
+        // Real mainnet create_v2 (Pump.fun program 6EF8..., slot 455573900,
+        // fetched live): proves the v2 wire shape — 16-account instruction,
+        // Borsh (name/symbol/uri) + trailing versioned args — decodes and
+        // emits exactly one launch event with the IDL account mapping.
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/create_v2_mainnet.json"))
+                .expect("fixture");
+        let fetched: EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_value(raw["result"].clone()).expect("decode");
+        assert_eq!(fetched.slot, 455573900);
+        let stats = Arc::new(ListenerStats::new());
+        let events = extract_events(&fetched, "frozen-sig", 455573900, &stats);
+        assert_eq!(events.len(), 1, "one v2 launch expected");
+        let ev = &events[0];
+        assert_eq!(ev.name, "makemerich");
+        assert_eq!(ev.symbol, "mmrich");
+        assert!(!ev.uri.is_empty());
+        assert_eq!(ev.slot, 455573900);
+        // IDL mapping: mint ends in "pump", user is the fee payer (keys[0]).
+        assert!(ev.mint.to_string().ends_with("pump"));
+        assert_ne!(ev.mint, ev.user);
+        assert_ne!(ev.bonding_curve, ev.mint);
     }
 }

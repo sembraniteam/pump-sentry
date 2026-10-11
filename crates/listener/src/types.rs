@@ -63,12 +63,15 @@ impl ListenerConfig {
     }
 
     /// Map the commitment string to a [`CommitmentConfig`].
-    /// Falls back to `confirmed` for unknown strings (never panics).
-    pub fn commitment_config(&self) -> CommitmentConfig {
+    /// Returns `None` for unknown strings (fail-closed: callers must not
+    /// silently coerce to `confirmed`; [`ListenerConfig::validate`] and
+    /// the binary's startup gate reject these first).
+    pub fn commitment_config(&self) -> Option<CommitmentConfig> {
         match self.commitment.as_str() {
-            "processed" => CommitmentConfig::processed(),
-            "finalized" => CommitmentConfig::finalized(),
-            _ => CommitmentConfig::confirmed(),
+            "processed" => Some(CommitmentConfig::processed()),
+            "finalized" => Some(CommitmentConfig::finalized()),
+            "confirmed" => Some(CommitmentConfig::confirmed()),
+            _ => None,
         }
     }
 }
@@ -96,6 +99,8 @@ pub struct ListenerStats {
     pub events_emitted: AtomicU64,
     /// Events dropped because the bounded channel was full.
     pub dropped_full: AtomicU64,
+    /// Candidates dropped because all fetch permits were busy.
+    pub dropped_throttled: AtomicU64,
 }
 
 /// Point-in-time snapshot (for logging / metrics export).
@@ -117,6 +122,8 @@ pub struct ListenerStatsSnapshot {
     pub events_emitted: u64,
     /// See [`ListenerStats::dropped_full`].
     pub dropped_full: u64,
+    /// See [`ListenerStats::dropped_throttled`].
+    pub dropped_throttled: u64,
 }
 
 impl ListenerStats {
@@ -135,6 +142,7 @@ impl ListenerStats {
             parse_ok: self.parse_ok.load(Ordering::Relaxed),
             parse_err: self.parse_err.load(Ordering::Relaxed),
             events_emitted: self.events_emitted.load(Ordering::Relaxed),
+            dropped_throttled: self.dropped_throttled.load(Ordering::Relaxed),
             dropped_full: self.dropped_full.load(Ordering::Relaxed),
         }
     }
@@ -142,6 +150,10 @@ impl ListenerStats {
     /// Increment helpers (each a single atomic op).
     pub fn inc_logs_seen(&self) {
         self.logs_seen.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Current logs-seen count (for health checks like backoff reset).
+    pub fn logs_seen(&self) -> u64 {
+        self.logs_seen.load(Ordering::Relaxed)
     }
     /// Increment candidate counter.
     pub fn inc_candidates(&self) {
@@ -168,6 +180,10 @@ impl ListenerStats {
         self.events_emitted.fetch_add(1, Ordering::Relaxed);
     }
     /// Increment dropped-full counter.
+    pub fn inc_dropped_throttled(&self) {
+        self.dropped_throttled.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Increment dropped-full counter.
     pub fn inc_dropped_full(&self) {
         self.dropped_full.fetch_add(1, Ordering::Relaxed);
     }
@@ -181,7 +197,15 @@ mod tests {
     fn default_config_validates() {
         let cfg = ListenerConfig::default();
         cfg.validate().expect("default config must validate");
-        assert_eq!(cfg.commitment_config(), CommitmentConfig::confirmed());
+        assert_eq!(cfg.commitment_config(), Some(CommitmentConfig::confirmed()));
+        assert_eq!(
+            ListenerConfig {
+                commitment: "bogus".to_string(),
+                ..ListenerConfig::default()
+            }
+            .commitment_config(),
+            None
+        );
     }
 
     #[test]

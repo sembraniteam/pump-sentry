@@ -2,7 +2,8 @@
 //!
 //! Invariants:
 //! 1. Secrets only enter via `SOLANA_PRIVATE_KEY` (base58 64-byte secret
-//!    or 32-byte seed); the decoded buffer is zeroized after use.
+//!    or 32-byte seed); env-string and decode buffers are zeroized after
+//!    use (best-effort: allocator copies are out of scope).
 //! 2. A hard 0.05 SOL floor ([`MIN_SOL_RESERVE_LAMPORTS`]) is never spent.
 //! 3. [`WalletGuard::assert_solvency`] checks
 //!    `balance >= trade + tip + reserve` before any swap is built.
@@ -13,7 +14,7 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use std::env;
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Minimum unspendable balance: 0.05 SOL (fees, ATA rent, tips).
 pub const MIN_SOL_RESERVE_LAMPORTS: u64 = 50_000_000;
@@ -47,6 +48,9 @@ pub enum WalletGuardError {
     /// RPC query failed: {0}
     #[error("RPC query failed: {0}")]
     Rpc(#[from] ClientError),
+    /// Balance read exceeded its deadline.
+    #[error("balance read timed out")]
+    Timeout,
 }
 
 /// Loaded trading keypair with solvency enforcement.
@@ -56,20 +60,24 @@ pub struct WalletGuard {
 
 impl WalletGuard {
     /// Load from `SOLANA_PRIVATE_KEY` (base58, whitespace-tolerant).
+    /// The env string is held in a [`Zeroizing`] wrapper so the secret
+    /// bytes are wiped when loading finishes.
     pub fn load_from_env() -> Result<Self, WalletGuardError> {
-        let key_str =
-            env::var("SOLANA_PRIVATE_KEY").map_err(|_| WalletGuardError::MissingKeyEnv)?;
+        let key_str = Zeroizing::new(
+            env::var("SOLANA_PRIVATE_KEY").map_err(|_| WalletGuardError::MissingKeyEnv)?,
+        );
         Self::from_base58(key_str.trim())
     }
 
     /// Build from a base58 string: 64-byte secret or 32-byte seed.
-    /// The decoded buffer is zeroized before returning.
+    /// Decode buffers are zeroized before returning; the input `&str` is
+    /// caller-owned (see [`Self::load_from_env`] for the zeroized path).
     pub fn from_base58(s: &str) -> Result<Self, WalletGuardError> {
         // Fast path: standard 64-byte secret strings (also validates ed25519).
         if let Ok(keypair) = Keypair::try_from_base58_string(s) {
             return Ok(Self { keypair });
         }
-        let mut bytes = bs58::decode(s).into_vec()?;
+        let mut bytes = Zeroizing::new(bs58::decode(s).into_vec()?);
         let result = match bytes.len() {
             32 => keypair_from_seed(&bytes)
                 .map_err(|e| WalletGuardError::BadSecret(e.to_string()))
@@ -91,14 +99,20 @@ impl WalletGuard {
     }
 
     /// Assert `balance >= trade_lamports + tip_lamports + reserve`.
-    /// Returns the balance on success for logging.
+    /// Returns the balance on success for logging. Deadline-bound.
     pub async fn assert_solvency(
         &self,
         rpc: &RpcClient,
         trade_lamports: u64,
         tip_lamports: u64,
     ) -> Result<u64, WalletGuardError> {
-        let balance = rpc.get_balance(&self.pubkey()).await?;
+        let balance = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            rpc.get_balance(&self.pubkey()),
+        )
+        .await
+        .map_err(|_| WalletGuardError::Timeout)?
+        .map_err(WalletGuardError::Rpc)?;
         let required = trade_lamports
             .saturating_add(tip_lamports)
             .saturating_add(MIN_SOL_RESERVE_LAMPORTS);

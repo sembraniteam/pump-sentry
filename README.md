@@ -19,6 +19,8 @@ Pump.fun logsSubscribe (WS)          crates/listener
   → TP/SL profile                    crates/risk-engine (LLM ≤300ms, else heuristic)
   → paper position                   crates/simulator ($100 virtual, slippage-aware)
   → ticker loop polls curves → TP/SL/trailing/timeout auto-close
+  → graduation → migration hunt → Raydium pool parse + Discord card
+  → post-migration vault ticker → 2x spike alerts (paper tracking)
 ```
 
 ## Crates
@@ -32,6 +34,7 @@ Pump.fun logsSubscribe (WS)          crates/listener
 | `crates/simulator`   | Virtual portfolio, bonding-curve slippage fills, TP/SL/trailing/timeout exits, realized + mark-to-market PnL         |
 | `crates/executor`    | Live buy/sell (guarded wallet, exact ix builders, Jito bundles) — only active with `--live`                          |
 | `crates/alert`       | Discord trade cards via Hermes CLI (fire-and-forget detached tasks, warn-only failures)                          |
+| `crates/migration`   | Graduation + Raydium/PumpSwap migration detection, fresh pool parsing                                            |
 
 Each crate has its own README with architecture details and examples.
 
@@ -82,6 +85,7 @@ cargo run
 | `FEE_BPS`                                                               | `30`                          | Commission per side (bps)                                                          |
 | `NOTIONAL_USD`                                                          | `10`                          | Paper size per trade                                                               |
 | `TRAIL_PERCENT`                                                         | `5`                           | Trailing-stop giveback (%)                                                         |
+| `MAX_OPEN_POSITIONS` / `MINT_COOLDOWN_SECS`                          | `3` / `3600`                  | Concurrent-position cap; per-mint re-entry cooldown                                |
 | `QUOTE_USD`                                                             | *(unset)*                     | Entry-quote override for tests; unset = reserve read or skip                       |
 | `GATE_WINDOW_SECS` / `GATE_MIN_BUYERS` / `GATE_POLL_MS`                 | `10` / `5` / `2000`           | Watchlist window, distinct-buyer quorum, observation cadence                       |
 | `DEV_MIN_AGE_SECS` / `DEV_MAX_PRIOR_LAUNCHES` / `DEV_SCREEN_SAMPLE_TXS` | `3600` / `1` / `20`           | Dev-wallet minimum age, tolerated prior launches, sampled transactions             |
@@ -107,7 +111,7 @@ way. Start on devnet-sized notionals and watch bundle UUIDs in logs.
 ## Testing
 
 ```sh
-cargo test --workspace                    # 155 tests: 4 alert, 17 auditor, 9 curve, 14 executor, 31 listener, 20 risk-engine, 21 simulator, 39 binary
+cargo test --workspace                    # 183 tests: 6 alert, 17 auditor, 9 curve, 15 executor, 35 listener, 15 migration, 20 risk-engine, 21 simulator, 45 binary
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -125,6 +129,7 @@ crates/auditor/        # RugCheck client + policy
 crates/risk-engine/    # prompt schema + LLM/fallback engine
 crates/simulator/      # portfolio + slippage + PnL
 crates/executor/       # live swaps via Jito (only with --live)
+crates/migration/       # graduation detector + Raydium pool parser
 ```
 
 ## Safety notes
@@ -141,3 +146,11 @@ crates/executor/       # live swaps via Jito (only with --live)
 - Entry gating: signals sit on a 10s watchlist until 5 distinct wallets
   buy; dev dumps abort immediately, silence times out. Nothing is bought
   on the create block anymore.
+- Bundle forensics is two-tier: slot clustering decides free from gate
+  swaps; funder walks (cached, concurrent, deadline-bound) run only when
+  slots are inconclusive. Reject drops, suspect trades paper-only.
+- Live fills are confirmed on-chain before tracking: unconfirmed buys
+  are never recorded, failed sells stay tracked with cooldown + attempt
+  budget, then give up loudly for manual exit.
+- Portfolio heat: max 3 concurrent positions, one holding per mint, 1h
+  per-mint cooldown after a close.

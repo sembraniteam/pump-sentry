@@ -20,6 +20,7 @@ use auditor::RugCheckClient;
 use curve::{CurveTicker, PriceTick};
 use executor::{JitoClient, SwapExecutor, WalletGuard};
 use listener::{DevScreenConfig, ListenerConfig, PumpFunListener, RpcScreener};
+use migration::{PoolTick, VaultTicker};
 use risk_engine::RiskEngine;
 use simulator::PaperPortfolio;
 use tokio::sync::mpsc;
@@ -44,6 +45,12 @@ async fn main() {
 
     let settings = Settings::from_env();
 
+    // Fail closed on unknown commitment (no silent coercion to confirmed).
+    if !matches!(settings.commitment.as_str(), "processed" | "confirmed" | "finalized") {
+        eprintln!("bad COMMITMENT: {}", settings.commitment);
+        std::process::exit(1);
+    }
+
     // Mode gate: paper unless explicitly opted into live risk.
     let live_mode = std::env::args().any(|a| a == "--live")
         || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
@@ -53,7 +60,18 @@ async fn main() {
         warn!("================================================================");
     }
 
-    let commitment = CurveTicker::parse_commitment(&settings.commitment);
+    // Surface suspicious config (typos fall back to defaults silently).
+    for warning in settings.warnings() {
+        warn!("config: {warning}");
+    }
+    if live_mode && !(settings.max_daily_loss_usd.is_finite() && settings.max_daily_loss_usd > 0.0) {
+        warn!("config: live mode without MAX_DAILY_LOSS_USD — no portfolio circuit breaker; set one");
+    }
+
+    let commitment = CurveTicker::parse_commitment(&settings.commitment).unwrap_or_else(|| {
+        eprintln!("bad COMMITMENT: {}", settings.commitment);
+        std::process::exit(1);
+    });
     let ticker = match CurveTicker::new(
         &settings.http_url,
         commitment,
@@ -67,7 +85,7 @@ async fn main() {
         }
     };
 
-    let (mut rx, stats, _handle) = match PumpFunListener::subscribe(ListenerConfig {
+    let (mut rx, stats, listener_handle) = match PumpFunListener::subscribe(ListenerConfig {
         ws_url: settings.ws_url.clone(),
         http_url: settings.http_url.clone(),
         commitment: settings.commitment.clone(),
@@ -117,7 +135,21 @@ async fn main() {
             }
         };
         let executor = match SwapExecutor::new(&settings.http_url, commitment, wallet) {
-            Ok(executor) => executor.with_jito(jito),
+            Ok(executor) => {
+                let executor = executor
+                    .with_jito(jito)
+                    .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports);
+                match &settings.fee_recipient {
+                    Some(recipient) => match executor::parse_pubkey(recipient) {
+                        Ok(pubkey) => executor.with_fee_recipient(pubkey),
+                        Err(e) => {
+                            eprintln!("bad FEE_RECIPIENT: {e}");
+                            std::process::exit(1);
+                        }
+                    },
+                    None => executor,
+                }
+            }
             Err(e) => {
                 eprintln!("bad executor config: {e}");
                 std::process::exit(1);
@@ -151,65 +183,146 @@ async fn main() {
 
     let gate_interval = Duration::from_millis(settings.gate_poll_ms);
 
-    let alerts = settings.discord_alerts.then(Alerter::new);
+    let alerts = settings.discord_alerts.then(|| match &settings.discord_channel {
+        Some(channel) => {
+            info!(%channel, "discord alerts routed to channel");
+            Alerter::new().with_channel(channel)
+        }
+        None => Alerter::new(),
+    });
     if alerts.is_none() {
         info!("discord alerts disabled (DISCORD_ALERTS=false)");
     }
 
+    let vault_ticker = match VaultTicker::new(
+        &settings.http_url,
+        commitment,
+        Duration::from_millis(settings.tick_interval_ms),
+        settings.sol_usd,
+    ) {
+        Ok(ticker) => ticker,
+        Err(e) => {
+            eprintln!("bad vault ticker config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let auditor = match RugCheckClient::new() {
+        Ok(auditor) => auditor,
+        Err(e) => {
+            eprintln!("bad auditor config: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let pipeline = Pipeline::shared(
         settings,
-        RugCheckClient::new(),
+        auditor,
         engine,
         ticker.clone(),
         PaperPortfolio::new(start_balance, fee_bps),
         live,
         screener,
         alerts,
+        vault_ticker.clone(),
     );
 
     // Ticker loop: poll watched curves → auto-close on TP/SL.
     let (tick_tx, mut tick_rx) = mpsc::channel::<PriceTick>(1024);
-    tokio::spawn(async move { ticker.run(tick_tx).await });
+    let tick_handle = tokio::spawn(async move { ticker.run(tick_tx).await });
+
+    // Pool loop: post-migration Raydium prices → spike alerts.
+    let (pool_tx, mut pool_rx) = mpsc::channel::<PoolTick>(1024);
+    let pool_handle = tokio::spawn(async move { vault_ticker.run(pool_tx).await });
 
     // Gate loop: poll the watchlist for buyer quorum → confirmed entries.
-    let gate_pipeline = Arc::clone(&pipeline);
-    tokio::spawn(async move {
-        let mut timer = tokio::time::interval(gate_interval);
-        loop {
-            timer.tick().await;
-            gate_pipeline.poll_gates().await;
-        }
-    });
+    // Each round runs as a JoinSet unit; overlapping rounds are skipped
+    // so two polls can never confirm the same mint twice.
+    let mut gate_timer = tokio::time::interval(gate_interval);
+    gate_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // In-flight units run as JoinSet tasks so Ctrl-C never cancels a
+    // half-applied launch/exit mid-await (paper-open without live mirror
+    // and similar partial commits). Shutdown drains them bounded.
+    let mut in_flight = tokio::task::JoinSet::new();
+    let stats_task = Arc::clone(&stats);
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
     loop {
+        // Reap finished units every iteration: JoinSet retains completed
+        // outputs until joined, so without this the set grows without
+        // bound over a long run (slow leak at Pump.fun event rates).
+        while in_flight.try_join_next().is_some() {}
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { break };
-                pipeline
-                    .on_launch(
-                        &event.mint.to_string(),
-                        &event.bonding_curve.to_string(),
-                        &event.associated_bonding_curve.to_string(),
-                        &event.user.to_string(),
-                        event.slot,
-                    )
-                    .await;
-                let snap = stats.snapshot();
-                let pending = pipeline.pending_count().await;
-                info!(logs = snap.logs_seen, candidates = snap.candidates,
-                    parse_ok = snap.parse_ok, dropped = snap.dropped_full,
-                    watchlist = pending, "listener stats");
+                let pipeline = Arc::clone(&pipeline);
+                let stats = Arc::clone(&stats_task);
+                in_flight.spawn(async move {
+                    pipeline
+                        .on_launch(
+                            &event.mint.to_string(),
+                            &event.bonding_curve.to_string(),
+                            &event.associated_bonding_curve.to_string(),
+                            &event.user.to_string(),
+                            event.creator.as_ref().map(|c| c.to_string()).as_deref(),
+                            event.slot,
+                        )
+                        .await;
+                    let snap = stats.snapshot();
+                    let pending = pipeline.pending_count().await;
+                    info!(logs = snap.logs_seen, candidates = snap.candidates,
+                        parse_ok = snap.parse_ok, dropped = snap.dropped_full,
+                        throttled = snap.dropped_throttled,
+                        watchlist = pending, "listener stats");
+                });
             },
             tick = tick_rx.recv() => {
                 let Some(tick) = tick else { break };
-                pipeline.on_tick(&tick).await;
-            },
+                let pipeline = Arc::clone(&pipeline);
+                in_flight.spawn(async move {
+                    pipeline.on_tick(&tick).await;
+                });
+            }
+            pool = pool_rx.recv() => {
+                let Some(pool) = pool else { break };
+                let pipeline = Arc::clone(&pipeline);
+                in_flight.spawn(async move {
+                    pipeline.on_pool_tick(&pool).await;
+                });
+            }
+            _ = gate_timer.tick() => {
+                if pipeline.try_begin_poll().await {
+                    let pipeline = Arc::clone(&pipeline);
+                    in_flight.spawn(async move {
+                        pipeline.poll_gates().await;
+                        pipeline.end_poll().await;
+                    });
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("shutdown requested");
                 break;
             }
         }
+    }
+
+    // Stop producers first, then let in-flight units finish (bounded).
+    // The listener loop exits on its own once the event channel closes...
+    // except it only checks between sessions, so close the channel AND
+    // abort the task, then await it briefly for a clean join.
+    rx.close();
+    tick_handle.abort();
+    pool_handle.abort();
+    listener_handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
+    let drain = async {
+        while in_flight.join_next().await.is_some() {}
+    };
+    if tokio::time::timeout(Duration::from_secs(30), drain)
+        .await
+        .is_err()
+    {
+        warn!("shutdown drain timed out; abandoning in-flight units");
     }
 
     warn!("streams ended; open positions need manual review");

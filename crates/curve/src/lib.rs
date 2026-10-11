@@ -8,5 +8,5 @@
 pub mod layout;
 pub mod ticker;
 
-pub use layout::{BondingCurveReserves, CurveParseError, PUMP_TOKEN_DECIMALS};
+pub use layout::{BondingCurveReserves, CurveParseError, BONDING_CURVE_MIN_LEN, COMPLETE_FLAG_OFFSET, PUMP_TOKEN_DECIMALS, TOKEN_SUPPLY_LEN, TOKEN_SUPPLY_OFFSET};
 pub use ticker::{CurveError, CurveTicker, PriceTick};

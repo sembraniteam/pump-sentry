@@ -41,28 +41,45 @@ impl Default for FillModel {
 }
 
 impl FillModel {
+    /// Total cost fraction for one side: constant-product impact plus
+    /// venue fee, clamped to the cap. Fee-only when liquidity is unknown
+    /// (non-finite or non-positive).
+    pub fn slip_fraction(&self, notional_usd: f64, liquidity_usd: f64) -> f64 {
+        let fee = match *self {
+            FillModel::Exact => 0.0,
+            FillModel::BondingCurve { fee_bps_per_side, .. } => {
+                (fee_bps_per_side.max(0.0) / 10_000.0).max(0.0)
+            }
+        };
+        let cap = match *self {
+            FillModel::Exact => 0.0,
+            FillModel::BondingCurve { max_slip_frac, .. } => max_slip_frac.max(0.0),
+        };
+        let size = if liquidity_usd.is_finite() && liquidity_usd > 0.0 {
+            (notional_usd / liquidity_usd).max(0.0)
+        } else {
+            0.0
+        };
+        (size + fee).clamp(0.0, cap)
+    }
     /// Convert a quote into an execution price.
     ///
-    /// Buys fill *above* the quote, sells *below* it. Never returns NaN,
-    /// zero, or negative: degenerate inputs fall back to the quote.
+    /// Buys fill *above* the quote, sells *below* it. Degenerate inputs
+    /// fall back to the quote as-is (including a non-finite quote, which
+    /// passes through so callers — not this pure function — decide the
+    /// fail-closed policy; every production caller validates first).
     pub fn fill_price(&self, side: Side, quote: f64, notional_usd: f64, liquidity_usd: f64) -> f64 {
         if !quote.is_finite() || quote <= 0.0 || !notional_usd.is_finite() || notional_usd <= 0.0 {
             return quote;
         }
-        let slip = match *self {
-            FillModel::Exact => 0.0,
-            FillModel::BondingCurve {
-                fee_bps_per_side,
-                max_slip_frac,
-            } => {
-                if !liquidity_usd.is_finite() || liquidity_usd <= 0.0 {
-                    return quote;
-                }
-                let size_frac = notional_usd / liquidity_usd;
-                let fee_frac = (fee_bps_per_side.max(0.0) / 10_000.0).max(0.0);
-                (size_frac + fee_frac).clamp(0.0, max_slip_frac.max(0.0))
+        if !liquidity_usd.is_finite() || liquidity_usd <= 0.0 {
+            match *self {
+                // Unknown liquidity: no cost basis, fill at quote.
+                FillModel::Exact => {}
+                FillModel::BondingCurve { .. } => return quote,
             }
-        };
+        }
+        let slip = self.slip_fraction(notional_usd, liquidity_usd);
         match side {
             Side::Long => quote * (1.0 + slip),
             Side::Short => quote * (1.0 - slip).max(0.0),

@@ -63,8 +63,8 @@ impl RugCheckClientBuilder {
         self
     }
 
-    /// Build the client.
-    pub fn build(self) -> RugCheckClient {
+    /// Build the client (fails only when the TLS backend is unusable).
+    pub fn build(self) -> Result<RugCheckClient, RugCheckError> {
         RugCheckClient::from_builder(self)
     }
 }
@@ -78,15 +78,9 @@ pub struct RugCheckClient {
     policy: AuditPolicy,
 }
 
-impl Default for RugCheckClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RugCheckClient {
     /// Build with skill defaults: 1500ms timeout, 30s pool idle, live API.
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, RugCheckError> {
         RugCheckClientBuilder::default().build()
     }
 
@@ -95,18 +89,17 @@ impl RugCheckClient {
         RugCheckClientBuilder::default()
     }
 
-    fn from_builder(b: RugCheckClientBuilder) -> Self {
+    fn from_builder(b: RugCheckClientBuilder) -> Result<Self, RugCheckError> {
         let client = Client::builder()
             .timeout(b.timeout)
             .pool_idle_timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to initialize HTTP client");
-        Self {
+            .build()?;
+        Ok(Self {
             client,
             base_url: b.base_url,
             max_retries: b.max_retries,
             policy: b.policy,
-        }
+        })
     }
 
     /// Report URL for a mint (factored out for testability).
@@ -161,10 +154,13 @@ impl RugCheckClient {
     }
 }
 
-/// Network errors worth retrying: timeouts, connection failures, and
-/// incomplete responses. Non-transient builder/config errors are not.
+/// Network errors worth retrying: timeouts and connection failures.
+/// Decode/body failures are deterministic (corrupt payload, not a bad
+/// network) and return at once instead of burning the retry budget plus
+/// backoff on the hot launch path. Non-transient builder/config errors
+/// are not retried either.
 fn is_transient_network_error(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode()
+    e.is_timeout() || e.is_connect()
 }
 
 /// Retry server-side failures and rate limits; client errors (4xx other
@@ -190,7 +186,7 @@ mod tests {
 
     #[test]
     fn report_url_format() {
-        let client = RugCheckClient::new();
+        let client = RugCheckClient::new().expect("client");
         assert_eq!(
             client.report_url("MINT123"),
             "https://api.rugcheck.xyz/v1/tokens/MINT123/report"
@@ -247,6 +243,7 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .max_retries(3)
             .build()
+            .expect("test client")
     }
 
     #[tokio::test]
@@ -276,7 +273,8 @@ mod tests {
             .base_url(&base)
             .timeout(Duration::from_secs(5))
             .max_retries(2)
-            .build();
+            .build()
+            .expect("test client");
         let start = Instant::now();
         let err = client.fetch_report("MINT123").await.expect_err("must fail");
         assert!(matches!(err, RugCheckError::HttpStatus(_)));

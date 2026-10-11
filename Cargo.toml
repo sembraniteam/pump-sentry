@@ -28,10 +28,12 @@ risk_engine = { package = "risk-engine", path = "crates/risk-engine" }
 simulator = { path = "crates/simulator" }
 curve = { path = "crates/curve" }
 executor = { path = "crates/executor" }
+migration = { path = "crates/migration" }
 alert = { path = "crates/alert" }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Single explicit TLS crypto provider: the tree enables both `ring`

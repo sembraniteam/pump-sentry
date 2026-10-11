@@ -50,8 +50,9 @@ pub struct RiskProfile {
 }
 
 impl RiskProfile {
-    /// Structural validation: finite numbers, TP non-negative on BUY,
-    /// SL non-positive on BUY, zeroed targets on PASS, moonbag in range.
+    /// Structural validation: finite numbers, strictly positive TP and
+    /// strictly negative SL on BUY (zero targets would fire instantly),
+    /// near-zero targets plus disarmed trailing/moonbag on PASS.
     pub fn is_valid(&self) -> bool {
         if !self.tp_percent.is_finite() || !self.sl_percent.is_finite() {
             return false;
@@ -63,9 +64,13 @@ impl RiskProfile {
             return false;
         }
         match self.action {
-            Action::Buy => self.tp_percent >= 0.0 && self.sl_percent <= 0.0,
+            Action::Buy => self.tp_percent > 0.0 && self.sl_percent < 0.0,
             Action::Pass => {
-                self.tp_percent == 0.0 && self.sl_percent == 0.0 && self.timeout_seconds == 0
+                self.tp_percent.abs() < 1e-9
+                    && self.sl_percent.abs() < 1e-9
+                    && self.timeout_seconds == 0
+                    && !self.trailing_stop
+                    && self.moonbag_percent == 0.0
             }
         }
     }
@@ -171,5 +176,38 @@ mod tests {
             };
             assert!(!bad.is_valid(), "moonbag={bad_moonbag}");
         }
+
+        // Zero-target BUY would fire on the first poll.
+        let zero_buy = RiskProfile {
+            action: Action::Buy,
+            tp_percent: 0.0,
+            sl_percent: 0.0,
+            trailing_stop: false,
+            timeout_seconds: 90,
+            moonbag_percent: 0.0,
+        };
+        assert!(!zero_buy.is_valid());
+
+        // Near-zero model outputs count as zeroed PASS targets.
+        let dusty_pass = RiskProfile {
+            action: Action::Pass,
+            tp_percent: 1e-12,
+            sl_percent: -1e-12,
+            trailing_stop: false,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+        };
+        assert!(dusty_pass.is_valid());
+
+        // Armed trailers on PASS are rejected.
+        let armed_pass = RiskProfile {
+            action: Action::Pass,
+            tp_percent: 0.0,
+            sl_percent: 0.0,
+            trailing_stop: true,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+        };
+        assert!(!armed_pass.is_valid());
     }
 }

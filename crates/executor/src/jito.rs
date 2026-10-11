@@ -47,7 +47,15 @@ pub enum JitoError {
 pub struct JitoClient {
     client: Client,
     endpoint: String,
+    /// `getTipAccounts` cache: (accounts, unix seconds fetched). The engine
+    /// rotates tip accounts; the compiled-in [`JITO_TIP_ACCOUNTS`] are only
+    /// the fallback when the fetch fails or is stale-blocked.
+    tips: std::sync::Arc<std::sync::Mutex<(Vec<String>, u64)>>,
 }
+
+/// Tip-account list TTL in seconds (one refresh per hour at most; a
+/// refresh failure silently keeps the previous list).
+pub const TIP_ACCOUNTS_TTL_SECS: u64 = 3_600;
 
 impl JitoClient {
     /// Build against a regional base URL, e.g.
@@ -65,6 +73,10 @@ impl JitoClient {
         Some(Self {
             client,
             endpoint: format!("{region_base_url}/api/v1/bundles"),
+            tips: std::sync::Arc::new(std::sync::Mutex::new((
+                JITO_TIP_ACCOUNTS.iter().map(|s| s.to_string()).collect(),
+                0,
+            ))),
         })
     }
 
@@ -75,13 +87,15 @@ impl JitoClient {
 
     /// Submit pre-encoded base64 transactions as one bundle.
     /// Returns the engine's bundle UUID on acceptance.
+    ///
+    /// The second param is mandatory, not decorative: the block engine
+    /// defaults to base58 decoding when `encoding` is omitted, so a
+    /// base64 bundle without it is rejected with `-32602: transaction #0
+    /// could not be decoded` (verified live against the engine; a prior
+    /// revision omitted the param following an incomplete skill example
+    /// and every bundle would have been refused).
     pub async fn send_bundle(&self, bundle_b64: Vec<String>) -> Result<String, JitoError> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [bundle_b64],
-        });
+        let payload = bundle_payload(bundle_b64);
         debug!(endpoint = %self.endpoint, txs = payload["params"][0].as_array().map(|a| a.len()).unwrap_or(0), "submitting bundle");
         let res = self
             .client
@@ -99,11 +113,96 @@ impl JitoClient {
     }
 }
 
+/// Build the `sendBundle` JSON-RPC payload (pure, unit-tested).
+/// `params[1]` carries `{"encoding": "base64"}` because the engine
+/// decodes base58 by default — see [`JitoClient::send_bundle`].
+pub fn bundle_payload(bundle_b64: Vec<String>) -> serde_json::Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendBundle",
+        "params": [bundle_b64, {"encoding": "base64"}],
+    })
+}
 /// Pick a tip account deterministically from `seed` (no RNG dependency;
 /// callers pass nanos or a counter).
 pub fn select_tip_account(seed: u64) -> Pubkey {
     let idx = (seed as usize) % JITO_TIP_ACCOUNTS.len();
     Pubkey::from_str_const(JITO_TIP_ACCOUNTS[idx])
+}
+
+impl JitoClient {
+    /// Tip account for this dispatch: the live `getTipAccounts` set when
+    /// fresh (refreshed at most hourly, 2s budget, silent fallback), else
+    /// the compiled-in constants. Never fails: worst case is the old
+    /// static rotation.
+    pub async fn tip_account(&self, seed: u64) -> Pubkey {
+        self.maybe_refresh_tips().await;
+        let guard = self.tips.lock().unwrap_or_else(|e| e.into_inner());
+        let list = &guard.0;
+        if list.is_empty() {
+            return select_tip_account(seed);
+        }
+        let account = &list[(seed as usize) % list.len()];
+        Pubkey::from_str_const(account.as_str())
+    }
+
+    /// Refresh the tip set when stale. Best-effort: any failure (timeout,
+    /// shape, empty, invalid pubkeys) keeps the previous list.
+    async fn maybe_refresh_tips(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stale = self
+            .tips
+            .lock()
+            .map(|g| now.saturating_sub(g.1) > TIP_ACCOUNTS_TTL_SECS)
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        if let Some(fresh) = self.fetch_tip_accounts().await
+            && let Ok(mut guard) = self.tips.lock()
+        {
+            *guard = (fresh, now);
+        }
+    }
+
+    /// Query the engine's `getTipAccounts`. `None` on any failure or when
+    /// the response carries no usable pubkeys.
+    async fn fetch_tip_accounts(&self) -> Option<Vec<String>> {
+        // `getTipAccounts` lives on the same base URL (not /bundles).
+        let base = self.endpoint.trim_end_matches("/api/v1/bundles");
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTipAccounts",
+            "params": [],
+        });
+        let res = match tokio::time::timeout(
+            Duration::from_millis(2000),
+            self.client.post(base).json(&payload).send(),
+        )
+        .await
+        {
+            Ok(Ok(res)) => res,
+            _ => return None,
+        };
+        let body: serde_json::Value = res.json().await.ok()?;
+        let accounts: Vec<String> = body
+            .get("result")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|s| Pubkey::from_str_const(s.as_str()).to_string() == *s)
+            .collect();
+        if accounts.is_empty() {
+            return None;
+        }
+        debug!(count = accounts.len(), "refreshed Jito tip accounts");
+        Some(accounts)
+    }
 }
 
 /// System transfer instruction (built by hand to avoid another sysvar
@@ -146,6 +245,18 @@ pub fn nanos_seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_payload_carries_base64_encoding() {
+        // Regression: omitting params[1] makes the engine decode base58
+        // and refuse every bundle (-32602). Verified live; lock the shape.
+        let payload = bundle_payload(vec!["dGVzdA==".to_string()]);
+        assert_eq!(payload["method"], "sendBundle");
+        let params = payload["params"].as_array().expect("params array");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0][0], "dGVzdA==");
+        assert_eq!(params[1]["encoding"], "base64");
+    }
 
     #[test]
     fn tip_accounts_are_valid_pubkeys() {

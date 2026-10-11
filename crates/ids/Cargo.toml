@@ -1,0 +1,19 @@
+[package]
+name = "ids"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+description = "Single source of truth for Solana program IDs and instruction discriminators"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "ids"
+path = "src/lib.rs"
+
+[dependencies]
+solana-pubkey = "4"
+
+[dev-dependencies]
+spl-token = { version = "9", default-features = false, features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "8", default-features = false, features = ["no-entrypoint"] }

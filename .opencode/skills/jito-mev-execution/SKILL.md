@@ -85,11 +85,15 @@ impl JitoClient {
     }
 
     pub async fn send_bundle(&self, bundle_b64: Vec<String>) -> Result<String, JitoError> {
+        // NOTE (verified live 2026-10-11): params[1] MUST carry
+        // {"encoding": "base64"}. The engine decodes base58 by default, so
+        // a bare [txs] params array makes it reject every bundle with
+        // -32602 "transaction #0 could not be decoded".
         let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendBundle",
-            "params": [bundle_b64]
+            "params": [bundle_b64, {"encoding": "base64"}]
         });
 
         let res = self.client.post(&self.endpoint).json(&payload).send().await?;

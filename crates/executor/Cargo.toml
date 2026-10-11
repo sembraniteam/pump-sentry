@@ -18,8 +18,10 @@ solana-hash = "4.7"
 solana-instruction = "3.5"
 solana-keypair = "3.1"
 solana-pubkey = "4.4"
+solana-signature = "3"
 solana-signer = "3.0"
 solana-transaction = "4.3"
+ids = { path = "../ids" }
 spl-token = { version = "9", default-features = false, features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "8", default-features = false, features = ["no-entrypoint"] }
 borsh = { version = "1", features = ["derive"] }
@@ -35,4 +37,8 @@ url = "2"
 zeroize = "1"
 
 [dev-dependencies]
+listener = { path = "../listener" }
+solana-message = "4"
+solana-rpc-client-api = "4.3.0"
+solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }
 tokio = { version = "1", features = ["full"] }

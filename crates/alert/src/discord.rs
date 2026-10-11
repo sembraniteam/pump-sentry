@@ -15,6 +15,13 @@ pub struct Alerter {
     binary: String,
     enabled: bool,
     timeout: Duration,
+    /// Optional Hermes channel target. `None` preserves the skill's
+    /// exact argv (`send --to discord <msg>`), leaving channel routing
+    /// to the host Hermes configuration. `Some(id)` sends to
+    /// `--to discord:<id>` (confirmed Hermes syntax for a specific
+    /// channel). Channel IDs are numeric snowflakes; anything else is
+    /// rejected at set time (fail-closed, keeps the default target).
+    channel: Option<String>,
 }
 
 impl Default for Alerter {
@@ -30,6 +37,7 @@ impl Alerter {
             binary: HERMES_BIN.to_string(),
             enabled: true,
             timeout: DISPATCH_TIMEOUT,
+            channel: None,
         }
     }
 
@@ -39,6 +47,7 @@ impl Alerter {
             binary: HERMES_BIN.to_string(),
             enabled: false,
             timeout: DISPATCH_TIMEOUT,
+            channel: None,
         }
     }
 
@@ -46,6 +55,29 @@ impl Alerter {
     pub fn with_binary(mut self, binary: &str) -> Self {
         self.binary = binary.to_string();
         self
+    }
+
+    /// Route to a specific Hermes Discord channel (`--to
+    /// `discord:<channel-id>`). Non-numeric input is rejected (keeps the
+    /// default `discord` target) since channel IDs are numeric snowflakes.
+    pub fn with_channel(mut self, channel: &str) -> Self {
+        let channel = channel.trim();
+        if !channel.is_empty() && channel.bytes().all(|b| b.is_ascii_digit()) {
+            self.channel = Some(channel.to_string());
+        }
+        self
+    }
+
+    /// argv for one dispatch (pure, unit-tested): the skill's exact
+    /// `send --to discord <msg>`, or `send --to discord:<id> <msg>` when
+    /// a channel is configured. The `--to` value is assembled here (never
+    /// through `sanitize`, which strips `:`).
+    fn argv(&self, message: &str) -> Vec<String> {
+        let target = match &self.channel {
+            Some(id) => format!("discord:{id}"),
+            None => "discord".to_string(),
+        };
+        vec!["send".to_string(), "--to".to_string(), target, message.to_string()]
     }
 
     /// Dispatch `message` as a detached task. Never blocks, never fails
@@ -56,10 +88,9 @@ impl Alerter {
         }
         let binary = self.binary.clone();
         let timeout = self.timeout;
+        let args = self.argv(&message);
         tokio::spawn(async move {
-            let run = Command::new(&binary)
-                .args(["send", "--to", "discord", &message])
-                .output();
+            let run = Command::new(&binary).args(&args).output();
             match tokio::time::timeout(timeout, run).await {
                 Err(_) => warn!(target: "alerting", "Hermes alert timed out"),
                 Ok(Err(e)) => warn!(target: "alerting", "Failed to spawn Hermes alert: {e}"),
@@ -80,14 +111,30 @@ impl Alerter {
         sl_pct: f64,
         notional_usd: f64,
     ) -> String {
+        let mint = Self::sanitize(mint);
         format!(
             "🟢 **[TRADE OPENED]**\n\
              • **Token Mint:** `{mint}`\n\
              • **Entry Price:** `${entry_usd:.8}`\n\
              • **Size:** `${notional_usd:.2}`\n\
              • **Target TP:** `+{tp_pct:.1}%` | **Stop Loss:** `{sl_pct:.1}%`\n\
-             • **Explorer:** https://solscan.io/token/{mint}"
+             • **Explorer:** https://explorer.solana.com/address/{mint}"
         )
+    }
+
+    /// Strip markdown/Discord control characters from interpolated fields.
+    /// Current callers only pass base58 pubkeys, bundle UUIDs, and internal
+    /// enums (all inert today), but any future field (token name/symbol)
+    /// is attacker-controlled — sanitize at the boundary so a new card
+    /// cannot become a mention/embed injection.
+    fn sanitize(s: &str) -> String {
+        s.chars()
+            .filter(|c| {
+                !matches!(c, '`' | '*' | '_' | '~' | '|' | '>' | '@' | '#' | ':' | '/' | '\\')
+                    && !c.is_control()
+            })
+            .take(128)
+            .collect()
     }
 
     /// Exit card (skill format, verbatim).
@@ -99,6 +146,8 @@ impl Alerter {
         equity: f64,
         is_moonbag: bool,
     ) -> String {
+        let mint = Self::sanitize(mint);
+        let reason = Self::sanitize(reason);
         let icon = if net_pnl >= 0.0 { "🎯" } else { "🛑" };
         let tag = if is_moonbag {
             "MOONBAG PARTIAL EXIT"
@@ -116,22 +165,67 @@ impl Alerter {
 
     /// Live buy dispatch card (bundle UUID for tracking).
     pub fn format_live_buy(mint: &str, bundle_id: &str, amount_tokens: u64) -> String {
+        let mint = Self::sanitize(mint);
+        let bundle_id = Self::sanitize(bundle_id);
         format!(
             "🚀 **[LIVE BUY SENT]**\n\
              • **Token Mint:** `{mint}`\n\
              • **Amount:** `{amount_tokens}` base units\n\
              • **Bundle:** `{bundle_id}`\n\
-             • **Explorer:** https://solscan.io/token/{mint}"
+             • **Explorer:** https://explorer.solana.com/address/{mint}"
         )
     }
 
     /// Live sell dispatch card.
     pub fn format_live_sell(mint: &str, bundle_id: &str) -> String {
+        let mint = Self::sanitize(mint);
+        let bundle_id = Self::sanitize(bundle_id);
         format!(
             "🔻 **[LIVE SELL SENT]**\n\
              • **Token Mint:** `{mint}`\n\
              • **Bundle:** `{bundle_id}`\n\
-             • **Explorer:** https://solscan.io/token/{mint}"
+             • **Explorer:** https://explorer.solana.com/address/{mint}"
+        )
+    }
+
+    /// Migration card: destination plus pool addresses when resolved.
+    /// `amm_id` / `base_mint` / `quote_mint` render as `unknown` when absent.
+    pub fn format_migration(
+        mint: &str,
+        destination: &str,
+        signature: &str,
+        amm_id: Option<&str>,
+        base_mint: Option<&str>,
+        quote_mint: Option<&str>,
+    ) -> String {
+        let mint = Self::sanitize(mint);
+        let destination = Self::sanitize(destination);
+        let signature = Self::sanitize(signature);
+        let amm = amm_id.map(Self::sanitize).unwrap_or_else(|| "unknown".to_string());
+        let base = base_mint.map(Self::sanitize).unwrap_or_else(|| "unknown".to_string());
+        let quote = quote_mint.map(Self::sanitize).unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "🌉 **[MIGRATION DETECTED]**\n\
+             • **Token Mint:** `{mint}`\n\
+             • **Destination:** `{destination}`\n\
+             • **AMM:** `{}`\n\
+             • **Base Mint:** `{}`\n\
+             • **Quote Mint:** `{}`\n\
+             • **Tx:** https://explorer.solana.com/tx/{signature}",
+            amm, base, quote,
+        )
+    }
+
+    /// Post-migration spike card: price crossed `multiple` off the first
+    /// pool tick after migration.
+    pub fn format_follow_spike(mint: &str, multiple: f64, price_usd: f64) -> String {
+        let mint = Self::sanitize(mint);
+        format!(
+            "🚀 **[POST-MIGRATION SPIKE]**\n\
+             • **Token Mint:** `{mint}`\n\
+             • **Move:** `{multiple:.1}x off migration`\n\
+             • **Price:** `${price_usd:.8}`\n\
+             • **Explorer:** https://explorer.solana.com/address/{mint}"
         )
     }
 }
@@ -148,7 +242,7 @@ mod tests {
         assert!(card.contains("$0.00000420"));
         assert!(card.contains("+40.0%"));
         assert!(card.contains("-10.0%"));
-        assert!(card.contains("solscan.io/token/MINT"));
+        assert!(card.contains("explorer.solana.com/address/MINT"));
     }
 
     #[test]
@@ -161,6 +255,73 @@ mod tests {
         assert!(loss.contains("🛑"));
         let moon = Alerter::format_exit("M", "Manual", 0.0, 0.0, 100.0, true);
         assert!(moon.contains("MOONBAG PARTIAL EXIT"));
+    }
+
+    #[test]
+    fn follow_spike_card_marks_multiple() {
+        let card = Alerter::format_follow_spike("M", 2.0, 0.01);
+        assert!(card.contains("[POST-MIGRATION SPIKE]"));
+        assert!(card.contains("2.0x"));
+        assert!(card.contains("explorer.solana.com/address/M"));
+    }
+
+    #[test]
+    fn migration_card_marks_pool() {
+        let card =
+            Alerter::format_migration("M", "RaydiumV4", "sig", Some("AMM"), Some("BASE"), None);
+        assert!(card.contains("[MIGRATION DETECTED]"));
+        assert!(card.contains("RaydiumV4"));
+        assert!(card.contains("`AMM`"));
+        assert!(card.contains("explorer.solana.com/tx/sig"));
+        let bare = Alerter::format_migration("M", "PumpSwap", "sig", None, None, None);
+        assert!(bare.contains("unknown"));
+    }
+
+    #[test]
+    fn interpolated_fields_are_sanitized() {
+        // Attacker-shaped inputs must not survive into the card as
+        // markdown mentions, code fences, or links (template backticks
+        // around fields are by design; payload backticks must be gone).
+        let card = Alerter::format_exit("@everyone `x`", "TakeProfit", 1.0, 1.0, 1.0, false);
+        assert!(!card.contains("@everyone"));
+        assert!(!card.contains("`x`"));
+        let mig = Alerter::format_migration(
+            "M",
+            "X",
+            "https://evil.example/@everyone",
+            Some("`AMM`"),
+            None,
+            None,
+        );
+        assert!(!mig.contains('@'));
+        assert!(!mig.contains("https://evil.example"));
+        // Backtick payloads collapse to plain text inside the template's
+        // own code span (no breakout): "`A`M`M`" renders as "`AMM`".
+        let tricky = Alerter::format_migration("M", "X", "s", Some("`A`M`M`"), None, None);
+        assert!(tricky.contains("`AMM`"));
+    }
+
+    #[test]
+    fn argv_defaults_to_skill_shape() {
+        // No channel: byte-identical to the skill's argv.
+        assert_eq!(
+            Alerter::new().argv("hi"),
+            vec!["send", "--to", "discord", "hi"]
+        );
+        // Numeric channel id: folded into the --to target.
+        assert_eq!(
+            Alerter::new().with_channel("123456789").argv("hi"),
+            vec!["send", "--to", "discord:123456789", "hi"]
+        );
+        // Blank or non-numeric input is rejected (default target kept).
+        assert_eq!(
+            Alerter::new().with_channel("  ").argv("hi"),
+            vec!["send", "--to", "discord", "hi"]
+        );
+        assert_eq!(
+            Alerter::new().with_channel("trades;rm -rf").argv("hi"),
+            vec!["send", "--to", "discord", "hi"]
+        );
     }
 
     #[tokio::test]

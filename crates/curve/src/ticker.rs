@@ -31,6 +31,9 @@ pub enum CurveError {
     /// RPC transport failure.
     #[error("rpc error: {0}")]
     Rpc(#[from] ClientError),
+    /// RPC read exceeded its deadline.
+    #[error("rpc read timed out")]
+    Timeout,
     /// Account does not exist (yet) on this RPC.
     #[error("curve account missing: {0}")]
     AccountMissing(String),
@@ -76,13 +79,15 @@ pub struct CurveTicker {
 }
 
 impl CurveTicker {
-    /// Map `"processed" | "confirmed" | "finalized"` to a commitment
-    /// (unknown strings fall back to `confirmed`; never panics).
-    pub fn parse_commitment(s: &str) -> CommitmentConfig {
+    /// Map `"processed" | "confirmed" | "finalized"` to a commitment.
+    /// Returns `None` for unknown strings (fail-closed; the binary's
+    /// startup gate rejects these before this is ever called).
+    pub fn parse_commitment(s: &str) -> Option<CommitmentConfig> {
         match s {
-            "processed" => CommitmentConfig::processed(),
-            "finalized" => CommitmentConfig::finalized(),
-            _ => CommitmentConfig::confirmed(),
+            "processed" => Some(CommitmentConfig::processed()),
+            "finalized" => Some(CommitmentConfig::finalized()),
+            "confirmed" => Some(CommitmentConfig::confirmed()),
+            _ => None,
         }
     }
 
@@ -137,19 +142,26 @@ impl CurveTicker {
         self.subs.read().await.len()
     }
 
-    /// One-shot reserve read for a curve address.
+
+/// One-shot reserve read for a curve address. Single retry plus a
+/// deadline so hung RPCs fail fast instead of stalling the caller.
+/// One-shot reserve read for a curve address. Single retry plus a
+/// deadline so hung RPCs fail fast instead of stalling the caller.
     pub async fn fetch_tick(&self, mint: &str, curve: &str) -> Result<PriceTick, CurveError> {
-        let key =
-            Pubkey::from_str(curve).map_err(|_| CurveError::BadCurveKey(curve.to_string()))?;
-        let account = self.rpc.get_account(&key).await?;
+        let key = Pubkey::from_str(curve).map_err(|_| CurveError::BadCurveKey(curve.to_string()))?;
+        let account = read_with_retry(&self.rpc, &key).await?;
         tick_from_account(mint, curve, &account.data, self.sol_usd)
     }
 
     /// Poll loop: `getMultipleAccounts` per round, one tick per curve.
-    /// Ends when the receiver drops.
+    /// Interval-based (no drift accumulation); ends when the receiver
+    /// drops. Batch failures back off instead of hammering the RPC.
     pub async fn run(self, tx: mpsc::Sender<PriceTick>) {
+        let mut timer = tokio::time::interval(self.interval);
+        // Skip the immediate first tick: let subscriptions settle.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::time::sleep(self.interval).await;
+            timer.tick().await;
             if tx.is_closed() {
                 debug!("tick receiver closed; ticker stopping");
                 return;
@@ -159,13 +171,22 @@ impl CurveTicker {
                 continue;
             }
             let keys: Vec<Pubkey> = watched.iter().map(|w| w.curve).collect();
-            let accounts = match self.rpc.get_multiple_accounts(&keys).await {
+            let accounts = match poll_round(&self.rpc, &keys).await {
                 Ok(accounts) => accounts,
                 Err(e) => {
-                    warn!(error = %e, n = keys.len(), "getMultipleAccounts failed");
+                    warn!(error = %e, n = keys.len(), "getMultipleAccounts failed; backing off");
+                    tokio::time::sleep(self.interval).await;
                     continue;
                 }
             };
+            if accounts.len() != watched.len() {
+                warn!(
+                    expected = watched.len(),
+                    got = accounts.len(),
+                    "account batch length mismatch; skipping round"
+                );
+                continue;
+            }
             for (entry, maybe_account) in watched.iter().zip(accounts.iter()) {
                 let Some(account) = maybe_account else {
                     debug!(mint = %entry.mint, "curve account missing (not yet indexed?)");
@@ -192,7 +213,54 @@ impl CurveTicker {
     }
 }
 
-/// Build a tick from raw account data. Pure; unit-testable.
+/// Per-round RPC deadline: hung reads fail instead of stalling polls.
+pub const ROUND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Single account read with one retry and a deadline.
+async fn read_with_retry(
+    rpc: &RpcClient,
+    key: &Pubkey,
+) -> Result<solana_account::Account, CurveError> {
+    let attempt = || async {
+        match tokio::time::timeout(ROUND_TIMEOUT, rpc.get_account(key)).await {
+            Ok(Ok(account)) => Ok(account),
+            Ok(Err(e)) => Err(CurveError::Rpc(e)),
+            Err(_) => Err(CurveError::Timeout),
+        }
+    };
+    match attempt().await {
+        Ok(account) => Ok(account),
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            attempt().await
+        }
+    }
+}
+
+/// Maximum accounts per `getMultipleAccounts` call: bounds payload size
+/// and stays clear of per-request account limits on public endpoints.
+pub const BATCH_CHUNK_SIZE: usize = 100;
+
+/// Batched multi-account read with a deadline (single attempt; the poll
+/// loop backs off and retries next round on failure). Large watchlists
+/// are split into [`BATCH_CHUNK_SIZE`] chunks so one oversized request
+/// cannot fail (or rate-limit) the whole round; results preserve key
+/// order across chunks.
+async fn poll_round(
+    rpc: &RpcClient,
+    keys: &[Pubkey],
+) -> Result<Vec<Option<solana_account::Account>>, CurveError> {
+    let mut out = Vec::with_capacity(keys.len());
+    for chunk in keys.chunks(BATCH_CHUNK_SIZE.max(1)) {
+        match tokio::time::timeout(ROUND_TIMEOUT, rpc.get_multiple_accounts(chunk)).await {
+            Ok(Ok(accounts)) => out.extend(accounts),
+            Ok(Err(e)) => return Err(CurveError::Rpc(e)),
+            Err(_) => return Err(CurveError::Timeout),
+        }
+    }
+    Ok(out)
+}
+
 fn tick_from_account(
     mint: &str,
     curve: &str,
