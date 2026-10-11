@@ -28,8 +28,10 @@ logsSubscribe (WebSocket, Mentions[pump_program])
 
 - Program: `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`
 - `create` discriminator: `[24, 30, 200, 40, 5, 28, 7, 119]`
+- `create_v2` discriminator: `[214, 144, 76, 236, 95, 139, 49, 180]` (14-account layout; creator parsed from args)
 - `buy` discriminator: `[102, 6, 61, 18, 1, 218, 235, 234]`
 - `sell` discriminator: `[51, 230, 133, 164, 1, 127, 131, 173]`
+- `buy_v2` discriminator: `[184, 23, 238, 97, 103, 197, 211, 61]` (trader at index 13; `sell_v2` unknown)
 
 ## Screening (`screen` module)
 
@@ -52,15 +54,18 @@ Win-rate hardening on top of the event stream:
   recent curve swaps with slots and supply shares (from decoded amounts
   over curve total supply) plus genesis-funder tracing for the first few
   distinct buyers. Funders resolve by walking each wallet's history to
-  its first transaction — uncapped page walk, `createAccount` and
-  `transfer` shapes — with every trace deadline-bound (20s) and fanned
-  out concurrently so one deep history cannot stall the gate.
-- Borsh args: `name: String, symbol: String, uri: String`
-- Accounts: `[0]=mint, [2]=bonding_curve, [3]=associated_bonding_curve,
-  [7]=user` (min 8).
+  its first transaction — page-capped (`MAX_FUNDER_PAGES`), `createAccount`
+  and `transfer` shapes — with an 8s per-buyer deadline inside a 15s
+  outer budget, fanned out concurrently so one deep history cannot stall
+  the gate. Untraceable majorities escalate to suspect (fail-closed).
+- Borsh args: `name: String, symbol: String, uri: String` (v2 trailing args ignored by design)
+- Accounts v1: `[0]=mint, [2]=bonding_curve, [3]=associated_bonding_curve,
+  [7]=user` (min 8). Accounts v2: mint/bonding-curve/assoc at `[0]/[2]/[3]`,
+  user at `[5]` (min 14).
 
-Top-level instruction `data` is base58; inner-instruction `data` is tried as
-base58 then base64. Account keys come from `transaction.message.accountKeys`
+Instruction `data` decodes through one shared helper (base58, then standard
+and URL-safe base64) for top-level and inner instructions alike. Account keys come from
+`transaction.message.accountKeys`
 plus `meta.loadedAddresses` (writable, then readonly).
 
 > Note: the fetch uses `UiTransactionEncoding::Json` because that is the
@@ -86,12 +91,12 @@ Connects to mainnet (`wss(s)://api.mainnet-beta.solana.com`, commitment
 ## API sketch
 
 ```rust
-let config = ListenerConfig::default ();
+let config = ListenerConfig::default();
 let ( mut rx, stats, _handle) = PumpFunListener::subscribe(config).await?;
 while let Some(ev) = rx.recv().await {
 println!("{} ({}) {}", ev.name, ev.symbol, ev.mint);
 }
-// Unbounded variant: PumpFunListener::subscribe_unbounded(config).await?
+// (No unbounded variant exists: every subscription is bounded + drop-on-full.)
 ```
 
 ## Tests
