@@ -1,5 +1,5 @@
 ---
-description: Simulate a paper trade entry and verify execution metrics ($1 Mint, $2 SOL_Amount).
+description: Simulate a paper trade entry and verify execution metrics ($1 Mint, $2 USD_Notional).
 agent: paper-trading-simulator
 subtask: true
 ---
@@ -7,26 +7,29 @@ subtask: true
 Simulate a paper trade execution for:
 
 - **Token Mint:** $1
-- **Trade Size (SOL):** $2
+- **USD Notional:** $2 (paper sizes in USD at curve spot — never SOL amounts)
 
-### Verification Tasks:
+### Verification Tasks (mirror `crates/simulator`):
 
-1. Calculate expected token output based on bonding curve reserves.
-2. Deduct simulated priority fees (0.001 SOL) and DEX swap fees (0.25%).
-3. Register the open position into the virtual portfolio ledger.
+1. Price the fill through `FillModel::BondingCurve` (size impact + 125 bps/side venue fee, 25% cap) — never at spot.
+2. Charge `fee_bps` commission on notionals on top (default 30 = 0.30%; never 125 on the default model or the venue
+   fee double-counts).
+3. Open via `open_position_params` (explicit rejects: empty mint, bad price/notional/TP/SL/fraction) and report the
+   numeric position id. Exits: TP/SL/trailing/timeout; TakeProfit scale-outs ratchet to move-breakeven, lift the
+   time-stop, and disarm the moonbag — Manual trims preserve terms.
 
 ### Expected Output Format:
 
 ```text
 === SIMULATED EXECUTION TICKET ===
-Timestamp:        <UTC_ISO_8601>
+Timestamp:        <unix_secs>
 Token Mint:       $1
-Allocated:        $2 SOL
-Fill Price (SOL): <simulated_fill_price>
+Notional:         $2 USD
+Fill Price:       <simulated_fill_price_usd>
 Price Impact:     <calculated_pct>%
-Estimated Fees:   <total_fees_in_sol> SOL
-Position ID:      <uuid>
-Portfolio Cash:   <remaining_virtual_cash> SOL
+Entry Fee:        <commission_usd> USD
+Position ID:      <u64>
+Portfolio Cash:   <remaining_virtual_cash> USD
 Active Positions: <count>
 ==================================
 ```

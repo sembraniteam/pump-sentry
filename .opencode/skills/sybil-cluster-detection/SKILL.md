@@ -62,7 +62,11 @@ pub enum BundleVerdict {
 pub struct BundleDetector;
 
 impl BundleDetector {
-    /// Evaluates whether early transactions represent an insider Jito bundle
+    /// Evaluates whether early transactions represent an insider Jito bundle.
+    /// Slot attribution uses each buyer's EARLIEST slot and the supply share
+    /// counts CREATION-SLOT buys only (later accumulation must not inflate it).
+    /// Only proven `Buy` sides enter the math — unattributable records never
+    /// count. Resolved-below-half funder ancestry escalates Safe → Suspect.
     pub fn evaluate_launch_slot(
         creation_slot: u64,
         early_swaps: &[(u64, Pubkey, f64)], // (slot, buyer_pubkey, supply_pct)

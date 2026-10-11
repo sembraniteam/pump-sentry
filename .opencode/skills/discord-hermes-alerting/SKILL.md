@@ -25,11 +25,16 @@ hermes send --to discord "Message content formatted with markdown"
 ## Architectural Invariants (Rust)
 
 1. **Never Block Execution:** Alert dispatch must be spawned as a detached Tokio background task (`tokio::spawn`), never
-   awaited inline on the hot pricing or swap paths.
+   awaited inline on the hot pricing or swap paths. At most 4 children run at once (shared semaphore); excess drops
+   with a counter — alerts are observability, never consensus.
 2. **Failure Tolerance:** If Hermes CLI fails, times out, or Discord returns an error, the error must be logged via
-   `tracing::warn!` without affecting portfolio state or trading logic.
+   `tracing::warn!` without affecting portfolio state or trading logic. Timeouts kill the child (`kill_on_drop`)
+   so late deliveries cannot duplicate; stderr logs are capped at 1KB. Binary from `HERMES_BIN` env, else `hermes`
+   on PATH (prefer absolute — PATH hijack risk).
 3. **Markdown Card Standards:** Use Discord-friendly markdown (bold headers, bullet points, emoji tags). Do not use HTML
-   or unsupported markdown tables.
+   or unsupported markdown tables. Sanitize every interpolated field (markdown chars, `[]()` links, zero-width/bidi
+   overrides) and cap at 128 chars. Pass formatter output as the positional message (a `-`-leading payload could
+   parse as a Hermes flag — `--` support is unverified).
 
 ## Rust Implementation Reference
 
@@ -40,7 +45,8 @@ use tracing::warn;
 pub struct DiscordAlert;
 
 impl DiscordAlert {
-    /// Fire-and-forget alert dispatch
+    /// Fire-and-forget alert dispatch (5s timeout, warn-only, child killed
+    /// on timeout). Prefer an absolute `HERMES_BIN`.
     pub fn send(message: String) {
         tokio::spawn(async move {
             match Command::new("hermes")
@@ -67,7 +73,7 @@ impl DiscordAlert {
              • **Entry Price:** `${entry_usd:.8}`\n\
              • **Size:** `${notional_usd:.2}`\n\
              • **Target TP:** `+{tp_pct:.1}%` | **Stop Loss:** `{sl_pct:.1}%`\n\
-             • **Explorer:** https://solscan.io/token/{mint}"
+             • **Explorer:** https://explorer.solana.com/address/{mint}"
         )
     }
 

@@ -45,9 +45,11 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum JitoError {
     #[error("Network error: {0}")]
-    Reqwest(#[from] reqwest::Error),
+    Network(#[from] reqwest::Error),
     #[error("RPC error: {0}")]
     Rpc(String),
+    #[error("bad Jito endpoint: {0}")]
+    BadUrl(String),
 }
 
 pub const JITO_TIP_ACCOUNTS: [&str; 4] = [
@@ -63,14 +65,24 @@ pub struct JitoClient {
 }
 
 impl JitoClient {
-    pub fn new(region_endpoint: &str) -> Self {
-        Self {
-            client: Client::builder()
-                .timeout(Duration::from_millis(2000))
-                .build()
-                .unwrap(),
-            endpoint: format!("{}/api/v1/bundles", region_endpoint),
+    /// Returns the reason instead of `None` (fail fast at startup, never
+    /// half-enable live dispatch).
+    pub fn new(region_base_url: &str) -> Result<Self, JitoError> {
+        match url::Url::parse(region_base_url) {
+            Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
+            _ => return Err(JitoError::BadUrl(region_base_url.to_string())),
         }
+        let client = Client::builder()
+            .timeout(Duration::from_millis(2000))
+            .build()?;
+        Ok(Self {
+            client,
+            endpoint: format!("{region_base_url}/api/v1/bundles"),
+            tips: std::sync::Arc::new(std::sync::Mutex::new((
+                JITO_TIP_ACCOUNTS.iter().map(|s| s.to_string()).collect(),
+                0,
+            ))),
+        })
     }
 
     pub fn create_tip_instruction(
@@ -106,4 +118,11 @@ impl JitoClient {
         Ok(body["result"].as_str().unwrap_or("").to_string())
     }
 }
+
+/// Tip accounts refresh hourly from `getTipAccounts` (2s budget, silent
+/// fallback to the compiled rotation). Post to the SAME bundles endpoint —
+/// Jito routes by the `method` field, not the path (posting to the bare base
+/// URL returns nothing and silently pins the fallback forever). Trust-but-verify:
+/// a fetched set with zero overlap against the compiled rotation is rejected
+/// (hijack/stale guard) instead of poisoning tips for an hour.
 ```

@@ -31,12 +31,14 @@ pub enum RugCheckError {
     Deserialization(#[from] serde_json::Error),
     #[error("Token rejected: {0}")]
     SecurityRejection(String),
+    #[error("bad RugCheck config: {0}")]
+    BadUrl(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RugCheckReport {
     pub mint: String,
-    pub score: u32,
+    pub score: u32, // REQUIRED: missing score fails deserialization (never defaults to 0)
     pub risks: Vec<RiskItem>,
     pub token: Option<TokenInfo>,
 }
@@ -47,7 +49,7 @@ pub struct RiskItem {
     pub value: String,
     pub description: String,
     pub score: u32,
-    pub level: String, // "info", "warn", "danger"
+    pub level: String, // allowlist: only "warn" passes; "danger", empty, and unknown all reject
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,6 +80,10 @@ impl RugCheckClient {
     }
 
     pub async fn evaluate_token(&self, mint: &str) -> Result<RugCheckReport, RugCheckError> {
+        // Fail-closed boundaries (see crates/auditor): 32-byte base58 mint
+        // before it touches the URL; report mint must match the request;
+        // bodies capped at 1MB; retries capped at 5, for timeouts/connects/
+        // 5xx/429/408 only.
         let url = format!("{}/tokens/{}/report", self.base_url, mint);
 
         let response = self.client.get(&url).send().await?;
@@ -86,6 +92,12 @@ impl RugCheckClient {
         }
 
         let report: RugCheckReport = response.json().await?;
+        if report.mint != mint {
+            return Err(RugCheckError::SecurityRejection(format!(
+                "report mint mismatch: asked '{mint}', got '{}'",
+                report.mint
+            )));
+        }
 
         // Invariant Verifications
         if report.score > 400 {
@@ -96,25 +108,36 @@ impl RugCheckClient {
         }
 
         for risk in &report.risks {
-            if risk.level.to_lowercase() == "danger" {
+            if risk.level.eq_ignore_ascii_case("danger") {
                 return Err(RugCheckError::SecurityRejection(format!(
                     "Critical risk detected: {} - {}",
                     risk.name, risk.description
+                )));
+            } else if !risk.level.eq_ignore_ascii_case("warn") {
+                return Err(RugCheckError::SecurityRejection(format!(
+                    "Unknown risk severity '{}' on {}: treating as dangerous",
+                    risk.level, risk.name
                 )));
             }
         }
 
         if let Some(token) = &report.token {
-            if token.mint_authority.is_some() {
+            let mint_auth = token.mint_authority.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            if mint_auth.is_some() {
                 return Err(RugCheckError::SecurityRejection(
                     "Mint authority is enabled".into(),
                 ));
             }
-            if token.freeze_authority.is_some() {
+            let freeze_auth = token.freeze_authority.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            if freeze_auth.is_some() {
                 return Err(RugCheckError::SecurityRejection(
                     "Freeze authority is enabled".into(),
                 ));
             }
+        } else {
+            return Err(RugCheckError::SecurityRejection(
+                "Missing on-chain token info; authorities unverifiable".into(),
+            ));
         }
 
         Ok(report)

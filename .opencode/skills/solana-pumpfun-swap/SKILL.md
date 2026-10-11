@@ -29,6 +29,13 @@ swaps against the Pump.fun bonding curve program.
 
 - **Buy:** `[102, 6, 61, 18, 1, 218, 235, 234]` (`0x66063d1201daebea`)
 - **Sell:** `[51, 230, 133, 164, 1, 127, 131, 173]` (`0x33e685a4017f83ad`)
+- **Buy_v2:** `[184, 23, 238, 97, 103, 197, 211, 61]` (mayhem-curve buys; trader at account index 13)
+- **Sell_v2:** `[93, 246, 130, 60, 231, 233, 64, 178]` (docs-sourced, UNOBSERVED on-chain — dev dumps through it stay
+  invisible; gate fail-closes on unknown pump ixs instead)
+- **Create_v2:** `[214, 144, 76, 236, 95, 139, 49, 180]` (current launches; 14–16 accounts)
+
+Buy args carry a trailing plain `bool track_volume` (live 25-byte payloads end `0x00`/`0x01`); the legacy 24-byte
+form leaves volume untracked.
 
 ## Rust Instruction Builder Implementation
 
@@ -134,3 +141,21 @@ impl PumpSwapBuilder {
     }
 }
 ```
+
+> **This skill's builder above is the LEGACY shape and is now deprecated in the repo** (`build_buy_ix` /
+> `build_sell_ix` bake in the canonical fee recipient, classic token program, no creator, and untracked volume).
+> Production code MUST use `PumpSwapBuilder::build_swap_ix` with explicit `SwapAccounts`
+> (`crates/executor/src/instructions.rs`):
+>
+> - **Fee recipient: resolve live** — explicit override → Global account bytes 41..73 → canonical constant. The
+>   program rotates recipients; hardcoding misdirects fees.
+> - **Token program: resolve per mint** — classic SPL vs Token-2022 (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`);
+>   ATA derivation AND the create-ATA ix must use it.
+> - **Creator: enables the extended mayhem shape** — token program, creator vault
+>   (`["creator-vault", creator]` PDA), event authority, program, global/user volume accumulators, fee-config
+>   accounts (extended BUY byte-verified against mainnet; extended SELL mirrors the SDK order, experimental and
+>   simulation-gated). `None` keeps the 12-account legacy core (rejected on mayhem curves).
+> - **ATA prefix: idempotent** (`data: [1]`, `CreateIdempotent`) — safe on existing accounts and immune to
+>   check-vs-land races.
+> - **Buyback accounts [16]/[17]: UNMAPPED** — per-token sourcing is open work; the ignored
+>   `mainnet_layout_acceptance` probe is the gate that must turn green before funding.

@@ -7,11 +7,14 @@ subtask: true
 Analyze the developer wallet address:
 **Deployer Address:** $ARGUMENTS
 
-### Verification Tasks:
+### Verification Tasks (mirror `screen_developer` + `judge_developer`):
 
-1. Query transaction history for previous token mint deployments.
-2. Calculate average survival lifespan of prior tokens.
-3. Identify initial SOL funding origin (CEX, Bridge, or Sybil Transfer).
+1. Query signature history (capped pages): wallet age from oldest activity; empty history fails closed.
+2. Sample recent transactions (bounded fanout) and count prior Pump.fun `create`/`create_v2` launches; reject serial
+   launchers over the max. Majority-unreadable samples fail closed (undercounts pass sybils).
+3. Identify genesis SOL funding via system `transfer`/`createAccount` shapes only (best-effort; SPL/mixer/CEX
+   attribution is NOT implemented — report untraceable as such, never as clean).
+4. Map survivors to the continuous trust score (0.7 at minimum age → 1.0 at 4x, −0.05 per prior, floor 0.4).
 
 ### Expected Output Format:
 
@@ -20,10 +23,9 @@ Analyze the developer wallet address:
 Address:           $ARGUMENTS
 Account Age:       <days/hours>
 Mints Deployed:    <count>
-Rugpull History:   <detected_count>
-Funding Ancestry:  <CEX_Name | Mixer | Fresh_Wallet>
-Reputation Score:  <0.00 to 1.00>
-Risk Category:     [WHITELISTED | NEUTRAL | SUSPECT | BLACKLISTED]
+Sample Trust:      [TRUSTWORTHY | UNREADABLE_FAIL_CLOSED]
+Trust Score:       <0.40 to 1.00>
+Risk Category:     [PASS | REJECT]
 Action Directive:  [ALLOW | BLOCK]
 ================================
 ```

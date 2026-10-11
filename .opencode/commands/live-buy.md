@@ -4,17 +4,22 @@ agent: solana-swap-executor
 subtask: true
 ---
 
-Execute an on-chain test buy swap against Pump.fun:
+Execute an on-chain test buy swap against Pump.fun (moves REAL funds — dry-run `simulateTransaction` first and
+re-read `crates/executor/README.md` before enabling):
 
 - **Target Mint:** $1
 - **Amount (SOL):** $2
 
-### Verification Invariants:
+### Verification Invariants (mirror `src/live.rs` + `crates/executor`):
 
-1. Confirm wallet balance >= ($2 SOL + 0.05 SOL reserve + Jito tip).
-2. Construct `create_associated_token_account_idempotent` instruction.
-3. Construct `PumpSwapBuilder::build_buy_ix` with 300 bps (3%) slippage cap.
-4. Prepend priority fee and append Jito tip instruction.
+1. Confirm wallet balance >= ($2 SOL + 0.05 SOL reserve + Jito tip) via `assert_solvency`.
+2. Resolve the mint's token program (classic vs Token-2022) and derive the program-bound ATA; prepend the idempotent
+   create-ATA ix when missing.
+3. Size via `plan_buy` (USD notional at curve spot, `max_sol_cost` capped at +100% slippage; default 200 bps) and
+   build via `PumpSwapBuilder::build_swap_ix` with explicit `SwapAccounts` (live fee recipient + creator).
+   NEVER use deprecated `build_buy_ix` (wrong recipient/program/shape on mayhem curves).
+4. Dispatch as a Jito bundle (`sendBundle` + `{"encoding": "base64"}`) with 30s dispatch deadline; confirm the
+   signature within 60s. Timeout/transport failures track as pending and re-poll — never assume unfilled.
 5. Sign with `SOLANA_PRIVATE_KEY` and dispatch bundle.
 
 ### Output Contract:
@@ -23,9 +28,10 @@ Execute an on-chain test buy swap against Pump.fun:
 === LIVE BUY TRANSACTION RECEIPT ===
 Target Mint:      $1
 SOL Dispatched:   $2 SOL
-Jito Tip:         0.001 SOL
+Jito Tip:         <tip_lamports> lamports
+Bundle ID:        <bundle_uuid>
 Signature:        <transaction_signature>
-Explorer URL:     https://solscan.io/tx/<signature>
-Inclusion Status: [CONFIRMED | FAILED]
+Explorer URL:     https://explorer.solana.com/tx/<signature>
+Inclusion Status: [CONFIRMED | PENDING_RECHECK | FAILED]
 ====================================
 ```

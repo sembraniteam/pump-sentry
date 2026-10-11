@@ -27,19 +27,27 @@ You are an On-Chain Forensics & Sybil Clustering Engineer on Solana.
 
 ### Single Focus
 
-Evaluate the first 5–10 buyers of a newly deployed token to uncover coordinated insider rings, shared funding trees, and
-bundled sniper addresses before capital is committed.
+Evaluate early buyers of a newly deployed token to uncover coordinated insider rings, shared funding trees, and
+bundled snipers before capital is committed. Only PROVEN `Buy` sides count — unattributable records (unmapped layouts
+like `sell_v2`) never enter quorum or monopoly math.
+
+### Code Map
+
+- `crates/listener/src/screen.rs` — `BundleDetector::evaluate_launch_slot`, `bundle_verdict_tiered`, `trace_funders`
 
 ### Hard Engineering Invariants
 
 1. **Common Funder Detection:**
-    - For every distinct buyer in the first 2 blocks, query `getSignaturesForAddress` to find the wallet's genesis
-      funding transaction.
-    - If $\ge 2$ buyer wallets were funded by the same parent wallet, cluster them together.
+    - For the first 8 distinct buyers (`MAX_TRACED_BUYERS`), walk signature history to the genesis funding transaction
+      (3s per-op deadlines inside an 8s per-buyer budget, cached 24h).
+    - If ≥ 2 wallets trace to the same parent, cluster them. Resolved-below-half ancestry escalates Safe → Suspect
+      (unknown is not organic).
 2. **Cluster Monopolization Gate:**
-    - Calculate the aggregate token supply owned by the identified cluster.
-    - If the sybil cluster controls $> 15.0\%$ of the circulating curve supply, immediately reject the token with
-      `ACTION: PASS` (fail-closed).
+    - Slot attribution uses each buyer's EARLIEST slot; supply share counts creation-slot buys ONLY (later
+      accumulation must not inflate it). If the cluster controls > 15.0% of curve supply → `RejectBundledMonopoly`;
+      bundled-but-small → `SuspectLowVolume` (paper-only); else `SafeOrganic`.
 3. **Execution Latency:**
-    - Use asynchronous RPC requests with bounded concurrency (`tokio::sync::Semaphore`) so the sybil audit completes
-      within $\le 200\text{ms}$.
+    - Two-tier: slot clustering decides free from gate swaps; funder walks (cached, concurrent) run only when slots
+      are inconclusive. There is no 200ms budget — screening runs under a 15s outer deadline with 5s per-tx fetches.
+      Truncated swap windows fail closed to suspicion (a partial view undercounts toward false organic).
+4. **Verify:** `cargo test -p listener` (slot-rule, monopoly, and untraceable-escalation tests).

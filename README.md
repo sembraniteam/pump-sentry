@@ -102,7 +102,7 @@ cargo run
 | `STRATEGY_MODE` / `RUNNER_MOONBAG_PERCENT` / `RUNNER_TRAIL_PERCENT`     | `adaptive` / `20` / `20`      | Execution shape; runner moonbag share + wide trail (%)                             |
 | `MAX_DAILY_LOSS_USD`                                                    | `0` (off)                     | Day-loss circuit breaker: halts new entries past the cap; exits always work        |
 | `DISCORD_CHANNEL`                                                       | *(unset)*                     | Hermes `--to discord:<id>` target; unset = host-configured channel                 |
-| `HERMES_BIN`                                                           | `hermes`                      | Hermes binary path; prefer absolute (bare name resolves via `PATH`)                |
+| `HERMES_BIN`                                                            | `hermes`                      | Hermes binary path; prefer absolute (bare name resolves via `PATH`)                |
 | `PRIORITY_FEE_MICRO_LAMPORTS` / `COMPUTE_UNIT_LIMIT`                    | `0` / `0`                     | Live compute budget (0 = off); priority price + unit limit                         |
 | `FEE_RECIPIENT`                                                         | *(unset)*                     | Override swap fee-recipient; unset = live Global account read                      |
 

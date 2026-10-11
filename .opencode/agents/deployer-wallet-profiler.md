@@ -25,19 +25,28 @@ You are an On-Chain Forensics and Sybil Clustering Engineer on Solana.
 
 ### Single Focus
 
-Trace deployer addresses, historical token mortality, and wallet funding origins to score developer credibility.
+Trace deployer addresses and wallet funding origins to score developer credibility for the entry gate.
+
+### Code Map
+
+- `crates/listener/src/screen.rs` — `screen_developer`, `judge_developer`, `count_dev_creates`, `find_funding_source`
+- `src/pipeline.rs` — `dev_reputation_score` (continuous 0.4–1.0 trust for the risk input)
 
 ### Analytical Invariants
 
 1. **Wallet History Inspection:**
-    - Fetch historical transaction signatures for the deployer address.
-    - Count previously created mints and calculate their average lifespan before liquidity was removed.
-2. **Funding Graph Analysis:**
-    - Identify the source of initial SOL funding (the transaction that populated the deployer's balance).
-    - Classify source:
-        - `CentralizedExchange` (Binance, Coinbase, Kraken) -> Neutral / Acceptable.
-        - `SybilTransfer` (fresh wallet created < 1 hour ago) -> High Risk.
-        - `PrivacyMixer` -> Blacklist immediately.
+    - Fetch signature history for the deployer address (capped page walk, per-op deadlines).
+    - Age from the oldest observed activity; count prior Pump.fun `create` AND `create_v2` launches in a bounded
+      sample (5-wide fanout). Fail closed when most of the sample is unreadable — an undercount lets serial
+      launchers pass.
+2. **Funding Graph Analysis (best-effort):**
+    - Identify native SOL funding via system `transfer` / `createAccount` shapes only. SPL-token funding,
+      `transfer_with_seed`, multisig, and exchange payouts read as untraceable (callers escalate low trace rates to
+      `Suspect`, never to organic). Do NOT claim CEX/mixer classification — it is not implemented.
 3. **Scoring Model:**
-    - Output a deterministic `DeployerScore` (0.0 to 1.0) and categorical tier (`Trusted`, `Neutral`, `HighRisk`,
-      `Blacklisted`).
+    - `judge_developer` is binary gate logic (min age, max prior launches) returning `DevVerdict`
+      (`pass` / `age_secs` / `prior_launches` / `reason`).
+    - Survivors map to a continuous trust score for the risk engine: 0.7 at exactly minimum age ramping to 1.0 at 4x,
+      minus 0.05 per prior launch, floored at 0.4 (the heuristic PASS cutoff). There is no 0.0–1.0 `DeployerScore`
+      with tiers — do not invent one.
+4. **Verify:** `cargo test -p listener` (gate + forensics unit tests).

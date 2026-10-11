@@ -1,32 +1,30 @@
 ---
-description: Perform on-chain funding graph forensics on the top holders of a token ($1 Mint Address).
+description: Perform on-chain funding graph forensics on the early buyers of a token ($1 Mint Address).
 agent: sybil-forensics-auditor
 subtask: true
 ---
 
-Analyze holder distribution and detect potential sybil rings:
+Analyze early-buyer distribution and detect potential sybil rings:
 **Target Mint:** $ARGUMENTS
 
-### Execution Steps:
+### Execution Steps (mirror `bundle_verdict_tiered` — this bot traces early BUYERS, not top holders):
 
-1. Fetch the top 10 token holders from the mint's largest accounts.
-2. For each holder, query the initial SOL funding transaction.
-3. Group addresses that share the same parent funder.
-4. Compute total supply held by the largest cluster.
+1. Read recent curve swaps (paginated, 3×25) and keep proven `Buy` sides only (unmapped layouts excluded).
+2. Take the first 8 distinct buyers; attribute each to its EARLIEST slot and sum creation-slot amounts only.
+3. Walk each buyer's genesis funding (cached, 8s budget each); cluster wallets sharing a parent funder.
+4. Escalate Safe → Suspect when fewer than half the walked buyers resolve (unknown is not organic).
 
 ### Expected Output Format:
 
 ```text
 === SYBIL & CLUSTER FORENSIC REPORT ===
 Target Mint:          $ARGUMENTS
-Top 10 Supply Share:  <pct>%
-Clusters Detected:    <count>
-Common Funder Wallet: <funder_pubkey_or_none>
+Creation-Slot Buys:   <count> (≥3 proves a bundle)
 Cluster Wallets:
-  - <holder_1> (<pct_held>%)
-  - <holder_2> (<pct_held>%)
+  - <buyer_1> (<creation-pct>%)
+  - <buyer_2> (<creation-pct>%)
 Aggregate Cluster %:  <cluster_total_pct>%
 Risk Assessment:      [CLEAN | SUSPICIOUS | SYBIL_MONOPOLY (>15%)]
-Recommendation:       [SAFE_TO_TRADE | REJECT_TOKEN]
+Recommendation:       [SAFE_TO_TRADE | PAPER_ONLY | REJECT_TOKEN]
 =======================================
 ```

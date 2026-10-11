@@ -49,7 +49,8 @@ pub const GRADUATION_REAL_SOL_LAMPORTS: u64 = 84_000_000_000; // ~84 SOL
 pub enum MigrationDestination {
     RaydiumV4,
     PumpSwap,
-    Unknown,
+    // NOTE: no `Unknown` variant in the repo — unrecognized transactions
+    // return `None` (ordinary swaps never match).
 }
 
 pub struct MigrationMonitor {
@@ -67,12 +68,17 @@ impl MigrationMonitor {
         }
     }
 
-    /// Checks if a bonding curve account has graduated from its raw binary data
+    /// Checks if a bonding curve account has graduated from its raw binary data.
+    /// The discriminator is checked FIRST: byte 48 on a non-curve account
+    /// (pool, token) must never read as graduation.
     pub fn is_curve_graduated(account_data: &[u8]) -> bool {
         if account_data.len() < 49 {
             return false;
         }
-        account_data[48] == 1 // complete flag at offset 48
+        if account_data[..8] != curve::BONDING_CURVE_DISCRIMINATOR {
+            return false;
+        }
+        account_data[48] != 0 // complete flag at offset 48 (any nonzero byte)
     }
 
     /// Evaluates graduation progress as percentage (0.0 to 100.0)
@@ -81,30 +87,40 @@ impl MigrationMonitor {
         progress.clamp(0.0, 100.0)
     }
 
-    /// Detects destination from an on-chain migration transaction
+    /// Detects destination from an on-chain migration transaction.
+    /// Requires the watched curve or expected base mint among the keys
+    /// (unlinked shared-tx inits must not false-positive), plus:
     pub fn classify_migration(
         &self,
         account_keys: &[Pubkey],
         instructions_data: &[Vec<u8>],
         log_messages: &[String],
+        curve: &Pubkey,
+        expected_base_mint: &Pubkey,
     ) -> Option<MigrationDestination> {
         let mentions_authority = account_keys.iter().any(|k| k == &self.pump_migration_authority);
-        if !mentions_authority {
+        let mentions_pump = account_keys.iter().any(|k| k == &self.pump_program);
+        if !mentions_authority && !mentions_pump {
+            return None;
+        }
+        let linked = account_keys.iter().any(|k| k == curve || k == expected_base_mint);
+        if !linked {
             return None;
         }
 
-        // 1. Raydium AMM V4 initialization check
+        // 1. Raydium AMM V4 initialization check (ASCII case-insensitive logs)
         let mentions_raydium = account_keys.iter().any(|k| k == &self.raydium_v4);
-        let has_raydium_log = log_messages.iter().any(|msg| msg.contains("initialize2"));
+        let has_raydium_log = log_messages.iter().any(|msg| msg.to_ascii_lowercase().contains("initialize2"));
         if mentions_raydium && has_raydium_log {
             return Some(MigrationDestination::RaydiumV4);
         }
 
-        // 2. PumpSwap migration instruction check
+        // 2. PumpSwap migration: legacy instruction OR current MigrateV2 log
         let has_pump_migrate_ix = instructions_data.iter().any(|ix| {
             ix.len() >= 8 && ix[..8] == PUMP_MIGRATE_DISCRIMINATOR
         });
-        if has_pump_migrate_ix {
+        let has_migrate_v2_log = log_messages.iter().any(|msg| msg.to_ascii_lowercase().contains("migratev2"));
+        if has_pump_migrate_ix || has_migrate_v2_log {
             return Some(MigrationDestination::PumpSwap);
         }
 

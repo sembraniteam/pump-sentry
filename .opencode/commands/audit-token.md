@@ -10,20 +10,24 @@ Audit the target Solana token mint address:
 Current git branch:
 !`git branch --show-current`
 
-### Verification Tasks:
+### Verification Tasks (mirror `crates/auditor` policy — anything else is advisory only):
 
-1. Verify if `mint_authority` and `freeze_authority` are disabled.
-2. Query RugCheck risk score and list all detected flags.
-3. Check top 10 non-bonding-curve holder distribution.
+1. Verify `mint_authority` and `freeze_authority` are disabled (absent or blank).
+2. Query RugCheck risk score (reject > 400) and list all flags (reject `danger` AND any unknown/empty severity —
+   only `warn` passes).
+3. Confirm the report carries a score and its mint matches the request (fail-closed otherwise).
+4. For live-book context, also report the dev screen (`screen_developer`: age + prior launches) and the bundle
+   verdict tier. This bot does NOT do top-holder distribution analysis — do not present one.
 
 ### Expected Output Format:
 
-| Metric           | Status              | Value               | Risk Rating            |
-|:-----------------|:--------------------|:--------------------|:-----------------------|
-| Mint Authority   | [Disabled / Active] | `<address_or_null>` | [SAFE / CRITICAL]      |
-| Freeze Authority | [Disabled / Active] | `<address_or_null>` | [SAFE / CRITICAL]      |
-| RugCheck Score   | [Computed]          | `<score>/1000`      | [SAFE / WARN / DANGER] |
-| Top 10 Holder %  | [Computed]          | `<pct>%`            | [SAFE / DANGER]        |
+| Metric           | Status              | Value               | Risk Rating       |
+|:-----------------|:--------------------|:--------------------|:------------------|
+| Mint Authority   | [Disabled / Active] | `<address_or_null>` | [SAFE / CRITICAL] |
+| Freeze Authority | [Disabled / Active] | `<address_or_null>` | [SAFE / CRITICAL] |
+| RugCheck Score   | [Computed]          | `<score> (cap 400)` | [SAFE / REJECT]   |
+| Risk Severities  | [All warn / Other]  | `<levels>`          | [SAFE / REJECT]   |
+| Dev Screen       | [Pass / Reject]     | `<age>, <priors>`   | [SAFE / REJECT]   |
 
 **Decision:** `[PROCEED_TO_SNIPE | REJECT_TOKEN]`
 **Reason:** `<brief_justification>`

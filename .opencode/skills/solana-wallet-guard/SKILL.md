@@ -41,6 +41,10 @@ pub enum WalletGuardError {
     MissingKeyEnv,
     #[error("Failed to decode base58 private key: {0}")]
     Base58Decode(#[from] bs58::decode::Error),
+    #[error("Invalid key length {0} bytes: expected 64-byte secret or 32-byte seed")]
+    BadKeyLength(usize),
+    #[error("Invalid secret key: {0}")]
+    BadSecret(String),
     #[error("Insufficient SOL balance: have {available_lamports} lamports, need {required_lamports} lamports (including 0.05 SOL reserve)"
     )]
     InsufficientFunds {
@@ -49,6 +53,8 @@ pub enum WalletGuardError {
     },
     #[error("RPC query failed: {0}")]
     Rpc(#[from] solana_client::client_error::ClientError),
+    #[error("balance read timed out")]
+    Timeout,
 }
 
 pub struct WalletGuard {
@@ -56,13 +62,23 @@ pub struct WalletGuard {
 }
 
 impl WalletGuard {
+    /// Load from `SOLANA_PRIVATE_KEY`: base58 64-byte secret OR 32-byte
+    /// seed (whitespace-tolerant; env string and decode buffers zeroized).
     pub fn load_from_env() -> Result<Self, WalletGuardError> {
         let key_str = env::var("SOLANA_PRIVATE_KEY")
             .map_err(|_| WalletGuardError::MissingKeyEnv)?;
 
+        // Fast path: standard 64-byte secret strings (also validates ed25519).
+        if let Ok(keypair) = Keypair::try_from_base58_string(key_str.trim()) {
+            return Ok(Self { keypair });
+        }
+        // Fallback: 32-byte seed; anything else is BadKeyLength.
         let bytes = bs58::decode(key_str.trim()).into_vec()?;
-        let keypair = Keypair::from_bytes(&bytes)
-            .map_err(|_| WalletGuardError::Base58Decode(bs58::decode::Error::BufferTooSmall))?;
+        if bytes.len() != 32 {
+            return Err(WalletGuardError::BadKeyLength(bytes.len()));
+        }
+        let keypair = Keypair::from_seed(&bytes)
+            .map_err(|e| WalletGuardError::BadSecret(e.to_string()))?;
 
         Ok(Self { keypair })
     }
@@ -75,6 +91,8 @@ impl WalletGuard {
         &self.keypair
     }
 
+    /// Deadline-bound (15s); saturating math so huge tips cannot wrap the
+    /// requirement below the balance.
     pub async fn assert_solvency(
         &self,
         rpc: &RpcClient,
@@ -82,7 +100,9 @@ impl WalletGuard {
         jito_tip_lamports: u64,
     ) -> Result<u64, WalletGuardError> {
         let balance = rpc.get_balance(&self.pubkey()).await?;
-        let required = trade_lamports + jito_tip_lamports + MIN_SOL_RESERVE_LAMPORTS;
+        let required = trade_lamports
+            .saturating_add(jito_tip_lamports)
+            .saturating_add(MIN_SOL_RESERVE_LAMPORTS);
 
         if balance < required {
             return Err(WalletGuardError::InsufficientFunds {
