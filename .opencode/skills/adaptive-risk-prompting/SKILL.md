@@ -35,14 +35,15 @@ OUTPUT SCHEMA:
   "tp_percent": <float>,
   "sl_percent": <float>,
   "trailing_stop": <bool>,
-  "timeout_seconds": <int>
+  "timeout_seconds": <int>,
+  "moonbag_percent": <float>
 }
 
 RULES:
 - If dev_reputation < 0.40 OR rugcheck_score > 350 -> "action": "PASS".
 - If buy_velocity_5s < 5 (no confirmed momentum/dead launch) -> "action": "PASS".
-- High Momentum (velocity > 25, liq > $20k) -> TP: 45.0 to 100.0, SL: -10.0, trailing: true, timeout: 180.
-- Moderate Momentum (velocity 5-25, liq >= $10k) -> TP: 30.0 to 50.0, SL: -8.0, trailing: false, timeout: 90.
+- High Momentum (velocity > 25, liq > $20k) -> TP: 45.0 to 100.0, SL: -10.0, trailing: true, timeout: 180, moonbag: 20.0.
+- Moderate Momentum (velocity 5-25, liq >= $10k) -> TP: 30.0 to 50.0, SL: -8.0, trailing: false, timeout: 90, moonbag: 0.0.
 - Otherwise (low liquidity or stagnant volume) -> "action": "PASS" (Never buy dead tokens).
 ```
 
@@ -58,6 +59,7 @@ pub struct RiskProfile {
     pub sl_percent: f64,
     pub trailing_stop: bool,
     pub timeout_seconds: u64,
+    pub moonbag_percent: f64,
 }
 
 pub fn evaluate_heuristic_fallback(
@@ -74,6 +76,7 @@ pub fn evaluate_heuristic_fallback(
             sl_percent: 0.0,
             trailing_stop: false,
             timeout_seconds: 0,
+            moonbag_percent: 0.0,
         };
     }
 
@@ -85,6 +88,7 @@ pub fn evaluate_heuristic_fallback(
             sl_percent: -10.0,
             trailing_stop: true,
             timeout_seconds: 180,
+            moonbag_percent: 20.0,
         }
     // 3. Moderate confirmed volume
     } else if buy_velocity_5s >= 5 && liq_usd >= 10_000.0 {
@@ -94,6 +98,7 @@ pub fn evaluate_heuristic_fallback(
             sl_percent: -8.0,
             trailing_stop: false,
             timeout_seconds: 90,
+            moonbag_percent: 0.0,
         }
     // 4. Default: Reject unproven liquidity/velocity
     } else {
@@ -103,6 +108,7 @@ pub fn evaluate_heuristic_fallback(
             sl_percent: 0.0,
             trailing_stop: false,
             timeout_seconds: 0,
+            moonbag_percent: 0.0,
         }
     }
 }
