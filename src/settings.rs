@@ -8,7 +8,11 @@ use risk_engine::StrategyMode;
 use std::collections::HashMap;
 
 /// Runtime knobs, all overridable via env.
-#[derive(Debug, Clone)]
+///
+/// Custom [`std::fmt::Debug`] redacts `inference_api_key`: a bearer token
+/// must never appear in logs, even if a future debug-print of the whole
+/// struct slips into an operational log line.
+#[derive(Clone)]
 pub struct Settings {
     /// WebSocket RPC URL for `logsSubscribe`.
     pub ws_url: String,
@@ -98,10 +102,62 @@ pub struct Settings {
     /// channel routing to the host Hermes configuration. Set to address
     /// `--to discord:<channel-id>` for a specific channel.
     pub discord_channel: Option<String>,
+    /// Strict preflight for live dispatch (`SIM_STRICT=true`): simulation
+    /// transport/timeout failures reject the bundle instead of proceeding
+    /// unproven. Default off (unknown sim results preserve today's
+    /// warn-and-proceed); enable for live funds.
+    pub sim_strict: bool,
     /// Parse failures seen by [`Settings::from_map`] (raw value → default
     /// used). Surfaced first by [`Settings::warnings`] so env typos never
     /// hide silently behind defaults.
     pub parse_notes: Vec<String>,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("ws_url", &self.ws_url)
+            .field("http_url", &self.http_url)
+            .field("commitment", &self.commitment)
+            .field("start_balance", &self.start_balance)
+            .field("fee_bps", &self.fee_bps)
+            .field("notional_usd", &self.notional_usd)
+            .field("trail_percent", &self.trail_percent)
+            .field("runner_trail_percent", &self.runner_trail_percent)
+            .field("liquidity_usd", &self.liquidity_usd)
+            .field("gate_window_secs", &self.gate_window_secs)
+            .field("gate_min_buyers", &self.gate_min_buyers)
+            .field("gate_poll_ms", &self.gate_poll_ms)
+            .field("max_open_positions", &self.max_open_positions)
+            .field("max_daily_loss_usd", &self.max_daily_loss_usd)
+            .field("mint_cooldown_secs", &self.mint_cooldown_secs)
+            .field("dev_min_age_secs", &self.dev_min_age_secs)
+            .field("dev_max_prior_launches", &self.dev_max_prior_launches)
+            .field("dev_screen_sample_txs", &self.dev_screen_sample_txs)
+            .field("quote_usd", &self.quote_usd)
+            .field("sol_usd", &self.sol_usd)
+            .field("tick_interval_ms", &self.tick_interval_ms)
+            .field("inference_endpoint", &self.inference_endpoint)
+            .field("inference_model", &self.inference_model)
+            .field("inference_timeout_ms", &self.inference_timeout_ms)
+            .field(
+                "inference_api_key",
+                &self.inference_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("slippage_bps", &self.slippage_bps)
+            .field("strategy_mode", &self.strategy_mode)
+            .field("runner_moonbag_percent", &self.runner_moonbag_percent)
+            .field("priority_fee_micro_lamports", &self.priority_fee_micro_lamports)
+            .field("compute_unit_limit", &self.compute_unit_limit)
+            .field("tip_lamports", &self.tip_lamports)
+            .field("fee_recipient", &self.fee_recipient)
+            .field("jito_endpoint", &self.jito_endpoint)
+            .field("discord_alerts", &self.discord_alerts)
+            .field("discord_channel", &self.discord_channel)
+            .field("sim_strict", &self.sim_strict)
+            .field("parse_notes", &self.parse_notes)
+            .finish()
+    }
 }
 
 impl Settings {
@@ -162,6 +218,7 @@ impl Settings {
                 .get("DISCORD_CHANNEL")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
+            sim_strict: get_bool(vars, "SIM_STRICT", false, &mut notes),
             parse_notes: notes,
         }
     }
@@ -402,6 +459,7 @@ mod tests {
         assert_eq!(s.strategy_mode, "adaptive");
         assert_eq!(s.runner_moonbag_percent, 20.0);
         assert_eq!(s.runner_trail_percent, 20.0);
+        assert!(!s.sim_strict);
         assert!(s.parse_notes.is_empty());
     }
 
@@ -415,6 +473,7 @@ mod tests {
             ("SLIPPAGE_BPS", "500"),
             ("JITO_TIP_LAMPORTS", "200000"),
             ("INFERENCE_API_KEY", "secret"),
+            ("SIM_STRICT", "true"),
         ]));
         assert_eq!(s.start_balance, 250.5);
         assert_eq!(s.gate_min_buyers, 5);
@@ -423,6 +482,7 @@ mod tests {
         assert_eq!(s.slippage_bps, 500);
         assert_eq!(s.tip_lamports, 200_000);
         assert_eq!(s.inference_api_key.as_deref(), Some("secret"));
+        assert!(s.sim_strict);
     }
 
     #[test]
@@ -480,6 +540,18 @@ mod tests {
         assert!(w.contains("COMMITMENT=processed"), "{w}");
         let s = Settings::from_map(&HashMap::new());
         assert!(!s.warnings().iter().any(|x| x.contains("COMMITMENT=")));
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        // A bearer token must survive even a careless whole-struct
+        // debug-print into an ops log.
+        let s = Settings::from_map(&vars(&[("INFERENCE_API_KEY", "super-secret")]));
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("super-secret"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        let clean = format!("{:?}", Settings::from_map(&HashMap::new()));
+        assert!(!clean.contains("super-secret"), "{clean}");
     }
 
     #[test]

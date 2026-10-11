@@ -16,7 +16,7 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 219 tests; live probes stay ignored
+cargo test --workspace            # 297 tests; live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
@@ -48,12 +48,26 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 
 - New launches are `create_v2` (disc `[214,144,…]`), **version-1
   envelopes**: fetch configs must allow v1 or RPC refuses them.
-- Swaps come in legacy (`buy`/`sell`) and `buy_v2` (`[184,23,…]`,
-  trader at index 13) shapes; `sell_v2` is unknown — dev dumps through
-  it are invisible, documented as residual blindness.
+- Swaps come in legacy (`buy`/`sell`) and v2 (`buy_v2` `[184,23,…]` /
+  `sell_v2` `[93,246,…]`, trader at index 13 = fee payer) shapes. Both v2
+  sides are frozen-sample proven (two `buy_v2` txs + one `sell_v2`;
+  amount = first u64 exact to the unit via balance-delta cross-checks).
+  Dev dumps through either abort the gate.
 - Token program is per-mint (classic SPL vs Token-2022); ATA derivation
   must use it. Fee recipient rotates — resolve from Global bytes
   41..73 (NOT 33; the old doc ignored the Anchor discriminator).
+- Raydium migration pools are WSOL-**based** (WSOL at slot 400, token at
+  432; vault contents prove it) — the old code assumed WSOL-quoted and
+  rejected every real pool at both the trust gate and the vault pricer.
+  Frozen proofs: `crates/migration/tests/fixtures/raydium_pool_fartcoin.json`
+  (canonical Oct-2024 Fartcoin pool) + `raydium_pool_mainnet.json`.
+- v2 launches have TWO insider identities (payer `user` + tail `creator`):
+  both are screened (worst trust wins) and both join the gate cohort
+  (either dump aborts). Prior-launch counting uses the versioned author
+  index (v1: 7, v2: 5) — a shared index undercounted v2 serial launchers.
+- Sizing assumes 6-decimal mints: the confirm gate verifies decimals per
+  mint and drops anything else (fail-closed). Live dispatch preflight is
+  warn-and-proceed unless `SIM_STRICT=true` (strict refuses unproven).
 - Fee payer ≠ `user` happens (relayers); holders may sit in aux
   accounts, not the canonical ATA. Simulation with `sig_verify:false`
   proves layout/logic, never authorization.

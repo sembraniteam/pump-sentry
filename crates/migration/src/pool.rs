@@ -6,9 +6,16 @@
 //! independently verified `quoteMint` memcmp offset 432
 //! (datasize 752, market-program 560, swapQuoteIn 664).
 //!
-//! Residual: the table is pinned by unit tests but not yet by a frozen
-//! mainnet `LiquidityStateV4` sample — capture one before trusting new
-//! fields beyond these five.
+//! ORIENTATION (chain-verified 2026-10-11, NOT assumed): Pump.fun
+//! migration pools are WSOL-**based** — slot 400 holds WSOL and slot 432
+//! holds the migrated token. Proven on two independent frozen pools
+//! (`raydium_pool_fartcoin`: the canonical Oct-2024 Fartcoin migration
+//! pool, $8M liquidity; `raydium_pool_mainnet`: a fresh pump-token pool):
+//! in both, the base vault holds WSOL and the quote vault holds the
+//! token (vault mints match the mint slots; Fartcoin vault balances
+//! 37,282 SOL vs 24.9M FART reproduce the market's $8.15M liquidity).
+//! Every trust gate and price formula in this crate follows that
+//! orientation — a WSOL-quoted pool is NOT a Pump migration pool.
 
 use solana_pubkey::Pubkey;
 
@@ -33,17 +40,22 @@ pub const OFF_QUOTE_MINT: usize = 432;
 pub const OFF_LP_MINT: usize = 464;
 
 /// Fresh Raydium AMM V4 pool, ready for instant swap routing.
+///
+/// Orientation follows the on-chain struct: on Pump.fun migration pools
+/// the BASE side is WSOL and the QUOTE side is the migrated token
+/// (chain-verified, see module docs) — the reverse of the pre-freeze
+/// assumption, which silently rejected every real migration pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaydiumV4Pool {
     /// Pool account address (the AMM ID; caller-supplied, not parsed).
     pub amm_id: Pubkey,
-    /// Base (coin) mint — the migrated token.
+    /// Base (coin) mint — WSOL on Pump.fun migrations.
     pub base_mint: Pubkey,
-    /// Quote (pc) mint — WSOL on Pump.fun migrations.
+    /// Quote (pc) mint — the migrated token.
     pub quote_mint: Pubkey,
-    /// Coin-side LP vault (base inventory).
+    /// Coin-side LP vault (WSOL inventory on migrations).
     pub base_vault: Pubkey,
-    /// Pc-side LP vault (quote inventory).
+    /// Pc-side LP vault (token inventory on migrations).
     pub quote_vault: Pubkey,
     /// LP mint for pool-share accounting.
     pub lp_mint: Pubkey,
@@ -76,34 +88,34 @@ impl RaydiumV4Pool {
         })
     }
 
-    /// True when the quote side is WSOL (standard Pump.fun migration).
-    pub fn is_wsol_quoted(&self) -> bool {
-        self.quote_mint == WSOL_MINT
+    /// True when the base side is WSOL (standard Pump.fun migration).
+    pub fn is_wsol_based(&self) -> bool {
+        self.base_mint == WSOL_MINT
     }
 
     /// Trust gate for freshly resolved pools: the account must be owned
     /// by the Raydium program (kills garbage/misparsed addresses), the
-    /// quote side must be WSOL, and the base must be the expected mint.
-    /// Pure; call before routing anything at a parsed pool.
-    pub fn validate(pool: &RaydiumV4Pool, owner: &Pubkey, expected_base_mint: &Pubkey) -> bool {
+    /// base side must be WSOL, and the quote must be the expected
+    /// migrated mint. Pure; call before routing anything at a parsed pool.
+    pub fn validate(pool: &RaydiumV4Pool, owner: &Pubkey, expected_token_mint: &Pubkey) -> bool {
         use crate::detector::RAYDIUM_V4_PROGRAM_ID;
         *owner == RAYDIUM_V4_PROGRAM_ID
-            && pool.is_wsol_quoted()
-            && pool.base_mint == *expected_base_mint
+            && pool.is_wsol_based()
+            && pool.quote_mint == *expected_token_mint
     }
 
     /// Parse plus trust gate in one step: `None` when the buffer is
-    /// short, the owner is not the Raydium program, the quote is not
-    /// WSOL, or the base mint is unexpected. Prefer this over
+    /// short, the owner is not the Raydium program, the base is not
+    /// WSOL, or the quote mint is unexpected. Prefer this over
     /// `parse` + manual `validate` at every new call site.
     pub fn parse_validated(
         amm_id: &Pubkey,
         data: &[u8],
         owner: &Pubkey,
-        expected_base_mint: &Pubkey,
+        expected_token_mint: &Pubkey,
     ) -> Option<Self> {
         match Self::parse(amm_id, data) {
-            Ok(pool) if Self::validate(&pool, owner, expected_base_mint) => Some(pool),
+            Ok(pool) if Self::validate(&pool, owner, expected_token_mint) => Some(pool),
             _ => None,
         }
     }
@@ -143,8 +155,8 @@ mod tests {
     fn slots_match_documented_table() {
         // The five 32-byte slots are contiguous in documented order: a
         // transposed offset constant breaks this before it breaks parsing.
-        // NOTE: pins code-to-table consistency, NOT table-to-chain — the
-        // offsets still want one frozen mainnet LiquidityStateV4 sample.
+        // Chain-pinned by `parses_frozen_mainnet_pools` below (two real
+        // 752-byte accounts), not just by this self-consistency check.
         assert_eq!(OFF_BASE_VAULT + 32, OFF_QUOTE_VAULT);
         assert_eq!(OFF_QUOTE_VAULT + 32, OFF_BASE_MINT);
         assert_eq!(OFF_BASE_MINT + 32, OFF_QUOTE_MINT);
@@ -153,15 +165,15 @@ mod tests {
     }
 
     #[test]
-    fn detects_wsol_quote() {
+    fn detects_wsol_base() {
         let amm_id = Pubkey::new_from_array([9; 32]);
         let mut data = pool_data();
-        data[OFF_QUOTE_MINT..OFF_QUOTE_MINT + 32].copy_from_slice(&WSOL_MINT.to_bytes());
+        data[OFF_BASE_MINT..OFF_BASE_MINT + 32].copy_from_slice(&WSOL_MINT.to_bytes());
         let pool = RaydiumV4Pool::parse(&amm_id, &data).expect("parse");
-        assert!(pool.is_wsol_quoted());
+        assert!(pool.is_wsol_based());
 
         let plain = RaydiumV4Pool::parse(&amm_id, &pool_data()).expect("parse");
-        assert!(!plain.is_wsol_quoted());
+        assert!(!plain.is_wsol_based());
     }
 
     #[test]
@@ -182,30 +194,111 @@ mod tests {
         use crate::detector::RAYDIUM_V4_PROGRAM_ID;
         let amm_id = Pubkey::new_from_array([9; 32]);
         let mut data = pool_data();
-        data[OFF_QUOTE_MINT..OFF_QUOTE_MINT + 32].copy_from_slice(&WSOL_MINT.to_bytes());
-        let base = Pubkey::new_from_array([13; 32]);
-        data[OFF_BASE_MINT..OFF_BASE_MINT + 32].copy_from_slice(&base.to_bytes());
+        // Migration orientation: WSOL at BASE, token at QUOTE.
+        data[OFF_BASE_MINT..OFF_BASE_MINT + 32].copy_from_slice(&WSOL_MINT.to_bytes());
+        let token = Pubkey::new_from_array([13; 32]);
+        data[OFF_QUOTE_MINT..OFF_QUOTE_MINT + 32].copy_from_slice(&token.to_bytes());
         let pool = RaydiumV4Pool::parse(&amm_id, &data).expect("parse");
 
         assert!(RaydiumV4Pool::validate(
             &pool,
             &RAYDIUM_V4_PROGRAM_ID,
-            &base
+            &token
         ));
         // Wrong owner (spoofed/garbage account).
-        assert!(!RaydiumV4Pool::validate(&pool, &base, &base));
-        // Wrong base mint.
+        assert!(!RaydiumV4Pool::validate(&pool, &token, &token));
+        // Wrong token mint.
         assert!(!RaydiumV4Pool::validate(
             &pool,
             &RAYDIUM_V4_PROGRAM_ID,
             &Pubkey::new_from_array([99; 32])
         ));
-        // Non-WSOL quote.
+        // Non-WSOL base.
         let plain = RaydiumV4Pool::parse(&amm_id, &pool_data()).expect("parse");
         assert!(!RaydiumV4Pool::validate(
             &plain,
             &RAYDIUM_V4_PROGRAM_ID,
-            &base
+            &token
         ));
+    }
+
+    /// Frozen pool fixture shape: `{amm, owner, data: [u8; 752]}`.
+    fn frozen_pool(name: &str) -> (Pubkey, Pubkey, Vec<u8>) {
+        let raw = match name {
+            "fartcoin" => include_str!("../tests/fixtures/raydium_pool_fartcoin.json"),
+            _ => include_str!("../tests/fixtures/raydium_pool_mainnet.json"),
+        };
+        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
+        let parse = |s: &str| {
+            use std::str::FromStr;
+            Pubkey::from_str(v[s].as_str().expect("pubkey str")).expect("pubkey")
+        };
+        let data: Vec<u8> = v["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|b| b.as_u64().expect("byte") as u8)
+            .collect();
+        (parse("amm"), parse("owner"), data)
+    }
+
+    #[test]
+    fn parses_frozen_fartcoin_migration_pool() {
+        // Canonical Oct-2024 Fartcoin migration pool ($8M liquidity):
+        // 752 bytes, Raydium-owned, WSOL at BASE, Fartcoin at QUOTE.
+        // Off-test cross-checks: both vaults' mints match the mint slots,
+        // and the vault balances (37,282 SOL vs 24.9M FART) reproduce the
+        // market's quoted liquidity.
+        use crate::detector::RAYDIUM_V4_PROGRAM_ID;
+        use std::str::FromStr;
+        let (amm, owner, data) = frozen_pool("fartcoin");
+        assert_eq!(data.len(), RAYDIUM_V4_ACCOUNT_SIZE);
+        assert_eq!(owner, RAYDIUM_V4_PROGRAM_ID);
+        let pool = RaydiumV4Pool::parse(&amm, &data).expect("parse");
+        assert!(pool.is_wsol_based());
+        assert_eq!(
+            pool.quote_mint,
+            Pubkey::from_str("9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump").expect("mint")
+        );
+        // All five slots distinct and non-zero.
+        let slots = [
+            pool.base_vault,
+            pool.quote_vault,
+            pool.base_mint,
+            pool.quote_mint,
+            pool.lp_mint,
+        ];
+        for (i, a) in slots.iter().enumerate() {
+            assert_ne!(*a, Pubkey::default(), "slot {i} zero");
+            for b in &slots[i + 1..] {
+                assert_ne!(a, b, "aliased slots");
+            }
+        }
+        // Trust gate passes for the migrated mint, rejects others.
+        assert!(RaydiumV4Pool::validate(&pool, &owner, &pool.quote_mint));
+        assert!(!RaydiumV4Pool::validate(
+            &pool,
+            &owner,
+            &Pubkey::new_from_array([99; 32])
+        ));
+        assert!(RaydiumV4Pool::parse_validated(&amm, &data, &owner, &pool.quote_mint).is_some());
+    }
+
+    #[test]
+    fn parses_frozen_pump_token_pool() {
+        // Second independent pool (fresh pump token): same WSOL-based
+        // orientation — the orientation is systematic, not a one-off.
+        use crate::detector::RAYDIUM_V4_PROGRAM_ID;
+        use std::str::FromStr;
+        let (amm, owner, data) = frozen_pool("mainnet");
+        assert_eq!(data.len(), RAYDIUM_V4_ACCOUNT_SIZE);
+        assert_eq!(owner, RAYDIUM_V4_PROGRAM_ID);
+        let pool = RaydiumV4Pool::parse(&amm, &data).expect("parse");
+        assert!(pool.is_wsol_based());
+        assert_eq!(
+            pool.quote_mint,
+            Pubkey::from_str("HyDKNdnhZNVYQMruBevbNsUWruA9STmAQrS4srXApump").expect("mint")
+        );
+        assert!(RaydiumV4Pool::parse_validated(&amm, &data, &owner, &pool.quote_mint).is_some());
     }
 }

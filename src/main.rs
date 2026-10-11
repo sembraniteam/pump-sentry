@@ -4,10 +4,16 @@
 //! `IS_LIVE=true`) the same signals additionally dispatch real Jito-routed
 //! swaps through `crates/executor` — read its README before enabling.
 //!
+//! The binary never runs bare: it only acts through an explicit
+//! subcommand (`start` / `stop` / `restart` / `status` / `logs` / `run`).
+//! Anything else prints usage and exits without touching the pipeline.
+//!
 //! Wiring only — all logic lives in [`settings`] (knobs), [`pipeline`]
-//! (launch handling, tick exits), and [`live`] (live sizing/dispatch),
+//! (launch handling, tick exits), [`live`] (live sizing/dispatch), and
+//! [`cli`] (supervisor commands, daemon files, shutdown signals),
 //! all unit-tested.
 
+mod cli;
 mod live;
 mod pipeline;
 mod settings;
@@ -32,12 +38,41 @@ use settings::Settings;
 
 #[tokio::main]
 async fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    match cli::parse_cli(&argv) {
+        cli::CliAction::Run { live } => run_pipeline(live).await,
+        cli::CliAction::Start { live } => cli::cmd_start(live, "start"),
+        cli::CliAction::Restart { live } => cli::cmd_restart(live),
+        cli::CliAction::Stop => cli::cmd_stop(),
+        cli::CliAction::Status => cli::cmd_status(),
+        cli::CliAction::Logs { lines, follow } => cli::cmd_logs(lines, follow).await,
+        cli::CliAction::Help { error } => {
+            if let Some(cause) = error {
+                eprintln!("error: {cause}\n");
+            }
+            eprintln!("{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Foreground pipeline: the body the old bare binary ran. `live_arg`
+/// comes from `run --live` (the daemon child passes it through); the
+/// `IS_LIVE=true` environment fallback is honored as before.
+async fn run_pipeline(live_arg: bool) {
     // Must run before any TLS use: the dependency tree enables both the
     // `ring` and `aws-lc-rs` rustls providers, so auto-detection panics.
     // `Err` only means another call already installed one — safe to ignore.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Daemon children redirect stdout/stderr to the log file: no ANSI
+    // color codes there (a colorized log is unreadable ops noise).
+    // Targets are dropped for the same reason (long module paths are
+    // noise in an ops log); levels + timestamps stay.
+    let daemon = std::env::var("BOT_DAEMON").is_ok_and(|v| v == "1");
     tracing_subscriber::fmt()
+        .with_target(false)
+        .with_ansi(!daemon)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new("info,solana_snipe_bot=debug")
@@ -54,8 +89,28 @@ async fn main() {
     }
 
     // Mode gate: paper unless explicitly opted into live risk.
-    let live_mode = std::env::args().any(|a| a == "--live")
-        || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
+    // `--live` now arrives via `run --live` (or `start --live` through
+    // the daemon child); the `IS_LIVE=true` fallback is unchanged.
+    let live_mode = live_arg || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
+    // Startup banner: the supervisor log records WHEN this boot happened
+    // and whether it was a first run or a re-run/restart, so the uptime
+    // question is answered by reading the log, not by memory.
+    {
+        let invocation = std::env::var("BOT_INVOCATION").unwrap_or_else(|_| "run".to_string());
+        let first_run = std::env::var("BOT_FIRST_RUN").is_ok_and(|v| v == "1");
+        let kind = match (invocation.as_str(), first_run) {
+            ("restart", _) => "restarted",
+            ("start", true) => "started (first run)",
+            ("start", false) => "started (re-run)",
+            _ => "started (foreground)",
+        };
+        info!(
+            "bot {kind} — pid {} mode {} unix_ts={}",
+            std::process::id(),
+            if live_mode { "live" } else { "paper" },
+            settings::now_secs(),
+        );
+    }
     if live_mode {
         warn!("================================================================");
         warn!("LIVE MODE: real SOL will move via Jito bundles.");
@@ -132,6 +187,9 @@ async fn main() {
             }
         };
         info!(payer = %wallet.pubkey(), "live wallet loaded");
+        if settings.sim_strict {
+            info!("strict preflight on: unproven simulations refuse to dispatch");
+        }
         let jito = match JitoClient::new(&settings.jito_endpoint) {
             Ok(jito) => jito,
             Err(e) => {
@@ -143,7 +201,8 @@ async fn main() {
             Ok(executor) => {
                 let executor = executor
                     .with_jito(jito)
-                    .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports);
+                    .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports)
+                    .with_strict_sim(settings.sim_strict);
                 match &settings.fee_recipient {
                     Some(recipient) => match executor::parse_pubkey(recipient) {
                         Ok(pubkey) => executor.with_fee_recipient(pubkey),
@@ -286,7 +345,10 @@ async fn main() {
                 let stats = Arc::clone(&stats_task);
                 let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
-                    let Ok(_permit) = permits.acquire_owned().await else { return };
+                    let Ok(_permit) = permits.acquire_owned().await else {
+                        debug!(mint = %event.mint, "launch dropped: dispatch saturated");
+                        return;
+                    };
                     // Owned first: borrowing `.as_deref()` temporaries
                     // across the `.await` below would self-borrow the
                     // future (rejected); named locals live in the future
@@ -315,7 +377,10 @@ async fn main() {
                 let pipeline = Arc::clone(&pipeline);
                 let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
-                    let Ok(_permit) = permits.acquire_owned().await else { return };
+                    let Ok(_permit) = permits.acquire_owned().await else {
+                        debug!(mint = %tick.mint, "tick dropped: dispatch saturated");
+                        return;
+                    };
                     pipeline.on_tick(&tick).await;
                 });
             }
@@ -324,7 +389,10 @@ async fn main() {
                 let pipeline = Arc::clone(&pipeline);
                 let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
-                    let Ok(_permit) = permits.acquire_owned().await else { return };
+                    let Ok(_permit) = permits.acquire_owned().await else {
+                        debug!(mint = %pool.mint, "pool tick dropped: dispatch saturated");
+                        return;
+                    };
                     pipeline.on_pool_tick(&pool).await;
                 });
             }
@@ -337,15 +405,25 @@ async fn main() {
                     });
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutdown requested");
+            // SIGINT (Ctrl-C) AND SIGTERM (`stop`, systemd, docker): the
+            // old code watched Ctrl-C only, so every supervisor stop
+            // killed the process mid-commit (paper-open without live
+            // mirror and friends) — the non-atomic shutdown.
+            _ = cli::shutdown_signal() => {
+                info!("shutdown requested (signal)");
                 clean_shutdown = true;
                 break;
             }
         }
     }
 
-    // Stop producers first, then let in-flight units finish (bounded).
+    // Atomic shutdown in three ordered steps: (1) stop producers so no
+    // NEW work enters, (2) snapshot what is still open so nothing is
+    // lost silently, (3) drain in-flight units bounded — and ABORT what
+    // remains past the deadline instead of exiting over live tasks. A
+    // second signal during the drain force-aborts immediately so a
+    // wedged RPC cannot hold the process hostage (the snapshot then
+    // records `clean: false`).
     // The listener loop exits on its own once the event channel closes...
     // except it only checks between sessions, so close the channel AND
     // abort the task, then await it briefly for a clean join.
@@ -354,18 +432,83 @@ async fn main() {
     pool_handle.abort();
     listener_handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
+
+    // Snapshot BEFORE the drain: paper opens, tracked live fills, and
+    // the watchlist, frozen to `logs/shutdown-<ts>.json` plus loud log
+    // lines. Best-effort file IO (a snapshot failure must not fail the
+    // shutdown itself); the log lines always fire.
+    let snap_ts = settings::now_secs();
+    let paper_open = pipeline.open_position_mints().await;
+    let live_tracked = pipeline.live_tracked_mints().await;
+    let watchlist_pending = pipeline.pending_count().await;
+    let mut summary = cli::ShutdownSummary {
+        ts: snap_ts,
+        pid: std::process::id(),
+        live: live_mode,
+        paper_open: paper_open.clone(),
+        live_tracked: live_tracked.clone(),
+        watchlist_pending,
+        clean: false, // fixed up below once the drain outcome is known
+    };
+    let snap_path = {
+        let (_, log_file) = cli::resolve_paths();
+        log_file
+            .parent()
+            .map(|d| d.join(format!("shutdown-{snap_ts}.json")))
+            .unwrap_or_else(|| format!("shutdown-{snap_ts}.json").into())
+    };
+    let write_snapshot = |summary: &cli::ShutdownSummary| {
+        if let Err(e) = std::fs::write(&snap_path, summary.to_json()) {
+            warn!(
+                "shutdown snapshot unwritable ({}): {e}",
+                snap_path.display()
+            );
+        } else {
+            info!("shutdown snapshot: {}", snap_path.display());
+        }
+    };
+    write_snapshot(&summary);
+    if !paper_open.is_empty() {
+        warn!(
+            "shutdown with {} open paper position(s): {:?}",
+            paper_open.len(),
+            paper_open
+        );
+    }
+    if !live_tracked.is_empty() {
+        warn!(
+            "shutdown with {} tracked live fill(s): {:?} — MANUAL REVIEW REQUIRED",
+            live_tracked.len(),
+            live_tracked
+        );
+    }
+    if watchlist_pending > 0 {
+        info!("shutdown with {watchlist_pending} watchlisted mint(s) pending quorum (dropped)");
+    }
+
     let drain = async {
         while in_flight.join_next().await.is_some() {}
     };
-    if tokio::time::timeout(Duration::from_secs(30), drain)
-        .await
-        .is_err()
-    {
-        warn!("shutdown drain timed out; abandoning in-flight units");
+    // Second signal during the drain: force-abort, snapshot dirty, exit.
+    let drained = tokio::select! {
+        out = tokio::time::timeout(Duration::from_secs(30), drain) => out.is_ok(),
+        _ = cli::shutdown_signal() => {
+            warn!("second shutdown signal; force-aborting in-flight units");
+            in_flight.abort_all();
+            false
+        }
+    };
+    if !drained {
+        warn!("shutdown drain timed out; aborting in-flight units");
+        in_flight.abort_all();
     }
+    // Record the true outcome in the snapshot (a timed-out/force-aborted
+    // drain leaves `clean: false` for the operator to notice).
+    summary.clean = drained && clean_shutdown;
+    write_snapshot(&summary);
 
     if clean_shutdown {
-        info!("shutdown complete");
+        info!("shutdown complete (drained={drained})");
     } else {
         // Streams ended without Ctrl-C (dead RPC, closed channels):
         // exit nonzero so supervisors and systemd notice the outage.

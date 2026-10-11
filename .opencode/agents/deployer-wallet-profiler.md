@@ -40,9 +40,12 @@ Trace deployer addresses and wallet funding origins to score developer credibili
       sample (5-wide fanout). Fail closed when most of the sample is unreadable — an undercount lets serial
       launchers pass.
 2. **Funding Graph Analysis (best-effort):**
-    - Identify native SOL funding via system `transfer` / `createAccount` shapes only. SPL-token funding,
-      `transfer_with_seed`, multisig, and exchange payouts read as untraceable (callers escalate low trace rates to
-      `Suspect`, never to organic). Do NOT claim CEX/mixer classification — it is not implemented.
+    - Identify SOL funding via system `transfer` / `createAccount` / `createAccountWithSeed` /
+      `transferWithSeed` (incl. inner/CPI-routed ones, which covers multisig-vault payouts executed as inner
+      system transfers) plus SPL onboarding via ATA creation paid by someone else (`payer` → `owner`).
+      Raw SPL `Transfer`/`TransferChecked` amounts and exchange payouts outside these shapes still read as
+      untraceable (callers escalate low trace rates to `Suspect`, never to organic). Do NOT claim CEX/mixer
+      classification — it is not implemented.
 3. **Scoring Model:**
     - `judge_developer` is binary gate logic (min age, max prior launches) returning `DevVerdict`
       (`pass` / `age_secs` / `prior_launches` / `reason`).

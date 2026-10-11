@@ -21,14 +21,17 @@ fresh pool account  ──→ RaydiumV4Pool::parse (AMM ID + base/quote
 - `detector` — `MigrationMonitor` with the canonical addresses,
   graduation flag/progress, and destination classification. Errors via
   `thiserror` (`MigrationError`).
-- `pool` — `LiquidityStateV4` slot reader (752-byte account; quote mint
-  at offset 432, contiguous 32-byte slots for vaults/mints). Tolerates
-  longer buffers for forward compatibility; `is_wsol_quoted` flags
-  standard Pump.fun migrations; `validate` gates trust (Raydium owner,
-  WSOL quote, expected base mint). `parse` alone is untrusted by
+- `pool` — `LiquidityStateV4` slot reader (752-byte account; contiguous
+  32-byte slots for vaults/mints at 336/368/400/432/464, pinned by two
+  frozen mainnet pools). Orientation is chain-verified: Pump.fun
+  migration pools are WSOL-**based** (WSOL at slot 400, token at 432);
+  `is_wsol_based` flags them; `validate` gates trust (Raydium owner,
+  WSOL base, expected token quote). `parse` alone is untrusted by
   contract — use `parse_validated` (parse + gate in one step).
 - `vault` — post-migration price ticker: chunked batched vault-balance
-  reads (≤50 pools per round, 15s deadline) converted to USD spot (Pump 6dp / WSOL 9dp).
+  reads (≤50 pools per round, 15s deadline) converted to USD spot
+  (SOL-per-token from the WSOL base vault over the token quote vault;
+  WSOL 9dp / Pump 6dp).
 
 ## Use
 
@@ -39,7 +42,7 @@ assert!(MigrationMonitor::is_curve_graduated(&account_data));
 assert_eq!(MigrationMonitor::calculate_progress(42_000_000_000), 50.0);
 
 let pool = RaydiumV4Pool::parse(&amm_id, &pool_data)?;
-assert!(pool.is_wsol_quoted());
+assert!(pool.is_wsol_based());
 ```
 
 ## Test

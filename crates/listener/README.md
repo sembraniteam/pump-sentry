@@ -6,7 +6,7 @@ Real-time detector for newly deployed Pump.fun tokens over Solana RPC.
 
 ```text
 logsSubscribe (WebSocket, Mentions[pump_program])
-  → filter: err.is_none() && logs contains "Instruction: Create"
+  → filter: err.is_none() && logs contains "Instruction: Create[V2]"
   → spawn worker: getTransaction (HTTP RPC, JSON) → parse → mpsc(10_000)
   → consumer prints / scores / buys
 ```
@@ -31,19 +31,32 @@ logsSubscribe (WebSocket, Mentions[pump_program])
 - `create_v2` discriminator: `[214, 144, 76, 236, 95, 139, 49, 180]` (14-account layout; creator parsed from args)
 - `buy` discriminator: `[102, 6, 61, 18, 1, 218, 235, 234]`
 - `sell` discriminator: `[51, 230, 133, 164, 1, 127, 131, 173]`
-- `buy_v2` discriminator: `[184, 23, 238, 97, 103, 197, 211, 61]` (trader at index 13; `sell_v2` unknown)
+- `buy_v2` discriminator: `[184, 23, 238, 97, 103, 197, 211, 61]` (27 accounts,
+  trader = fee payer at index 13, amount = first u64 — dual-sample proven)
+- `sell_v2` discriminator: `[93, 246, 130, 60, 231, 233, 64, 178]` (26 accounts,
+  trader = fee payer at index 13, amount = first u64 — frozen-sample proven;
+  dev dumps through it abort the gate like legacy sells)
 
 ## Screening (`screen` module)
 
 Win-rate hardening on top of the event stream:
 
-- `extract_pump_swaps` classifies buy/sell instructions (trader = account
-  index 6) in any fetched transaction.
+- `extract_pump_swaps` classifies buy/sell instructions (legacy trader =
+  account index 6; v2 `buy_v2`/`sell_v2` trader = fee payer at index 13,
+  amounts = first u64 — both frozen-sample proven) in any fetched
+  transaction. Unmapped pump instructions surface as `Unknown` (first
+  account, amount 0, never quorum-counted).
 - `EntryGate` is a pure watchlist state machine: entries get a time
-  window to gather distinct non-dev buyers; dev sells abort immediately (dev dump), quorum confirms, silence times out.
+  window to gather distinct non-dev buyers; sells (or unknown ixs) from
+  any watched insider abort immediately (dev dump), quorum confirms, silence times out.
+  v2 launches watch a 2-wallet cohort (launcher + distinct creator) via
+  `add_cohort`; cohort buys never count.
 - `screen_developer` checks dev-wallet history over RPC: rejects fresh
   wallets (no history) and serial launchers, fail-closed on transport
   errors. `judge_developer` holds the pure policy for unit tests.
+  Prior-launch counting (`count_dev_creates`) uses the versioned author
+  index (v1: 7, v2: 5) so v2 serial launchers cannot hide. The pipeline
+  screens the v2 creator too and carries the worst of both trusts.
 - `RpcScreener` bundles both behind one client for the pipeline.
 - `BundleDetector::evaluate_launch_slot` (skill `sybil-cluster-detection`):
   3+ buys in the exact creation slot, or 2+ wallets sharing one genesis
@@ -54,10 +67,11 @@ Win-rate hardening on top of the event stream:
   recent curve swaps with slots and supply shares (from decoded amounts
   over curve total supply) plus genesis-funder tracing for the first few
   distinct buyers. Funders resolve by walking each wallet's history to
-  its first transaction — page-capped (`MAX_FUNDER_PAGES`), `createAccount`
-  and `transfer` shapes — with an 8s per-buyer deadline inside a 15s
-  outer budget, fanned out concurrently so one deep history cannot stall
-  the gate. Untraceable majorities escalate to suspect (fail-closed).
+  its first transaction — page-capped (`MAX_FUNDER_PAGES`), system
+  `transfer` / `createAccount` / seeded variants (incl. inner/CPI-routed)
+  plus payer-paid ATA creation — with an 8s per-buyer deadline inside a
+  15s outer budget, fanned out concurrently so one deep history cannot
+  stall the gate. Untraceable majorities escalate to suspect (fail-closed).
 - Borsh args: `name: String, symbol: String, uri: String` (v2 trailing args ignored by design)
 - Accounts v1: `[0]=mint, [2]=bonding_curve, [3]=associated_bonding_curve,
   [7]=user` (min 8). Accounts v2: mint/bonding-curve/assoc at `[0]/[2]/[3]`,

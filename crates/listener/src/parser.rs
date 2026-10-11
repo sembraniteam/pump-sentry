@@ -41,7 +41,10 @@ pub const IDX_USER: usize = 7;
 pub const IDX_V2_MINT: usize = 0;
 pub const IDX_V2_BONDING_CURVE: usize = 2;
 pub const IDX_V2_ASSOCIATED_BONDING_CURVE: usize = 3;
-pub const IDX_V2_USER: usize = 5;
+/// Payer (`user`) inside `create_v2`. Named `CREATE` (not bare `V2`):
+/// `screen` has its own v2 index — the swap trader at position 13 — and
+/// sharing the name once hid a wrong-index bug in dev-launch counting.
+pub const IDX_CREATE_V2_USER: usize = 5;
 /// Minimum number of accounts expected on a `create_v2` instruction.
 pub const PUMP_CREATE_V2_MIN_ACCOUNTS: usize = 14;
 
@@ -284,7 +287,9 @@ pub fn parse_pump_create_v2(
     let associated_bonding_curve = *accounts
         .get(IDX_V2_ASSOCIATED_BONDING_CURVE)
         .ok_or(insufficient(accounts.len()))?;
-    let user = *accounts.get(IDX_V2_USER).ok_or(insufficient(accounts.len()))?;
+    let user = *accounts
+        .get(IDX_CREATE_V2_USER)
+        .ok_or(insufficient(accounts.len()))?;
 
     let args_start = PUMP_CREATE_V2_DISCRIMINATOR.len();
     let args_bytes: &[u8] = match data.get(args_start..) {

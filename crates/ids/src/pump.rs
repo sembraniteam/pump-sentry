@@ -35,18 +35,22 @@ pub const PUMP_BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 /// `sell` instruction discriminator (skill solana-pumpfun-swap).
 pub const PUMP_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 /// `buy_v2` instruction discriminator: v2/mayhem bonding-curve buys.
-/// Verified against a real mainnet `buy_v2` (27-account instruction in
-/// the frozen `create_v2` launch tx): payload is 16 bytes, consistent
-/// with `(amount: u64, max_sol_cost: u64)` like legacy `buy`.
-/// NOTE: single-sample inference for the args layout; the discriminator
-/// and trader position below are certain, the amount semantic is not.
-/// `sell_v2` is still unknown (discriminator and layout unverified) and
-/// deliberately unhandled — dev dumps routed through it are invisible to
-/// the gate (documented residual blindness, fail-open on that path).
+/// Chain-proven 2026-10-11 against TWO frozen mainnet `buy_v2` txs
+/// (27-account instructions): accounts[13] is the fee payer and payload
+/// bytes 8..16 equal the buyer's token-balance delta to the unit in both
+/// (3_485_709_524_202 and 8_671_591_758_466). Payload is 16 bytes:
+/// `(amount: u64, max_sol_cost: u64)` like legacy `buy` (the second
+/// sample's guard is `u64::MAX` — an open ape with no slippage cap).
 pub const PUMP_BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
-/// `sell_v2` instruction discriminator (docs-sourced, NOT mainnet-
-/// observed: no verified sample yet, so no classifier is built on it).
-/// Present so future detection work has one canonical value to confirm.
+/// `sell_v2` instruction discriminator: v2/mayhem bonding-curve sells.
+/// Mainnet-verified 2026-10-11 against a frozen `sell_v2` (26-account
+/// instruction, `sell_v2_mainnet.json`): accounts[13] is the fee payer
+/// (same trader position as `buy_v2`), and payload bytes 8..16 are the
+/// sold base units to the unit (fee payer's token balance decreased by
+/// exactly that amount). Payload is 24 bytes: discriminator + `(amount:
+/// u64, min_sol_output: u64)` mirroring legacy `sell`. The gate
+/// classifies these as `Sell` (dev dumps abort); live sell *building*
+/// still targets the legacy shape (a v2 sell builder is future work).
 pub const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 /// `migrate` instruction discriminator (skill solana-raydium-migration).
 pub const PUMP_MIGRATE_DISCRIMINATOR: [u8; 8] = [155, 234, 231, 146, 236, 158, 162, 30];

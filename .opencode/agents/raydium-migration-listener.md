@@ -46,14 +46,15 @@ is no Raydium swap builder and no CPMM support. Do not add live execution here.
       graduation). Progress = `real_sol / 84_000_000_000`, clamped 0–100%.
 2. **Classification Rules (all required):**
     - Raydium V4: Raydium program (`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`) + `initialize2` log (ASCII
-      case-insensitive) + pump program or migration authority present + the watched curve or expected base mint among
+      case-insensitive) + pump program or migration authority present + the watched curve or expected token mint among
       the keys (unlinked shared-tx inits must not false-positive).
     - PumpSwap: `migrate` discriminator or `MigrateV2` log + same key linkage. Migration authority is a supporting
       signal, not a gate (modern flows omit it).
-3. **Pool Trust Gate:**
-    - `parse_validated` only: Raydium-owned account, WSOL quote, base equals the expected mint. Anything else keeps
-      scanning (unresolvable Raydium hits report pool-less, loudly).
-    - Vault pricing verifies token-program ownership, exact mint pairing, and positive prices; followed pools evict
-      after 24h idle or on spike (bounded growth).
+3. **Pool Trust Gate (orientation is chain-verified, not assumed):**
+    - `parse_validated` only: Raydium-owned account, WSOL **base**, quote equals the expected migrated mint.
+      Pump.fun migration pools are WSOL-based (Fartcoin pool + one fresh pump-token pool frozen in
+      `crates/migration/tests/fixtures/`). Anything else keeps scanning.
+    - Vault pricing verifies token-program ownership, exact mint pairing (base vault holds WSOL, quote vault the
+      token), and positive prices; followed pools evict after 24h idle or on spike (bounded growth).
 4. **No Live Sniping:** pool addresses feed alerts + paper follow only. No ATA pre-warming exists — do not claim any.
 5. **Verify:** `cargo test -p migration` (frozen-tx replays + trust-gate tests).

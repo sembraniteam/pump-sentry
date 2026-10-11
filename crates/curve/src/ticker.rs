@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, warn};
 
 /// Ticker failures: configuration and one-shot fetch errors. The
@@ -85,7 +85,16 @@ pub struct CurveTicker {
     /// Ticks dropped because the downstream queue was full (see `run`:
     /// drop-on-full keeps one slow consumer from stalling every curve).
     dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Mint → decimals cache for [`CurveTicker::token_decimals`].
+    /// Decimals are immutable on-chain, so entries never expire; the map
+    /// is bounded by distinct mints ever confirmed (evicted oldest-first
+    /// past the cap).
+    decimals: Arc<Mutex<HashMap<String, u8>>>,
 }
+
+/// Cap for the decimals cache (distinct confirmed mints; LRU-ish
+/// oldest-first eviction past it).
+pub const DECIMALS_CACHE_CAP: usize = 5_000;
 
 impl CurveTicker {
     /// Map `"processed" | "confirmed" | "finalized"` to a commitment.
@@ -126,6 +135,7 @@ impl CurveTicker {
             interval,
             sol_usd,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            decimals: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -180,11 +190,50 @@ impl CurveTicker {
         tick_from_account(mint, curve, &account.data, &account.owner, self.sol_usd)
     }
 
+    /// Mint decimals from the mint account (cached per mint; immutable
+    /// on-chain so entries never expire). Fail-closed `Err` on
+    /// transport/timeout/short data — callers sizing in base units must
+    /// never guess. Both SPL programs share the fixed 44-byte prefix
+    /// (extensions only append), so one offset serves both.
+    pub async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError> {
+        if let Some(hit) = self.decimals.lock().await.get(mint) {
+            return Ok(*hit);
+        }
+        let key = Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
+        let account = match tokio::time::timeout(DECIMALS_TIMEOUT, self.rpc.get_account(&key)).await
+        {
+            Ok(Ok(account)) => account,
+            Ok(Err(e)) => return Err(CurveError::Rpc(e)),
+            Err(_) => return Err(CurveError::Timeout),
+        };
+        let decimals = account
+            .data
+            .get(MINT_DECIMALS_OFFSET)
+            .copied()
+            .ok_or(CurveError::Parse(CurveParseError::DataTooShort(
+                account.data.len(),
+            )))?;
+        let mut cache = self.decimals.lock().await;
+        if cache.len() >= DECIMALS_CACHE_CAP
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(mint.to_string(), decimals);
+        Ok(decimals)
+    }
+
     /// Poll loop: `getMultipleAccounts` per round, one tick per curve.
     /// Interval-based (no drift accumulation); ends when the receiver
     /// drops. Batch failures back off instead of hammering the RPC.
     /// Delivery is drop-on-full (with a counter): one slow consumer must
     /// not head-of-line-block every watched curve.
+    ///
+    /// Mirrors `migration::VaultTicker::run` on purpose (single-account
+    /// arity here vs vault pairs there, different batching): the shared
+    /// shape is timer → closed-check → snapshot → deadline-bound fetch →
+    /// length check → parse → drop-on-full send. Keep the backpressure
+    /// contract (drop + counter + deadlines) in sync across both.
     pub async fn run(self, tx: mpsc::Sender<PriceTick>) {
         let mut timer = tokio::time::interval(self.interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -265,6 +314,16 @@ pub const ROUND_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-round RPC deadline: hung reads fail instead of stalling polls.
 pub const ROUND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Byte offset of `decimals` in an SPL mint account: mint(32) +
+/// mint-authority `COption<Pubkey>`(36) + supply(8) = 44. Shared by the
+/// classic and Token-2022 programs (extensions only append past the
+/// fixed prefix).
+pub const MINT_DECIMALS_OFFSET: usize = 44;
+
+/// Deadline for one mint-decimals read (confirm path only; the hot
+/// ticker loop never reads mints).
+pub const DECIMALS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Single account read with one retry and a deadline. The retry fires
 /// only for transient failures (transport/timeout/overload): a missing

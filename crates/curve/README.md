@@ -24,6 +24,10 @@ getAccount / getMultipleAccounts (HTTP RPC)
   loop ends
   when the receiver drops. Unknown commitments are rejected (`None`),
   never coerced — callers fail closed.
+- `token_decimals` — mint decimals from the mint account (offset 44,
+  shared by both SPL programs), cached per mint and fail-closed on
+  transport errors. The pipeline's confirm gate drops non-6 mints
+  rather than mispricing base-unit math by 10^Δ.
 
 ## Use
 

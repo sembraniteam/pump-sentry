@@ -111,7 +111,9 @@ impl VaultTicker {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Watch a pool's vaults (idempotent per mint).
+    /// Watch a pool's vaults (idempotent per mint). On Pump.fun migration
+    /// pools the base vault holds WSOL (`base_decimals` 9) and the quote
+    /// vault holds the token (`quote_decimals` 6) — see `pool` docs.
     pub async fn watch(
         &self,
         mint: &str,
@@ -135,7 +137,8 @@ impl VaultTicker {
         Ok(())
     }
 
-    /// Watch with standard Pump.fun/WSOL decimals (6/9).
+    /// Watch with standard WSOL/token decimals (9/6): base vault holds
+    /// WSOL, quote vault holds the Pump.fun token.
     pub async fn watch_defaults(
         &self,
         mint: &str,
@@ -148,8 +151,8 @@ impl VaultTicker {
             amm_id,
             base_vault,
             quote_vault,
-            PUMP_TOKEN_DECIMALS_DEFAULT,
             WSOL_DECIMALS_DEFAULT,
+            PUMP_TOKEN_DECIMALS_DEFAULT,
         )
         .await
     }
@@ -173,6 +176,12 @@ impl VaultTicker {
 /// Interval-based (no drift); batch failures back off. Ends when the
 /// receiver drops. Delivery is drop-on-full (with a counter): one slow
 /// consumer must not stall every followed pool.
+///
+/// Mirrors `curve::CurveTicker::run` on purpose (vault pairs here vs
+/// single accounts there, chunked batching): the shared shape is timer
+/// → closed-check → snapshot → deadline-bound fetch → length check →
+/// parse → drop-on-full send. Keep the backpressure contract (drop +
+/// counter + deadlines) in sync across both.
     pub async fn run(self, tx: mpsc::Sender<PoolTick>) {
         let mut timer = tokio::time::interval(self.interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -304,10 +313,15 @@ fn is_token_program(owner: &Pubkey) -> bool {
 /// f64 ratios hold ~1e-16 relative precision at any magnitude; only the
 /// final USD values are range-checked.
 ///
+/// Orientation (chain-verified, see `pool` docs): on Pump.fun migration
+/// pools the BASE vault holds WSOL and the QUOTE vault holds the token.
+/// Spot = SOL-per-token (base over quote) × SOL/USD; liquidity = the
+/// SOL side in USD.
+///
 /// Trust gates (fail-closed `None`): both vaults must be owned by a
 /// token program (classic SPL or Token-2022 — anything else is not a
 /// token account), and the embedded mints must match the watched pair
-/// (base vault holds the token, quote vault holds WSOL). A misconfigured
+/// (base vault holds WSOL, quote vault holds the token). A misconfigured
 /// watch (swapped vaults, wrong pool) prices the wrong pair silently
 /// without these.
 fn price_tick(
@@ -325,23 +339,23 @@ fn price_tick(
         return None;
     }
     let base_mint = Pubkey::try_from(&base_data[0..32]).ok()?;
-    if base_mint.to_string() != pool.mint {
+    if base_mint != ids::WSOL_MINT {
         return None;
     }
     let quote_mint = Pubkey::try_from(&quote_data[0..32]).ok()?;
-    if quote_mint != ids::WSOL_MINT {
+    if quote_mint.to_string() != pool.mint {
         return None;
     }
     let base_ui = token_amount(base_data)? as f64 / 10f64.powi(i32::from(pool.base_decimals));
     let quote_ui = token_amount(quote_data)? as f64 / 10f64.powi(i32::from(pool.quote_decimals));
-    if !base_ui.is_finite() || base_ui <= 0.0 || !quote_ui.is_finite() || quote_ui < 0.0 {
+    if !base_ui.is_finite() || base_ui <= 0.0 || !quote_ui.is_finite() || quote_ui <= 0.0 {
         return None;
     }
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
         return None;
     }
-    let price_usd = quote_ui / base_ui * sol_usd;
-    let liquidity_usd = quote_ui * sol_usd;
+    let price_usd = base_ui / quote_ui * sol_usd;
+    let liquidity_usd = base_ui * sol_usd;
     if !price_usd.is_finite() || price_usd <= 0.0 || !liquidity_usd.is_finite() {
         return None;
     }
@@ -366,27 +380,29 @@ mod tests {
         data
     }
 
-    fn base_mint() -> Pubkey {
+    fn token_mint() -> Pubkey {
         Pubkey::new_from_array([5; 32])
     }
 
+    /// Migration orientation: base vault holds WSOL (9dp), quote vault
+    /// holds the token (6dp).
     fn pool() -> WatchedPool {
         WatchedPool {
-            mint: base_mint().to_string(),
+            mint: token_mint().to_string(),
             amm_id: Pubkey::new_from_array([9; 32]),
             base_vault: Pubkey::new_from_array([1; 32]),
             quote_vault: Pubkey::new_from_array([2; 32]),
-            base_decimals: 6,
-            quote_decimals: 9,
+            base_decimals: 9,
+            quote_decimals: 6,
         }
     }
 
-    fn tick(base: u64, quote: u64) -> Option<PoolTick> {
+    fn tick(base_sol_lamports: u64, quote_token_units: u64) -> Option<PoolTick> {
         price_tick(
             &pool(),
-            &vault_bytes(&base_mint(), base),
+            &vault_bytes(&ids::WSOL_MINT, base_sol_lamports),
             &ids::TOKEN_PROGRAM_ID,
-            &vault_bytes(&ids::WSOL_MINT, quote),
+            &vault_bytes(&token_mint(), quote_token_units),
             &ids::TOKEN_PROGRAM_ID,
             150.0,
         )
@@ -394,8 +410,8 @@ mod tests {
 
     #[test]
     fn prices_pool_from_vaults() {
-        // 1M tokens vs 30 SOL @ $150: $0.0045 per token, $4500 liq.
-        let tick = tick(1_000_000_000_000, 30_000_000_000).expect("tick");
+        // 30 SOL vs 1M tokens @ $150: $0.0045 per token, $4500 liq.
+        let tick = tick(30_000_000_000, 1_000_000_000_000).expect("tick");
         assert!(
             (tick.price_usd - 0.0045).abs() < 1e-9,
             "price={}",
@@ -413,7 +429,7 @@ mod tests {
                 &pool(),
                 &[0u8; 10],
                 &ids::TOKEN_PROGRAM_ID,
-                &vault_bytes(&ids::WSOL_MINT, 1),
+                &vault_bytes(&token_mint(), 1),
                 &ids::TOKEN_PROGRAM_ID,
                 150.0,
             )
@@ -422,9 +438,9 @@ mod tests {
         assert!(
             price_tick(
                 &pool(),
-                &vault_bytes(&base_mint(), 0),
+                &vault_bytes(&ids::WSOL_MINT, 0),
                 &ids::TOKEN_PROGRAM_ID,
-                &vault_bytes(&ids::WSOL_MINT, 1),
+                &vault_bytes(&token_mint(), 1),
                 &ids::TOKEN_PROGRAM_ID,
                 150.0,
             )
@@ -433,9 +449,9 @@ mod tests {
         assert!(
             price_tick(
                 &pool(),
-                &vault_bytes(&base_mint(), 1),
-                &ids::TOKEN_PROGRAM_ID,
                 &vault_bytes(&ids::WSOL_MINT, 1),
+                &ids::TOKEN_PROGRAM_ID,
+                &vault_bytes(&token_mint(), 1),
                 &ids::TOKEN_PROGRAM_ID,
                 0.0,
             )
@@ -450,9 +466,9 @@ mod tests {
         assert!(
             price_tick(
                 &pool(),
-                &vault_bytes(&base_mint(), 1_000_000),
-                &stranger,
                 &vault_bytes(&ids::WSOL_MINT, 1_000_000),
+                &stranger,
+                &vault_bytes(&token_mint(), 1_000_000),
                 &ids::TOKEN_PROGRAM_ID,
                 150.0,
             )
@@ -462,31 +478,31 @@ mod tests {
         assert!(
             price_tick(
                 &pool(),
-                &vault_bytes(&base_mint(), 1_000_000_000_000),
-                &ids::TOKEN_2022_PROGRAM_ID,
                 &vault_bytes(&ids::WSOL_MINT, 30_000_000_000),
+                &ids::TOKEN_2022_PROGRAM_ID,
+                &vault_bytes(&token_mint(), 1_000_000_000_000),
                 &ids::TOKEN_2022_PROGRAM_ID,
                 150.0,
             )
             .is_some()
         );
-        // Base vault holding another mint prices the wrong pair.
+        // Base vault not holding WSOL prices the wrong pair.
         assert!(
             price_tick(
                 &pool(),
                 &vault_bytes(&Pubkey::new_from_array([6; 32]), 1_000_000),
                 &ids::TOKEN_PROGRAM_ID,
-                &vault_bytes(&ids::WSOL_MINT, 1_000_000),
+                &vault_bytes(&token_mint(), 1_000_000),
                 &ids::TOKEN_PROGRAM_ID,
                 150.0,
             )
             .is_none()
         );
-        // Non-WSOL quote is not the followed pair.
+        // Quote vault not holding the followed token is not our pair.
         assert!(
             price_tick(
                 &pool(),
-                &vault_bytes(&base_mint(), 1_000_000),
+                &vault_bytes(&ids::WSOL_MINT, 1_000_000),
                 &ids::TOKEN_PROGRAM_ID,
                 &vault_bytes(&Pubkey::new_from_array([7; 32]), 1_000_000),
                 &ids::TOKEN_PROGRAM_ID,

@@ -12,10 +12,11 @@ execution (see Live mode).
 Pump.fun logsSubscribe (WS)          crates/listener
   → getTransaction → parse create/create_v2 ix → PumpTokenLaunchEvent
   → RugCheck report                  crates/auditor   (reject = skip, fail-closed)
-  → dev-wallet history               listener::screen (fresh/serial devs rejected)
-  → watchlist: buyer quorum          listener::screen (dev dump aborts, silence times out)
+  → dev + v2-creator history         listener::screen (fresh/serial insiders rejected)
+  → watchlist: buyer quorum          listener::screen (insider dump aborts incl. sell_v2, silence times out)
   → bundle forensics at confirm      listener::screen (reject drops, suspect paper-only)
   → bonding-curve reserves           crates/curve     (live price + liquidity)
+  → mint-decimals gate               crates/curve     (non-6 mints dropped, fail-closed)
   → TP/SL profile                    crates/risk-engine (LLM ≤300ms, else heuristic)
   → strategy shape                   STRATEGY_MODE (adaptive/scalp/runner)
   → paper position                   crates/simulator ($100 virtual, slippage-aware)
@@ -54,16 +55,32 @@ Each crate has its own README with architecture details and examples.
 # Build everything
 cargo build --workspace
 
+# The binary only acts through an explicit subcommand (bare `cargo run`
+# prints usage and runs nothing):
+cargo run -- start            # background daemon, logs to logs/bot.log
+cargo run -- status           # check the daemon (pid, mode, log)
+cargo run -- logs -n 50       # tail the log (add --follow to follow it)
+cargo run -- restart --live   # stop + restart in live mode
+cargo run -- stop             # stop the daemon (SIGTERM, drain, snapshot)
+
+# Foreground (debugging):
+cargo run -- run
+
 # Watch live Pump.fun launches (prints parsed create events)
 cargo run -p listener --example watch
 
-# Run the paper pipeline (defaults: $100 virtual, confirmed commitment)
-cargo run
-
 # Run with real funds: every BUY signal also dispatches a Jito bundle,
 # every paper close also sells the tracked live amount
-IS_LIVE=true SOLANA_PRIVATE_KEY=<base58> cargo run -- --live
+IS_LIVE=true SOLANA_PRIVATE_KEY=<base58> cargo run -- start --live
 ```
+
+Daemon details: `start`/`restart` spawn `<binary> run` detached
+(`nohup`, stdout/stderr appended to `logs/bot.log`), record the pid in
+`logs/bot.pid`, and log a banner with when the bot was first started vs
+restarted. `stop` sends SIGTERM (bounded 30s in-flight drain + a
+`logs/shutdown-<ts>.json` snapshot of still-open paper/live positions
+for manual review), then SIGKILL past 45s. `LOG_FILE` / `PID_FILE`
+override the default paths; run every command from the same directory.
 
 With knobs:
 
@@ -99,6 +116,7 @@ cargo run
 | `IS_LIVE` / `--live`                                                    | *(unset)*                     | Live mode: mirror signals with real Jito-routed swaps (needs `SOLANA_PRIVATE_KEY`) |
 | `SOLANA_PRIVATE_KEY`                                                    | *(unset)*                     | Trading keypair, base58 (live mode refuses to start without it)                    |
 | `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`                  | `200` / `100000` / frankfurt  | Live sizing guard, per-bundle tip, block-engine region                             |
+| `SIM_STRICT`                                                            | `false`                       | Strict preflight: unproven sims refuse live dispatch instead of warn-and-proceed   |
 | `STRATEGY_MODE` / `RUNNER_MOONBAG_PERCENT` / `RUNNER_TRAIL_PERCENT`     | `adaptive` / `20` / `20`      | Execution shape; runner moonbag share + wide trail (%)                             |
 | `MAX_DAILY_LOSS_USD`                                                    | `0` (off)                     | Day-loss circuit breaker: halts new entries past the cap; exits always work        |
 | `DISCORD_CHANNEL`                                                       | *(unset)*                     | Hermes `--to discord:<id>` target; unset = host-configured channel                 |
@@ -135,7 +153,7 @@ the risk profile runs verbatim):
 ## Testing
 
 ```sh
-cargo test --workspace                    # 219 tests across all crates, live probes ignored by default
+cargo test --workspace                    # 297 tests across all crates, live probes ignored by default
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -143,7 +161,8 @@ cargo fmt --all -- --check
 ## Layout
 
 ```
-src/main.rs            # thin binary: wiring + run loop (+ --live gate)
+src/main.rs            # supervisor CLI (start/stop/restart/status/logs/run) + run loop
+src/cli.rs             # subcommand parsing, daemon files, shutdown signals (tested)
 src/settings.rs        # env knobs (tested)
 src/pipeline.rs        # launch handling + tick exits (tested)
 src/live.rs            # live sizing + Jito dispatch sink (tested)
@@ -165,12 +184,18 @@ crates/migration/       # graduation detector + Raydium pool parser
   `NOTIONAL_USD`, and reviewed parameters.
 - `crates/executor` refuses to build anything when the wallet guard
   fails: missing key, or balance below trade + tip + 0.05 SOL reserve.
-- Auditing and dev screening are fail-closed (transport errors skip the
-  token). Velocity below 5 measured buyers resolves to `PASS` — no demand,
-  no trade.
+- Auditing and insider screening are fail-closed (transport errors skip
+  the token). Both the launcher and, on `create_v2` launches, the distinct
+  creator are screened; either reject drops the signal and the gate
+  watches both wallets for dumps. Velocity below 5 measured buyers
+  resolves to `PASS` — no demand, no trade.
 - Entry gating: signals sit on a 10s watchlist until 5 distinct wallets
-  buy; dev dumps abort immediately, silence times out. Nothing is bought
-  on the create block anymore.
+  buy; insider dumps abort immediately (legacy sells and verified
+  `sell_v2`), silence times out. Nothing is bought on the create block
+  anymore.
+- Entry pricing additionally gates on mint decimals (standard 6):
+  non-6 or unreadable decimals drop the signal instead of mispricing
+  base-unit math.
 - Bundle forensics is two-tier: slot clustering decides free from gate
   swaps; funder walks (cached, concurrent, deadline-bound) run only when
   slots are inconclusive. Reject drops, suspect trades paper-only.

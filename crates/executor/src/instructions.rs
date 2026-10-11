@@ -16,8 +16,10 @@
 //! - Mayhem buyback-routing accounts [16]/[17] are still unmapped
 //!   (per-token sourcing is the candidate next step; the ignored
 //!   layout-acceptance test is the gate).
-//! - `sell_v2` is unobserved on-chain (dev dumps through it stay
-//!   invisible; the gate fail-closes on unknown pump ixs instead).
+//! - `sell_v2` is chain-verified for *detection* (26 accounts, trader at
+//!   13, amount = first u64 — frozen `sell_v2_mainnet` sample), but live
+//!   sell *building* still targets the legacy shape: a v2 sell builder
+//!   mirroring the verified layout is future work before mayhem exits.
 //!
 //! RUNTIME (not build-time) ROUTING — never hardcoded here:
 //! - Fee recipient resolves live (override → Global account → canonical

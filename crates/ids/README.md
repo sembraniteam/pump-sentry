@@ -9,8 +9,8 @@ instead of silent mainnet misbehavior.
 
 - `pump` — Pump.fun program, fee recipient, global/event authorities,
   migration authority; `create` / `create_v2` / `buy` / `sell` /
-  `buy_v2` / `migrate` discriminators (v2 + `sell_v2` gaps documented
-  where unverified).
+  `buy_v2` / `sell_v2` / `migrate` discriminators (all mainnet-verified;
+  see the frozen fixtures in `listener`/`migration`).
 - `raydium` — Raydium AMM v4 program, WSOL mint.
 - `system` — system program, SPL token programs, rent sysvar, ATA program.
 

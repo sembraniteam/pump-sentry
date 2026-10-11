@@ -8,11 +8,13 @@
 //!   fail-closed on transport errors.
 
 use crate::parser::{
-    PUMP_CREATE_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID, decode_ix_data,
+    IDX_CREATE_V2_USER, PUMP_CREATE_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID,
+    decode_ix_data,
 };
 pub use ids::{
-    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR,
-    PUMP_SELL_DISCRIMINATOR, SYSTEM_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID, PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR,
+    PUMP_MIGRATE_DISCRIMINATOR, PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR,
+    SYSTEM_PROGRAM_ID,
 };
 use migration::{MigrationDestination, MigrationMonitor, RAYDIUM_V4_PROGRAM_ID, RaydiumV4Pool};
 use solana_client::{
@@ -38,10 +40,16 @@ use thiserror::Error;
 use tracing::{debug, warn};
 /// Account index of the trader (`user`) in buy/sell instructions.
 pub const IDX_SWAP_USER: usize = 6;
-/// Account index of the trader in `buy_v2` instructions: the fee payer
-/// (first signer) at position 13. Verified against a real mainnet
-/// `buy_v2` (27 accounts; position 13 resolved to the fee-payer key).
-pub const IDX_BUY_V2_USER: usize = 13;
+/// Account index of the trader in v2 (`buy_v2`/`sell_v2`) instructions:
+/// the fee payer (first signer) at position 13. Verified against real
+/// mainnet samples — a `buy_v2` (27 accounts; position 13 resolved to the
+/// fee-payer key) and a `sell_v2` (26 accounts; position 13 resolved to
+/// the fee payer whose token balance decreased by exactly the payload
+/// amount; see the frozen `sell_v2_mainnet` fixture).
+pub const IDX_SWAP_V2_USER: usize = 13;
+/// Previous name of [`IDX_SWAP_V2_USER`] (kept: the position covers both
+/// v2 sides, not buys only).
+pub const IDX_BUY_V2_USER: usize = IDX_SWAP_V2_USER;
 /// Account index of the creator (`user`) in create instructions.
 pub const IDX_CREATE_USER: usize = 7;
 
@@ -69,12 +77,12 @@ pub enum SwapSide {
     Buy,
     /// Tokens sold for SOL.
     Sell,
-    /// Pump.fun instruction with an unmapped discriminator (the `sell_v2`
-    /// dev-dump path is the known case). Side and trader layout are
-    /// unproven: the wallet is the ix's first listed account
-    /// (best-effort attribution), the amount is always 0, and quorum
-    /// never counts these — they exist only for the dev fail-closed
-    /// rule in [`EntryGate::observe`].
+    /// Pump.fun instruction with an unmapped discriminator (no known case
+    /// left: `sell_v2` is classified since its frozen-sample verification).
+    /// Side and trader layout are unproven: the wallet is the ix's first
+    /// listed account (best-effort attribution), the amount is always 0,
+    /// and quorum never counts these — they exist only for the dev
+    /// fail-closed rule in [`EntryGate::observe`].
     Unknown,
 }
 
@@ -113,10 +121,10 @@ impl SwapRecord {
 }
 
 /// Classify every Pump.fun buy/sell instruction in a fetched transaction.
-/// Covers legacy `buy`/`sell` plus `buy_v2` (v2/mayhem-curve buys use a
-/// different discriminator and a 27-account layout with the trader at
-/// index 13). Instructions with unmapped discriminators surface as
-/// [`SwapSide::Unknown`] (never quorum-counted; only the dev
+/// Covers legacy `buy`/`sell` plus v2 (`buy_v2`/`sell_v2`: different
+/// discriminators, 27/26-account layouts, trader at index 13 — both
+/// frozen-sample verified). Instructions with unmapped discriminators
+/// surface as [`SwapSide::Unknown`] (never quorum-counted; only the dev
 /// fail-closed rule consumes them); `create`/`migrate` lifecycle ixs
 /// stay ignored. Non-pump instructions, undecodable data, and short
 /// account lists are skipped. Never panics.
@@ -147,21 +155,23 @@ pub fn extract_pump_swaps(
         let Some(raw) = decode_ix_data(data_b58) else {
             return;
         };
-        // (side, trader account index): v2 buys share the side but not
+        // (side, trader account index): v2 swaps share the side but not
         // the layout.
         let (side, user_idx) = if raw.starts_with(&PUMP_BUY_DISCRIMINATOR) {
             (SwapSide::Buy, IDX_SWAP_USER)
         } else if raw.starts_with(&PUMP_SELL_DISCRIMINATOR) {
             (SwapSide::Sell, IDX_SWAP_USER)
         } else if raw.starts_with(&PUMP_BUY_V2_DISCRIMINATOR) {
-            (SwapSide::Buy, IDX_BUY_V2_USER)
+            (SwapSide::Buy, IDX_SWAP_V2_USER)
+        } else if raw.starts_with(&PUMP_SELL_V2_DISCRIMINATOR) {
+            (SwapSide::Sell, IDX_SWAP_V2_USER)
         } else {
-            // Unmapped Pump.fun instruction (the `sell_v2` dev-dump path
-            // is the known case): the trader layout is unproven, so never
-            // attribute a side or an amount. `create`/`migrate` are benign
-            // lifecycle ixs and stay ignored; anything else is recorded
-            // against the first listed account so the gate can fail
-            // closed when it names the dev wallet.
+            // Unmapped Pump.fun instruction: the trader layout is
+            // unproven, so never attribute a side or an amount.
+            // `create`/`migrate` are benign lifecycle ixs and stay
+            // ignored; anything else is recorded against the first
+            // listed account so the gate can fail closed when it names
+            // the dev wallet.
             if raw.starts_with(&PUMP_CREATE_DISCRIMINATOR)
                 || raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
                 || raw.starts_with(&PUMP_MIGRATE_DISCRIMINATOR)
@@ -189,10 +199,11 @@ pub fn extract_pump_swaps(
         let Some(wallet) = keys.get(usize::from(*account)).copied() else {
             return;
         };
-        // Amount is assumed to be the first u64 for all three variants
-        // (single-fixture evidence for `buy_v2`; a wrong layout corrupts
-        // the monopoly share, so this stays documented until the v2 IDL
-        // args are pinned by a second sample).
+        // Amount is the first u64 for all four variants. Chain-proven for
+        // both v2 sides from frozen samples (trader = fee payer at index
+        // 13; token-balance delta equals bytes 8..16 to the unit — two
+        // independent `buy_v2` txs plus one `sell_v2`) and per the skill
+        // for legacy `buy`/`sell`.
         let amount_base_units = raw
             .get(8..16)
             .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
@@ -241,13 +252,18 @@ pub fn count_dev_creates(
         let Some(raw) = decode_ix_data(data_b58) else {
             return;
         };
-        if !raw.starts_with(&PUMP_CREATE_DISCRIMINATOR)
-            && !raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
-        {
+        // Author position differs by version: v1 `user` sits at index 7,
+        // v2 `user` at index 5 (14-account IDL layout). A single index
+        // here silently undercounts v2 serial launchers into a pass.
+        let author_idx = if raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR) {
+            IDX_CREATE_V2_USER
+        } else if raw.starts_with(&PUMP_CREATE_DISCRIMINATOR) {
+            IDX_CREATE_USER
+        } else {
             return;
-        }
+        };
         let author = accounts
-            .get(IDX_CREATE_USER)
+            .get(author_idx)
             .and_then(|idx| keys.get(usize::from(*idx)).copied());
         if author == Some(*dev) {
             count += 1;
@@ -288,7 +304,11 @@ pub enum GateOutcome {
 /// Pending watchlist entry.
 #[derive(Debug)]
 struct PendingGate {
-    dev: Pubkey,
+    /// Watched insider wallets: the launcher plus, on v2 launches, the
+    /// distinct creator (see [`EntryGate::add_cohort`]). Buys from any of
+    /// these never count toward quorum; sells/unknowns from any abort.
+    /// Bounded ([`MAX_COHORT_WALLETS`]) so entries stay small.
+    devs: Vec<Pubkey>,
     deadline_secs: u64,
     buyers: HashSet<Pubkey>,
     /// First-submit time: caps relaunch refreshes so spam cannot extend
@@ -314,6 +334,11 @@ pub struct EntryGate {
 /// timeout sweeps stall. The entry with the nearest deadline is evicted
 /// (loudly) to make room.
 pub const MAX_PENDING_ENTRIES: usize = 10_000;
+
+/// Cohort cap per watchlist entry: launcher + creator fit with margin;
+/// more wallets cannot join one entry (each is a distinct insider to
+/// watch, not a quorum voter).
+pub const MAX_COHORT_WALLETS: usize = 4;
 
 impl EntryGate {
     /// New gate: entries get `window_secs` to gather `min_buyers`.
@@ -341,6 +366,8 @@ impl EntryGate {
     /// Relaunch refreshes the window but buyers carry over (demand already
     /// observed stays valid). The refresh is capped at `created + 3×window`
     /// so a spammed relaunch cannot extend the watchlist entry forever.
+    /// A relaunch resets the insider cohort to the new dev alone — use
+    /// [`EntryGate::add_cohort`] after each submit for v2 creators.
     pub fn submit(&mut self, mint: &str, dev: &str, now_secs: u64) -> bool {
         let Ok(dev) = Pubkey::from_str(dev) else {
             return false;
@@ -348,7 +375,7 @@ impl EntryGate {
         let deadline_secs = now_secs.saturating_add(self.window_secs);
         match self.pending.get_mut(mint) {
             Some(entry) => {
-                entry.dev = dev;
+                entry.devs = vec![dev];
                 let cap = entry.created_secs.saturating_add(self.window_secs.saturating_mul(3));
                 entry.deadline_secs = deadline_secs.min(cap);
             }
@@ -365,21 +392,52 @@ impl EntryGate {
                 }
                 self.pending.insert(
                     mint.to_string(),
-                    PendingGate { dev, deadline_secs, buyers: HashSet::new(), created_secs: now_secs },
+                    PendingGate {
+                        devs: vec![dev],
+                        deadline_secs,
+                        buyers: HashSet::new(),
+                        created_secs: now_secs,
+                    },
                 );
             }
         }
         true
     }
 
+    /// Watch one more insider wallet on an existing entry (v2 creator
+    /// cohort). Returns false when the wallet is unparsable, the entry
+    /// is missing, already listed, or the cohort is full — fail-closed:
+    /// the caller must drop the signal rather than watch half the
+    /// insiders. Never resets deadlines or buyers.
+    pub fn add_cohort(&mut self, mint: &str, wallet: &str) -> bool {
+        let Ok(wallet) = Pubkey::from_str(wallet) else {
+            return false;
+        };
+        let Some(entry) = self.pending.get_mut(mint) else {
+            return false;
+        };
+        if entry.devs.contains(&wallet) || entry.devs.len() >= MAX_COHORT_WALLETS {
+            return false;
+        }
+        entry.devs.push(wallet);
+        true
+    }
+
+    /// Abandon a watchlist entry without an outcome (fail-closed unwind
+    /// when post-submit setup cannot complete). True when an entry was
+    /// removed.
+    pub fn remove(&mut self, mint: &str) -> bool {
+        self.pending.remove(mint).is_some()
+    }
+
     /// Fold one observation round into the entry. Removes the entry on
     /// terminal outcomes. Unknown mints report [`GateOutcome::Wait`].
     ///
-    /// Best-effort dev-dump detection: only a `Sell` authored by the dev
-    /// wallet aborts here. Dumps routed through transfers, funded sybils,
-    /// or the unmapped `sell_v2` layout (see [`SwapSide::Unknown`]) do not
-    /// abort on their own — cluster forensics in [`BundleDetector`]
-    /// covers coordinated funding instead.
+    /// Best-effort dev-dump detection: a `Sell` (legacy or `sell_v2`,
+    /// whose layout is frozen-sample verified) authored by any watched
+    /// insider wallet (launcher cohort) aborts here. Dumps routed through
+    /// transfers or funded sybils do not abort on their own — cluster
+    /// forensics in [`BundleDetector`] covers coordinated funding instead.
     pub fn observe(&mut self, mint: &str, swaps: &[SwapRecord], now_secs: u64) -> GateOutcome {
         let Some(entry) = self.pending.get_mut(mint) else {
             return GateOutcome::Wait;
@@ -387,12 +445,12 @@ impl EntryGate {
         for swap in swaps {
             match swap.side {
                 SwapSide::Buy => {
-                    if swap.wallet != entry.dev {
+                    if !entry.devs.contains(&swap.wallet) {
                         entry.buyers.insert(swap.wallet);
                     }
                 }
                 SwapSide::Sell => {
-                    if swap.wallet == entry.dev {
+                    if entry.devs.contains(&swap.wallet) {
                         let reason = format!("dev dump by {} in {}", swap.wallet, swap.signature);
                         self.pending.remove(mint);
                         return GateOutcome::Abort { reason };
@@ -400,10 +458,10 @@ impl EntryGate {
                 }
                 SwapSide::Unknown => {
                     // Fail closed on the residual blindness: an unmapped
-                    // pump ix naming the dev wallet smells like a
-                    // `sell_v2` dump through an unverified layout. Stranger
+                    // pump ix naming a watched insider smells like a dump
+                    // through a layout we cannot parse yet. Stranger
                     // unknowns never count toward quorum and never abort.
-                    if swap.wallet == entry.dev {
+                    if entry.devs.contains(&swap.wallet) {
                         let reason = format!(
                             "possible dev dump via unknown pump ix by {} in {}",
                             swap.wallet, swap.signature
@@ -852,6 +910,10 @@ pub struct DetectedMigration {
 /// Produced from [`DetectedMigration::report`]; the pipeline's `Screener`
 /// trait speaks only this shape so the binary never depends on RPC-layer
 /// key types.
+///
+/// Orientation: on Pump.fun Raydium migrations the base side is WSOL and
+/// the quote side is the migrated token (chain-verified, see
+/// `migration::pool` docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationReport {
     /// Migration transaction signature (base58).
@@ -860,13 +922,13 @@ pub struct MigrationReport {
     pub destination: MigrationDestination,
     /// New AMM account, if resolved.
     pub amm_id: Option<String>,
-    /// Pool base mint, if parsed.
+    /// Pool base mint (WSOL on migrations), if parsed.
     pub base_mint: Option<String>,
-    /// Pool quote mint, if parsed.
+    /// Pool quote mint (the migrated token), if parsed.
     pub quote_mint: Option<String>,
-    /// Coin-side LP vault, if parsed (post-migration tracking).
+    /// Coin-side LP vault (WSOL inventory), if parsed.
     pub base_vault: Option<String>,
-    /// Pc-side LP vault, if parsed (post-migration tracking).
+    /// Pc-side LP vault (token inventory), if parsed.
     pub quote_vault: Option<String>,
 }
 
@@ -1145,7 +1207,7 @@ impl RpcScreener {
     /// signatures, classify each candidate, and on a Raydium hit resolve
     /// the new AMM id (initialize2 account 1) plus its parsed pool.
     /// The pool is trusted only after the full gate: Raydium-owned
-    /// account, WSOL quote, and base matching `expected_base_mint` —
+    /// account, WSOL base, and quote matching `expected_token_mint` —
     /// anything else keeps scanning. Returns `None` when no migration is
     /// found. Runs once per mint upstream — never in a hot loop.
     /// Bounded by [`SCREEN_RPC_TIMEOUT`] like every other screening path
@@ -1153,9 +1215,9 @@ impl RpcScreener {
     pub async fn hunt_migration(
         &self,
         curve: &Pubkey,
-        expected_base_mint: &Pubkey,
+        expected_token_mint: &Pubkey,
     ) -> Result<Option<DetectedMigration>, ScreenError> {
-        match with_screen_timeout(self.hunt_migration_inner(curve, expected_base_mint)).await {
+        match with_screen_timeout(self.hunt_migration_inner(curve, expected_token_mint)).await {
             None => Err(ScreenError::Timeout("hunt_migration")),
             Some(result) => result.map_err(ScreenError::Rpc),
         }
@@ -1164,7 +1226,7 @@ impl RpcScreener {
     async fn hunt_migration_inner(
         &self,
         curve: &Pubkey,
-        expected_base_mint: &Pubkey,
+        expected_token_mint: &Pubkey,
     ) -> Result<Option<DetectedMigration>, ClientError> {
         let monitor = MigrationMonitor::new();
         let tx_config = json_tx_config(self.commitment);
@@ -1222,8 +1284,13 @@ impl RpcScreener {
                     ix_datas.push(ix.data);
                     pairs.push((ix.program, ix.accounts));
                 }
-                match monitor.classify_migration(&keys, &ix_datas, &logs, curve, expected_base_mint)
-                {
+                match monitor.classify_migration(
+                    &keys,
+                    &ix_datas,
+                    &logs,
+                    curve,
+                    expected_token_mint,
+                ) {
                     Some(MigrationDestination::RaydiumV4) => {
                         let amm_id = initialize2_amm_id(&pairs);
                         let pool = match amm_id {
@@ -1247,7 +1314,7 @@ impl RpcScreener {
                                     &amm,
                                     &account.data,
                                     &account.owner,
-                                    expected_base_mint,
+                                    expected_token_mint,
                                 ) {
                                     Some(pool) => Some(pool),
                                     None => {
@@ -1363,9 +1430,9 @@ impl RpcScreener {
         let total_supply = self.curve_total_supply(curve).await?;
 
         // Distinct buyers, first-seen order, bounded (RPC budget).
-        // Only proven `Buy` sides count: `Unknown` records (unmapped
-        // layouts like `sell_v2`) carry no trustworthy amount or side,
-        // so the monopoly math ignores them rather than guessing.
+        // Only proven `Buy` sides count: `Unknown` records (future
+        // unmapped layouts) carry no trustworthy amount or side, so the
+        // monopoly math ignores them rather than guessing.
         let mut seen: HashSet<Pubkey> = HashSet::new();
         let mut buyers: Vec<Pubkey> = Vec::new();
         for record in records.iter().filter(|r| r.side == SwapSide::Buy) {
@@ -1691,13 +1758,22 @@ fn unix_now() -> u64 {
 }
 
 /// Find the source of a native SOL transfer into `beneficiary` inside a
-/// fetched transaction (top-level and inner instructions). Handles both
-/// funding shapes: system `transfer` (u32 LE 2, 12 bytes, accounts
-/// `[from, to]`) and system `createAccount` (u32 LE 0, 52 bytes, accounts
-/// `[funder, new]`). Pure; `None` when no such transfer exists.
+/// fetched transaction (top-level and inner instructions). Handles the
+/// system funding shapes: `transfer` (u32 LE 2, 12 bytes, accounts
+/// `[from, to]`), `createAccount` (u32 LE 0, 52 bytes, accounts
+/// `[funder, new]`), `createAccountWithSeed` (u32 LE 3, ≥92 bytes,
+/// accounts `[from, new, base]`), and `transferWithSeed` (u32 LE 11,
+/// ≥52 bytes, accounts `[from, base, to]`). Multisig/CPI-routed funding
+/// is covered whenever it executes one of these as an inner instruction
+/// (the traversal below visits them). Also attributes ATA creation paid
+/// by someone else: a `createAssociatedTokenAccount`/`CreateIdempotent`
+/// instruction (`[payer, ata, owner, ...]`) whose `owner` is the
+/// beneficiary names the SPL onboarding funder. Pure; `None` when no
+/// such transfer exists.
 ///
-/// Best-effort by construction: SPL-token funding, `transfer_with_seed`,
-/// multisig, and exchange payouts do not match either arm and read as
+/// Best-effort by construction: raw SPL-token `Transfer`/`TransferChecked`
+/// amounts carry no ATA→owner map without account fetches, and exchange
+/// payouts outside these shapes, do not match any arm and read as
 /// untraceable (callers escalate low trace rates to `Suspect`, never to
 /// organic).
 pub fn find_funding_source(
@@ -1714,30 +1790,17 @@ pub fn find_funding_source(
     let keys = resolve_keys(raw, &tx_with_meta.meta)?;
 
     let scan = |program_id_index: u8, accounts: &[u8], data_b58: &str| -> Option<Pubkey> {
-        if keys
+        let program = keys
             .get(usize::from(program_id_index))
             .copied()
-            .unwrap_or_default()
-            != SYSTEM_PROGRAM_ID
-        {
-            return None;
+            .unwrap_or_default();
+        if program == SYSTEM_PROGRAM_ID {
+            scan_system_funding(&keys, accounts, data_b58, beneficiary)
+        } else if program == ASSOCIATED_TOKEN_PROGRAM_ID {
+            scan_ata_funding(&keys, accounts, data_b58, beneficiary)
+        } else {
+            None
         }
-        let raw = decode_ix_data(data_b58)?;
-        // System transfer (u32 LE 2, 12 bytes, [from, to]) or account
-        // creation (u32 LE 0, 52 bytes, [funder, new]).
-        // Length-guarded BEFORE slicing: short payloads are not funding,
-        // never a panic (this function promises never to panic).
-        if raw.len() < 4 {
-            return None;
-        }
-        let tag = u32::from_le_bytes(raw[..4].try_into().ok()?);
-        let (from_idx, to_idx) = match (raw.len(), tag) {
-            (12, 2) | (52, 0) => (0usize, 1usize),
-            _ => return None,
-        };
-        let from = keys.get(usize::from(*accounts.get(from_idx)?)).copied()?;
-        let to = keys.get(usize::from(*accounts.get(to_idx)?)).copied()?;
-        (to == *beneficiary).then_some(from)
     };
 
     let mut found: Option<Pubkey> = None;
@@ -1753,11 +1816,66 @@ pub fn find_funding_source(
     found
 }
 
+/// System-program arm of [`find_funding_source`]: SOL transfers and
+/// account creations paying into `beneficiary`, including the seeded
+/// variants (`TransferWithSeed` tag 11, `CreateAccountWithSeed` tag 3 —
+/// account orders verified against the SDK constructors).
+/// Length-guarded BEFORE slicing: short payloads are not funding, never
+/// a panic.
+fn scan_system_funding(
+    keys: &[Pubkey],
+    accounts: &[u8],
+    data_b58: &str,
+    beneficiary: &Pubkey,
+) -> Option<Pubkey> {
+    let raw = decode_ix_data(data_b58)?;
+    if raw.len() < 4 {
+        return None;
+    }
+    let tag = u32::from_le_bytes(raw[..4].try_into().ok()?);
+    let (from_idx, to_idx) = match (raw.len(), tag) {
+        (12, 2) | (52, 0) => (0usize, 1usize),
+        // CreateAccountWithSeed: 4 + 32 base + 8 seed-len + seed +
+        // 8 lamports + 8 space + 32 owner (≥92); [from, new, base].
+        (len, 3) if len >= 92 => (0usize, 1usize),
+        // TransferWithSeed: 4 + 8 lamports + 8 seed-len + seed + 32
+        // owner (≥52); [from, base, to].
+        (len, 11) if len >= 52 => (0usize, 2usize),
+        _ => return None,
+    };
+    let from = keys.get(usize::from(*accounts.get(from_idx)?)).copied()?;
+    let to = keys.get(usize::from(*accounts.get(to_idx)?)).copied()?;
+    (to == *beneficiary).then_some(from)
+}
+
+/// ATA-program arm of [`find_funding_source`]: someone paying the rent
+/// to create `beneficiary`'s associated token account is an SPL funding
+/// link. Matches `Create` (`[0]`) and `CreateIdempotent` (`[1]`) single
+/// bytes with `[payer, ata, owner, ...]` account order.
+fn scan_ata_funding(
+    keys: &[Pubkey],
+    accounts: &[u8],
+    data_b58: &str,
+    beneficiary: &Pubkey,
+) -> Option<Pubkey> {
+    let raw = decode_ix_data(data_b58)?;
+    if raw.len() != 1 || (raw[0] != 0 && raw[0] != 1) {
+        return None;
+    }
+    if accounts.len() < 3 {
+        return None;
+    }
+    let payer = keys.get(usize::from(accounts[0])).copied()?;
+    let owner = keys.get(usize::from(accounts[2])).copied()?;
+    (owner == *beneficiary).then_some(payer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use solana_transaction_status::{
-        EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiRawMessage, UiTransaction,
+        EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiInnerInstructions, UiRawMessage,
+        UiTransaction, UiTransactionTokenBalance,
     };
 
     fn key(byte: u8) -> String {
@@ -1874,6 +1992,146 @@ mod tests {
     }
 
     #[test]
+    fn replay_mainnet_buy_v2_amount_matches_balance_delta() {
+        // Independent on-chain proof of the amount semantic (not just
+        // "the first u64 looks right"): in the same frozen tx, the
+        // buyer's token-balance delta for exactly one mint equals the
+        // classified amount to the unit.
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/create_v2_mainnet.json"))
+                .expect("fixture");
+        let fetched: EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let records = extract_pump_swaps(&fetched, "sig");
+        let buy = records
+            .iter()
+            .find(|r| r.side == SwapSide::Buy)
+            .expect("one buy");
+        let meta = fetched.transaction.meta.as_ref().expect("fixture meta");
+        let buyer = buy.wallet.to_string();
+        let delta = |balances: &OptionSerializer<Vec<UiTransactionTokenBalance>>| -> i128 {
+            match balances {
+                OptionSerializer::Some(list) => list
+                    .iter()
+                    .filter(|b| matches!(&b.owner, OptionSerializer::Some(o) if o == &buyer))
+                    .map(|b| b.ui_token_amount.amount.parse::<i128>().unwrap_or(0))
+                    .sum(),
+                _ => 0,
+            }
+        };
+        let net = delta(&meta.post_token_balances) - delta(&meta.pre_token_balances);
+        assert_eq!(net, buy.amount_base_units as i128);
+        assert_eq!(net, 3_485_709_524_202);
+    }
+
+    #[test]
+    fn replay_mainnet_buy_v2_second_sample() {
+        // Second independent `buy_v2` tx (27 accounts, 24-byte payload):
+        // trader resolves to the fee payer and the amount matches the
+        // buyer's token-balance delta to the unit (8_671_591_758_466).
+        // The trailing u64 is `u64::MAX` (open slippage guard) — amount
+        // semantics need no further samples.
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/buy_v2_second_mainnet.json"))
+                .expect("fixture");
+        let fetched: EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let records = extract_pump_swaps(&fetched, "sig");
+        let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
+        assert_eq!(buys.len(), 1);
+        assert_eq!(
+            buys[0].wallet.to_string(),
+            "6VrR1eTzeEj6eubVpxAQbHFqJ6fQHUnMqxsCEhg7kgrj"
+        );
+        assert_eq!(buys[0].amount_base_units, 8_671_591_758_466);
+    }
+
+    #[test]
+    fn replay_mainnet_sell_v2_swap() {
+        // Frozen mainnet `sell_v2` (26 accounts): the trader must resolve
+        // to the fee payer with the exact on-chain amount. Cross-checked
+        // off-test: the fee payer's token balance decreased by exactly
+        // 3_060_466_246_688 units of the sold mint, and the ix's account
+        // 13 is the fee-payer key — so index-13 attribution and the
+        // first-u64 amount are chain-proven, not inferred.
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/sell_v2_mainnet.json"))
+                .expect("fixture");
+        let fetched: EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_value(raw["result"].clone()).expect("decode");
+        assert_eq!(fetched.slot, 455676914);
+        let records = extract_pump_swaps(&fetched, "sig");
+        let sells: Vec<_> = records
+            .iter()
+            .filter(|r| r.side == SwapSide::Sell)
+            .collect();
+        assert_eq!(sells.len(), 1);
+        assert_eq!(
+            sells[0].wallet.to_string(),
+            "Bck5r87KG8Ak9WhyGQpHn5SqvyuB6tTHQAMCzoxjsBU2"
+        );
+        assert_eq!(sells[0].amount_base_units, 3_060_466_246_688);
+    }
+
+    #[test]
+    fn cohort_wallets_dump_abort_but_never_count() {
+        // v2 creator cohort: their sells abort like the launcher's, and
+        // their buys never count toward quorum.
+        let mut gate = EntryGate::new(60, 2);
+        let dev = Pubkey::new_from_array([7; 32]);
+        let creator = Pubkey::new_from_array([8; 32]);
+        assert!(gate.submit("MINT", &dev.to_string(), 1000));
+        assert!(gate.add_cohort("MINT", &creator.to_string()));
+        // Duplicate / unknown cohort joins fail (bounded, explicit).
+        assert!(!gate.add_cohort("MINT", &creator.to_string()));
+        assert!(!gate.add_cohort("MINT", "not-a-key"));
+        assert!(!gate.add_cohort("NOPE", &creator.to_string()));
+        // Creator buying does not count toward quorum.
+        let cohort_buy = SwapRecord {
+            signature: "c1".to_string(),
+            slot: 1001,
+            wallet: creator,
+            side: SwapSide::Buy,
+            amount_base_units: 1_000,
+        };
+        assert_eq!(gate.observe("MINT", &[cohort_buy], 1001), GateOutcome::Wait);
+        // Creator selling aborts immediately.
+        let dump = SwapRecord {
+            signature: "c2".to_string(),
+            slot: 1002,
+            wallet: creator,
+            side: SwapSide::Sell,
+            amount_base_units: 1_000,
+        };
+        match gate.observe("MINT", &[dump], 1002) {
+            GateOutcome::Abort { reason } => assert!(reason.contains("dev dump")),
+            other => panic!("expected abort, got {other:?}"),
+        }
+        assert_eq!(gate.pending_count(), 0);
+    }
+
+    #[test]
+    fn sell_v2_dev_dump_aborts_the_gate() {
+        // A classified `sell_v2` authored by the dev wallet aborts like
+        // any legacy dev dump (layout now verified, no more blindness).
+        let mut gate = EntryGate::new(60, 2);
+        let dev = Pubkey::new_from_array([7; 32]);
+        assert!(gate.submit("MINT", &dev.to_string(), 1000));
+        let dump = SwapRecord {
+            signature: "v2dump".to_string(),
+            slot: 1003,
+            wallet: dev,
+            side: SwapSide::Sell,
+            amount_base_units: 1_000,
+        };
+        match gate.observe("MINT", &[dump], 1003) {
+            GateOutcome::Abort { reason } => assert!(reason.contains("dev dump")),
+            other => panic!("expected abort, got {other:?}"),
+        }
+        assert_eq!(gate.pending_count(), 0);
+    }
+
+    #[test]
     fn ignores_non_pump_program() {
         let foreign = buy_ix(5, 6); // program idx 5 = key(5), not pump
         let tx = swap_tx(vec![foreign]);
@@ -1882,9 +2140,9 @@ mod tests {
 
     #[test]
     fn unknown_pump_ix_is_recorded_but_never_counts() {
-        // Unmapped discriminators (e.g. sell_v2) surface as `Unknown`
-        // against the ix's first listed account — never dropped
-        // silently, never quorum-counted, amount always 0.
+        // Unmapped discriminators surface as `Unknown` against the ix's
+        // first listed account — never dropped silently, never
+        // quorum-counted, amount always 0.
         let mut unknown = buy_ix(0, 6);
         unknown.data = bs58::encode([0u8; 24]).into_string();
         let tx = swap_tx(vec![unknown]);
@@ -1897,10 +2155,38 @@ mod tests {
     }
 
     #[test]
+    fn count_dev_creates_uses_versioned_author_index() {
+        // Regression: v2 `user` sits at index 5, v1 at 7. A single index
+        // for both silently undercounts v2 serial launchers (missed
+        // rejects) and misattributes v1-adjacent wallets (false counts).
+        let mk = |disc: &[u8; 8]| {
+            let mut data = disc.to_vec();
+            data.extend_from_slice(&[9u8; 16]);
+            UiCompiledInstruction {
+                program_id_index: 0,
+                // Identity mapping: position i resolves to key(i), so
+                // position 5 is the v2 author and 7 the v1 author.
+                accounts: (0u8..14).collect(),
+                data: bs58::encode(data).into_string(),
+                stack_height: None,
+            }
+        };
+        let v1 = mk(&PUMP_CREATE_DISCRIMINATOR);
+        let v2 = mk(&PUMP_CREATE_V2_DISCRIMINATOR);
+        let tx_v1 = swap_tx(vec![v1]);
+        let tx_v2 = swap_tx(vec![v2]);
+        // Position 5 → key(5) (v2 author); position 7 → key(7) (v1 author).
+        assert_eq!(count_dev_creates(&tx_v1, &Pubkey::new_from_array([7; 32])), 1);
+        assert_eq!(count_dev_creates(&tx_v1, &Pubkey::new_from_array([5; 32])), 0);
+        assert_eq!(count_dev_creates(&tx_v2, &Pubkey::new_from_array([5; 32])), 1);
+        assert_eq!(count_dev_creates(&tx_v2, &Pubkey::new_from_array([7; 32])), 0);
+    }
+
+    #[test]
     fn create_and_migrate_ixs_stay_ignored() {
         // Benign lifecycle ixs must not become `Unknown` records (a dev
         // migration touching the curve must never abort the gate).
-        let mut mk = |disc: &[u8; 8]| {
+        let mk = |disc: &[u8; 8]| {
             let mut ix = buy_ix(0, 6);
             let mut data = disc.to_vec();
             data.extend_from_slice(&[9u8; 16]);
@@ -2438,5 +2724,199 @@ mod tests {
         cache.put("new".to_string(), "v".to_string(), 5000);
         assert_eq!(cache.get("old", 5000), None);
         assert_eq!(cache.get("new", 5000), Some("v".to_string()));
+    }
+
+    /// Build a fabricated transaction from explicit account keys,
+    /// top-level instructions, and an optional meta (for inner-ix cases).
+    fn funding_tx_with_meta(
+        account_keys: Vec<String>,
+        instructions: Vec<UiCompiledInstruction>,
+        meta: Option<UiTransactionStatusMeta>,
+    ) -> EncodedConfirmedTransactionWithStatusMeta {
+        EncodedConfirmedTransactionWithStatusMeta {
+            slot: 9,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig".to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: solana_message::MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 1,
+                        },
+                        account_keys,
+                        recent_blockhash: key(99),
+                        instructions,
+                        address_table_lookups: None,
+                        transaction_config: None,
+                    }),
+                }),
+                meta,
+                version: None,
+            },
+            block_time: None,
+            transaction_index: None,
+        }
+    }
+
+    #[test]
+    fn funding_source_found_via_transfer_with_seed() {
+        // TransferWithSeed (tag 11, [from, base, to]): the seeded
+        // funding path the old detector missed. Layout hand-encoded per
+        // the SDK constructor source (`system-interface/.../instruction.rs`
+        // `transfer_with_seed`: bincode tag 11 ++ lamports ++ seed-string
+        // ++ owner; accounts [from, base-signer, to]).
+        let mut data = 11u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&1_000u64.to_le_bytes());
+        data.extend_from_slice(&4u64.to_le_bytes());
+        data.extend_from_slice(b"seed");
+        data.extend_from_slice(&SYSTEM_PROGRAM_ID.to_bytes());
+        let ui = UiCompiledInstruction {
+            program_id_index: 0,
+            accounts: vec![1, 2, 3],
+            data: bs58::encode(&data).into_string(),
+            stack_height: None,
+        };
+        let mut account_keys = vec![SYSTEM_PROGRAM_ID.to_string()];
+        for b in 1u8..=4 {
+            account_keys.push(key(b));
+        }
+        let tx = funding_tx_with_meta(account_keys, vec![ui], None);
+        let (from, to) = (
+            Pubkey::new_from_array([1; 32]),
+            Pubkey::new_from_array([3; 32]),
+        );
+        assert_eq!(find_funding_source(&tx, &to), Some(from));
+        assert_eq!(find_funding_source(&tx, &from), None);
+    }
+
+    #[test]
+    fn funding_source_found_via_create_with_seed() {
+        // CreateAccountWithSeed (tag 3, [from, new, base]): bincode tag 3
+        // ++ base ++ seed-string ++ lamports ++ space ++ owner.
+        let mut data = 3u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&Pubkey::new_from_array([2; 32]).to_bytes());
+        data.extend_from_slice(&4u64.to_le_bytes());
+        data.extend_from_slice(b"seed");
+        data.extend_from_slice(&1_000u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&SYSTEM_PROGRAM_ID.to_bytes());
+        let ui = UiCompiledInstruction {
+            program_id_index: 0,
+            accounts: vec![1, 2, 3],
+            data: bs58::encode(&data).into_string(),
+            stack_height: None,
+        };
+        let mut account_keys = vec![SYSTEM_PROGRAM_ID.to_string()];
+        for b in 1u8..=4 {
+            account_keys.push(key(b));
+        }
+        let tx = funding_tx_with_meta(account_keys, vec![ui], None);
+        let (from, new) = (
+            Pubkey::new_from_array([1; 32]),
+            Pubkey::new_from_array([2; 32]),
+        );
+        assert_eq!(find_funding_source(&tx, &new), Some(from));
+    }
+
+    #[test]
+    fn funding_source_found_via_ata_creation() {
+        // SPL onboarding: the funder pays rent to create the buyer's ATA
+        // ([payer, ata, owner, mint, system, token-program], data [1]).
+        let payer = Pubkey::new_from_array([1; 32]);
+        let ata = Pubkey::new_from_array([2; 32]);
+        let owner = Pubkey::new_from_array([3; 32]);
+        let mint = Pubkey::new_from_array([4; 32]);
+        let order = vec![
+            ASSOCIATED_TOKEN_PROGRAM_ID,
+            payer,
+            ata,
+            owner,
+            mint,
+            SYSTEM_PROGRAM_ID,
+        ];
+        for disc in [[0u8], [1u8]] {
+            let ui = UiCompiledInstruction {
+                program_id_index: 0,
+                accounts: vec![1, 2, 3, 4, 5],
+                data: bs58::encode(disc).into_string(),
+                stack_height: None,
+            };
+            let tx = funding_tx_with_meta(
+                order.iter().map(|k| k.to_string()).collect(),
+                vec![ui],
+                None,
+            );
+            assert_eq!(
+                find_funding_source(&tx, &owner),
+                Some(payer),
+                "disc {disc:?}"
+            );
+        }
+        // ATA created for someone else: not our beneficiary.
+        let ui = UiCompiledInstruction {
+            program_id_index: 0,
+            accounts: vec![1, 2, 3, 4, 5],
+            data: bs58::encode([1u8]).into_string(),
+            stack_height: None,
+        };
+        let tx = funding_tx_with_meta(
+            order.iter().map(|k| k.to_string()).collect(),
+            vec![ui],
+            None,
+        );
+        assert_eq!(find_funding_source(&tx, &mint), None);
+    }
+
+    #[test]
+    fn funding_source_found_in_inner_instruction() {
+        // Multisig/CPI-routed funding executes the system transfer as an
+        // INNER instruction (outer ix belongs to another program): the
+        // traversal must still attribute it.
+        let mut data = 2u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&500u64.to_le_bytes());
+        let inner = UiCompiledInstruction {
+            program_id_index: 0,
+            accounts: vec![1, 2],
+            data: bs58::encode(data).into_string(),
+            stack_height: None,
+        };
+        let outer = UiCompiledInstruction {
+            program_id_index: 3,
+            accounts: vec![],
+            data: bs58::encode([9u8; 8]).into_string(),
+            stack_height: None,
+        };
+        let other_program = Pubkey::new_from_array([9; 32]);
+        let order = vec![
+            SYSTEM_PROGRAM_ID.to_string(),
+            key(1),
+            key(2),
+            other_program.to_string(),
+        ];
+        let meta = UiTransactionStatusMeta {
+            err: None,
+            status: Ok(()),
+            fee: 5000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: OptionSerializer::Some(vec![UiInnerInstructions {
+                index: 0,
+                instructions: vec![UiInstruction::Compiled(inner)],
+            }]),
+            log_messages: OptionSerializer::None,
+            pre_token_balances: OptionSerializer::None,
+            post_token_balances: OptionSerializer::None,
+            rewards: OptionSerializer::None,
+            loaded_addresses: OptionSerializer::None,
+            return_data: OptionSerializer::None,
+            compute_units_consumed: OptionSerializer::None,
+            cost_units: OptionSerializer::None,
+        };
+        let tx = funding_tx_with_meta(order, vec![outer], Some(meta));
+        assert_eq!(
+            find_funding_source(&tx, &Pubkey::new_from_array([2; 32])),
+            Some(Pubkey::new_from_array([1; 32]))
+        );
     }
 }

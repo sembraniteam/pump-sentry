@@ -142,6 +142,10 @@ pub struct SwapExecutor {
     /// preflight, canonical constant as fallback; the program rotates
     /// recipients so hardcoding fails closed into fee misdirection).
     fee_recipient_override: Option<Pubkey>,
+    /// Strict preflight: transport/timeout simulation failures reject
+    /// the dispatch instead of proceeding with a warning. Default off
+    /// (today's behavior); enable for live funds via `SIM_STRICT=true`.
+    strict_sim: bool,
 }
 
 /// Global account layout: 8-byte Anchor discriminator, then
@@ -197,6 +201,7 @@ impl SwapExecutor {
             compute_unit_limit: 0,
             compute_unit_price: 0,
             fee_recipient_override: None,
+            strict_sim: false,
         })
     }
 
@@ -212,6 +217,15 @@ impl SwapExecutor {
     /// only to pin a recipient (e.g. tests, emergencies).
     pub fn with_fee_recipient(mut self, fee_recipient: Pubkey) -> Self {
         self.fee_recipient_override = Some(fee_recipient);
+        self
+    }
+
+    /// Strict preflight: simulation transport/timeout failures reject the
+    /// dispatch (`SimFailed`) instead of proceeding unproven. Off by
+    /// default (an unknown sim result preserves today's behavior rather
+    /// than blocking valid trades); turn on for live funds.
+    pub fn with_strict_sim(mut self, strict: bool) -> Self {
+        self.strict_sim = strict;
         self
     }
 
@@ -584,7 +598,9 @@ impl SwapExecutor {
     /// A definitive simulation failure rejects the dispatch *before* any
     /// fee is spent (layout bugs surface here, not on-chain). Transport
     /// failures proceed with a warning — an unknown sim result preserves
-    /// today's behavior rather than blocking valid trades.
+    /// today's behavior rather than blocking valid trades — unless
+    /// strict preflight is on ([`SwapExecutor::with_strict_sim`]), in
+    /// which case they reject too (see [`sim_transport_outcome`]).
     async fn simulate_tx(&self, tx: &Transaction, label: &str) -> Result<(), ExecutorError> {
         use solana_client::rpc_config::RpcSimulateTransactionConfig;
         let config = RpcSimulateTransactionConfig {
@@ -608,13 +624,26 @@ impl SwapExecutor {
             }
             Ok(Err(e)) => {
                 warn!(%label, error = %e, "simulation RPC failed; proceeding without preflight");
-                Ok(())
+                sim_transport_outcome(self.strict_sim, "RPC failure")
             }
             Err(_) => {
                 warn!(%label, "simulation timed out; proceeding without preflight");
-                Ok(())
+                sim_transport_outcome(self.strict_sim, "timeout")
             }
         }
+    }
+}
+
+/// Decide an unproven preflight (simulation transport/timeout): fail
+/// closed under strict mode, warn-and-proceed otherwise. Pure so the
+/// policy is unit-tested without network.
+fn sim_transport_outcome(strict: bool, cause: &str) -> Result<(), ExecutorError> {
+    if strict {
+        Err(ExecutorError::SimFailed(format!(
+            "preflight unavailable ({cause}); strict mode refuses to dispatch unproven"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -643,5 +672,21 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(matches!(err, ExecutorError::BadSignature { .. }));
+    }
+
+    #[test]
+    fn strict_preflight_rejects_unproven_dispatch() {
+        // Default (off): unknown sim result preserves today's behavior.
+        assert!(sim_transport_outcome(false, "timeout").is_ok());
+        // Strict: transport/timeout failures refuse to dispatch unproven.
+        for cause in ["timeout", "RPC failure"] {
+            match sim_transport_outcome(true, cause) {
+                Err(ExecutorError::SimFailed(msg)) => assert!(msg.contains(cause), "{msg}"),
+                other => panic!("expected SimFailed, got {other:?}"),
+            }
+        }
+        // Builder plumbing enables the policy.
+        assert!(!executor().strict_sim);
+        assert!(executor().with_strict_sim(true).strict_sim);
     }
 }

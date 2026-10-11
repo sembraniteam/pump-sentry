@@ -100,7 +100,7 @@ impl MigrationMonitor {
     /// it is a supporting signal, not a gate. Rules, in order:
     /// 1. Raydium V4: Raydium program + `initialize2` log, with the pump
     ///    program or the migration authority also present, AND the watched
-    ///    curve or expected base mint among the keys (a shared tx carrying
+    ///    curve or expected token mint among the keys (a shared tx carrying
     ///    an unrelated Raydium init must not false-positive).
     /// 2. PumpSwap: `migrate` discriminator or `MigrateV2` log, with the
     ///    pump program or the migration authority also present, AND the
@@ -112,7 +112,7 @@ impl MigrationMonitor {
         instructions_data: &[Vec<u8>],
         log_messages: &[String],
         curve: &Pubkey,
-        expected_base_mint: &Pubkey,
+        expected_token_mint: &Pubkey,
     ) -> Option<MigrationDestination> {
         let mentions_authority = account_keys
             .iter()
@@ -124,7 +124,7 @@ impl MigrationMonitor {
         // Linkage: the migration must touch what we watch.
         let linked = account_keys
             .iter()
-            .any(|k| k == curve || k == expected_base_mint);
+            .any(|k| k == curve || k == expected_token_mint);
         if !linked {
             return None;
         }

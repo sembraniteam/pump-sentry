@@ -9,10 +9,11 @@ use executor::{BuyOrder, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, 
 use std::time::Duration;
 use thiserror::Error;
 
-/// Pump.fun mint decimals (base-unit scale). Protocol-fixed: the Pump.fun
-/// program mints every token (classic and Token-2022 flows alike) at 6
-/// decimals, so sizing reads one constant instead of parsing per-mint
-/// account layouts at dispatch time.
+/// Pump.fun mint decimals (base-unit scale). The confirm path verifies
+/// every mint reads 6 before sizing (see `ReserveFeed::token_decimals`
+/// and the decimals gate in `confirm_open`): non-6 mints are dropped
+/// rather than mispriced, so this constant is a checked invariant, not
+/// an assumption.
 pub const TOKEN_DECIMALS: u32 = 6;
 /// Lamports per SOL.
 pub const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
@@ -241,10 +242,13 @@ impl LiveTrader {
 
     /// True when at least one buy awaits confirmation.
     pub fn has_pending(&self) -> bool {
-        self.pending
-            .lock()
-            .map(|g| !g.is_empty())
-            .unwrap_or(false)
+        match self.pending.lock() {
+            Ok(guard) => !guard.is_empty(),
+            Err(_) => {
+                tracing::warn!("pending-tracker lock poisoned; assuming pending");
+                true
+            }
+        }
     }
 
     /// Re-poll every pending buy once (one fresh confirmation window each).
@@ -272,11 +276,15 @@ impl LiveTrader {
         let _reset = ResetOnDrop {
             busy: std::sync::Arc::clone(&self.recheck_busy),
         };
-        let snapshot: Vec<PendingBuy> = self
-            .pending
-            .lock()
-            .map(|g| g.values().cloned().collect())
-            .unwrap_or_default();
+        let snapshot: Vec<PendingBuy> = match self.pending.lock() {
+            Ok(guard) => guard.values().cloned().collect(),
+            // Poisoned after a prior panic: report empty (nothing
+            // rechecked) but loudly, never silently.
+            Err(_) => {
+                tracing::warn!("pending-tracker lock poisoned; recheck skipped");
+                Vec::new()
+            }
+        };
         let results = futures_util::future::join_all(snapshot.into_iter().map(|entry| async {
             let outcome = match self
                 .executor
@@ -290,10 +298,16 @@ impl LiveTrader {
                     if attempts >= PENDING_MAX_ATTEMPTS {
                         RecheckOutcome::GiveUp
                     } else {
-                        if let Ok(mut guard) = self.pending.lock()
-                            && let Some(stored) = guard.get_mut(&entry.position.mint)
-                        {
-                            stored.attempts = attempts;
+                        match self.pending.lock() {
+                            Ok(mut guard) => {
+                                if let Some(stored) = guard.get_mut(&entry.position.mint) {
+                                    stored.attempts = attempts;
+                                }
+                            }
+                            Err(_) => tracing::warn!(
+                                mint = %entry.position.mint,
+                                "pending-tracker lock poisoned; attempt counter frozen"
+                            ),
                         }
                         RecheckOutcome::StillUnknown
                     }
@@ -306,11 +320,15 @@ impl LiveTrader {
         for (entry, outcome) in results {
             match outcome {
                 RecheckOutcome::StillUnknown => {}
-                _ => {
-                    if let Ok(mut guard) = self.pending.lock() {
+                _ => match self.pending.lock() {
+                    Ok(mut guard) => {
                         guard.remove(&entry.position.mint);
                     }
-                }
+                    Err(_) => tracing::warn!(
+                        mint = %entry.position.mint,
+                        "pending-tracker lock poisoned; settled entry not removed"
+                    ),
+                },
             }
             out.push(PendingRecheck {
                 position: entry.position,
@@ -319,6 +337,25 @@ impl LiveTrader {
             });
         }
         out
+    }
+
+    /// Build the tracked [`LivePosition`] for one buy (single
+    /// constructor so dispatch, confirm, and pending paths cannot drift
+    /// apart on what a fill carries).
+    fn pending_position(
+        mint: &str,
+        curve: &str,
+        assoc_curve: &str,
+        amount_tokens: u64,
+        creator: Option<String>,
+    ) -> LivePosition {
+        LivePosition {
+            mint: mint.to_string(),
+            curve: curve.to_string(),
+            assoc_curve: assoc_curve.to_string(),
+            amount_tokens,
+            creator,
+        }
     }
 
     /// Buy `notional_usd` at `price_usd` via Jito bundle.
@@ -372,13 +409,13 @@ impl LiveTrader {
             .await
         {
             Ok(ConfirmOutcome::Confirmed) => Ok((
-                LivePosition {
-                    mint: mint.to_string(),
-                    curve: curve.to_string(),
-                    assoc_curve: assoc_curve.to_string(),
-                    amount_tokens: plan.amount_tokens,
-                    creator: creator.map(|c| c.to_string()),
-                },
+                Self::pending_position(
+                    mint,
+                    curve,
+                    assoc_curve,
+                    plan.amount_tokens,
+                    creator.map(|c| c.to_string()),
+                ),
                 receipt.bundle_id,
             )),
             Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
@@ -392,13 +429,13 @@ impl LiveTrader {
                 Self::track_pending(
                     &self.pending,
                     mint,
-                    LivePosition {
-                        mint: mint.to_string(),
-                        curve: curve.to_string(),
-                        assoc_curve: assoc_curve.to_string(),
-                        amount_tokens: plan.amount_tokens,
-                        creator: creator.map(|c| c.to_string()),
-                    },
+                    Self::pending_position(
+                        mint,
+                        curve,
+                        assoc_curve,
+                        plan.amount_tokens,
+                        creator.map(|c| c.to_string()),
+                    ),
                     &receipt,
                 );
                 Err(LiveError::Unconfirmed(format!(
@@ -414,13 +451,13 @@ impl LiveTrader {
                 Self::track_pending(
                     &self.pending,
                     mint,
-                    LivePosition {
-                        mint: mint.to_string(),
-                        curve: curve.to_string(),
-                        assoc_curve: assoc_curve.to_string(),
-                        amount_tokens: plan.amount_tokens,
-                        creator: creator.map(|c| c.to_string()),
-                    },
+                    Self::pending_position(
+                        mint,
+                        curve,
+                        assoc_curve,
+                        plan.amount_tokens,
+                        creator.map(|c| c.to_string()),
+                    ),
                     &receipt,
                 );
                 Err(LiveError::Unconfirmed(format!(
@@ -443,17 +480,24 @@ impl LiveTrader {
         position: LivePosition,
         receipt: &JitoReceipt,
     ) {
-        if let Ok(mut guard) = pending.lock() {
-            if let Some(existing) = guard.get(mint) {
-                tracing::warn!(mint = %mint, old_bundle = %existing.bundle_id, new_bundle = %receipt.bundle_id,
-                    "second pending buy for the same mint; keeping the first, MANUAL REVIEW REQUIRED for the second");
+        match pending.lock() {
+            Ok(mut guard) => {
+                if let Some(existing) = guard.get(mint) {
+                    tracing::warn!(mint = %mint, old_bundle = %existing.bundle_id, new_bundle = %receipt.bundle_id,
+                        "second pending buy for the same mint; keeping the first, MANUAL REVIEW REQUIRED for the second");
+                }
+                guard.entry(mint.to_string()).or_insert(PendingBuy {
+                    position,
+                    signature: receipt.signature.clone(),
+                    bundle_id: receipt.bundle_id.clone(),
+                    attempts: 1,
+                });
             }
-            guard.entry(mint.to_string()).or_insert(PendingBuy {
-                position,
-                signature: receipt.signature.clone(),
-                bundle_id: receipt.bundle_id.clone(),
-                attempts: 1,
-            });
+            // A poisoned lock means a prior panic already fired: losing
+            // the bag's tracking silently would strand real funds without
+            // exit automation — escalate loudly instead.
+            Err(_) => tracing::warn!(mint = %mint, bundle = %receipt.bundle_id,
+                "pending-tracker lock poisoned; buy fill untracked, MANUAL REVIEW REQUIRED"),
         }
     }
 

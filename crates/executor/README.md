@@ -87,7 +87,9 @@ engine (`result` UUID, no `-32602`), proving base64 decode with the
 - `sendBundle` carries `{"encoding": "base64"}` (live-verified; without it
   the engine refuses every bundle with `-32602`).
 - Every dispatch runs `simulateTransaction` preflight first: definitive
-  failures refuse before fees burn; transport trouble proceeds with a log.
+  failures refuse before fees burn; transport trouble proceeds with a log
+  unless `SIM_STRICT=true` (`with_strict_sim`), which refuses unproven
+  dispatches — enable it for live funds.
 - Fee recipient resolves live from the Global account (override with
   `FEE_RECIPIENT` / `with_fee_recipient`); tip accounts refresh hourly
   from `getTipAccounts` with static fallback.
@@ -99,4 +101,6 @@ engine (`result` UUID, no `-32602`), proving base64 decode with the
 - Mainnet tip calibration for `tip_lamports` under real bundle competition.
 - Mayhem `[16]/[17]` buyback-routing sourcing (see `instructions` docs);
   the ignored `mainnet_layout_acceptance` probe is the gate.
-- `sell_v2` discriminator/layout (currently unobserved on-chain).
+- `sell_v2` discriminator/layout (chain-verified for detection since
+  2026-10-11: 26 accounts, trader at 13, amount = first u64 — see the
+  `sell_v2_mainnet` replay test; a v2 sell *builder* is still future work).

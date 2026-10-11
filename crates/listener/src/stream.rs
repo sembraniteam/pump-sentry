@@ -46,9 +46,19 @@ const MAX_CONCURRENT_FETCHES: usize = 32;
 /// of stalling it forever with no metric and no retry.
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Anchor log marker emitted for `create` instructions (matched
-/// case-insensitively: `create_v2` variants share the prefix).
-const CREATE_LOG_MARKER: &str = "instruction: create";
+/// Anchor log markers emitted for launch instructions (matched
+/// case-insensitively at the call site). Both versions are listed
+/// explicitly: v2 matching used to ride on the v1 prefix
+/// (`"instruction: createv2".contains("instruction: create")`), which is
+/// correct but implicit — a program-side log rename would silently drop
+/// one version.
+const CREATE_LOG_MARKERS: [&str; 2] = ["instruction: create", "instruction: createv2"];
+
+/// True when any program log line announces a launch (v1 or v2).
+/// Pure; the read loop lowercases once per line before calling.
+fn is_launch_log(line: &str) -> bool {
+    CREATE_LOG_MARKERS.iter().any(|m| line.contains(m))
+}
 
 /// Typed listener errors — everything maps here, never panics.
 #[derive(Error, Debug)]
@@ -235,7 +245,7 @@ impl PumpFunListener {
                 .value
                 .logs
                 .iter()
-                .any(|line| line.to_ascii_lowercase().contains(CREATE_LOG_MARKER));
+                .any(|line| is_launch_log(&line.to_ascii_lowercase()));
             if !has_create {
                 continue;
             }
@@ -730,6 +740,23 @@ mod tests {
         assert_eq!(decode_ix_data(&b58), Some(raw.clone()));
         assert_eq!(decode_ix_data(&b64), Some(raw));
         assert_eq!(decode_ix_data("!!!not-valid!!!"), None);
+    }
+
+    #[test]
+    fn launch_log_marker_covers_both_versions() {
+        // Anchor PascalCases the log (`Create`, `CreateV2`); the read
+        // loop lowercases before matching. Both versions must hit, and an
+        // unrelated swap log must not.
+        for line in [
+            "program log: instruction: create",
+            "program log: instruction: createv2",
+            "program log: instruction: create_v2",
+        ] {
+            assert!(is_launch_log(line), "missed: {line}");
+        }
+        assert!(!is_launch_log("program log: instruction: buy"));
+        assert!(!is_launch_log("program log: instruction: sell"));
+        assert!(!is_launch_log(""));
     }
 
     #[test]

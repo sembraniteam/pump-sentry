@@ -40,6 +40,8 @@ impl Auditor for RugCheckClient {
 pub trait ReserveFeed {
     /// One-shot reserve read for a curve.
     async fn fetch_tick(&self, mint: &str, curve: &str) -> Result<PriceTick, CurveError>;
+    /// Mint decimals for base-unit math (cached upstream).
+    async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError>;
     /// Watch a curve for exit polling.
     async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError>;
     /// Stop watching; true when an entry was removed.
@@ -49,6 +51,10 @@ pub trait ReserveFeed {
 impl ReserveFeed for CurveTicker {
     async fn fetch_tick(&self, mint: &str, curve: &str) -> Result<PriceTick, CurveError> {
         self.fetch_tick(mint, curve).await
+    }
+
+    async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError> {
+        self.token_decimals(mint).await
     }
 
     async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
@@ -426,7 +432,8 @@ pub struct PendingSignal {
     /// Signature watermark for incremental curve reads.
     pub last_sig: Option<String>,
     /// Continuous dev-trust score (0.4–1.0) from the launch-time screen,
-    /// carried to confirm time for the risk input.
+    /// carried to confirm time for the risk input. On v2 launches with a
+    /// distinct creator this is the WORST of both insider screens.
     pub dev_trust: f64,
 }
 
@@ -547,6 +554,29 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         self.gate_state.lock().await.gate.pending_count()
     }
 
+    /// Mints with open paper positions (shutdown snapshot: nothing open
+    /// may vanish silently on SIGTERM).
+    pub async fn open_position_mints(&self) -> Vec<String> {
+        let portfolio = self.portfolio.lock().await;
+        portfolio
+            .position_ids()
+            .iter()
+            .filter_map(|id| portfolio.position(*id).map(|p| p.mint.clone()))
+            .collect()
+    }
+
+    /// Mints with tracked live fills (shutdown snapshot: these need
+    /// manual review when the drain does not finish them).
+    pub async fn live_tracked_mints(&self) -> Vec<String> {
+        self.exec
+            .live_positions
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Claim the gate-poll slot; false when a round is already running.
     /// A claim older than [`STALE_POLL_SECS`] is treated as leaked (the
     /// owning task was cancelled before [`Pipeline::end_poll`]) and taken
@@ -612,29 +642,38 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // continuous trust score (see `dev_reputation_score`) rather than
         // a flat 1.0, so barely-old-enough wallets price worse than
         // long-aged ones.
-        let dev_trust = match self.screener.screen_dev(dev).await {
-            Ok(verdict) if verdict.pass => {
-                info!(%mint, age = ?verdict.age_secs, priors = verdict.prior_launches, "dev screen pass");
-                dev_reputation_score(
-                    verdict.age_secs,
-                    verdict.prior_launches,
-                    self.settings.dev_min_age_secs,
-                )
-            }
-            Ok(verdict) => {
-                info!(%mint, reason = %verdict.reason, "dev screen reject");
-                return;
-            }
-            Err(e) => {
-                warn!(%mint, error = %e, "dev screen error; skipping (fail-closed)");
-                return;
-            }
+        let dev_trust = match self.screen_wallet(mint, dev, "dev").await {
+            Some(trust) => trust,
+            None => return,
         };
+
+        // 2b. v2 creator history — fail closed AND. `create_v2` launches
+        // carry a creator distinct from the payer/launcher, with its own
+        // rug history: screening only the payer lets serial creators
+        // through. The signal carries the worst of both trusts, and the
+        // gate watches both wallets for dumps.
+        let mut trust = dev_trust;
+        let distinct_creator = creator.filter(|c| *c != dev);
+        if let Some(creator) = distinct_creator {
+            match self.screen_wallet(mint, creator, "creator").await {
+                Some(creator_trust) => trust = trust.min(creator_trust),
+                None => return,
+            }
+        }
 
         // 3. Watchlist — demand confirmation happens in poll_gates.
         let mut state = self.gate_state.lock().await;
         if !state.gate.submit(mint, dev, now_secs()) {
             warn!(%mint, "bad dev address; skipping");
+            return;
+        }
+        if let Some(creator) = distinct_creator
+            && !state.gate.add_cohort(mint, creator)
+        {
+            // Half-watched insiders are worse than none: unwind instead
+            // of tracking a launch whose creator dumps unseen.
+            state.gate.remove(mint);
+            warn!(%mint, "creator cohort untrackable; skipping (fail-closed)");
             return;
         }
         state.meta.insert(
@@ -646,10 +685,34 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 creation_slot: slot,
                 last_sig: None,
                 creator: creator.map(|c| c.to_string()),
-                dev_trust,
+                dev_trust: trust,
             },
         );
         info!(%mint, score = report.score, "watchlisted; awaiting buyer quorum");
+    }
+
+    /// Screen one insider wallet (launcher or creator): audit-logged
+    /// verdict mapped to a trust score. `None` means skip-the-signal
+    /// (reject or transport error — both fail closed).
+    async fn screen_wallet(&self, mint: &str, wallet: &str, role: &str) -> Option<f64> {
+        match self.screener.screen_dev(wallet).await {
+            Ok(verdict) if verdict.pass => {
+                info!(%mint, %role, age = ?verdict.age_secs, priors = verdict.prior_launches, "insider screen pass");
+                Some(dev_reputation_score(
+                    verdict.age_secs,
+                    verdict.prior_launches,
+                    self.settings.dev_min_age_secs,
+                ))
+            }
+            Ok(verdict) => {
+                info!(%mint, %role, reason = %verdict.reason, "insider screen reject");
+                None
+            }
+            Err(e) => {
+                warn!(%mint, %role, error = %e, "insider screen error; skipping (fail-closed)");
+                None
+            }
+        }
     }
 
     /// Drive every watchlisted mint one observation round: confirm opens
@@ -824,6 +887,22 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(%mint, "no live price and QUOTE_USD unset; dropping signal");
             return;
         };
+
+        // Mint-decimals gate: every sizing path below scales by 10^6
+        // (Pump.fun standard). A non-6 mint would misprice entries and
+        // live orders by 10^Δ — drop it loudly instead of guessing.
+        // Unreadable decimals fail closed for the same reason.
+        match self.reserves.token_decimals(mint).await {
+            Ok(6) => {}
+            Ok(other) => {
+                warn!(%mint, decimals = other, "non-6-decimal mint; sizing assumes 6 — dropping signal");
+                return;
+            }
+            Err(e) => {
+                warn!(%mint, error = %e, "mint decimals unreadable; dropping signal (fail-closed)");
+                return;
+            }
+        }
 
         // Developer passed a real on-chain history screen (trust carried
         // on the signal from launch time).
@@ -1163,6 +1242,54 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
+    /// Clone the per-mint tick mutex, creating it on first use. The map
+    /// guard is released before the mutex is locked (never held across),
+    /// so [`Pipeline::maybe_unwatch`] eviction cannot deadlock against
+    /// this path: clones held by in-flight tasks keep working after
+    /// eviction, and eviction only happens on a confirmed-empty book.
+    async fn mint_serial(&self, mint: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let serial = {
+            let mut locks = self.tick_locks.lock().await;
+            locks
+                .entry(mint.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        serial.lock_owned().await
+    }
+
+    /// Shared close-path tail: unwatch the feed on a confirmed-empty
+    /// state (no paper positions, no tracked live fills, no watchlisted
+    /// signal), evict this mint's serialization locks so the lock maps
+    /// stay bounded, and hunt migrations on graduated curves. Called by
+    /// both `on_tick` branches so the rule cannot diverge again; every
+    /// step is idempotent, so concurrent empties are harmless.
+    async fn maybe_unwatch(&self, tick: &PriceTick) {
+        if !self
+            .portfolio
+            .lock()
+            .await
+            .positions_for_mint(&tick.mint)
+            .is_empty()
+        {
+            return;
+        }
+        if self.exec.live_positions.lock().await.contains_key(&tick.mint) {
+            return;
+        }
+        if self.gate_state.lock().await.gate.contains(&tick.mint) {
+            return;
+        }
+        if self.reserves.unwatch(&tick.mint).await {
+            info!(mint = %tick.mint, "unwatched (nothing left)");
+            self.tick_locks.lock().await.remove(&tick.mint);
+            self.exec.live_sell_locks.lock().await.remove(&tick.mint);
+        }
+        if tick.complete {
+            self.report_migration_once(&tick.mint, &tick.curve).await;
+        }
+    }
+
     /// One price tick: evaluate exits for every open position on the mint,
     /// close on trigger, retry failed live exits, unwatch when nothing
     /// remains.
@@ -1170,14 +1297,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Per-mint serialization: two ticks for one mint must not
         // interleave close math and live probes (fractions computed from
         // divergent views would double-sell or strand dust).
-        let serial = {
-            let mut locks = self.tick_locks.lock().await;
-            locks
-                .entry(tick.mint.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _serial = serial.lock().await;
+        let _serial = self.mint_serial(&tick.mint).await;
         let mut portfolio = self.portfolio.lock().await;
         let ids: Vec<u64> = portfolio.positions_for_mint(&tick.mint);
         let mut closed_fraction = 0.0f64;
@@ -1196,19 +1316,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Pending buys recheck regardless of paper state (cheap when
             // a round is already in flight: late callers skip).
             self.recheck_live_pending().await;
-            // Same confirmed-empty rule as the close path below (paper,
-            // live, AND gate): unwinding the feed while a signal is still
-            // watchlisted only churns watch/unwatch.
-            let gate_pending = self.gate_state.lock().await.gate.contains(&tick.mint);
-            if !gate_pending
-                && !self.exec.live_positions.lock().await.contains_key(&tick.mint)
-                && self.reserves.unwatch(&tick.mint).await
-            {
-                info!(mint = %tick.mint, "unwatched (nothing left)");
-            }
-            if tick.complete {
-                self.report_migration_once(&tick.mint, &tick.curve).await;
-            }
+            // Shared tail: unwatch on confirmed-empty, evict locks,
+            // hunt migrations on graduated curves.
+            self.maybe_unwatch(tick).await;
             return;
         } else {
             if tick.complete {
@@ -1291,29 +1401,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // confirmation keeps its feed (cheap when a round is already in
         // flight: late callers skip).
         self.recheck_live_pending().await;
-        // Re-check under fresh locks: the gate task may have opened a new
-        // position for this mint during the awaits above. Unwatch only on
-        // a confirmed-empty state.
-        let still_open = !self
-            .portfolio
-            .lock()
-            .await
-            .positions_for_mint(&tick.mint)
-            .is_empty();
-        let live_holding = self.exec.live_positions.lock().await.contains_key(&tick.mint);
-        let gate_pending = self
-            .gate_state
-            .lock()
-            .await
-            .gate
-            .contains(&tick.mint);
-        if !still_open && !live_holding && !gate_pending && self.reserves.unwatch(&tick.mint).await
-        {
-            info!(mint = %tick.mint, "unwatched (nothing left)");
-        }
-        if tick.complete {
-            self.report_migration_once(&tick.mint, &tick.curve).await;
-        }
+        // Shared tail (see above): re-checks under fresh locks, so a
+        // position opened by the gate task during the awaits above is
+        // never unwatched from under it.
+        self.maybe_unwatch(tick).await;
     }
 
     /// Hunt and announce the migration exactly once per mint. Runs after
@@ -1611,6 +1702,8 @@ mod tests {
         unwatched: StdMutex<Vec<String>>,
         /// When true, `watch` fails (exit-feed outage plumbing).
         fail_watch: bool,
+        /// Mint decimals reported by `token_decimals` (6 = standard).
+        decimals: u8,
     }
 
     impl StubReserves {
@@ -1620,6 +1713,7 @@ mod tests {
                 watched: StdMutex::new(vec![]),
                 unwatched: StdMutex::new(vec![]),
                 fail_watch: false,
+                decimals: 6,
             }
         }
 
@@ -1629,7 +1723,13 @@ mod tests {
                 watched: StdMutex::new(vec![]),
                 unwatched: StdMutex::new(vec![]),
                 fail_watch: false,
+                decimals: 6,
             }
+        }
+
+        fn with_decimals(mut self, decimals: u8) -> Self {
+            self.decimals = decimals;
+            self
         }
     }
 
@@ -1639,6 +1739,10 @@ mod tests {
                 .clone()
                 .filter(|t| t.mint == mint)
                 .ok_or(CurveError::AccountMissing(mint.to_string()))
+        }
+
+        async fn token_decimals(&self, _mint: &str) -> Result<u8, CurveError> {
+            Ok(self.decimals)
         }
 
         async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
@@ -1736,6 +1840,9 @@ mod tests {
 
     struct StubScreenerInner {
         dev: StdMutex<DevOutcome>,
+        /// Wallets that fail screening even when `dev` passes (creator
+        /// cohort tests).
+        reject_wallets: StdMutex<Vec<String>>,
         swaps: StdMutex<HashMap<String, Vec<SwapRecord>>>,
         bundle: StdMutex<BundleOutcome>,
         migration: StdMutex<Option<MigrationReport>>,
@@ -1755,6 +1862,7 @@ mod tests {
             Self {
                 inner: Arc::new(StubScreenerInner {
                     dev: StdMutex::new(DevOutcome::Pass),
+                    reject_wallets: StdMutex::new(Vec::new()),
                     swaps: StdMutex::new(HashMap::new()),
                     bundle: StdMutex::new(BundleOutcome::Safe),
                     migration: StdMutex::new(None),
@@ -1766,6 +1874,14 @@ mod tests {
         fn with_dev(dev: DevOutcome) -> Self {
             let stub = Self::passing();
             *stub.inner.dev.lock().expect("lock") = dev;
+            stub
+        }
+
+        /// Fail screening for one wallet (creator-cohort tests) while
+        /// every other wallet follows `dev`.
+        fn rejecting(wallet: &str) -> Self {
+            let stub = Self::passing();
+            stub.inner.reject_wallets.lock().expect("lock").push(wallet.to_string());
             stub
         }
 
@@ -1781,7 +1897,15 @@ mod tests {
     }
 
     impl Screener for StubScreener {
-        async fn screen_dev(&self, _dev: &str) -> Result<DevVerdict, ScreenError> {
+        async fn screen_dev(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
+            if self.inner.reject_wallets.lock().expect("lock").contains(&dev.to_string()) {
+                return Ok(DevVerdict {
+                    pass: false,
+                    age_secs: Some(100),
+                    prior_launches: 0,
+                    reason: "stub cohort reject".to_string(),
+                });
+            }
             match *self.inner.dev.lock().expect("lock") {
                 DevOutcome::Pass => Ok(DevVerdict {
                     pass: true,
@@ -2040,6 +2164,54 @@ mod tests {
         }
         assert!(pipe.try_begin_poll().await);
         pipe.end_poll().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_snapshot_lists_open_and_live_state() {
+        let live = StubLive::working();
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::failing(),
+            funded(),
+            StubScreener::passing(),
+            Some(live),
+        );
+        // Empty book: nothing open, nothing tracked, nothing pending.
+        assert!(pipe.open_position_mints().await.is_empty());
+        assert!(pipe.live_tracked_mints().await.is_empty());
+        assert_eq!(pipe.pending_count().await, 0);
+        // Manual paper open + tracked live fill surface by mint.
+        pipe.portfolio
+            .lock()
+            .await
+            .open_position(
+                "MINT",
+                Side::Long,
+                2.0,
+                10.0,
+                1e9,
+                75.0,
+                -8.0,
+                false,
+                0.0,
+                0,
+                0.0,
+                1000,
+            )
+            .expect("manual open");
+        pipe.exec.live_positions.lock().await.insert(
+            "LIVE".to_string(),
+            LivePosition {
+                mint: "LIVE".to_string(),
+                curve: "CURVE".to_string(),
+                assoc_curve: "ASSOC".to_string(),
+                amount_tokens: 1_000,
+                creator: None,
+            },
+        );
+        assert_eq!(pipe.open_position_mints().await, vec!["MINT".to_string()]);
+        assert_eq!(pipe.live_tracked_mints().await, vec!["LIVE".to_string()]);
     }
 
     #[tokio::test]
@@ -2448,6 +2620,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_skips_on_creator_reject() {
+        // v2 creator fails screening while the launcher passes: no
+        // watchlist entry (fail-closed AND over both insider wallets).
+        let creator = fixture_wallet(8);
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            StubScreener::rejecting(&creator),
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), Some(&creator), 5000)
+            .await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn launch_watches_creator_cohort_dump() {
+        // Distinct v2 creator is screened, watchlisted, and its dump
+        // aborts the gate like the launcher's.
+        let creator = fixture_wallet(8);
+        let dump = SwapRecord::new("dump", &creator, SwapSide::Sell, 1003, 1_000_000)
+            .expect("fixture");
+        let screener = StubScreener::with_swaps("MINT", vec![dump]);
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), Some(&creator), 5000)
+            .await;
+        assert_eq!(pipe.pending_count().await, 1);
+        pipe.poll_gates().await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn launch_skips_on_audit_reject_and_error() {
         for outcome in [AuditOutcome::Reject, AuditOutcome::Broken] {
             let reserves = StubReserves::with_tick(tick("MINT", 2.0));
@@ -2480,6 +2695,26 @@ mod tests {
         );
         pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
             .await;
+        pipe.poll_gates().await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn confirm_drops_non_six_decimal_mint() {
+        // Sizing scales by 10^6 everywhere: a 9-decimal mint would
+        // misprice entries 1000x — drop loudly instead of guessing.
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0)).with_decimals(9);
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000).await;
         pipe.poll_gates().await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert_eq!(pipe.pending_count().await, 0);

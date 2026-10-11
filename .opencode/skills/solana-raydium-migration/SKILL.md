@@ -88,7 +88,7 @@ impl MigrationMonitor {
     }
 
     /// Detects destination from an on-chain migration transaction.
-    /// Requires the watched curve or expected base mint among the keys
+    /// Requires the watched curve or expected token mint among the keys
     /// (unlinked shared-tx inits must not false-positive), plus:
     pub fn classify_migration(
         &self,
@@ -96,14 +96,14 @@ impl MigrationMonitor {
         instructions_data: &[Vec<u8>],
         log_messages: &[String],
         curve: &Pubkey,
-        expected_base_mint: &Pubkey,
+        expected_token_mint: &Pubkey,
     ) -> Option<MigrationDestination> {
         let mentions_authority = account_keys.iter().any(|k| k == &self.pump_migration_authority);
         let mentions_pump = account_keys.iter().any(|k| k == &self.pump_program);
         if !mentions_authority && !mentions_pump {
             return None;
         }
-        let linked = account_keys.iter().any(|k| k == curve || k == expected_base_mint);
+        let linked = account_keys.iter().any(|k| k == curve || k == expected_token_mint);
         if !linked {
             return None;
         }
