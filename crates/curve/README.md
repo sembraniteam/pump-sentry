@@ -19,8 +19,11 @@ getAccount / getMultipleAccounts (HTTP RPC)
   `real_*`, `token_total_supply`, `complete`); genesis-reserve unit
   test pins spot ≈ 2.7959e-8 SOL.
 - `ticker` — `CurveTicker` with a dynamic watch set (`watch`/`unwatch` per mint), `fetch_tick` one-shot reads, and a
-  `run` loop emitting `PriceTick`s via `getMultipleAccounts` per round.
-  Missed rounds log and continue; the loop ends when the receiver drops.
+  `run` loop emitting `PriceTick`s via chunked `getMultipleAccounts` (≤100
+  accounts per call) per round. Every round is deadline-bound (`ROUND_TIMEOUT` 15s); missed rounds log and continue; the
+  loop ends
+  when the receiver drops. Unknown commitments are rejected (`None`),
+  never coerced — callers fail closed.
 
 ## Use
 
