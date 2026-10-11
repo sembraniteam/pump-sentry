@@ -8,20 +8,27 @@ Non-blocking Discord trade alerts via Hermes CLI (skill
 ```
 Alerter::send(card)
   └─ tokio::spawn detached: `hermes send --to discord[:<channel-id>] "<card>"`
-     ├─ 5s timeout → warn only
+     ├─ 5s timeout → child killed, warn only
      ├─ spawn failure → warn only
      ├─ non-zero exit → warn with stderr
      └─ success → silent
 ```
 
-Never blocks pricing or swap paths; never fails the caller.
+Never blocks pricing or swap paths; never fails the caller. Alerts are
+observability, not consensus: at most 4 children run at once, excess
+messages drop with a counter (`dropped_count`) instead of fork-bombing
+the host under storm load.
 
 - `discord::Alerter` — `{binary, enabled, timeout, channel}`;
   `disabled()` is a no-op for tests and silent runs; `with_binary()`
   redirects dispatch (tests use `/bin/echo` and `/bin/false`);
-  `with_channel("<numeric-id>")` targets `--to discord:<id>` (blank or
-  non-numeric input keeps the default target; the skill defines no
-  channel flag — routing otherwise lives in the host Hermes config).
+  `with_channel("<numeric-id>")` targets `--to discord:<id>` (blank,
+  non-numeric, or overlong input keeps the default target; the skill
+  defines no channel flag — routing otherwise lives in the host Hermes
+  config). `HERMES_BIN` env overrides the binary path (prefer absolute:
+  a bare `hermes` resolves via `PATH`, which a writable directory can
+  hijack). Timed-out children are killed (`kill_on_drop`) so late
+  deliveries cannot duplicate after the timeout.
 - Cards — skill formats verbatim: `format_entry` (🟢 open with TP/SL),
   `format_exit` (🎯/🛑 with reason, signed PnL, equity, moonbag tag),
   `format_live_buy` / `format_live_sell` carrying the Jito bundle UUID,

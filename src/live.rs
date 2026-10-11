@@ -34,6 +34,11 @@ pub enum LiveError {
 /// Fill-confirmation deadline per dispatch (bundles land in seconds or
 /// not at all; the gate loop must not stall on one token).
 pub const LIVE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
+/// Dispatch deadline per Jito send: only `confirm_signature` used to be
+/// bounded, so a hung RPC/Jito call blocked the caller (and its locks)
+/// forever. A timed-out dispatch has no receipt, so the fill is reported
+/// unknown for manual review rather than assumed either way.
+pub const LIVE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Minimum spacing between live-sell retries for one mint.
 pub const SELL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 /// Failed live sells before tracking is dropped for manual exit.
@@ -177,6 +182,11 @@ pub struct LiveTrader {
     /// via [`LiveTrader::recheck_pending`] until confirmed, failed, or
     /// out of attempts (then manual review). Short critical sections only.
     pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+    /// At most one [`LiveTrader::recheck_pending`] round runs at a time:
+    /// ticks fire every second while a round can take up to the confirm
+    /// timeout, so overlapping rounds would stack identical confirm RPCs
+    /// and race the attempt counters. Late callers skip (empty vec).
+    recheck_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Buy awaiting confirmation: reserved for the recheck loop, never treated
@@ -225,6 +235,7 @@ impl LiveTrader {
             pending: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            recheck_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -239,14 +250,34 @@ impl LiveTrader {
     /// Re-poll every pending buy once (one fresh confirmation window each).
     /// Confirmed and failed entries leave the map; unknown ones stay until
     /// [`PENDING_MAX_ATTEMPTS`] and then report [`RecheckOutcome::GiveUp`].
+    /// Confirms run concurrently (one slow mint must not hold up the
+    /// rest); a round already in flight makes late callers skip.
     pub async fn recheck_pending(&self) -> Vec<PendingRecheck> {
+        if self
+            .recheck_busy
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Vec::new();
+        }
+        // Reset on every exit path, including panic unwinds: a stuck flag
+        // would silence all future rechecks.
+        struct ResetOnDrop {
+            busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                self.busy.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _reset = ResetOnDrop {
+            busy: std::sync::Arc::clone(&self.recheck_busy),
+        };
         let snapshot: Vec<PendingBuy> = self
             .pending
             .lock()
             .map(|g| g.values().cloned().collect())
             .unwrap_or_default();
-        let mut out = Vec::with_capacity(snapshot.len());
-        for entry in snapshot {
+        let results = futures_util::future::join_all(snapshot.into_iter().map(|entry| async {
             let outcome = match self
                 .executor
                 .confirm_signature(&entry.signature, LIVE_CONFIRM_TIMEOUT)
@@ -268,6 +299,11 @@ impl LiveTrader {
                     }
                 }
             };
+            (entry, outcome)
+        }))
+        .await;
+        let mut out = Vec::with_capacity(results.len());
+        for (entry, outcome) in results {
             match outcome {
                 RecheckOutcome::StillUnknown => {}
                 _ => {
@@ -292,27 +328,43 @@ impl LiveTrader {
             req.mint, req.curve, req.assoc_curve, req.notional_usd, req.price_usd, req.sol_usd,
         );
         let creator = match req.creator {
-            Some(c) => Some(parse_pubkey(c).map_err(|e| LiveError::BadOrder(e.to_string()))?),
+            Some(c) => {
+                Some(parse_pubkey(c).map_err(|e| LiveError::BadOrder(format!("bad creator '{c}': {e}")))?)
+            }
             None => None,
         };
         let plan =
             plan_buy(notional_usd, price_usd, sol_usd, self.slippage_bps).ok_or_else(|| {
                 LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
             })?;
-        let receipt = self
-            .executor
-            .buy_jito(&BuyOrder {
-                mint: parse_pubkey(mint).map_err(|e| LiveError::BadOrder(e.to_string()))?,
+        let receipt = match tokio::time::timeout(
+            LIVE_DISPATCH_TIMEOUT,
+            self.executor.buy_jito(&BuyOrder {
+                mint: parse_pubkey(mint)
+                    .map_err(|e| LiveError::BadOrder(format!("bad mint '{mint}': {e}")))?,
                 bonding_curve: parse_pubkey(curve)
-                    .map_err(|e| LiveError::BadOrder(e.to_string()))?,
+                    .map_err(|e| LiveError::BadOrder(format!("bad curve '{curve}': {e}")))?,
                 associated_bonding_curve: parse_pubkey(assoc_curve)
-                    .map_err(|e| LiveError::BadOrder(e.to_string()))?,
+                    .map_err(|e| LiveError::BadOrder(format!("bad assoc_curve '{assoc_curve}': {e}")))?,
                 amount_tokens: plan.amount_tokens,
                 max_sol_cost: plan.max_sol_cost,
                 tip_lamports: self.tip_lamports,
                 creator,
-            })
-            .await?;
+            }),
+        )
+        .await
+        {
+            Ok(dispatch) => dispatch?,
+            Err(_) => {
+                // Dispatch hung: the bundle may or may not have reached
+                // the engine, and there is no signature to re-poll — the
+                // fill is unknown and needs a human.
+                return Err(LiveError::Unconfirmed(format!(
+                    "buy dispatch of {mint} timed out after {:?}; fill unknown, MANUAL REVIEW REQUIRED",
+                    LIVE_DISPATCH_TIMEOUT
+                )));
+            }
+        };
         tracing::info!(%mint, bundle = %receipt.bundle_id, amount = plan.amount_tokens, "LIVE buy dispatched");
         match self
             .executor
@@ -382,6 +434,9 @@ impl LiveTrader {
     /// Record an unconfirmed buy for the recheck loop. Used for timeouts
     /// AND transport errors alike: in both cases the fill is unknown, and
     /// only a proven on-chain failure (`FailedOnChain`) means no fill.
+    /// First receipt wins per mint: a second pending buy for the same
+    /// mint is logged loudly for manual review instead of silently
+    /// dropping the first bag's tracking.
     fn track_pending(
         pending: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
         mint: &str,
@@ -389,15 +444,16 @@ impl LiveTrader {
         receipt: &JitoReceipt,
     ) {
         if let Ok(mut guard) = pending.lock() {
-            guard.insert(
-                mint.to_string(),
-                PendingBuy {
-                    position,
-                    signature: receipt.signature.clone(),
-                    bundle_id: receipt.bundle_id.clone(),
-                    attempts: 1,
-                },
-            );
+            if let Some(existing) = guard.get(mint) {
+                tracing::warn!(mint = %mint, old_bundle = %existing.bundle_id, new_bundle = %receipt.bundle_id,
+                    "second pending buy for the same mint; keeping the first, MANUAL REVIEW REQUIRED for the second");
+            }
+            guard.entry(mint.to_string()).or_insert(PendingBuy {
+                position,
+                signature: receipt.signature.clone(),
+                bundle_id: receipt.bundle_id.clone(),
+                attempts: 1,
+            });
         }
     }
 
@@ -416,24 +472,37 @@ impl LiveTrader {
             self.slippage_bps,
         )
         .ok_or_else(|| LiveError::BadOrder(format!("cannot floor sell of {}", position.mint)))?;
-        let receipt = self
-            .executor
-            .sell_jito(&SellOrder {
+        let receipt = match tokio::time::timeout(
+            LIVE_DISPATCH_TIMEOUT,
+            self.executor.sell_jito(&SellOrder {
                 mint: parse_pubkey(&position.mint)
-                    .map_err(|e| LiveError::BadOrder(e.to_string()))?,
+                    .map_err(|e| LiveError::BadOrder(format!("bad mint '{}': {e}", position.mint)))?,
                 bonding_curve: parse_pubkey(&position.curve)
-                    .map_err(|e| LiveError::BadOrder(e.to_string()))?,
+                    .map_err(|e| LiveError::BadOrder(format!("bad curve '{}': {e}", position.curve)))?,
                 associated_bonding_curve: parse_pubkey(&position.assoc_curve)
-                    .map_err(|e| LiveError::BadOrder(e.to_string()))?,
+                    .map_err(|e| LiveError::BadOrder(format!("bad assoc_curve '{}': {e}", position.assoc_curve)))?,
                 amount_tokens: position.amount_tokens,
                 min_sol_output: floor,
                 tip_lamports: self.tip_lamports,
                 creator: match &position.creator {
-                    Some(c) => Some(parse_pubkey(c).map_err(|e| LiveError::BadOrder(e.to_string()))?),
+                    Some(c) => Some(
+                        parse_pubkey(c)
+                            .map_err(|e| LiveError::BadOrder(format!("bad creator '{c}': {e}")))?,
+                    ),
                     None => None,
                 },
-            })
-            .await?;
+            }),
+        )
+        .await
+        {
+            Ok(dispatch) => dispatch?,
+            Err(_) => {
+                return Err(LiveError::Unconfirmed(format!(
+                    "sell dispatch of {} timed out after {:?}; still holding",
+                    position.mint, LIVE_DISPATCH_TIMEOUT
+                )));
+            }
+        };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE sell dispatched");
         match self
             .executor

@@ -21,6 +21,9 @@ pub enum RugCheckError {
     /// Token rejected: {0}
     #[error("Token rejected: {0}")]
     SecurityRejection(String),
+    /// Client misconfiguration (bad API root): {0}
+    #[error("bad RugCheck config: {0}")]
+    BadUrl(String),
 }
 
 /// Risk report for one mint, as returned by
@@ -29,8 +32,9 @@ pub enum RugCheckError {
 pub struct RugCheckReport {
     /// Token mint address (base58).
     pub mint: String,
-    /// Aggregate risk score; higher is riskier.
-    #[serde(default)]
+    /// Aggregate risk score; higher is riskier. Required: a missing
+    /// score must fail the fetch (fail-closed), never parse as 0 and
+    /// sail through the score gate.
     pub score: u32,
     /// Individual risk findings.
     #[serde(default)]
@@ -54,7 +58,9 @@ pub struct RiskItem {
     /// Risk contribution in points.
     #[serde(default)]
     pub score: u32,
-    /// Severity: `warn` or `danger`.
+    /// Severity: `warn` or `danger`. Required in spirit but tolerant in
+    /// parsing: an unknown level parses fine and is rejected by policy
+    /// (fail-closed there, where the allowlist lives).
     #[serde(default)]
     pub level: String,
 }
@@ -103,10 +109,17 @@ mod tests {
     #[test]
     fn tolerates_missing_fields() {
         let report: RugCheckReport =
-            serde_json::from_str(r#"{"mint": "ABC"}"#).expect("minimal JSON");
+            serde_json::from_str(r#"{"mint": "ABC", "score": 0}"#).expect("minimal JSON");
         assert_eq!(report.mint, "ABC");
         assert_eq!(report.score, 0);
         assert!(report.risks.is_empty());
         assert!(report.token.is_none());
+    }
+
+    #[test]
+    fn missing_score_fails_closed() {
+        // No score must not parse as 0 (a free pass through the gate).
+        let err = serde_json::from_str::<RugCheckReport>(r#"{"mint": "ABC"}"#).expect_err("must fail");
+        assert!(err.to_string().contains("score"));
     }
 }

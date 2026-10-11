@@ -16,6 +16,7 @@
 //! Spot price follows the constant-product invariant: SOL per token =
 //! `virtual_sol / virtual_token`, scaled by token decimals.
 
+use solana_sdk::pubkey::Pubkey;
 use thiserror::Error;
 
 /// sha256(`"account:BondingCurve"`)[..8], verified by hashing.
@@ -49,6 +50,9 @@ pub enum CurveParseError {
     /// First 8 bytes are not the bonding-curve discriminator.
     #[error("bonding curve discriminator mismatch")]
     BadDiscriminator,
+    /// Account owner is not the Pump.fun program (spoofed price source).
+    #[error("bonding curve account owned by {0}, not the pump program")]
+    WrongOwner(String),
 }
 
 /// Parsed virtual + real reserves of a Pump.fun bonding curve.
@@ -70,8 +74,7 @@ pub struct BondingCurveReserves {
 
 impl BondingCurveReserves {
     /// Parse raw account data. Bounds-checked; never panics.
-    pub fn parse(data: &[u8]) -> Result<Self, CurveParseError> {
-        if data.len() < BONDING_CURVE_MIN_LEN {
+    pub fn parse(data: &[u8]) -> Result<Self, CurveParseError> {        if data.len() < BONDING_CURVE_MIN_LEN {
             return Err(CurveParseError::DataTooShort(data.len()));
         }
         if data[..8] != BONDING_CURVE_DISCRIMINATOR {
@@ -90,6 +93,17 @@ impl BondingCurveReserves {
             token_total_supply: u64le(40),
             complete: data[48] != 0,
         })
+    }
+
+    /// Parse with program-ownership gating: any account with a colliding
+    /// prefix but a foreign owner (spoofed price source) is rejected.
+    /// Prefer this over [`Self::parse`] whenever the account owner is
+    /// known (every RPC read returns it).
+    pub fn parse_validated(data: &[u8], owner: &Pubkey) -> Result<Self, CurveParseError> {
+        if owner != &ids::PUMP_PROGRAM_ID {
+            return Err(CurveParseError::WrongOwner(owner.to_string()));
+        }
+        Self::parse(data)
     }
 
     /// Spot price in SOL per whole token, or `None` on empty reserves.
@@ -178,8 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_short_and_foreign_data() {
-        assert_eq!(
+    fn rejects_short_and_foreign_data() {        assert_eq!(
             BondingCurveReserves::parse(&[0u8; 10]),
             Err(CurveParseError::DataTooShort(10))
         );
@@ -212,5 +225,16 @@ mod tests {
         r.virtual_token_reserves = 0;
         assert_eq!(r.price_sol(6), None);
         assert_eq!(r.price_usd(6, 150.0), None);
+    }
+
+    #[test]
+    fn validated_parse_gates_owner() {
+        let data = genesis_data();
+        assert!(BondingCurveReserves::parse_validated(&data, &ids::PUMP_PROGRAM_ID).is_ok());
+        let stranger = Pubkey::new_from_array([9; 32]);
+        assert_eq!(
+            BondingCurveReserves::parse_validated(&data, &stranger),
+            Err(CurveParseError::WrongOwner(stranger.to_string()))
+        );
     }
 }

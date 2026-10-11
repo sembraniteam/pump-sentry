@@ -4,12 +4,13 @@
 //! tests inject stubs instead of network clients. Pure helpers
 //! ([`resolve_entry`]) stay free functions for direct testing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use alert::Alerter;
 use auditor::{RugCheckClient, RugCheckError, RugCheckReport};
 use curve::{CurveError, CurveTicker, PriceTick};
+use executor::ExecutorError;
 use listener::{
     BundleAnalysis, BundleVerdict, DevVerdict, EntryGate, GateOutcome, MigrationReport,
     RpcScreener, ScreenError, SwapRecord,
@@ -18,7 +19,7 @@ use migration::{PoolTick, VaultTicker};
 use risk_engine::{Action, RiskEngine, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics, evaluate_heuristic_fallback, resolve_strategy};
 use simulator::{ExitReason, PaperPortfolio, Side, check_exit};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveTrader, PendingRecheck, RecheckOutcome, SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN};
 use crate::settings::{Settings, now_secs};
@@ -126,13 +127,14 @@ impl AlertSink for Alerter {
 pub trait Screener {
     /// Developer history verdict; `Err` means fail-closed skip.
     async fn screen_dev(&self, dev: &str) -> Result<DevVerdict, ScreenError>;
-    /// Swap records for a curve since `since_sig`, plus the new watermark.
+    /// Swap records for a curve since `since_sig`, plus the new watermark
+    /// and a truncation flag (a truncated round must not advance quorum).
     async fn observe_curve(
         &self,
         mint: &str,
         curve: &str,
         since_sig: Option<&str>,
-    ) -> Result<(Vec<SwapRecord>, Option<String>), ScreenError>;
+    ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError>;
     /// Bundle forensics at confirm time; `Err` means fail-closed drop.
     async fn screen_bundle(
         &self,
@@ -158,7 +160,7 @@ impl Screener for RpcScreener {
         _mint: &str,
         curve: &str,
         since_sig: Option<&str>,
-    ) -> Result<(Vec<SwapRecord>, Option<String>), ScreenError> {
+    ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError> {
         let curve = listener::parse_address(curve)?;
         self.curve_swaps(&curve, since_sig).await
     }
@@ -186,12 +188,38 @@ impl Screener for RpcScreener {
     }
 }
 
-/// One curve observation: `(mint, signal, swaps+watermark or error)`.
+/// One curve observation: `(mint, signal, swaps+watermark+truncated or error)`.
 type Observation = (
     String,
     PendingSignal,
-    Result<(Vec<SwapRecord>, Option<String>), ScreenError>,
+    Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError>,
 );
+
+/// Concurrent RPC fanout per gate phase: a full `join_all` over a
+/// thousand-entry watchlist opens a thousand concurrent RPCs (rate-limit
+/// mass timeouts); 16 at a time keeps rounds moving without hammering.
+const GATE_FANOUT: usize = 16;
+
+/// Map screened dev history to a 0.4–1.0 trust score for the risk
+/// input. Screening already rejected young/prolific wallets; survivors
+/// ramp from 0.7 at exactly `min_age` to 1.0 at 4× `min_age`, minus 0.05
+/// per prior launch. The 0.4 floor equals the heuristic PASS cutoff, so
+/// screening and scoring cannot disagree on the worst devs. A disabled
+/// age gate (`min_age_secs == 0`) scores full trust (nothing to ramp on).
+/// Unknown age scores 0.6 (below any screened survivor — unreachable in
+/// production since screening rejects ageless wallets outright).
+pub fn dev_reputation_score(
+    age_secs: Option<u64>,
+    prior_launches: usize,
+    min_age_secs: u64,
+) -> f64 {
+    let age_factor = match (age_secs, min_age_secs) {
+        (Some(age), min) if min > 0 => (age as f64 / (min as f64 * 4.0)).min(1.0),
+        (Some(_), _) => 1.0,
+        (None, _) => 0.0,
+    };
+    (0.6 + 0.4 * age_factor - 0.05 * prior_launches as f64).clamp(0.4, 1.0)
+}
 
 /// Resolve an entry price and sizing liquidity from a reserve read.
 ///
@@ -263,10 +291,14 @@ pub struct Pipeline<
     pub reserves: R,
     /// Virtual positions and cash.
     pub portfolio: Mutex<PaperPortfolio>,
+    /// Per-mint tick serialization (see [`Pipeline::on_tick`]).
+    pub tick_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Real-funds execution state (dispatcher, fills, retries).
     pub exec: LiveExecution<L>,
-    /// Mints already reported as migrated (report once).
-    pub migrated: Mutex<HashSet<String>>,
+    /// Mints already reported as migrated, with first-report time
+    /// (pruned past a day; a stale entry only risks a duplicate card,
+    /// never a missed migration).
+    pub migrated: Mutex<HashMap<String, u64>>,
     /// Post-migration pool watchlist (paper tracking only).
     pub followed: Mutex<HashMap<String, FollowState>>,
     /// Raydium vault ticker for followed pools.
@@ -278,6 +310,9 @@ pub struct Pipeline<
     /// Day-loss circuit breaker (new entries halt past the cap; exits
     /// never block).
     pub daily: Mutex<DailyBreaker>,
+    /// Execution strategy, parsed once at startup (unknown modes fall
+    /// back to adaptive with a warning there, not per-tick spam).
+    pub strategy: StrategyMode,
     /// Trade cards; `None` silences alerting entirely.
     pub alerts: Option<T>,
 }
@@ -332,7 +367,19 @@ pub struct FollowState {
     pub entry_price: f64,
     /// Whether the spike card already fired.
     pub alerted_spike: bool,
+    /// Last pool-tick time (unix secs): idle follows older than
+    /// [`FOLLOW_TTL_SECS`] are evicted (dead pools, bounded growth).
+    pub last_seen_secs: u64,
 }
+
+/// Idle-follow TTL: post-migration pools that never spike stop being
+/// polled after a day (evicted with their vault watch).
+pub const FOLLOW_TTL_SECS: u64 = 86_400;
+/// Reported-migration memory: entries older than a day are pruned (a
+/// stale entry only risks a duplicate card, never a miss).
+pub const MIGRATED_TTL_SECS: u64 = 86_400;
+/// Backstop cap for reported-migration memory (oldest-first eviction).
+pub const MIGRATED_CAP: usize = 5_000;
 
 /// Confirm-open request: one gate-confirmed signal plus its quorum.
 /// Bundles the four `confirm_open` inputs so new context cannot grow the
@@ -378,6 +425,9 @@ pub struct PendingSignal {
     pub creation_slot: u64,
     /// Signature watermark for incremental curve reads.
     pub last_sig: Option<String>,
+    /// Continuous dev-trust score (0.4–1.0) from the launch-time screen,
+    /// carried to confirm time for the risk input.
+    pub dev_trust: f64,
 }
 
 /// Entry gate plus signal context under one lock (no lock ordering).
@@ -386,9 +436,19 @@ pub struct GateState {
     pub gate: EntryGate,
     /// Per-mint context for pending entries.
     pub meta: HashMap<String, PendingSignal>,
-    /// Gate-poll mutual exclusion across overlapping rounds.
-    pub poll_busy: std::sync::atomic::AtomicBool,
+    /// Gate-poll mutual exclusion across overlapping rounds. Set while a
+    /// round runs, with the claim timestamp: a claim older than
+    /// [`STALE_POLL_SECS`] is treated as leaked (owning task cancelled
+    /// before [`Pipeline::end_poll`]) and may be taken over, so the gate
+    /// self-heals instead of stalling forever.
+    pub poll_busy: bool,
+    /// `now_secs` of the current `poll_busy` claim (0 when free).
+    pub poll_started_secs: u64,
 }
+
+/// Age after which a gate-poll claim is considered leaked and eligible
+/// for takeover (normal rounds finish in seconds; margin is generous).
+pub const STALE_POLL_SECS: u64 = 120;
 
 /// Day-loss circuit breaker: halts *new entries* once the UTC-day
 /// realized net passes the configured loss cap. Exits always keep
@@ -438,7 +498,8 @@ impl GateState {
         Self {
             gate,
             meta: HashMap::new(),
-            poll_busy: std::sync::atomic::AtomicBool::new(false),
+            poll_busy: false,
+            poll_started_secs: 0,
         }
     }
 }
@@ -458,18 +519,24 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         vaults: VaultTicker,
     ) -> Arc<Self> {
         let gate = EntryGate::new(settings.gate_window_secs, settings.gate_min_buyers);
+        let strategy = settings.strategy_mode.parse().unwrap_or_else(|e| {
+            warn!(mode = %settings.strategy_mode, error = %e, "bad strategy mode; using adaptive");
+            StrategyMode::Adaptive
+        });
         Arc::new(Self {
             settings,
             auditor,
             engine,
             reserves,
             portfolio: Mutex::new(portfolio),
+            tick_locks: Mutex::new(HashMap::new()),
             exec: LiveExecution::paper().with_live(live),
-            migrated: Mutex::new(HashSet::new()),
+            migrated: Mutex::new(HashMap::new()),
             followed: Mutex::new(HashMap::new()),
             screener,
             gate_state: Mutex::new(GateState::new(gate)),
             daily: Mutex::new(DailyBreaker::new(now_secs())),
+            strategy,
             alerts,
             vaults,
         })
@@ -481,27 +548,31 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
     }
 
     /// Claim the gate-poll slot; false when a round is already running.
+    /// A claim older than [`STALE_POLL_SECS`] is treated as leaked (the
+    /// owning task was cancelled before [`Pipeline::end_poll`]) and taken
+    /// over with a loud log.
     pub async fn try_begin_poll(&self) -> bool {
-        self.gate_state
-            .lock()
-            .await
-            .poll_busy
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok()
+        let mut state = self.gate_state.lock().await;
+        let now = now_secs();
+        if state.poll_busy && now.saturating_sub(state.poll_started_secs) < STALE_POLL_SECS {
+            return false;
+        }
+        if state.poll_busy {
+            warn!(
+                "stale gate-poll claim (age {:?}s); taking over",
+                now.saturating_sub(state.poll_started_secs)
+            );
+        }
+        state.poll_busy = true;
+        state.poll_started_secs = now;
+        true
     }
 
     /// Release the gate-poll slot after a round.
     pub async fn end_poll(&self) {
-        self.gate_state
-            .lock()
-            .await
-            .poll_busy
-            .store(false, std::sync::atomic::Ordering::Release);
+        let mut state = self.gate_state.lock().await;
+        state.poll_busy = false;
+        state.poll_started_secs = 0;
     }
 }
 
@@ -518,6 +589,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         creator: Option<&str>,
         slot: u64,
     ) {
+        // Invariant: every address here arrives as a stringified, already
+        // parsed `Pubkey` (production callers forward parser output, which
+        // is typed). Stubs pass placeholders like "MINT" — downstream
+        // screening parses defensively (`parse_address` at each RPC
+        // boundary), so a bad string degrades to per-round warnings until
+        // the gate sweep, never to a mispriced open.
         // 1. Audit — fail closed.
         let report = match self.auditor.evaluate_token(mint).await {
             Ok(report) => report,
@@ -531,10 +608,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         };
 
-        // 2. Developer history — fail closed.
-        match self.screener.screen_dev(dev).await {
+        // 2. Developer history — fail closed. Survivors fold into a
+        // continuous trust score (see `dev_reputation_score`) rather than
+        // a flat 1.0, so barely-old-enough wallets price worse than
+        // long-aged ones.
+        let dev_trust = match self.screener.screen_dev(dev).await {
             Ok(verdict) if verdict.pass => {
                 info!(%mint, age = ?verdict.age_secs, priors = verdict.prior_launches, "dev screen pass");
+                dev_reputation_score(
+                    verdict.age_secs,
+                    verdict.prior_launches,
+                    self.settings.dev_min_age_secs,
+                )
             }
             Ok(verdict) => {
                 info!(%mint, reason = %verdict.reason, "dev screen reject");
@@ -544,7 +629,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 warn!(%mint, error = %e, "dev screen error; skipping (fail-closed)");
                 return;
             }
-        }
+        };
 
         // 3. Watchlist — demand confirmation happens in poll_gates.
         let mut state = self.gate_state.lock().await;
@@ -561,6 +646,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 creation_slot: slot,
                 last_sig: None,
                 creator: creator.map(|c| c.to_string()),
+                dev_trust,
             },
         );
         info!(%mint, score = report.score, "watchlisted; awaiting buyer quorum");
@@ -583,15 +669,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         };
-        // Phase 1: concurrent observations.
+        // Phase 1: concurrent observations, bounded so a large
+        // watchlist cannot open one RPC per mint at once.
+        use futures_util::stream::{self, StreamExt};
         let observations: Vec<Observation> =
-            futures_util::future::join_all(mints.into_iter().map(|(mint, signal)| async move {
+            stream::iter(mints.into_iter().map(|(mint, signal)| async move {
                 let observed = self
                     .screener
                     .observe_curve(&mint, &signal.curve, signal.last_sig.as_deref())
                     .await;
                 (mint, signal, observed)
             }))
+            .buffered(GATE_FANOUT)
+            .collect()
             .await;
         // Phase 2: gate state machine (fast, sequential for determinism).
         enum GateStep {
@@ -602,13 +692,21 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         let mut confirmed: Vec<(String, PendingSignal, u32)> = Vec::new();
         for (mint, mut signal, observed) in observations {
-            let (swaps, newest) = match observed {
+            let (swaps, newest, truncated) = match observed {
                 Ok(observed) => observed,
                 Err(e) => {
                     warn!(%mint, error = %e, "curve observation failed; keeping watch");
                     continue;
                 }
             };
+            if truncated {
+                // Partial view: never confirm on it and never advance the
+                // watermark — the next round re-reads the same window once
+                // velocity cools. Sustained truncation hits the deadline
+                // (abort), the fail-closed answer to a gap.
+                debug!(%mint, "curve observation truncated; holding watch without quorum");
+                continue;
+            }
             // Single critical section: skip the round when a concurrent
             // relaunch replaced the snapshot (never clobber fresh signal
             // context), then observe and remove atomically on terminal
@@ -616,8 +714,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             let step = {
                 let mut state = self.gate_state.lock().await;
                 let fresh = state.meta.get(&mint);
+                // Any identity drift (curve, ATA, creator, score, slot)
+                // means a concurrent relaunch replaced the snapshot: never
+                // clobber fresh signal context or confirm on stale reads.
                 let stale = fresh.is_some_and(|current| {
                     current.curve != signal.curve
+                        || current.assoc_curve != signal.assoc_curve
+                        || current.creator != signal.creator
                         || current.score != signal.score
                         || current.creation_slot != signal.creation_slot
                 });
@@ -649,9 +752,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 GateStep::Waiting | GateStep::Stale => {}
             }
         }
-        // Phase 3: concurrent bundle forensics + opens.
+        // Phase 3: bundle forensics + opens, bounded like phase 1 (the
+        // slowest RPC path must never fan out without limit either).
         if !confirmed.is_empty() {
-            futures_util::future::join_all(confirmed.into_iter().map(|(mint, signal, buyers)| async move {
+            use futures_util::stream::{self, StreamExt};
+            stream::iter(confirmed.into_iter().map(|(mint, signal, buyers)| async move {
                 // Bundle forensics before money moves: reject drops,
                 // suspect trades paper-only, safe runs the full flow.
                 match self
@@ -676,10 +781,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                 }
             }))
+            .buffered(GATE_FANOUT)
+            .collect::<Vec<()>>()
             .await;
         }
         let now = now_secs();
-        for (mint, outcome) in self.gate_state.lock().await.gate.sweep_timeouts(now) {
+        // Collect under one short critical section: iterating while
+        // re-locking per mint depends on temporary-guard drops and would
+        // self-deadlock the moment a refactor holds the guard across.
+        let timeouts = { self.gate_state.lock().await.gate.sweep_timeouts(now) };
+        for (mint, outcome) in timeouts {
             // Only drop meta when no fresh entry replaced it mid-sweep.
             let mut state = self.gate_state.lock().await;
             if !state.gate.contains(&mint) {
@@ -714,11 +825,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         };
 
-        // Developer passed a real on-chain history screen: encode as full trust.
+        // Developer passed a real on-chain history screen (trust carried
+        // on the signal from launch time).
         let metrics = TokenMetrics {
             liquidity_usd,
             buy_velocity_5s: buyers,
-            dev_reputation: 1.0,
+            dev_reputation: signal.dev_trust,
             rugcheck_score: signal.score,
         };
         let profile = match &self.engine {
@@ -734,15 +846,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             info!(%mint, buyers, score = signal.score, "risk PASS at confirm");
             return;
         }
-        // Multi-strategy execution: rewrite the BUY profile per
-        // STRATEGY_MODE (adaptive = verbatim, scalp = TP band + full
-        // exits, runner = forced moonbag + trailing). Unknown modes fall
-        // back to adaptive with a startup warning (see settings).
+        // Multi-strategy execution: rewrite the BUY profile per the
+        // startup-parsed `self.strategy` (adaptive = verbatim, scalp = TP
+        // band + full exits, runner = forced moonbag + trailing).
         let strategy = StrategyConfig {
-            mode: self.settings.strategy_mode.parse().unwrap_or_else(|e| {
-                warn!(mode = %self.settings.strategy_mode, error = %e, "bad strategy mode; using adaptive");
-                StrategyMode::Adaptive
-            }),
+            mode: self.strategy,
             runner_moonbag_percent: self.settings.runner_moonbag_percent,
         };
         let profile = resolve_strategy(&profile, &strategy);
@@ -837,14 +945,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 info!(%mint, id, entry = format!("{entry_quote:.10}"),
                     tp = profile.tp_percent, sl = profile.sl_percent,
                     equity = format!("{:.2}", snap.equity), "paper position opened");
-                self.emit(Alerter::format_entry(
+                // Emit after the guard drops (below): alert dispatch must
+                // never run while the portfolio lock is held.
+                let card = Alerter::format_entry(
                     mint,
                     entry_quote,
                     profile.tp_percent,
                     profile.sl_percent,
                     self.settings.notional_usd,
-                ));
+                );
                 drop(portfolio);
+                self.emit(card);
                 // No feed, no live leg: without the exit ticker a real bag
                 // would have no TP/SL automation, so the live mirror stays
                 // out (paper still opens for manual review).
@@ -932,7 +1043,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// scale-outs mirror exactly; dust write-offs drop tracking with a
     /// loud log. No-ops when nothing is tracked for the mint. Dispatches
     /// serialize per mint; failures back off with cooldown + attempt
-    /// budget while successes reset it.
+    /// budget while successes reset it. Deterministic pre-dispatch
+    /// rejects (bad keys, dust floor) re-probe on cooldown without
+    /// consuming budget.
     async fn live_sell(&self, mint: &str, price_usd: f64, fraction_closed: f64) {
         let Some(trader) = &self.exec.live else { return };
         // Per-mint serialization: sizing and tracking stay atomic across
@@ -1005,6 +1118,26 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.emit(Alerter::format_live_sell(mint, &bundle));
             }
             Err(e) => {
+                // Deterministic pre-dispatch rejects (bad keys, dust
+                // floor) would never succeed on retry: re-probe at the
+                // cooldown cadence (a later tick may price out of dust)
+                // without consuming the attempt budget.
+                let deterministic = matches!(
+                    &e,
+                    LiveError::BadOrder(_)
+                        | LiveError::Dispatch(ExecutorError::BadOrder(_))
+                );
+                if deterministic {
+                    self.exec
+                        .live_retry
+                        .lock()
+                        .await
+                        .entry(mint.to_string())
+                        .or_insert((0u32, 0u64))
+                        .1 = now;
+                    warn!(%mint, error = %e, "LIVE sell rejected before dispatch; holding, will re-probe");
+                    return;
+                }
                 let attempts = {
                     let mut retry = self.exec.live_retry.lock().await;
                     let entry = retry.entry(mint.to_string()).or_insert((0u32, 0u64));
@@ -1034,13 +1167,25 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// close on trigger, retry failed live exits, unwatch when nothing
     /// remains.
     pub async fn on_tick(&self, tick: &PriceTick) {
+        // Per-mint serialization: two ticks for one mint must not
+        // interleave close math and live probes (fractions computed from
+        // divergent views would double-sell or strand dust).
+        let serial = {
+            let mut locks = self.tick_locks.lock().await;
+            locks
+                .entry(tick.mint.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _serial = serial.lock().await;
         let mut portfolio = self.portfolio.lock().await;
         let ids: Vec<u64> = portfolio.positions_for_mint(&tick.mint);
         let mut closed_fraction = 0.0f64;
-        // Breaker inputs collected under the portfolio guard, recorded
-        // after it is released (see below): the day-loss lock must never
-        // be acquired while the portfolio lock is held.
+        // Breaker inputs AND alert cards are collected under the guard
+        // and flushed after it drops: neither the day-loss lock nor
+        // alert dispatch may run while the portfolio lock is held.
         let mut closed_pnls: Vec<f64> = Vec::new();
+        let mut closed_cards: Vec<(String, f64, f64, f64, bool)> = Vec::new();
         let now = now_secs();
         if ids.is_empty() {
             drop(portfolio);
@@ -1048,9 +1193,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             if self.exec.live_positions.lock().await.contains_key(&tick.mint) {
                 self.live_sell(&tick.mint, tick.price_usd, 1.0).await;
             }
-            // Pending buys recheck regardless of paper state.
+            // Pending buys recheck regardless of paper state (cheap when
+            // a round is already in flight: late callers skip).
             self.recheck_live_pending().await;
-            if !self.exec.live_positions.lock().await.contains_key(&tick.mint)
+            // Same confirmed-empty rule as the close path below (paper,
+            // live, AND gate): unwinding the feed while a signal is still
+            // watchlisted only churns watch/unwatch.
+            let gate_pending = self.gate_state.lock().await.gate.contains(&tick.mint);
+            if !gate_pending
+                && !self.exec.live_positions.lock().await.contains_key(&tick.mint)
                 && self.reserves.unwatch(&tick.mint).await
             {
                 info!(mint = %tick.mint, "unwatched (nothing left)");
@@ -1105,9 +1256,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         net = format!("{:+.2}", trade.net_pnl),
                         pct = format!("{:+.2}%", trade.net_pnl_percent),
                         "paper position closed");
-                        self.emit(Alerter::format_exit(
-                            &tick.mint,
-                            &format!("{:?}", trade.reason),
+                        closed_cards.push((
+                            format!("{:?}", trade.reason),
                             trade.net_pnl,
                             trade.net_pnl_percent,
                             equity,
@@ -1128,12 +1278,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         for pnl in closed_pnls {
             self.daily.lock().await.record(pnl, now);
         }
+        for (reason, pnl, pct, equity, moonbag) in closed_cards {
+            self.emit(Alerter::format_exit(
+                &tick.mint, &reason, pnl, pct, equity, moonbag,
+            ));
+        }
         if closed_fraction > 0.0 {
             self.live_sell(&tick.mint, tick.price_usd, closed_fraction)
                 .await;
         }
         // Pending buys recheck before the unwatch decision so a late
-        // confirmation keeps its feed.
+        // confirmation keeps its feed (cheap when a round is already in
+        // flight: late callers skip).
         self.recheck_live_pending().await;
         // Re-check under fresh locks: the gate task may have opened a new
         // position for this mint during the awaits above. Unwatch only on
@@ -1166,8 +1322,20 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     async fn report_migration_once(&self, mint: &str, curve: &str) {
         {
             let mut migrated = self.migrated.lock().await;
-            if !migrated.insert(mint.to_string()) {
+            let now = now_secs();
+            if migrated.insert(mint.to_string(), now).is_some() {
                 return;
+            }
+            // Bounded growth: graduated mints never un-graduate, so
+            // pruning day-old entries only risks a duplicate card.
+            migrated.retain(|_, at| now.saturating_sub(*at) <= MIGRATED_TTL_SECS);
+            if migrated.len() > MIGRATED_CAP
+                && let Some(oldest) = migrated
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(mint, _)| mint.clone())
+            {
+                migrated.remove(&oldest);
             }
         }
         match self.screener.detect_migration(curve, mint).await {
@@ -1235,26 +1403,49 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(mint = %tick.mint, observed_at = tick.observed_at, "ignoring stale pool tick");
             return;
         }
+        let now = now_secs();
+        // Evict idle follows first (dead pools): collect under the guard,
+        // unwatch outside it — vaults own a separate lock that must never
+        // be acquired while `followed` is held.
+        let stale: Vec<String> = {
+            let followed = self.followed.lock().await;
+            followed
+                .iter()
+                .filter(|(_, state)| now.saturating_sub(state.last_seen_secs) > FOLLOW_TTL_SECS)
+                .map(|(mint, _)| mint.clone())
+                .collect()
+        };
+        for mint in &stale {
+            self.vaults.unwatch(mint).await;
+        }
+        if !stale.is_empty() {
+            let mut followed = self.followed.lock().await;
+            for mint in &stale {
+                followed.remove(mint);
+            }
+        }
         let mut followed = self.followed.lock().await;
         let state = followed.entry(tick.mint.clone()).or_insert(FollowState {
             entry_price: tick.price_usd,
             alerted_spike: false,
+            last_seen_secs: now,
         });
+        state.last_seen_secs = now;
         if state.alerted_spike {
             return;
         }
         if tick.price_usd >= state.entry_price * FOLLOW_SPIKE_MULT {
             state.alerted_spike = true;
-            info!(mint = %tick.mint, multiple = FOLLOW_SPIKE_MULT, price = tick.price_usd, "post-migration spike");
+            let mint = tick.mint.clone();
+            drop(followed);
+            info!(mint = %mint, multiple = FOLLOW_SPIKE_MULT, price = tick.price_usd, "post-migration spike");
             self.emit(Alerter::format_follow_spike(
-                &tick.mint,
+                &mint,
                 FOLLOW_SPIKE_MULT,
                 tick.price_usd,
             ));
             // Alert fired: release the pool watch and the follow entry so a
             // dead pool is not polled forever (unbounded growth).
-            let mint = tick.mint.clone();
-            drop(followed);
             self.vaults.unwatch(&mint).await;
             self.followed.lock().await.remove(&mint);
         }
@@ -1306,6 +1497,10 @@ mod tests {
         sells: StdMutex<Vec<(String, u64)>>,
         fail_buys: std::sync::atomic::AtomicBool,
         fail_sells: std::sync::atomic::AtomicBool,
+        /// When set, sells fail transiently (`Unconfirmed`, consumes the
+        /// retry budget) instead of deterministically (`BadOrder`, which
+        /// re-probes without consuming it).
+        fail_sells_transient: std::sync::atomic::AtomicBool,
         /// Overlap-test hook: sells of `block_mint` wait on `unblock`
         /// until notified; `started` records every entered sell so the
         /// test can prove two mints overlap instead of serializing.
@@ -1322,6 +1517,7 @@ mod tests {
                     sells: StdMutex::new(vec![]),
                     fail_buys: std::sync::atomic::AtomicBool::new(false),
                     fail_sells: std::sync::atomic::AtomicBool::new(false),
+                    fail_sells_transient: std::sync::atomic::AtomicBool::new(false),
                     block_mint: StdMutex::new(None),
                     started: StdMutex::new(vec![]),
                     unblock: tokio::sync::Notify::new(),
@@ -1381,6 +1577,13 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 return Err(LiveError::BadOrder("stubbed sell failure".to_string()));
+            }
+            if self
+                .inner
+                .fail_sells_transient
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(LiveError::Unconfirmed("stubbed transient sell failure".to_string()));
             }
             self.inner
                 .started
@@ -1536,6 +1739,7 @@ mod tests {
         swaps: StdMutex<HashMap<String, Vec<SwapRecord>>>,
         bundle: StdMutex<BundleOutcome>,
         migration: StdMutex<Option<MigrationReport>>,
+        truncated: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1554,6 +1758,7 @@ mod tests {
                     swaps: StdMutex::new(HashMap::new()),
                     bundle: StdMutex::new(BundleOutcome::Safe),
                     migration: StdMutex::new(None),
+                    truncated: std::sync::atomic::AtomicBool::new(false),
                 }),
             }
         }
@@ -1599,7 +1804,7 @@ mod tests {
             mint: &str,
             _curve: &str,
             _since_sig: Option<&str>,
-        ) -> Result<(Vec<SwapRecord>, Option<String>), ScreenError> {
+        ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError> {
             let swaps = self
                 .inner
                 .swaps
@@ -1608,7 +1813,11 @@ mod tests {
                 .get(mint)
                 .cloned()
                 .unwrap_or_default();
-            Ok((swaps, Some("sig-stub".to_string())))
+            let truncated = self
+                .inner
+                .truncated
+                .load(std::sync::atomic::Ordering::Relaxed);
+            Ok((swaps, Some("sig-stub".to_string()), truncated))
         }
 
         async fn screen_bundle(
@@ -1718,6 +1927,24 @@ mod tests {
     }
 
     #[test]
+    fn dev_reputation_ramps_with_age_and_priors() {
+        fn approx(v: f64, want: f64) {
+            assert!((v - want).abs() < 1e-12, "got {v}, want {want}");
+        }
+        // Just old enough: 0.7; long-aged: 1.0; priors discount slightly.
+        approx(dev_reputation_score(Some(3600), 0, 3600), 0.7);
+        approx(dev_reputation_score(Some(14_400), 0, 3600), 1.0);
+        approx(dev_reputation_score(Some(100_000), 0, 3600), 1.0);
+        approx(dev_reputation_score(Some(14_400), 1, 3600), 0.95);
+        // Unknown age (unreachable via screening, which rejects ageless
+        // wallets) scores below any survivor; heavy priors bottom out.
+        approx(dev_reputation_score(None, 0, 3600), 0.6);
+        approx(dev_reputation_score(Some(3600), 100, 3600), 0.4);
+        // Disabled age gate scores full trust.
+        approx(dev_reputation_score(Some(1), 0, 0), 1.0);
+    }
+
+    #[test]
     fn entry_rejects_degenerate_tick() {
         // A feed print of NaN/zero/negative price (or bad liquidity) is
         // worse than none: it must drop the signal, never open on it.
@@ -1789,6 +2016,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_poll_claim_is_taken_over() {
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            StubScreener::passing(),
+            None,
+        );
+        assert!(pipe.try_begin_poll().await);
+        // Fresh claim blocks a second overlapping round.
+        assert!(!pipe.try_begin_poll().await);
+        pipe.end_poll().await;
+        assert!(pipe.try_begin_poll().await);
+        pipe.end_poll().await;
+        // Ancient claim (owning task died before end_poll) is taken over
+        // instead of stalling the gate forever.
+        {
+            let mut state = pipe.gate_state.lock().await;
+            state.poll_busy = true;
+            state.poll_started_secs = 0;
+        }
+        assert!(pipe.try_begin_poll().await);
+        pipe.end_poll().await;
+    }
+
+    #[tokio::test]
     async fn daily_breaker_blocks_opens_but_not_exits() {
         let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
         let reserves = StubReserves::with_tick(tick("MINT", 2.0));
@@ -1850,6 +2104,31 @@ mod tests {
         drop(portfolio);
         assert_eq!(pipe.pending_count().await, 0);
         assert_eq!(pipe.reserves.watched.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn truncated_round_never_confirms() {
+        // Quorum swaps on a truncated round: no confirm, no watermark
+        // advance — the entry stays watchlisted for the next round.
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        screener
+            .inner
+            .truncated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 1);
     }
 
     #[tokio::test]
@@ -2803,7 +3082,7 @@ mod tests {
     async fn live_sell_retries_on_cooldown_then_gives_up() {
         use std::sync::atomic::Ordering;
         let live = StubLive::working();
-        live.inner.fail_sells.store(true, Ordering::Relaxed);
+        live.inner.fail_sells_transient.store(true, Ordering::Relaxed);
         let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
         let pipe = pipeline_screened(
             Settings::from_map(&HashMap::new()),
@@ -2834,6 +3113,35 @@ mod tests {
         pipe.on_tick(&tick("MINT", 3.0)).await;
         assert!(pipe.exec.live_positions.lock().await.is_empty());
         assert!(live.sells().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_sell_deterministic_reject_skips_budget() {
+        // Pre-dispatch rejects (bad order, dust) re-probe without
+        // consuming the 5-attempt budget: attempts stay empty no matter
+        // how many ticks fail this way.
+        use std::sync::atomic::Ordering;
+        let live = StubLive::working();
+        live.inner.fail_sells.store(true, Ordering::Relaxed);
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+        assert!(live.sells().is_empty());
+        let retry = pipe.exec.live_retry.lock().await;
+        assert!(retry.get("MINT").is_none_or(|(attempts, _)| *attempts == 0));
+        drop(retry);
+        // Still tracked for later re-probes (never given up on).
+        assert!(pipe.exec.live_positions.lock().await.contains_key("MINT"));
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 solana-pubkey = "4"
+solana-account = "4"
 solana-client = "4.3.0"
 solana-commitment-config = "3"
 curve = { path = "../curve" }

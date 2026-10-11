@@ -42,6 +42,9 @@ pub enum PortfolioError {
     /// 80%, keep a 20% moonbag runner).
     #[error("invalid close fraction: {0}")]
     InvalidFraction(f64),
+    /// Mint must be a non-empty address string.
+    #[error("invalid mint: {0:?}")]
+    InvalidMint(String),
 }
 
 /// Pro-rata slice of a position being settled. Owns its data so the
@@ -96,6 +99,12 @@ fn flip_side(side: Side) -> Side {
         Side::Long => Side::Short,
         Side::Short => Side::Long,
     }
+}
+
+/// Finite `v`, else disarmed `0.0` (for trail/moonbag normalization:
+/// NaN would poison downstream exit math through `clamp`/`max`).
+fn finite_or_zero(v: f64) -> f64 {
+    if v.is_finite() { v } else { 0.0 }
 }
 
 /// Mark-to-market quote for one mint: price plus the liquidity context
@@ -181,6 +190,13 @@ pub struct PaperPortfolio {
 impl PaperPortfolio {
     /// Fund a portfolio: `starting_balance_usd` (e.g. `100.0`) with
     /// `fee_bps` commission per side (e.g. `30.0` = 0.30%).
+    ///
+    /// Two fee layers apply — do not confuse them: `fee_bps` is the
+    /// *commission* charged here on entry/exit notionals, while the
+    /// [`FillModel::BondingCurve`] fill prices already embed the *venue*
+    /// fee (125 bps/side on Pump.fun) plus price impact. Setting
+    /// `fee_bps = 125` on top of the default fill model would
+    /// double-count the venue fee; keep `fee_bps` to commission only.
     pub fn new(starting_balance_usd: f64, fee_bps: f64) -> Self {
         Self {
             starting_balance: starting_balance_usd.max(0.0),
@@ -209,7 +225,8 @@ impl PaperPortfolio {
         self.starting_balance
     }
 
-    /// Open position handles.
+    /// Open position handles, in arbitrary map order (sort when
+    /// deterministic order matters).
     pub fn position_ids(&self) -> Vec<PositionId> {
         self.positions.keys().copied().collect()
     }
@@ -303,6 +320,9 @@ impl PaperPortfolio {
         if !sl_percent.is_finite() || sl_percent >= 0.0 {
             return Err(PortfolioError::InvalidStopLoss(sl_percent));
         }
+        if p.mint.is_empty() {
+            return Err(PortfolioError::InvalidMint(p.mint.to_string()));
+        }
 
         let entry_price = self
             .fill
@@ -324,7 +344,10 @@ impl PaperPortfolio {
 
         self.cash -= need;
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        // 2^64 positions is unreachable; a silent saturating reuse would
+        // overwrite a live position, so fail loudly instead (precedent:
+        // Borsh-encode expects elsewhere in the tree).
+        self.next_id = self.next_id.checked_add(1).expect("position id space exhausted");
         self.positions.insert(
             id,
             Position {
@@ -337,12 +360,14 @@ impl PaperPortfolio {
                 entry_fee,
                 tp_percent,
                 sl_percent,
-                trail_percent: p.trail_percent.max(0.0),
+                // Non-finite trail/moonbag normalize to disarmed (0):
+                // NaN clamps to NaN and would poison downstream math.
+                trail_percent: finite_or_zero(p.trail_percent).max(0.0),
                 trailing_stop: p.trailing,
                 best_price: entry_price,
                 opened_at: p.now_secs,
                 timeout_seconds: p.timeout_seconds,
-                moonbag_percent: p.moonbag_percent.clamp(0.0, 100.0),
+                moonbag_percent: finite_or_zero(p.moonbag_percent).clamp(0.0, 100.0),
             },
         );
         Ok(id)
@@ -428,17 +453,18 @@ impl PaperPortfolio {
             open.quantity -= slice.quantity;
             open.entry_notional -= slice.entry_notional;
             open.entry_fee -= slice.entry_fee;
-            // Moonbag protection: a TakeProfit scale-out ratchets the
-            // runner's stop to breakeven (never loosens an already
-            // tighter stop). Other reasons leave stops untouched.
-            if reason == ExitReason::TakeProfit {
+            // Moonbag protection, TakeProfit scale-outs ONLY: the runner's
+            // stop ratchets to breakeven (never loosens an already-tighter
+            // stop) and the time-stop lifts plus the moonbag disarms so it
+            // rides on trailing alone. A Manual trim must not do any of
+            // this — otherwise a 1% rebalance accidentally creates a
+            // never-expiring, never-scalable position.
+            //
+            // Note the ratchet is move-breakeven, not net-breakeven:
+            // entry+exit fees and slippage still apply, so a stopped
+            // runner nets a small bounded loss by design.
+            if reason == ExitReason::TakeProfit && fraction < 1.0 {
                 open.sl_percent = open.sl_percent.max(0.0);
-            }
-            // Runner freedom: the surviving slice rides on trailing stop
-            // alone — the time-stop is lifted so runners chase 5x–10x
-            // instead of expiring on schedule. Full closes (fraction >=
-            // 1.0) return early above and never reach here.
-            if fraction < 1.0 {
                 open.timeout_seconds = 0;
                 open.moonbag_percent = 0.0;
             }
@@ -518,7 +544,7 @@ impl PaperPortfolio {
         for position in self.positions.values() {
             locked += position.entry_notional;
             let value = match marks.get(&position.mint) {
-                Some(mark) if mark.price.is_finite() => {                    let exit_size = position.quantity.abs() * mark.price;
+                Some(mark) if mark.price.is_finite() && mark.price > 0.0 => {                    let exit_size = position.quantity.abs() * mark.price;
                     let slip = self.fill.slip_fraction(exit_size, mark.liquidity_usd);
                     let exit_price = match position.side {
                         Side::Long => mark.price * (1.0 - slip),
@@ -1027,6 +1053,67 @@ mod tests {
         pf.close_partial_position(id2, 0.5, 2.0, 1e9, ExitReason::Manual, 1)
             .expect("partial");
         assert_eq!(pf.position(id2).expect("p").sl_percent, -8.0);
+    }
+
+    #[test]
+    fn manual_partial_preserves_runner_terms() {
+        // Only TakeProfit scale-outs ratchet the stop, lift the timeout,
+        // and disarm the moonbag: a Manual trim keeps all three intact.
+        let mut pf = funded();
+        let id = pf
+            .open_position("M", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, true, 5.0, 90, 20.0, 0)
+            .expect("open");
+        pf.close_partial_position(id, 0.5, 1.5, 1e9, ExitReason::Manual, 1)
+            .expect("partial");
+        let p = pf.position(id).expect("runner");
+        assert_eq!(p.sl_percent, -8.0);
+        assert_eq!(p.timeout_seconds, 90);
+        assert_eq!(p.moonbag_percent, 20.0);
+        // ...while a TakeProfit scale-out transforms all three.
+        pf.close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::TakeProfit, 2)
+            .expect("partial");
+        let p = pf.position(id).expect("runner");
+        assert_eq!(p.sl_percent, 0.0);
+        assert_eq!(p.timeout_seconds, 0);
+        assert_eq!(p.moonbag_percent, 0.0);
+    }
+
+    #[test]
+    fn rejects_empty_mint() {
+        let mut pf = funded();
+        assert!(matches!(
+            pf.open_position("", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0),
+            Err(PortfolioError::InvalidMint(_))
+        ));
+    }
+
+    #[test]
+    fn nan_trail_and_moonbag_normalize_to_zero() {
+        let mut pf = funded();
+        let id = pf
+            .open_position(
+                "M", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, true, f64::NAN, 90, f64::NAN, 0,
+            )
+            .expect("open");
+        let p = pf.position(id).expect("p");
+        assert_eq!(p.trail_percent, 0.0);
+        assert_eq!(p.moonbag_percent, 0.0);
+    }
+
+    #[test]
+    fn snapshot_ignores_degenerate_marks() {
+        let mut pf = funded();
+        open_40_at_1(&mut pf);
+        let base = pf.snapshot(&HashMap::new());
+        for price in [0.0, -2.0, f64::NAN] {
+            let mut marks = HashMap::new();
+            marks.insert(
+                "MINT".to_string(),
+                Mark { price, liquidity_usd: 1e9 },
+            );
+            let snap = pf.snapshot(&marks);
+            assert_eq!(snap.unrealized_pnl, base.unrealized_pnl, "price {price}");
+        }
     }
 
     #[test]

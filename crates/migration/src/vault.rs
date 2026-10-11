@@ -34,6 +34,9 @@ pub enum VaultError {
     /// Address is not a valid pubkey: {0}
     #[error("invalid address: {0}")]
     BadAddress(String),
+    /// SOL→USD conversion is not a positive finite price.
+    #[error("invalid SOL/USD price: {0}")]
+    BadSolUsd(f64),
 }
 
 /// One pool price observation in USD.
@@ -69,11 +72,15 @@ pub struct VaultTicker {
     subs: Arc<RwLock<HashMap<String, WatchedPool>>>,
     interval: Duration,
     sol_usd: f64,
+    /// Ticks dropped on a full downstream queue (see `run`).
+    dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl VaultTicker {
     /// Build a ticker: `http_url` + commitment for reads, `interval`
-    /// between poll rounds, `sol_usd` for conversion.
+    /// between poll rounds, `sol_usd` for conversion. A non-positive or
+    /// non-finite `sol_usd` is rejected (it would price every pool at
+    /// nothing or NaN).
     pub fn new(
         http_url: &str,
         commitment: CommitmentConfig,
@@ -84,6 +91,9 @@ impl VaultTicker {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             _ => return Err(VaultError::BadUrl(http_url.to_string())),
         }
+        if !sol_usd.is_finite() || sol_usd <= 0.0 {
+            return Err(VaultError::BadSolUsd(sol_usd));
+        }
         Ok(Self {
             rpc: Arc::new(RpcClient::new_with_commitment(
                 http_url.to_string(),
@@ -91,12 +101,14 @@ impl VaultTicker {
             )),
             subs: Arc::new(RwLock::new(HashMap::new())),
             interval,
-            sol_usd: if sol_usd.is_finite() && sol_usd > 0.0 {
-                sol_usd
-            } else {
-                0.0
-            },
+            sol_usd,
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Ticks dropped on a full downstream queue (backpressure accounting).
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Watch a pool's vaults (idempotent per mint).
@@ -152,17 +164,21 @@ impl VaultTicker {
         self.subs.read().await.len()
     }
 
-/// Maximum vault pools per `getMultipleAccounts` round chunk.
-/// Mirrors the curve ticker's chunking: one oversized request must not
-/// fail (or rate-limit) the whole round.
-pub const VAULT_BATCH_CHUNK_PAIRS: usize = 50;
+    /// Maximum vault pools per `getMultipleAccounts` round chunk.
+    /// Mirrors the curve ticker's chunking: one oversized request must not
+    /// fail (or rate-limit) the whole round.
+    pub const VAULT_BATCH_CHUNK_PAIRS: usize = 50;
 
 /// Poll loop: one batched vault read per round, one tick per pool.
 /// Interval-based (no drift); batch failures back off. Ends when the
-/// receiver drops.
+/// receiver drops. Delivery is drop-on-full (with a counter): one slow
+/// consumer must not stall every followed pool.
     pub async fn run(self, tx: mpsc::Sender<PoolTick>) {
         let mut timer = tokio::time::interval(self.interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Discard the immediate first tick: one full interval before the
+        // first round, matching the curve ticker.
+        timer.tick().await;
         loop {
             timer.tick().await;
             if tx.is_closed() {
@@ -175,37 +191,22 @@ pub const VAULT_BATCH_CHUNK_PAIRS: usize = 50;
             }
             // Flatten to chunked batched calls: [base0, quote0, ...] per
             // chunk so pool growth cannot breach per-request limits.
-            // Chunks preserve pool order; results are concatenated.
-            let mut accounts = Vec::with_capacity(watched.len() * 2);
-            let mut batch_failed = false;
-            for pool_chunk in watched.chunks(Self::VAULT_BATCH_CHUNK_PAIRS.max(1)) {
-                let keys: Vec<Pubkey> = pool_chunk
-                    .iter()
-                    .flat_map(|w| [w.base_vault, w.quote_vault])
-                    .collect();
-                match tokio::time::timeout(
-                    Duration::from_secs(15),
-                    self.rpc.get_multiple_accounts(&keys),
-                )
-                .await
-                {
-                    Ok(Ok(mut got)) => accounts.append(&mut got),
-                    Ok(Err(e)) => {
-                        warn!(error = %e, pools = watched.len(), "pool vault batch failed; backing off");
-                        batch_failed = true;
-                        break;
-                    }
-                    Err(_) => {
-                        warn!(pools = watched.len(), "pool vault batch timed out; backing off");
-                        batch_failed = true;
-                        break;
-                    }
+            // Chunks preserve pool order; results are concatenated. The
+            // whole round is deadline-bound (sequential 15s chunks would
+            // otherwise pile missed ticks behind a huge watchlist).
+            let accounts = match tokio::time::timeout(
+                Duration::from_secs(60),
+                self.poll_round(&watched),
+            )
+            .await
+            {
+                Ok(accounts) => accounts,
+                Err(_) => {
+                    warn!(pools = watched.len(), "pool round timed out; backing off");
+                    tokio::time::sleep(self.interval).await;
+                    continue;
                 }
-            }
-            if batch_failed {
-                tokio::time::sleep(self.interval).await;
-                continue;
-            }
+            };
             if accounts.len() != watched.len() * 2 {
                 warn!(
                     expected = watched.len() * 2,
@@ -219,16 +220,60 @@ pub const VAULT_BATCH_CHUNK_PAIRS: usize = 50;
                     debug!(mint = %pool.mint, "pool vault missing");
                     continue;
                 };
-                let Some(tick) = price_tick(pool, &base.data, &quote.data, self.sol_usd) else {
+                let Some(tick) = price_tick(
+                    pool,
+                    &base.data,
+                    &base.owner,
+                    &quote.data,
+                    &quote.owner,
+                    self.sol_usd,
+                ) else {
                     debug!(mint = %pool.mint, "pool price uncomputable");
                     continue;
                 };
-                if tx.send(tick).await.is_err() {
-                    debug!("pool tick receiver closed; ticker stopping");
-                    return;
+                match tx.try_send(tick) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        debug!("pool tick queue full; dropping tick");
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        debug!("pool tick receiver closed; ticker stopping");
+                        return;
+                    }
                 }
             }
         }
+    }
+
+    /// One round of chunked vault reads (extracted for the round-level
+    /// deadline above). A failed chunk aborts the round with a short vec
+    /// (the length-mismatch path skips loudly, never half-prices).
+    async fn poll_round(&self, watched: &[WatchedPool]) -> Vec<Option<solana_account::Account>> {
+        let mut accounts = Vec::with_capacity(watched.len() * 2);
+        for pool_chunk in watched.chunks(Self::VAULT_BATCH_CHUNK_PAIRS.max(1)) {
+            let keys: Vec<Pubkey> = pool_chunk
+                .iter()
+                .flat_map(|w| [w.base_vault, w.quote_vault])
+                .collect();
+            match tokio::time::timeout(
+                Duration::from_secs(15),
+                self.rpc.get_multiple_accounts(&keys),
+            )
+            .await
+            {
+                Ok(Ok(mut got)) => accounts.append(&mut got),
+                Ok(Err(e)) => {
+                    warn!(error = %e, pools = watched.len(), "pool vault batch failed; backing off");
+                    break;
+                }
+                Err(_) => {
+                    warn!(pools = watched.len(), "pool vault batch timed out; backing off");
+                    break;
+                }
+            }
+        }
+        accounts
     }
 }
 
@@ -248,16 +293,43 @@ fn token_amount(data: &[u8]) -> Option<u64> {
         .map(u64::from_le_bytes)
 }
 
-/// Price one pool from raw vault account data. Pure; unit-tested.
+/// True for the two token programs whose accounts share the classic
+/// 165-byte layout (extensions may extend Token-2022 accounts, never
+/// move the mint/owner/amount prefix).
+fn is_token_program(owner: &Pubkey) -> bool {
+    owner == &ids::TOKEN_PROGRAM_ID || owner == &ids::TOKEN_2022_PROGRAM_ID
+}
+
+/// Price one pool from raw vault accounts. Pure; unit-tested.
 /// f64 ratios hold ~1e-16 relative precision at any magnitude; only the
 /// final USD values are range-checked.
+///
+/// Trust gates (fail-closed `None`): both vaults must be owned by a
+/// token program (classic SPL or Token-2022 — anything else is not a
+/// token account), and the embedded mints must match the watched pair
+/// (base vault holds the token, quote vault holds WSOL). A misconfigured
+/// watch (swapped vaults, wrong pool) prices the wrong pair silently
+/// without these.
 fn price_tick(
     pool: &WatchedPool,
     base_data: &[u8],
+    base_owner: &Pubkey,
     quote_data: &[u8],
+    quote_owner: &Pubkey,
     sol_usd: f64,
 ) -> Option<PoolTick> {
+    if !is_token_program(base_owner) || !is_token_program(quote_owner) {
+        return None;
+    }
     if base_data.len() < TOKEN_ACCOUNT_MIN_LEN || quote_data.len() < TOKEN_ACCOUNT_MIN_LEN {
+        return None;
+    }
+    let base_mint = Pubkey::try_from(&base_data[0..32]).ok()?;
+    if base_mint.to_string() != pool.mint {
+        return None;
+    }
+    let quote_mint = Pubkey::try_from(&quote_data[0..32]).ok()?;
+    if quote_mint != ids::WSOL_MINT {
         return None;
     }
     let base_ui = token_amount(base_data)? as f64 / 10f64.powi(i32::from(pool.base_decimals));
@@ -286,15 +358,21 @@ fn price_tick(
 mod tests {
     use super::*;
 
-    fn vault_bytes(amount: u64) -> Vec<u8> {
+    fn vault_bytes(mint: &Pubkey, amount: u64) -> Vec<u8> {
         let mut data = vec![0u8; 165];
+        data[0..32].copy_from_slice(&mint.to_bytes());
+        data[32..64].copy_from_slice(&[4u8; 32]); // owner placeholder
         data[64..72].copy_from_slice(&amount.to_le_bytes());
         data
     }
 
+    fn base_mint() -> Pubkey {
+        Pubkey::new_from_array([5; 32])
+    }
+
     fn pool() -> WatchedPool {
         WatchedPool {
-            mint: "MINT".to_string(),
+            mint: base_mint().to_string(),
             amm_id: Pubkey::new_from_array([9; 32]),
             base_vault: Pubkey::new_from_array([1; 32]),
             quote_vault: Pubkey::new_from_array([2; 32]),
@@ -303,16 +381,21 @@ mod tests {
         }
     }
 
+    fn tick(base: u64, quote: u64) -> Option<PoolTick> {
+        price_tick(
+            &pool(),
+            &vault_bytes(&base_mint(), base),
+            &ids::TOKEN_PROGRAM_ID,
+            &vault_bytes(&ids::WSOL_MINT, quote),
+            &ids::TOKEN_PROGRAM_ID,
+            150.0,
+        )
+    }
+
     #[test]
     fn prices_pool_from_vaults() {
         // 1M tokens vs 30 SOL @ $150: $0.0045 per token, $4500 liq.
-        let tick = price_tick(
-            &pool(),
-            &vault_bytes(1_000_000_000_000),
-            &vault_bytes(30_000_000_000),
-            150.0,
-        )
-        .expect("tick");
+        let tick = tick(1_000_000_000_000, 30_000_000_000).expect("tick");
         assert!(
             (tick.price_usd - 0.0045).abs() < 1e-9,
             "price={}",
@@ -323,9 +406,94 @@ mod tests {
 
     #[test]
     fn rejects_degenerate_vaults() {
-        assert!(price_tick(&pool(), &[0u8; 10], &vault_bytes(1), 150.0).is_none());
-        assert!(price_tick(&pool(), &vault_bytes(0), &vault_bytes(1), 150.0).is_none());
-        assert!(price_tick(&pool(), &vault_bytes(1), &vault_bytes(1), 0.0).is_none());
+        assert!(tick(0, 0).is_none());
+        assert!(tick(0, 1).is_none());
+        assert!(
+            price_tick(
+                &pool(),
+                &[0u8; 10],
+                &ids::TOKEN_PROGRAM_ID,
+                &vault_bytes(&ids::WSOL_MINT, 1),
+                &ids::TOKEN_PROGRAM_ID,
+                150.0,
+            )
+            .is_none()
+        );
+        assert!(
+            price_tick(
+                &pool(),
+                &vault_bytes(&base_mint(), 0),
+                &ids::TOKEN_PROGRAM_ID,
+                &vault_bytes(&ids::WSOL_MINT, 1),
+                &ids::TOKEN_PROGRAM_ID,
+                150.0,
+            )
+            .is_none()
+        );
+        assert!(
+            price_tick(
+                &pool(),
+                &vault_bytes(&base_mint(), 1),
+                &ids::TOKEN_PROGRAM_ID,
+                &vault_bytes(&ids::WSOL_MINT, 1),
+                &ids::TOKEN_PROGRAM_ID,
+                0.0,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_owner_and_wrong_mints() {
+        // Non-token program owner is not a token account.
+        let stranger = Pubkey::new_from_array([9; 32]);
+        assert!(
+            price_tick(
+                &pool(),
+                &vault_bytes(&base_mint(), 1_000_000),
+                &stranger,
+                &vault_bytes(&ids::WSOL_MINT, 1_000_000),
+                &ids::TOKEN_PROGRAM_ID,
+                150.0,
+            )
+            .is_none()
+        );
+        // Token-2022 owner is accepted (same layout prefix).
+        assert!(
+            price_tick(
+                &pool(),
+                &vault_bytes(&base_mint(), 1_000_000_000_000),
+                &ids::TOKEN_2022_PROGRAM_ID,
+                &vault_bytes(&ids::WSOL_MINT, 30_000_000_000),
+                &ids::TOKEN_2022_PROGRAM_ID,
+                150.0,
+            )
+            .is_some()
+        );
+        // Base vault holding another mint prices the wrong pair.
+        assert!(
+            price_tick(
+                &pool(),
+                &vault_bytes(&Pubkey::new_from_array([6; 32]), 1_000_000),
+                &ids::TOKEN_PROGRAM_ID,
+                &vault_bytes(&ids::WSOL_MINT, 1_000_000),
+                &ids::TOKEN_PROGRAM_ID,
+                150.0,
+            )
+            .is_none()
+        );
+        // Non-WSOL quote is not the followed pair.
+        assert!(
+            price_tick(
+                &pool(),
+                &vault_bytes(&base_mint(), 1_000_000),
+                &ids::TOKEN_PROGRAM_ID,
+                &vault_bytes(&Pubkey::new_from_array([7; 32]), 1_000_000),
+                &ids::TOKEN_PROGRAM_ID,
+                150.0,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -339,6 +507,18 @@ mod tests {
             )
             .is_err()
         );
+        for bad in [0.0, -150.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                VaultTicker::new(
+                    "https://api.mainnet-beta.solana.com",
+                    solana_commitment_config::CommitmentConfig::confirmed(),
+                    Duration::from_millis(500),
+                    bad,
+                )
+                .is_err(),
+                "sol {bad}"
+            );
+        }
     }
 
     #[tokio::test]

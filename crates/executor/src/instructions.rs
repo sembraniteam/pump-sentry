@@ -5,15 +5,26 @@
 //! `spl-token` / `spl-associated-token-account` crates so version drift
 //! fails loudly in tests instead of on-chain.
 //!
-//! ASSUMPTIONS REQUIRING MAINNET PROOF BEFORE FUNDING:
-//! - 12-account legacy `buy`/`sell` layout. Newer flows (`buy_v2` with
-//!   volume tracking, extra vault/fee accounts) are NOT built here; if
-//!   Pump.fun routes new coins through them, these instructions fail.
-//! - Single hardcoded `FEE_RECIPIENT`. If the program rotates recipients
-//!   per transaction (8-way selection from Global is documented), the
-//!   recipient must be read on-chain at runtime instead.
+//! SHAPES BUILT HERE:
+//! - 12-account legacy `buy`/`sell` core (classic curves).
+//! - 16/14-account extended mayhem shape when the creator is known
+//!   (creator vault + volume/fee-config routing; extended BUY verified
+//!   byte-exact against a frozen mainnet mayhem buy, extended SELL
+//!   mirrors the published SDK order and stays experimental).
 //!
-//! Verify both against one recent mainnet buy/sell (see README TODO).
+//! ASSUMPTIONS REQUIRING MAINNET PROOF BEFORE FUNDING:
+//! - Mayhem buyback-routing accounts [16]/[17] are still unmapped
+//!   (per-token sourcing is the candidate next step; the ignored
+//!   layout-acceptance test is the gate).
+//! - `sell_v2` is unobserved on-chain (dev dumps through it stay
+//!   invisible; the gate fail-closes on unknown pump ixs instead).
+//!
+//! RUNTIME (not build-time) ROUTING — never hardcoded here:
+//! - Fee recipient resolves live (override → Global account → canonical
+//!   constant); the program rotates recipients.
+//! - Token program resolves per mint (classic SPL vs Token-2022); the
+//!   ATA derives bound to it (a 2022 mint through the classic program
+//!   fails with `IncorrectProgramId`, verified live).
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_instruction::{AccountMeta, Instruction};

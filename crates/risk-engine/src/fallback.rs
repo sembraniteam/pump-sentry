@@ -33,6 +33,19 @@ pub const MODERATE_MOMENTUM_LIQUIDITY_USD: f64 = 10_000.0;
 ///   trailing, 180s.
 /// - Moderate (`velocity >= 5`, `liq >= $10k`) → TP 35, SL −8, no trail, 90s.
 /// - Otherwise (unproven liquidity/velocity) → PASS.
+///
+/// PASS shape (zeroed targets, disarmed trailing/moonbag) is shared so
+/// the three call sites cannot drift apart.
+const fn pass_profile() -> RiskProfile {
+    RiskProfile {
+        action: Action::Pass,
+        tp_percent: 0.0,
+        sl_percent: 0.0,
+        trailing_stop: false,
+        timeout_seconds: 0,
+        moonbag_percent: 0.0,
+    }
+}
 pub fn evaluate_heuristic_fallback(
     liq_usd: f64,
     buy_velocity_5s: u32,
@@ -43,27 +56,13 @@ pub fn evaluate_heuristic_fallback(
     // sail a non-reputation straight into the momentum branches.
     // Fail closed on any non-finite input.
     if !liq_usd.is_finite() || !dev_rep.is_finite() {
-        return RiskProfile {
-            action: Action::Pass,
-            tp_percent: 0.0,
-            sl_percent: 0.0,
-            trailing_stop: false,
-            timeout_seconds: 0,
-            moonbag_percent: 0.0,
-        };
+        return pass_profile();
     }
     if dev_rep < DEV_REPUTATION_FLOOR
         || rugcheck_score > RUGCHECK_SCORE_CAP
         || buy_velocity_5s < MODERATE_MOMENTUM_VELOCITY
     {
-        return RiskProfile {
-            action: Action::Pass,
-            tp_percent: 0.0,
-            sl_percent: 0.0,
-            trailing_stop: false,
-            timeout_seconds: 0,
-            moonbag_percent: 0.0,
-        };
+        return pass_profile();
     }
     if buy_velocity_5s > HIGH_MOMENTUM_VELOCITY && liq_usd > HIGH_MOMENTUM_LIQUIDITY_USD {
         RiskProfile {
@@ -84,14 +83,7 @@ pub fn evaluate_heuristic_fallback(
             moonbag_percent: 0.0,
         }
     } else {
-        RiskProfile {
-            action: Action::Pass,
-            tp_percent: 0.0,
-            sl_percent: 0.0,
-            trailing_stop: false,
-            timeout_seconds: 0,
-            moonbag_percent: 0.0,
-        }
+        pass_profile()
     }
 }
 
@@ -128,6 +120,30 @@ mod tests {
     fn passes_on_high_rugcheck_score() {
         let p = evaluate_heuristic_fallback(100_000.0, 100, 0.9, 351);
         assert_eq!(p.action, Action::Pass);
+    }
+
+    #[test]
+    fn prompt_bands_match_heuristic_constants() {
+        // SYSTEM_PROMPT duplicates the decision bands as prose; a
+        // constant change without a prompt change silently forks the
+        // model policy from the heuristic. This test forces them to
+        // move together.
+        let prompt = crate::schema::SYSTEM_PROMPT;
+        assert!(prompt.contains(&DEV_REPUTATION_FLOOR.to_string()), "dev floor");
+        assert!(prompt.contains(&RUGCHECK_SCORE_CAP.to_string()), "score cap");
+        assert!(prompt.contains(&HIGH_MOMENTUM_VELOCITY.to_string()), "high velocity");
+        assert!(
+            prompt.contains(&HIGH_MOMENTUM_LIQUIDITY_USD.to_string()),
+            "high liquidity"
+        );
+        assert!(
+            prompt.contains(&MODERATE_MOMENTUM_VELOCITY.to_string()),
+            "moderate velocity"
+        );
+        assert!(
+            prompt.contains(&MODERATE_MOMENTUM_LIQUIDITY_USD.to_string()),
+            "moderate liquidity"
+        );
     }
 
     #[test]

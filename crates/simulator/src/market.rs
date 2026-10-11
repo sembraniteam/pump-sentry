@@ -44,12 +44,28 @@ impl FillModel {
     /// Total cost fraction for one side: constant-product impact plus
     /// venue fee, clamped to the cap. Fee-only when liquidity is unknown
     /// (non-finite or non-positive).
+    ///
+    /// Negative `fee_bps_per_side`/`max_slip_frac` are trusted-config
+    /// mistakes: they clamp to zero (debug-asserted) rather than
+    /// understating costs. Validate user-supplied configs upstream.
     pub fn slip_fraction(&self, notional_usd: f64, liquidity_usd: f64) -> f64 {
+        if let FillModel::BondingCurve {
+            fee_bps_per_side,
+            max_slip_frac,
+        } = *self
+        {
+            debug_assert!(
+                fee_bps_per_side >= 0.0,
+                "negative venue fee silently zeroes costs"
+            );
+            debug_assert!(
+                max_slip_frac >= 0.0,
+                "negative slip cap silently zeroes costs"
+            );
+        }
         let fee = match *self {
             FillModel::Exact => 0.0,
-            FillModel::BondingCurve { fee_bps_per_side, .. } => {
-                (fee_bps_per_side.max(0.0) / 10_000.0).max(0.0)
-            }
+            FillModel::BondingCurve { fee_bps_per_side, .. } => fee_bps_per_side.max(0.0) / 10_000.0,
         };
         let cap = match *self {
             FillModel::Exact => 0.0,

@@ -47,13 +47,30 @@ pub enum ConfigError {
 impl ListenerConfig {
     /// Validate URLs and commitment without doing any I/O.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        match url::Url::parse(&self.ws_url) {
-            Ok(u) if u.scheme() == "ws" || u.scheme() == "wss" => {}
+        let ws = match url::Url::parse(&self.ws_url) {
+            Ok(u) if u.scheme() == "ws" || u.scheme() == "wss" => u,
             _ => return Err(ConfigError::BadWsUrl(self.ws_url.clone())),
-        }
-        match url::Url::parse(&self.http_url) {
-            Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
+        };
+        let http = match url::Url::parse(&self.http_url) {
+            Ok(u) if u.scheme() == "http" || u.scheme() == "https" => u,
             _ => return Err(ConfigError::BadHttpUrl(self.http_url.clone())),
+        };
+        // Hostless URLs (`wss://`, `https:///x`) always mis-resolve.
+        if ws.host_str().is_none_or(|h| h.is_empty()) {
+            return Err(ConfigError::BadWsUrl(self.ws_url.clone()));
+        }
+        if http.host_str().is_none_or(|h| h.is_empty()) {
+            return Err(ConfigError::BadHttpUrl(self.http_url.clone()));
+        }
+        // Split-brain networks (mainnet WS + devnet HTTP) mis-resolve
+        // addresses silently: loud, but not fatal — dedicated WS
+        // providers legitimately differ from the HTTP endpoint.
+        if ws.host_str() != http.host_str() {
+            tracing::warn!(
+                ws = %self.ws_url,
+                http = %self.http_url,
+                "listener WS and HTTP hosts differ; ensure both serve the same cluster"
+            );
         }
         match self.commitment.as_str() {
             "processed" | "confirmed" | "finalized" => {}
@@ -63,16 +80,13 @@ impl ListenerConfig {
     }
 
     /// Map the commitment string to a [`CommitmentConfig`].
-    /// Returns `None` for unknown strings (fail-closed: callers must not
+    /// Delegates to [`curve::CurveTicker::parse_commitment`] (single
+    /// source — a new level is added in exactly one place). Returns
+    /// `None` for unknown strings (fail-closed: callers must not
     /// silently coerce to `confirmed`; [`ListenerConfig::validate`] and
     /// the binary's startup gate reject these first).
     pub fn commitment_config(&self) -> Option<CommitmentConfig> {
-        match self.commitment.as_str() {
-            "processed" => Some(CommitmentConfig::processed()),
-            "finalized" => Some(CommitmentConfig::finalized()),
-            "confirmed" => Some(CommitmentConfig::confirmed()),
-            _ => None,
-        }
+        curve::CurveTicker::parse_commitment(&self.commitment)
     }
 }
 

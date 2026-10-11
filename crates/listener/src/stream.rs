@@ -41,8 +41,14 @@ use tracing::{debug, info, warn};
 /// Upper bound on concurrent `getTransaction` workers.
 const MAX_CONCURRENT_FETCHES: usize = 32;
 
-/// Anchor log marker emitted for the `create` instruction.
-const CREATE_LOG_MARKER: &str = "Instruction: Create";
+/// Deadline for the WebSocket handshake (`connect` + `logs_subscribe`):
+/// a hung handshake must trip the reconnect loop (with backoff) instead
+/// of stalling it forever with no metric and no retry.
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Anchor log marker emitted for `create` instructions (matched
+/// case-insensitively: `create_v2` variants share the prefix).
+const CREATE_LOG_MARKER: &str = "instruction: create";
 
 /// Typed listener errors — everything maps here, never panics.
 #[derive(Error, Debug)]
@@ -177,8 +183,32 @@ impl PumpFunListener {
             commitment: Some(commitment),
         };
 
-        let client = PubsubClient::new(&self.config.ws_url).await?;
-        let (mut sub, _unsub) = client.logs_subscribe(filter, sub_config).await?;
+        let client = match tokio::time::timeout(
+            WS_HANDSHAKE_TIMEOUT,
+            PubsubClient::new(&self.config.ws_url),
+        )
+        .await
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => return Err(ListenerError::Pubsub(e)),
+            Err(_) => {
+                return Err(ListenerError::Terminated(
+                    "websocket connect timed out".to_string(),
+                ));
+            }
+        };
+        let (mut sub, _unsub) = match tokio::time::timeout(
+            WS_HANDSHAKE_TIMEOUT,
+            client.logs_subscribe(filter, sub_config),
+        )
+        .await
+        {
+            Ok(Ok(sub)) => sub,
+            Ok(Err(e)) => return Err(ListenerError::Pubsub(e)),
+            Err(_) => {
+                return Err(ListenerError::Terminated("logsSubscribe timed out".to_string()));
+            }
+        };
         info!(
             ws = %self.config.ws_url,
             commitment = %self.config.commitment,
@@ -186,6 +216,12 @@ impl PumpFunListener {
         );
 
         while let Some(response) = sub.next().await {
+            // Downstream may drop mid-session: stop spawning workers for
+            // a dead channel instead of fetching until the socket ends.
+            if tx.is_closed() {
+                info!("downstream closed mid-session; ending subscription");
+                break;
+            }
             self.stats.inc_logs_seen();
             let sig_str = response.value.signature.clone();
             let slot_hint = response.context.slot;
@@ -199,15 +235,16 @@ impl PumpFunListener {
                 .value
                 .logs
                 .iter()
-                .any(|line| line.contains(CREATE_LOG_MARKER));
+                .any(|line| line.to_ascii_lowercase().contains(CREATE_LOG_MARKER));
             if !has_create {
                 continue;
             }
             self.stats.inc_candidates();
 
             // Hand the RPC round-trip to a worker; never block the read loop.
-            // Throttled: when all fetch permits are out, drop with a metric
-            // instead of queueing unbounded worker tasks.
+            // Concurrency is bounded INSIDE the worker (per-attempt fetch
+            // permits): workers that find no permit exit immediately, and
+            // backoff sleeps never pin a permit.
             let tx_clone = tx.clone();
             let rpc_clone = Arc::clone(rpc);
             let stats_clone = Arc::clone(&self.stats);
@@ -218,22 +255,14 @@ impl PumpFunListener {
                 debug!(signature = %sig_str, "unknown commitment; dropping candidate");
                 continue;
             };
-            let permit = match sem_clone.try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    stats_clone.inc_dropped_throttled();
-                    debug!(signature = %sig_str, "fetch saturated; dropping candidate");
-                    continue;
-                }
-            };
             tokio::spawn(async move {
-                let _permit = permit;
                 fetch_and_emit(
                     &sig_str,
                     slot_hint,
                     &rpc_clone,
                     &tx_clone,
                     &stats_clone,
+                    &sem_clone,
                     commitment,
                 )
                 .await;
@@ -256,10 +285,26 @@ impl PumpFunListener {
         ),
         ListenerError,
     > {
+        Self::subscribe_with_capacity(config, EVENT_CHANNEL_CAPACITY).await
+    }
+
+    /// Spawn a listener with an explicit channel capacity (tests tune
+    /// this down to exercise drop-on-full paths without 10k events).
+    pub async fn subscribe_with_capacity(
+        config: ListenerConfig,
+        capacity: usize,
+    ) -> Result<
+        (
+            mpsc::Receiver<ListenerEvent>,
+            Arc<ListenerStats>,
+            JoinHandle<()>,
+        ),
+        ListenerError,
+    > {
         let listener = PumpFunListener::new(config)?;
         let stats = listener.stats();
         let stats_out = Arc::clone(&stats);
-        let (tx, rx) = mpsc::channel::<ListenerEvent>(EVENT_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<ListenerEvent>(capacity.max(1));
         let handle: JoinHandle<()> = tokio::spawn(async move {
             if let Err(e) = listener.run(tx).await {
                 warn!(error = %e, "listener exited with error");
@@ -270,38 +315,72 @@ impl PumpFunListener {
 }
 
 /// Fetch one transaction with a single retry for transient failures.
+/// Permits are held only across live RPCs, never across the backoff
+/// sleep: attempt 1 runs under a permit, the 250ms sleep runs free, and
+/// attempt 2 re-acquires (giving up with a metric when saturated).
+/// Returns `None` on any terminal outcome (metrics recorded inside).
 /// Deterministic errors (unknown transaction, bad params, rejected
-/// encoding) return immediately without burning an extra RPC or holding
-/// a fetch permit through a sleep. Returns the underlying RPC error
-/// (callers count and log it).
-async fn fetch_tx_with_retry(
+/// encoding) return immediately without burning an extra RPC.
+async fn fetch_tx_permit_bound(
     rpc: &RpcClient,
     signature: &Signature,
     tx_config: RpcTransactionConfig,
-) -> Result<
-    solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
-    ClientError,
-> {
-    match rpc.get_transaction_with_config(signature, tx_config).await {
-        Ok(v) => Ok(v),
+    sem: &Arc<Semaphore>,
+    stats: &Arc<ListenerStats>,
+    sig_str: &str,
+) -> Option<solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta> {
+    let acquire = |why: &str| {
+        match sem.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                stats.inc_dropped_throttled();
+                debug!(signature = %sig_str, why, "fetch saturated; dropping candidate");
+                None
+            }
+        }
+    };
+    let permit = acquire("first attempt")?;
+    let first = rpc.get_transaction_with_config(signature, tx_config).await;
+    drop(permit);
+    match first {
+        Ok(v) => Some(v),
         Err(e) if is_transient_fetch_error(&e) => {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            rpc.get_transaction_with_config(signature, tx_config).await
+            let _permit = acquire("retry")?;
+            match rpc.get_transaction_with_config(signature, tx_config).await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    stats.inc_fetch_err();
+                    debug!(signature = %sig_str, error = %e, "getTransaction retry failed");
+                    None
+                }
+            }
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            stats.inc_fetch_err();
+            debug!(signature = %sig_str, error = %e, "getTransaction failed");
+            None
+        }
     }
 }
 
-/// True for failures worth one retry: transport-level trouble, not
-/// deterministic rejections. Retried: I/O errors and reqwest
-/// timeouts/connects. Returned at once: RPC response errors (unknown
-/// transaction, bad params), decode/body failures, signing/transaction
-/// errors. Mirrors the auditor's transient classification.
+/// True for failures worth one retry: transport-level trouble plus
+/// node-overload/availability RPC codes — NOT deterministic rejections.
+/// Retried: I/O errors, reqwest timeouts/connects, and JSON-RPC
+/// `-32005` (node behind/unhealthy), `-32007`/`-32009` (skipped or
+/// missing slots), `429` (rate-limited). Returned at once: unknown
+/// transaction, bad params (`-32602`), unsupported tx version
+/// (`-32015`), decode/body failures, signing/transaction errors.
+/// Mirrors the auditor's transient classification.
 fn is_transient_fetch_error(e: &ClientError) -> bool {
     use solana_client::client_error::ClientErrorKind;
     match e.kind() {
         ClientErrorKind::Io(_) => true,
         ClientErrorKind::Reqwest(e) => e.is_timeout() || e.is_connect(),
+        ClientErrorKind::RpcError(solana_client::rpc_request::RpcError::RpcResponseError {
+            code: -32005 | -32007 | -32009 | 429,
+            ..
+        }) => true,
         ClientErrorKind::Middleware(_)
         | ClientErrorKind::RpcError(_)
         | ClientErrorKind::SerdeJson(_)
@@ -314,13 +393,16 @@ fn is_transient_fetch_error(e: &ClientError) -> bool {
 /// Fetch one transaction and emit every `create` event found in it.
 ///
 /// Runs inside a spawned worker (not the socket read loop). Never panics;
-/// all failures are counted and logged.
+/// all failures are counted and logged. Fetch permits are acquired per
+/// attempt and released across the backoff sleep: a sleeping worker must
+/// not pin one of the 32 fetch slots.
 async fn fetch_and_emit(
     sig_str: &str,
     slot_hint: u64,
     rpc: &RpcClient,
     tx: &mpsc::Sender<ListenerEvent>,
     stats: &Arc<ListenerStats>,
+    sem: &Arc<Semaphore>,
     commitment: CommitmentConfig,
 ) {
     let signature = match Signature::from_str(sig_str) {
@@ -344,20 +426,16 @@ async fn fetch_and_emit(
         max_supported_transaction_version: Some(1),
     };
 
-    // One retry for transient failures (429/5xx/ppconnect blips), then
-    // give up: a missed launch beats a wedged worker. Whole fetch is
-    // deadline-bound so hung RPCs cannot hold semaphore permits forever.
+    // Whole fetch is deadline-bound (one throttled/overloaded retry, then
+    // give up: a missed launch beats a wedged worker) so hung RPCs cannot
+    // hold semaphore permits forever.
     let fetched = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        fetch_tx_with_retry(rpc, &signature, tx_config),
+        fetch_tx_permit_bound(rpc, &signature, tx_config, sem, stats, sig_str),
     )
     .await    {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            stats.inc_fetch_err();
-            debug!(signature = %sig_str, error = %e, "getTransaction failed");
-            return;
-        }
+        Ok(Some(v)) => v,
+        Ok(None) => return,
         Err(_) => {
             stats.inc_fetch_err();
             debug!(signature = %sig_str, "getTransaction timed out");
@@ -404,15 +482,16 @@ fn extract_events(
         Ok(lists) => lists,
         Err(e) => {
             debug!(signature = %sig_str, error = %e, "unable to decode transaction");
-            stats.inc_fetch_err();
+            // Decode-layer failure (bad keys/encoding), not a fetch
+            // failure: count it where it belongs so fetch_ok stays clean.
+            stats.inc_parse_err();
             return out;
         }
     };
 
-    // Top-level instructions: `data` is base58 per the Json contract,
-    // decoded through the shared helper (base58 → base64 → url-safe) so
-    // top-level and inner instructions cannot drift (a node sending
-    // base64 at top level used to drop valid launches here).
+    // Top-level and inner instructions share one create-classification
+    // path (a `sell_v2` fix in one place must not be forgotten in the
+    // other): decode, then parse v2-or-v1, counting outcomes identically.
     for (program_id, accounts, data_b58) in top_ixs {
         if program_id != PUMP_PROGRAM_ID {
             continue;
@@ -424,37 +503,21 @@ fn extract_events(
                 continue;
             }
         };
-        if is_pump_create_v2_ix(&raw) {
-            // v2 launches parse with the 14-account IDL layout and flow
-            // through identical downstream screening.
-            match parse_pump_create_v2(&raw, &accounts, sig_str.to_string(), slot) {
-                Ok(ev) => {
-                    stats.inc_parse_ok();
-                    out.push(ev);
-                }
-                Err(e) => {
-                    stats.inc_parse_err();
-                    debug!(signature = %sig_str, error = %e, "top-level v2 parse failed");
-                }
-            }
-            continue;
-        }
-        if !is_pump_create_ix(&raw) {
-            continue;
-        }
-        match parse_pump_create(&raw, &accounts, sig_str.to_string(), slot) {
-            Ok(ev) => {
+        match parse_create_event(&raw, &accounts, sig_str, slot) {
+            Ok(Some(ev)) => {
                 stats.inc_parse_ok();
                 out.push(ev);
             }
+            Ok(None) => {}
             Err(e) => {
                 stats.inc_parse_err();
-                debug!(signature = %sig_str, error = %e, "top-level parse failed");
+                debug!(signature = %sig_str, error = %e, "top-level create parse failed");
             }
         }
     }
 
-    // Inner instructions: `data` may be base58 or base64 — try both.
+    // Inner instructions: `data` may be base58 or base64 — decoded
+    // through the same shared helper as top-level.
     for (program_id, accounts, data_str) in inner_ixs {
         if program_id != PUMP_PROGRAM_ID {
             continue;
@@ -466,30 +529,15 @@ fn extract_events(
                 continue;
             }
         };
-        if is_pump_create_v2_ix(&raw) {
-            match parse_pump_create_v2(&raw, &accounts, sig_str.to_string(), slot) {
-                Ok(ev) => {
-                    stats.inc_parse_ok();
-                    out.push(ev);
-                }
-                Err(e) => {
-                    stats.inc_parse_err();
-                    debug!(signature = %sig_str, error = %e, "inner v2 parse failed");
-                }
-            }
-            continue;
-        }
-        if !is_pump_create_ix(&raw) {
-            continue;
-        }
-        match parse_pump_create(&raw, &accounts, sig_str.to_string(), slot) {
-            Ok(ev) => {
+        match parse_create_event(&raw, &accounts, sig_str, slot) {
+            Ok(Some(ev)) => {
                 stats.inc_parse_ok();
                 out.push(ev);
             }
+            Ok(None) => {}
             Err(e) => {
                 stats.inc_parse_err();
-                debug!(signature = %sig_str, error = %e, "inner parse failed");
+                debug!(signature = %sig_str, error = %e, "inner create parse failed");
             }
         }
     }
@@ -498,6 +546,25 @@ fn extract_events(
     debug!(signature = %sig_str, slot, slot_hint, "extracted events");
 
     out
+}
+
+/// Classify one decoded Pump.fun instruction as a launch event:
+/// `Some` on `create`/`create_v2`, `None` on other discriminators,
+/// `Err` on malformed create payloads. Single home for the v2→v1
+/// branching used by top-level and inner loops alike.
+fn parse_create_event(
+    raw: &[u8],
+    accounts: &[Pubkey],
+    sig: &str,
+    slot: u64,
+) -> Result<Option<crate::parser::PumpTokenLaunchEvent>, crate::parser::PumpParseError> {
+    if is_pump_create_v2_ix(raw) {
+        parse_pump_create_v2(raw, accounts, sig.to_string(), slot).map(Some)
+    } else if is_pump_create_ix(raw) {
+        parse_pump_create(raw, accounts, sig.to_string(), slot).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Decoded instruction view: (program_id, resolved accounts, raw data string).
@@ -601,12 +668,26 @@ fn append_loaded(keys: &mut Vec<Pubkey>, extra: &[String]) -> Result<(), Listene
 }
 
 /// Resolve one compiled instruction to (program_id, accounts, data string).
+/// Out-of-bounds indexes (malformed RPC payloads) log at debug and skip —
+/// callers must never mistake a truncated instruction for an absent one
+/// in silence.
 fn decode_compiled_ix(cix: &UiCompiledInstruction, account_keys: &[Pubkey]) -> Option<DecodedIx> {
-    let program_id = *account_keys.get(usize::from(cix.program_id_index))?;
+    let program_id = match account_keys.get(usize::from(cix.program_id_index)) {
+        Some(p) => *p,
+        None => {
+            debug!(program_id_index = cix.program_id_index, keys = account_keys.len(), "compiled ix program index out of bounds");
+            return None;
+        }
+    };
     let mut accounts = Vec::with_capacity(cix.accounts.len());
     for idx in &cix.accounts {
-        let key = *account_keys.get(usize::from(*idx))?;
-        accounts.push(key);
+        match account_keys.get(usize::from(*idx)) {
+            Some(key) => accounts.push(*key),
+            None => {
+                debug!(index = idx, keys = account_keys.len(), "compiled ix account index out of bounds");
+                return None;
+            }
+        }
     }
     Some((program_id, accounts, cix.data.clone()))
 }

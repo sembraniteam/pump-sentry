@@ -102,6 +102,7 @@ cargo run
 | `STRATEGY_MODE` / `RUNNER_MOONBAG_PERCENT` / `RUNNER_TRAIL_PERCENT`     | `adaptive` / `20` / `20`      | Execution shape; runner moonbag share + wide trail (%)                             |
 | `MAX_DAILY_LOSS_USD`                                                    | `0` (off)                     | Day-loss circuit breaker: halts new entries past the cap; exits always work        |
 | `DISCORD_CHANNEL`                                                       | *(unset)*                     | Hermes `--to discord:<id>` target; unset = host-configured channel                 |
+| `HERMES_BIN`                                                           | `hermes`                      | Hermes binary path; prefer absolute (bare name resolves via `PATH`)                |
 | `PRIORITY_FEE_MICRO_LAMPORTS` / `COMPUTE_UNIT_LIMIT`                    | `0` / `0`                     | Live compute budget (0 = off); priority price + unit limit                         |
 | `FEE_RECIPIENT`                                                         | *(unset)*                     | Override swap fee-recipient; unset = live Global account read                      |
 
@@ -111,7 +112,8 @@ Without flags the bot is a pure simulator. With `--live` (or
 `IS_LIVE=true`) each paper open additionally sends a buy bundle (swap + tip in one transaction) and each paper close
 sells the tracked
 amount — the paper book stays the system of record while live legs are
-best-effort with loud errors. Sizing derives from the USD notional at
+best-effort with loud errors. Live startup waits 5s before dispatching
+(Ctrl-C aborts; automation-safe, no prompt). Sizing derives from the USD notional at
 curve spot with a `SLIPPAGE_BPS` guard; sells floor proceeds the same
 way. Start on devnet-sized notionals and watch bundle UUIDs in logs.
 

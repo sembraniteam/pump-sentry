@@ -24,7 +24,7 @@ use migration::{PoolTick, VaultTicker};
 use risk_engine::RiskEngine;
 use simulator::PaperPortfolio;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use live::LiveTrader;
 use pipeline::Pipeline;
@@ -38,9 +38,11 @@ async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "info,solana_snipe_bot=debug",
-        ))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,solana_snipe_bot=debug")
+            }),
+        )
         .init();
 
     let settings = Settings::from_env();
@@ -56,8 +58,11 @@ async fn main() {
         || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
     if live_mode {
         warn!("================================================================");
-        warn!("LIVE MODE: real SOL will move via Jito bundles. Ctrl-C to abort.");
+        warn!("LIVE MODE: real SOL will move via Jito bundles.");
+        warn!("Starting in 5s — Ctrl-C now to abort (no confirmation prompt,");
+        warn!("so automation never hangs; the delay is the abort window).");
         warn!("================================================================");
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
     // Surface suspicious config (typos fall back to defaults silently).
@@ -128,9 +133,9 @@ async fn main() {
         };
         info!(payer = %wallet.pubkey(), "live wallet loaded");
         let jito = match JitoClient::new(&settings.jito_endpoint) {
-            Some(jito) => jito,
-            None => {
-                eprintln!("bad JITO_ENDPOINT: {}", settings.jito_endpoint);
+            Ok(jito) => jito,
+            Err(e) => {
+                eprintln!("bad JITO_ENDPOINT '{}': {e}", settings.jito_endpoint);
                 std::process::exit(1);
             }
         };
@@ -266,6 +271,9 @@ async fn main() {
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let stats_task = Arc::clone(&stats);
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
+    // Tracks a clean Ctrl-C exit: any other loop end (closed channels,
+    // dead streams) exits nonzero so supervisors notice.
+    let mut clean_shutdown = false;
     loop {
         // Reap finished units every iteration: JoinSet retains completed
         // outputs until joined, so without this the set grows without
@@ -279,19 +287,24 @@ async fn main() {
                 let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
                     let Ok(_permit) = permits.acquire_owned().await else { return };
+                    // Owned first: borrowing `.as_deref()` temporaries
+                    // across the `.await` below would self-borrow the
+                    // future (rejected); named locals live in the future
+                    // state like any other capture.
+                    let creator = event.creator.as_ref().map(|c| c.to_string());
                     pipeline
                         .on_launch(
                             &event.mint.to_string(),
                             &event.bonding_curve.to_string(),
                             &event.associated_bonding_curve.to_string(),
                             &event.user.to_string(),
-                            event.creator.as_ref().map(|c| c.to_string()).as_deref(),
+                            creator.as_deref(),
                             event.slot,
                         )
                         .await;
                     let snap = stats.snapshot();
                     let pending = pipeline.pending_count().await;
-                    info!(logs = snap.logs_seen, candidates = snap.candidates,
+                    debug!(logs = snap.logs_seen, candidates = snap.candidates,
                         parse_ok = snap.parse_ok, dropped = snap.dropped_full,
                         throttled = snap.dropped_throttled,
                         watchlist = pending, "listener stats");
@@ -326,6 +339,7 @@ async fn main() {
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("shutdown requested");
+                clean_shutdown = true;
                 break;
             }
         }
@@ -350,7 +364,14 @@ async fn main() {
         warn!("shutdown drain timed out; abandoning in-flight units");
     }
 
-    warn!("streams ended; open positions need manual review");
+    if clean_shutdown {
+        info!("shutdown complete");
+    } else {
+        // Streams ended without Ctrl-C (dead RPC, closed channels):
+        // exit nonzero so supervisors and systemd notice the outage.
+        warn!("streams ended; open positions need manual review");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -362,5 +383,15 @@ mod tests {
     fn crypto_provider_installs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    /// Cross-crate invariant: the risk-engine heuristic cap must stay at
+    /// or below the auditor's hard gate, or scores 351–400 would resolve
+    /// to BUY-side profiles the auditor would have rejected outright.
+    #[test]
+    fn heuristic_cap_within_audit_cap() {
+        assert!(
+            risk_engine::fallback::RUGCHECK_SCORE_CAP <= auditor::AuditPolicy::default().max_score
+        );
     }
 }

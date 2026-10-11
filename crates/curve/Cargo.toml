@@ -16,6 +16,8 @@ solana-sdk = "5.0.0"
 solana-client = "4.3.0"
 solana-commitment-config = "3"
 solana-account = "4"
+futures-util = "0.3"
+ids = { path = "../ids" }
 tokio = { version = "1", features = ["time", "sync"] }
 thiserror = "2"
 tracing = "0.1"

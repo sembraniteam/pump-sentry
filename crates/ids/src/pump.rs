@@ -83,4 +83,24 @@ mod tests {
             "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg"
         );
     }
+
+    #[test]
+    fn discriminators_are_pairwise_distinct() {
+        // A copy-paste discriminator would alias two instruction kinds
+        // into one parser arm (buys read as sells or vice versa).
+        let discs = [
+            PUMP_CREATE_DISCRIMINATOR,
+            PUMP_CREATE_V2_DISCRIMINATOR,
+            PUMP_BUY_DISCRIMINATOR,
+            PUMP_SELL_DISCRIMINATOR,
+            PUMP_BUY_V2_DISCRIMINATOR,
+            PUMP_SELL_V2_DISCRIMINATOR,
+            PUMP_MIGRATE_DISCRIMINATOR,
+        ];
+        for (i, a) in discs.iter().enumerate() {
+            for b in &discs[i + 1..] {
+                assert_ne!(a, b, "aliased discriminator");
+            }
+        }
+    }
 }

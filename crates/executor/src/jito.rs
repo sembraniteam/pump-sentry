@@ -40,6 +40,9 @@ pub enum JitoError {
     /// Transaction serialization failed.
     #[error("Bundle encoding failed: {0}")]
     Encode(String),
+    /// Block-engine URL is invalid.
+    #[error("bad Jito endpoint: {0}")]
+    BadUrl(String),
 }
 
 /// Regional block-engine bundle client.
@@ -60,17 +63,18 @@ pub const TIP_ACCOUNTS_TTL_SECS: u64 = 3_600;
 impl JitoClient {
     /// Build against a regional base URL, e.g.
     /// `https://frankfurt.mainnet.block-engine.jito.wtf`.
-    /// Returns `None` on malformed URLs (fail fast at startup).
-    pub fn new(region_base_url: &str) -> Option<Self> {
+    /// Returns the reason instead of `None` so startup logs say more
+    /// than "bad URL" (fail fast at startup, never half-enable live).
+    pub fn new(region_base_url: &str) -> Result<Self, JitoError> {
         match url::Url::parse(region_base_url) {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
-            _ => return None,
+            _ => return Err(JitoError::BadUrl(region_base_url.to_string())),
         }
         let client = Client::builder()
             .timeout(Duration::from_millis(2000))
             .build()
-            .ok()?;
-        Some(Self {
+            .map_err(JitoError::Network)?;
+        Ok(Self {
             client,
             endpoint: format!("{region_base_url}/api/v1/bundles"),
             tips: std::sync::Arc::new(std::sync::Mutex::new((
@@ -312,8 +316,14 @@ mod tests {
 
     #[test]
     fn rejects_bad_endpoint() {
-        assert!(JitoClient::new("notaurl").is_none());
-        assert!(JitoClient::new("wss://example.com").is_none());
+        assert!(matches!(
+            JitoClient::new("notaurl"),
+            Err(JitoError::BadUrl(_))
+        ));
+        assert!(matches!(
+            JitoClient::new("wss://example.com"),
+            Err(JitoError::BadUrl(_))
+        ));
         let client =
             JitoClient::new("https://frankfurt.mainnet.block-engine.jito.wtf").expect("ok");
         assert!(client.endpoint().ends_with("/api/v1/bundles"));

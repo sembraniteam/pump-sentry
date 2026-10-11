@@ -15,7 +15,11 @@ use thiserror::Error;
 /// Canonical addresses and discriminators live in [`ids`]; re-exported
 /// here so the whole workspace shares one definition (a program upgrade
 /// edits exactly one file).
-pub use ids::{PUMP_CREATE_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR};
+pub use ids::{
+    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_CREATE_DISCRIMINATOR,
+    PUMP_CREATE_V2_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR,
+    PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR,
+};
 
 /// Minimum number of accounts expected on a `create` instruction.
 pub const PUMP_CREATE_MIN_ACCOUNTS: usize = 8;
@@ -75,8 +79,15 @@ pub struct PumpCreateInstructionArgs {
     pub uri: String,
 }
 
-/// Borsh args of Pump.fun `create_v2`: same triple plus a mayhem flag.
-/// Verified against the canonical IDL (`pump_bonding_curve` snapshot).
+/// Borsh args of Pump.fun `create_v2` as a TEST-ENCODING helper only.
+///
+/// WARNING — not a wire mirror: live `create_v2` bytes carry the 32-byte
+/// creator IMMEDIATELY after the string triple (vault-PDA verified), so
+/// a bool in this position would misattribute the creator by one byte.
+/// The bool's true wire position is unmapped. Use
+/// [`decode_name_symbol_uri`] + explicit tail reads for wire decoding
+/// (see [`parse_pump_create_v2`]); this struct exists so tests can
+/// encode IDL-shaped payloads.
 #[derive(borsh::BorshDeserialize, borsh::BorshSerialize, Debug, Clone, PartialEq, Eq)]
 pub struct PumpCreateV2InstructionArgs {
     /// Token name.
@@ -133,6 +144,19 @@ pub fn is_pump_create_ix(data: &[u8]) -> bool {
 #[inline]
 pub fn is_pump_create_v2_ix(data: &[u8]) -> bool {
     data.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
+}
+
+/// Decode the leading Borsh `(name, symbol, uri)` triple shared by
+/// `create` and `create_v2` args, advancing `cursor` past it and leaving
+/// any versioned tail for the caller. One decode path for both versions:
+/// Borsh `&[u8]` decoding never requires exact consumption (no
+/// `try_from_slice` tail breakage), and allocation is slice-bounded on
+/// top of borsh's cautious 1MB cap — a hostile length prefix fails
+/// without giant allocations.
+fn decode_name_symbol_uri(
+    cursor: &mut &[u8],
+) -> Result<PumpCreateInstructionArgs, PumpParseError> {
+    PumpCreateInstructionArgs::deserialize(cursor).map_err(PumpParseError::Borsh)
 }
 
 /// Parse a Pump.fun `create` instruction.
@@ -210,7 +234,7 @@ fn parse_pump_create_inner(
         return Err(PumpParseError::ArgsTooLong(args_bytes.len()));
     }
     let mut args_slice: &[u8] = args_bytes;
-    let args = PumpCreateInstructionArgs::deserialize(&mut args_slice)?;
+    let args = decode_name_symbol_uri(&mut args_slice)?;
 
     Ok(PumpTokenLaunchEvent {
         mint,
@@ -270,33 +294,21 @@ pub fn parse_pump_create_v2(
     if args_bytes.len() > MAX_CREATE_ARGS_LEN {
         return Err(PumpParseError::ArgsTooLong(args_bytes.len()));
     }
-    // Decode the leading (name, symbol, uri) triple by hand and ignore
-    // the trailing versioned args: deployed v2 args carry extra fields
-    // after `uri` (a 32-byte creator plus versioned tail — observed live),
-    // so a strict struct decode would break on every program upgrade.
-    // Length-prefixed strings are self-delimiting; the tail is irrelevant
-    // to launch screening.
+    // Decode the leading (name, symbol, uri) triple with the shared
+    // helper and read the creator from the versioned tail: the FIRST 32
+    // bytes after the triple. Wire-verified, not IDL-assumed — a frozen
+    // mainnet create_v2 carries triple + creator[32] + 11 unknown tail
+    // bytes, and the creator-vault PDA derived from exactly these bytes
+    // matched a live mayhem buy's vault account. (The IDL-shaped
+    // `PumpCreateV2InstructionArgs` puts a bool right after the triple
+    // and must NOT be used for wire decoding — it would misattribute by
+    // one byte.) Short tail → None (event stays valid, swaps fall back
+    // to the legacy shape).
     let mut cursor: &[u8] = args_bytes;
-    let mut next_string = || -> Result<String, PumpParseError> {
-        if cursor.len() < 4 {
-            return Err(PumpParseError::DataTooShort);
-        }
-        let len = u32::from_le_bytes(cursor[..4].try_into().map_err(|_| PumpParseError::DataTooShort)?) as usize;
-        cursor = &cursor[4..];
-        if cursor.len() < len || len > MAX_CREATE_ARGS_LEN {
-            return Err(PumpParseError::DataTooShort);
-        }
-        let s = std::str::from_utf8(&cursor[..len]).map_err(|_| PumpParseError::BadString)?;
-        cursor = &cursor[len..];
-        Ok(s.to_string())
-    };
-    let name = next_string()?;
-    let symbol = next_string()?;
-    let uri = next_string()?;
-    // Creator: the 32 bytes following the string triple. Verified live:
-    // the creator-vault PDA derived from these exact bytes matched a real
-    // mayhem buy's vault account. Short tail → None (event stays valid,
-    // swaps fall back to the legacy shape).
+    let args = decode_name_symbol_uri(&mut cursor)?;
+    let name = args.name;
+    let symbol = args.symbol;
+    let uri = args.uri;
     let creator = cursor
         .get(..32)
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
@@ -319,22 +331,47 @@ pub fn parse_pump_create_v2(
 /// Decode instruction data tolerant to RPC encoding: base58, then
 /// standard base64, then URL-safe base64. Empty payloads never decode.
 /// Single home for every decoder in the crate (stream, screen).
+///
+/// A base64 payload using only bs58-alphabet characters would mis-decode
+/// as base58, so when several decodings succeed the one opening with a
+/// known Pump.fun discriminator wins; otherwise the first success is
+/// kept (previous behavior).
 pub fn decode_ix_data(data_str: &str) -> Option<Vec<u8>> {
     use base64::Engine;
-    if let Ok(raw) = bs58::decode(data_str).into_vec()
-        && !raw.is_empty()
-    {
-        return Some(raw);
+    let decodings = [
+        bs58::decode(data_str).into_vec().ok(),
+        base64::engine::general_purpose::STANDARD
+            .decode(data_str)
+            .ok(),
+        base64::engine::general_purpose::URL_SAFE
+            .decode(data_str)
+            .ok(),
+    ];
+    let mut fallback: Option<Vec<u8>> = None;
+    for decoded in decodings.into_iter().flatten() {
+        if decoded.is_empty() {
+            continue;
+        }
+        if starts_with_known_discriminator(&decoded) {
+            return Some(decoded);
+        }
+        if fallback.is_none() {
+            fallback = Some(decoded);
+        }
     }
-    if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(data_str)
-        && !raw.is_empty()
-    {
-        return Some(raw);
-    }
-    base64::engine::general_purpose::URL_SAFE
-        .decode(data_str)
-        .ok()
-        .filter(|raw| !raw.is_empty())
+    fallback
+}
+
+/// True when `data` opens with any known Pump.fun discriminator
+/// (create/create_v2/buy/sell/buy_v2/sell_v2/migrate).
+fn starts_with_known_discriminator(data: &[u8]) -> bool {
+    data.starts_with(&PUMP_CREATE_DISCRIMINATOR)
+        || data.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
+        || data.starts_with(&PUMP_BUY_DISCRIMINATOR)
+        || data.starts_with(&PUMP_SELL_DISCRIMINATOR)
+        || data.starts_with(&PUMP_BUY_V2_DISCRIMINATOR)
+        || data.starts_with(&PUMP_SELL_V2_DISCRIMINATOR)
+        || data.starts_with(&PUMP_MIGRATE_DISCRIMINATOR)
 }
 
 /// Parse helper matching the skill signature `parse_pump_create(data, accounts)`
@@ -455,6 +492,63 @@ mod tests {
         assert_eq!(ev.symbol, "PEPE");
         assert_eq!(ev.signature, "sig123");
         assert_eq!(ev.slot, 42);
+    }
+
+    #[test]
+    fn parse_v2_pins_live_wire_tail() {
+        // Frozen mainnet create_v2 (146-byte data): string triple, then
+        // creator[32], then an 11-byte versioned tail of unknown layout.
+        // The creator bytes are the same ones whose vault PDA matched a
+        // live mayhem buy — first-32 attribution is evidence-backed. If
+        // anyone "fixes" the parser to the IDL-struct order (bool right
+        // after the triple), this test breaks loudly.
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/create_v2_mainnet.json"))
+                .expect("fixture");
+        let msg = &raw["result"]["transaction"]["message"];
+        let keys: Vec<String> =
+            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        let pump = PUMP_PROGRAM_ID.to_string();
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            let pi = ix["programIdIndex"].as_u64().expect("pi") as usize;
+            if keys.get(pi) != Some(&pump) {
+                continue;
+            }
+            let data = decode_ix_data(ix["data"].as_str().expect("data")).expect("decode");
+            if !is_pump_create_v2_ix(&data) {
+                continue;
+            }
+            let idx: Vec<usize> =
+                serde_json::from_value(ix["accounts"].clone()).expect("accts");
+            // 16-account live instruction (MIN tolerance is 14).
+            assert_eq!(idx.len(), 16);
+            let accounts: Vec<Pubkey> = idx
+                .iter()
+                .map(|i| Pubkey::from_str(&keys[*i]).expect("key"))
+                .collect();
+            let ev =
+                parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77).expect("parse");
+            assert_eq!(ev.name, "makemerich");
+            assert_eq!(ev.symbol, "mmrich");
+            assert_eq!(
+                ev.uri,
+                "https://ipfs.io/ipfs/QmNsGCZiXUFWrGfDUZgs9MCV7Q8JEZxQGjUbj4Tj2oNMjh"
+            );
+            assert_eq!(ev.mint.to_string(), keys[idx[0]]);
+            assert_eq!(ev.bonding_curve.to_string(), keys[idx[2]]);
+            assert_eq!(ev.associated_bonding_curve.to_string(), keys[idx[3]]);
+            assert_eq!(ev.user.to_string(), keys[idx[5]]);
+            assert_eq!(
+                ev.creator,
+                Some(Pubkey::new_from_array([
+                    181, 33, 156, 169, 71, 74, 115, 4, 142, 47, 129, 175, 116, 186, 124, 26,
+                    181, 141, 124, 30, 200, 103, 36, 11, 1, 87, 83, 217, 77, 172, 67, 38,
+                ]))
+            );
+            assert_eq!(ev.slot, 77);
+            return;
+        }
+        panic!("no create_v2 instruction in fixture");
     }
 
     #[test]

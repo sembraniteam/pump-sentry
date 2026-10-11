@@ -1,13 +1,24 @@
 //! Hermes CLI dispatch plus Discord markdown card formatters.
 
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 /// Per-message dispatch deadline (failure tolerance per skill).
 pub const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hermes binary invoked for delivery.
 pub const HERMES_BIN: &str = "hermes";
+/// Env override for the Hermes binary path. Prefer an absolute path here:
+/// a bare `"hermes"` resolves via `PATH`, and a writable directory early
+/// in `PATH` lets an attacker substitute the alert binary.
+pub const HERMES_BIN_ENV: &str = "HERMES_BIN";
+/// Maximum concurrent Hermes children: every `send` forks a process, so
+/// an exit storm must queue behind permits instead of fork-bombing the
+/// host. Excess messages are dropped with a counter (see
+/// [`Alerter::dropped_count`]) — alerts are observability, never consensus.
+pub const MAX_INFLIGHT_ALERTS: usize = 4;
 
 /// Fire-and-forget Discord alerter. Cloneable and cheap.
 #[derive(Debug, Clone)]
@@ -22,6 +33,19 @@ pub struct Alerter {
     /// channel). Channel IDs are numeric snowflakes; anything else is
     /// rejected at set time (fail-closed, keeps the default target).
     channel: Option<String>,
+    /// Dispatch permits shared across clones (see [`MAX_INFLIGHT_ALERTS`]).
+    permits: Arc<Semaphore>,
+    /// Messages dropped for lack of a permit (shared across clones).
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Resolve the Hermes binary: explicit override first, `HERMES_BIN` env
+/// second, bare `"hermes"` on `PATH` last.
+fn resolve_binary() -> String {
+    match std::env::var(HERMES_BIN_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => HERMES_BIN.to_string(),
+    }
 }
 
 impl Default for Alerter {
@@ -31,24 +55,33 @@ impl Default for Alerter {
 }
 
 impl Alerter {
-    /// Enabled alerter shelling out to `hermes`.
+    /// Enabled alerter shelling out to Hermes (see [`resolve_binary`]).
     pub fn new() -> Self {
         Self {
-            binary: HERMES_BIN.to_string(),
+            binary: resolve_binary(),
             enabled: true,
             timeout: DISPATCH_TIMEOUT,
             channel: None,
+            permits: Arc::new(Semaphore::new(MAX_INFLIGHT_ALERTS)),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// No-op alerter: [`Alerter::send`] returns immediately.
     pub fn disabled() -> Self {
         Self {
-            binary: HERMES_BIN.to_string(),
+            binary: resolve_binary(),
             enabled: false,
             timeout: DISPATCH_TIMEOUT,
             channel: None,
+            permits: Arc::new(Semaphore::new(MAX_INFLIGHT_ALERTS)),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Messages dropped for lack of a dispatch permit (storm backpressure).
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Override the binary (tests point this at `echo`/`false`).
@@ -60,9 +93,13 @@ impl Alerter {
     /// Route to a specific Hermes Discord channel (`--to
     /// `discord:<channel-id>`). Non-numeric input is rejected (keeps the
     /// default `discord` target) since channel IDs are numeric snowflakes.
+    /// Overlong input is rejected too (argv bloat fails the spawn).
     pub fn with_channel(mut self, channel: &str) -> Self {
         let channel = channel.trim();
-        if !channel.is_empty() && channel.bytes().all(|b| b.is_ascii_digit()) {
+        if !channel.is_empty()
+            && channel.len() <= 32
+            && channel.bytes().all(|b| b.is_ascii_digit())
+        {
             self.channel = Some(channel.to_string());
         }
         self
@@ -81,21 +118,45 @@ impl Alerter {
     }
 
     /// Dispatch `message` as a detached task. Never blocks, never fails
-    /// the caller: delivery problems only log.
+    /// the caller: delivery problems only log. At most
+    /// [`MAX_INFLIGHT_ALERTS`] children run at once; excess messages are
+    /// dropped with a counter rather than forking unboundedly.
+    ///
+    /// Pass formatter output (`format_entry`, ...): the message travels
+    /// as a positional argv element after `--to`, so a payload starting
+    /// with `-` could parse as a Hermes flag. Formatters sanitize their
+    /// fields; raw caller strings are not re-sanitized here (no shell is
+    /// involved — `Command` execs directly — but flag injection is a
+    /// parser property of Hermes, whose `--` support is unverified).
     pub fn send(&self, message: String) {
         if !self.enabled {
             return;
         }
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let dropped = self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                warn!(target: "alerting", dropped, "alert storm; dropping message");
+                return;
+            }
+        };
         let binary = self.binary.clone();
         let timeout = self.timeout;
         let args = self.argv(&message);
         tokio::spawn(async move {
-            let run = Command::new(&binary).args(&args).output();
+            // Hold the permit for the whole child lifetime.
+            let _permit = permit;
+            let mut cmd = Command::new(&binary);
+            // A timed-out future drops here: kill the orphan so a late
+            // child cannot deliver a duplicate after the timeout.
+            cmd.kill_on_drop(true);
+            let run = cmd.args(&args).output();
             match tokio::time::timeout(timeout, run).await {
                 Err(_) => warn!(target: "alerting", "Hermes alert timed out"),
                 Ok(Err(e)) => warn!(target: "alerting", "Failed to spawn Hermes alert: {e}"),
                 Ok(Ok(output)) if !output.status.success() => {
                     let err = String::from_utf8_lossy(&output.stderr);
+                    let err: String = err.chars().take(1024).collect();
                     warn!(target: "alerting", "Hermes Discord delivery failed: {err}");
                 }
                 Ok(Ok(_)) => {}
@@ -126,12 +187,18 @@ impl Alerter {
     /// Current callers only pass base58 pubkeys, bundle UUIDs, and internal
     /// enums (all inert today), but any future field (token name/symbol)
     /// is attacker-controlled — sanitize at the boundary so a new card
-    /// cannot become a mention/embed injection.
+    /// cannot become a mention/embed injection. Brackets and parens go
+    /// too (`[text](url)` links), as do Unicode format characters
+    /// (zero-width/bidi overrides, which `char::is_control` misses).
     fn sanitize(s: &str) -> String {
         s.chars()
             .filter(|c| {
-                !matches!(c, '`' | '*' | '_' | '~' | '|' | '>' | '@' | '#' | ':' | '/' | '\\')
-                    && !c.is_control()
+                !matches!(
+                    c,
+                    '`' | '*' | '_' | '~' | '|' | '>' | '@' | '#' | ':' | '/' | '\\' | '['
+                        | ']' | '(' | ')'
+                ) && !c.is_control()
+                    && !is_format_char(*c)
             })
             .take(128)
             .collect()
@@ -230,6 +297,16 @@ impl Alerter {
     }
 }
 
+/// Unicode format characters (`Cf`) smuggled past `char::is_control`:
+/// zero-width spaces/joiners and bidi overrides that reorder displayed
+/// text (spoofed mints, fake mentions).
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +376,40 @@ mod tests {
         // own code span (no breakout): "`A`M`M`" renders as "`AMM`".
         let tricky = Alerter::format_migration("M", "X", "s", Some("`A`M`M`"), None, None);
         assert!(tricky.contains("`AMM`"));
+    }
+
+    #[test]
+    fn sanitize_blocks_links_and_bidi() {
+        // Markdown links die with their brackets and parens.
+        let card = Alerter::format_exit("[click](https://evil.example)", "TakeProfit", 1.0, 1.0, 1.0, false);
+        assert!(!card.contains("https://evil.example"));
+        assert!(!card.contains("[click]"));
+        // Zero-width and bidi-override characters are stripped.
+        let sneaky = "AB\u{200B}CD\u{202E}EF";
+        assert_eq!(Alerter::sanitize(sneaky), "ABCDEF");
+        assert_eq!(Alerter::sanitize("a\u{FEFF}b"), "ab");
+    }
+
+    #[test]
+    fn storm_drops_behind_permits() {
+        // Permit pool is 4: exhaust it, then the next send drops loudly
+        // instead of forking.
+        let alert = Alerter::new().with_binary("/bin/echo");
+        let mut held = Vec::new();
+        for _ in 0..MAX_INFLIGHT_ALERTS {
+            held.push(alert.permits.clone().try_acquire_owned().expect("permit"));
+        }
+        alert.send("storm".to_string());
+        assert_eq!(alert.dropped_count(), 1);
+        drop(held);
+    }
+
+    #[test]
+    fn channel_rejects_overlong_input() {
+        assert_eq!(
+            Alerter::new().with_channel(&"1".repeat(64)).argv("hi"),
+            vec!["send", "--to", "discord", "hi"]
+        );
     }
 
     #[test]

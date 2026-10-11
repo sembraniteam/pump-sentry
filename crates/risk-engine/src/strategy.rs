@@ -35,7 +35,8 @@ pub enum StrategyMode {
     /// Follow the risk profile verbatim (model/heuristic decides).
     #[default]
     Adaptive,
-    /// Quick scalp: TP in [+25%, +35%], full exit, no runners.
+    /// Quick scalp: TP clamped down to +35% (below-band targets
+    /// honored as-is, never widened), full exit, no runners.
     ScalpQuick,
     /// Moonbag runner: TP sells most, rides the rest on trailing.
     Runner,
@@ -79,12 +80,16 @@ impl Default for StrategyConfig {
 /// BUY profiles keep SL/timeout and gain the mode's TP/moonbag/trailing
 /// shape. Outputs always satisfy [`RiskProfile::is_valid`] when inputs do.
 ///
+/// Invalid profiles pass through untouched for the caller to reject
+/// explicitly: clamping garbage (e.g. `tp.min(35)` on `-5`) would launder
+/// it into a still-invalid profile that merely looks processed.
+///
 /// Scalp clamps DOWN only: `tp` above the band is cut to
 /// [`SCALP_TP_MAX`]; `tp` below [`SCALP_TP_MIN`] passes through (callers
 /// must warn — silently widening a model's early exit is how winners
 /// become losers).
 pub fn resolve_strategy(profile: &RiskProfile, cfg: &StrategyConfig) -> RiskProfile {
-    if profile.action != Action::Buy {
+    if profile.action != Action::Buy || !profile.is_valid() {
         return *profile;
     }
     match cfg.mode {
@@ -103,9 +108,17 @@ pub fn resolve_strategy(profile: &RiskProfile, cfg: &StrategyConfig) -> RiskProf
             sl_percent: profile.sl_percent,
             trailing_stop: true,
             timeout_seconds: profile.timeout_seconds,
-            moonbag_percent: cfg.runner_moonbag_percent.clamp(0.0, 100.0),
+            // `f64::clamp` on NaN yields NaN (never the range): normalize
+            // non-finite config to the default first.
+            moonbag_percent: finite_or(cfg.runner_moonbag_percent, RUNNER_MOONBAG_DEFAULT)
+                .clamp(0.0, 100.0),
         },
     }
+}
+
+/// Finite `v`, else `default` (for pre-clamp normalization).
+fn finite_or(v: f64, default: f64) -> f64 {
+    if v.is_finite() { v } else { default }
 }
 
 #[cfg(test)]
@@ -176,6 +189,43 @@ mod tests {
         let mid = resolve_strategy(&buy(30.0, 0.0, false), &cfg);
         assert_eq!(mid.tp_percent, 30.0);
         assert!(mid.is_valid());
+    }
+
+    #[test]
+    fn invalid_profiles_pass_through_untouched() {
+        // Clamping garbage would launder it into a still-invalid profile
+        // that looks processed; the caller must reject it explicitly.
+        let invalid = RiskProfile {
+            action: Action::Buy,
+            tp_percent: -5.0,
+            sl_percent: 3.0,
+            trailing_stop: false,
+            timeout_seconds: 90,
+            moonbag_percent: 0.0,
+        };
+        assert!(!invalid.is_valid());
+        for mode in [
+            StrategyMode::Adaptive,
+            StrategyMode::ScalpQuick,
+            StrategyMode::Runner,
+        ] {
+            let cfg = StrategyConfig {
+                mode,
+                ..StrategyConfig::default()
+            };
+            assert_eq!(resolve_strategy(&invalid, &cfg), invalid);
+        }
+    }
+
+    #[test]
+    fn nan_moonbag_config_falls_back_to_default() {
+        let cfg = StrategyConfig {
+            mode: StrategyMode::Runner,
+            runner_moonbag_percent: f64::NAN,
+        };
+        let p = resolve_strategy(&buy(60.0, 0.0, false), &cfg);
+        assert_eq!(p.moonbag_percent, RUNNER_MOONBAG_DEFAULT);
+        assert!(p.is_valid());
     }
 
     #[test]

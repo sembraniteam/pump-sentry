@@ -224,6 +224,12 @@ impl Settings {
         if self.sol_usd <= 0.0 || !self.sol_usd.is_finite() {
             out.push(format!("SOL_USD={} is not positive; pricing is garbage", self.sol_usd));
         }
+        if self.commitment == "processed" {
+            out.push(
+                "COMMITMENT=processed is optimistic (reorgable prints): prefer confirmed for exits"
+                    .to_string(),
+            );
+        }
         if self.start_balance <= 0.0 || !self.start_balance.is_finite() {
             out.push(format!(
                 "START_BALANCE={} is not positive finite; the paper book starts broke",
@@ -351,12 +357,22 @@ fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> O
 }
 
 /// Local unix seconds; `0` when the clock is unavailable (never panics).
+/// A broken clock corrupts day buckets, gate deadlines, and cooldowns —
+/// warn once (loud on first use, silent after, so a wedged clock cannot
+/// spam every tick).
 pub fn now_secs() -> u64 {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("system clock before unix epoch; time math degrades to 0");
+            }
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -438,8 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_values_warn() {
-        let s = Settings::from_map(&vars(&[
+    fn degenerate_values_warn() {        let s = Settings::from_map(&vars(&[
             ("GATE_POLL_MS", "0"),
             ("TICK_INTERVAL_MS", "0"),
             ("TRAIL_PERCENT", "0"),
@@ -456,6 +471,15 @@ mod tests {
         assert!(w.contains("JITO_TIP_LAMPORTS=0"), "{w}");
         assert!(w.contains("SLIPPAGE_BPS=20000"), "{w}");
         assert!(w.contains("QUOTE_USD override is set"), "{w}");
+    }
+
+    #[test]
+    fn processed_commitment_warns() {
+        let s = Settings::from_map(&vars(&[("COMMITMENT", "processed")]));
+        let w = s.warnings().join("\n");
+        assert!(w.contains("COMMITMENT=processed"), "{w}");
+        let s = Settings::from_map(&HashMap::new());
+        assert!(!s.warnings().iter().any(|x| x.contains("COMMITMENT=")));
     }
 
     #[test]

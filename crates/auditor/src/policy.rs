@@ -1,9 +1,9 @@
 //! Security policy: pure invariant checks over a [`RugCheckReport`].
 //!
-//! Separated from HTTP fetching so the rules are unit-testable and
+//! separated from HTTP fetching so the rules are unit-testable and
 //! reusable (e.g. for cached reports). [`assess`] collects *all*
 //! violations; [`RugCheckClient::evaluate_token`](crate::RugCheckClient::evaluate_token)
-//! maps the first violation to [`RugCheckError::SecurityRejection`].
+//! joins them into the [`RugCheckError::SecurityRejection`].
 
 use crate::types::{RugCheckError, RugCheckReport};
 
@@ -22,6 +22,9 @@ pub struct AuditPolicy {
     /// Reports with `score > max_score` are rejected.
     pub max_score: u32,
     /// Reject when any risk has level `danger` (case-insensitive).
+    /// Fail-closed on unknown levels: only `warn` passes, anything else
+    /// (empty, `critical`, future severities) is rejected rather than
+    /// waved through.
     pub reject_danger: bool,
     /// Reject when a mint authority is still enabled.
     pub reject_mint_authority: bool,
@@ -58,15 +61,15 @@ impl Verdict {
         matches!(self, Verdict::Allow)
     }
 
-    /// Convert to `Result`, mapping the first reason to a rejection.
+    /// Convert to `Result`, joining every reason into the rejection.
     pub fn into_result(self) -> Result<(), RugCheckError> {
         match self {
             Verdict::Allow => Ok(()),
+            Verdict::Reject { reasons } if reasons.is_empty() => {
+                Err(RugCheckError::SecurityRejection("rejected".to_string()))
+            }
             Verdict::Reject { reasons } => Err(RugCheckError::SecurityRejection(
-                reasons
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| "rejected".to_string()),
+                reasons.join("; "),
             )),
         }
     }
@@ -94,15 +97,33 @@ pub fn assess(report: &RugCheckReport, policy: &AuditPolicy) -> Verdict {
                     "Critical risk detected: {} - {}",
                     risk.name, risk.description
                 ));
+            } else if !risk.level.eq_ignore_ascii_case("warn") {
+                // Unknown severity (empty, `critical`, future levels):
+                // fail closed instead of waving it through.
+                reasons.push(format!(
+                    "Unknown risk severity '{}' on {}: treating as dangerous",
+                    risk.level, risk.name
+                ));
             }
         }
     }
 
     if let Some(token) = &report.token {
-        if policy.reject_mint_authority && token.mint_authority.is_some() {
+        // Blank strings are as good as absent (some providers emit "").
+        let mint_auth = token
+            .mint_authority
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let freeze_auth = token
+            .freeze_authority
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if policy.reject_mint_authority && mint_auth.is_some() {
             reasons.push("Mint authority is enabled".to_string());
         }
-        if policy.reject_freeze_authority && token.freeze_authority.is_some() {
+        if policy.reject_freeze_authority && freeze_auth.is_some() {
             reasons.push("Freeze authority is enabled".to_string());
         }
     } else {
@@ -178,6 +199,31 @@ mod tests {
             }
             Verdict::Allow => panic!("expected rejection"),
         }
+    }
+
+    #[test]
+    fn rejects_unknown_severity() {
+        // Empty (serde default), `critical`, and future levels must fail
+        // closed — only `warn` passes.
+        for level in ["", "critical", "HIGH", "info"] {
+            let mut report = clean_report();
+            report.risks[0].level = level.to_string();
+            match assess(&report, &AuditPolicy::default()) {
+                Verdict::Reject { reasons } => {
+                    assert!(reasons.iter().any(|r| r.contains("severity")), "{level}");
+                }
+                Verdict::Allow => panic!("expected rejection for {level}"),
+            }
+        }
+    }
+
+    #[test]
+    fn blank_authorities_count_as_absent() {
+        let mut report = clean_report();
+        let token = report.token.as_mut().expect("token");
+        token.mint_authority = Some("  ".to_string());
+        token.freeze_authority = Some(String::new());
+        assert_eq!(assess(&report, &AuditPolicy::default()), Verdict::Allow);
     }
 
     #[test]

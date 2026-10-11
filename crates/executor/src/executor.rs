@@ -1,10 +1,12 @@
-//! Swap dispatch: solvency-guarded build, sign, and confirm.
+//! Swap dispatch: solvency-guarded build, sign, simulate, and confirm.
 //!
 //! Every order runs [`WalletGuard::assert_solvency`] first — a broke or
-//! underfunded wallet fails *before* any instruction is built. Sends go
+//! underfunded wallet fails *before* any instruction is built — then a
+//! `simulateTransaction` preflight rejects definitive failures before
+//! fees burn (transport trouble proceeds with a log). Sends go
 //! through standard RPC confirmation (`buy`/`sell`) or Jito bundles
-//! (`buy_jito`/`sell_jito` with an in-bundle tip). Priority fees and
-//! simulate-transaction preflight remain TODOs (see `README.md`).
+//! (`buy_jito`/`sell_jito` with an in-bundle tip). Priority fees attach
+//! via `with_compute_budget`.
 
 use solana_client::{client_error::ClientError, nonblocking::rpc_client::RpcClient};
 use solana_commitment_config::CommitmentConfig;

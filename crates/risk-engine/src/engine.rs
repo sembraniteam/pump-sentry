@@ -20,6 +20,15 @@ pub const FALLBACK_TIMEOUT: Duration = Duration::from_millis(300);
 pub const DEFAULT_TEMPERATURE: f32 = 0.1;
 /// Small cap: the output schema fits in a few dozen tokens.
 pub const DEFAULT_MAX_TOKENS: u32 = 128;
+/// Hard ceiling for the inference deadline: a caller-configured hour
+/// would stall the hot path, so [`RiskEngineBuilder::timeout`] values
+/// clamp here at build time.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(2);
+/// Token budget bounds: 0 starves the model into permanent fallback,
+/// unbounded budgets burn latency and cost.
+pub const MIN_MAX_TOKENS: u32 = 16;
+/// See [`MIN_MAX_TOKENS`].
+pub const MAX_MAX_TOKENS: u32 = 512;
 
 /// Engine failures that are *not* model trouble (i.e. caller bugs).
 #[derive(Error, Debug)]
@@ -93,7 +102,9 @@ impl RiskEngineBuilder {
         self
     }
 
-    /// Inference deadline before falling back (default 300ms).
+    /// Inference deadline before falling back (default 300ms, clamped
+    /// to [`MAX_TIMEOUT`] at build so a misconfigured hour cannot stall
+    /// the hot path).
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -135,22 +146,29 @@ impl RiskEngine {
     }
 
     fn from_builder(b: RiskEngineBuilder) -> Result<Self, RiskEngineError> {
-        if b.endpoint.trim().is_empty() {
-            return Err(RiskEngineError::BadEndpoint(b.endpoint));
+        let endpoint = b.endpoint.trim().to_string();
+        match reqwest::Url::parse(&endpoint) {
+            Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
+            _ => return Err(RiskEngineError::BadEndpoint(b.endpoint)),
         }
+        // Clamp caller-controlled budgets: an hour-long timeout or a
+        // zero/unbounded token budget would break the 300ms hot-path
+        // contract (falling back always, or never).
+        let timeout = b.timeout.min(MAX_TIMEOUT);
+        let max_tokens = b.max_tokens.clamp(MIN_MAX_TOKENS, MAX_MAX_TOKENS);
         let client = Client::builder()
-            .timeout(b.timeout.saturating_add(Duration::from_millis(100)))
+            .timeout(timeout.saturating_add(Duration::from_millis(100)))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| RiskEngineError::HttpClient(e.to_string()))?;
         Ok(Self {
             client,
-            endpoint: b.endpoint,
+            endpoint,
             model: b.model,
             api_key: b.api_key,
-            timeout: b.timeout,
+            timeout,
             temperature: b.temperature.clamp(0.0, 1.0),
-            max_tokens: b.max_tokens,
+            max_tokens,
         })
     }
 
@@ -377,11 +395,34 @@ mod tests {
 
     #[test]
     fn bad_endpoint_rejected() {
-        let err = RiskEngine::builder()
-            .endpoint("   ")
+        for bad in ["   ", ":::not-a-url", "ftp://example.com", "https://"] {
+            let err = RiskEngine::builder()
+                .endpoint(bad)
+                .build()
+                .expect_err("must fail");
+            assert!(matches!(err, RiskEngineError::BadEndpoint(_)), "{bad}");
+        }
+    }
+
+    #[test]
+    fn caller_budgets_clamped() {
+        let engine = RiskEngine::builder()
+            .timeout(Duration::from_secs(3600))
             .build()
-            .expect_err("must fail");
-        assert!(matches!(err, RiskEngineError::BadEndpoint(_)));
+            .expect("engine");
+        assert_eq!(engine.timeout, MAX_TIMEOUT);
+        let tiny = RiskEngine::builder()
+            .timeout(Duration::ZERO)
+            .build()
+            .expect("engine");
+        assert_eq!(tiny.timeout, Duration::ZERO);
+        let tokens = RiskEngineBuilder {
+            max_tokens: u32::MAX,
+            ..RiskEngineBuilder::default()
+        }
+        .build()
+        .expect("engine");
+        assert_eq!(tokens.max_tokens, MAX_MAX_TOKENS);
     }
 
     #[test]

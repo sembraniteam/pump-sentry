@@ -50,9 +50,11 @@ pub struct RiskProfile {
 }
 
 impl RiskProfile {
-    /// Structural validation: finite numbers, strictly positive TP and
-    /// strictly negative SL on BUY (zero targets would fire instantly),
-    /// near-zero targets plus disarmed trailing/moonbag on PASS.
+    /// Admission policy for model/LLM profiles (enforced by the engine
+    /// before any profile reaches the ledger): TP in `(0, 1000%]`, SL in
+    /// `[-100%, 0)`, timeout within an hour (`0` = no time-stop, used by
+    /// moonbag runners). Unbounded magnitudes would create positions
+    /// that never TP or never expire.
     pub fn is_valid(&self) -> bool {
         if !self.tp_percent.is_finite() || !self.sl_percent.is_finite() {
             return false;
@@ -64,7 +66,13 @@ impl RiskProfile {
             return false;
         }
         match self.action {
-            Action::Buy => self.tp_percent > 0.0 && self.sl_percent < 0.0,
+            Action::Buy => {
+                self.tp_percent > 0.0
+                    && self.tp_percent <= MAX_TP_PERCENT
+                    && self.sl_percent < 0.0
+                    && self.sl_percent >= MIN_SL_PERCENT
+                    && self.timeout_seconds <= MAX_TIMEOUT_SECS
+            }
             Action::Pass => {
                 self.tp_percent.abs() < 1e-9
                     && self.sl_percent.abs() < 1e-9
@@ -75,6 +83,16 @@ impl RiskProfile {
         }
     }
 }
+
+/// Maximum take-profit in percent (10x): beyond this a position would
+/// effectively never take profit.
+pub const MAX_TP_PERCENT: f64 = 1000.0;
+/// Minimum stop-loss in percent (-100% = total loss): beyond this is
+/// not a stop at all.
+pub const MIN_SL_PERCENT: f64 = -100.0;
+/// Maximum exit timeout in seconds (one hour): beyond this a position
+/// would effectively never expire.
+pub const MAX_TIMEOUT_SECS: u64 = 3600;
 
 /// System instruction sent to the model (skill prompt specification
 /// plus the decision bands, so the model follows the same table as the
@@ -187,6 +205,46 @@ mod tests {
             moonbag_percent: 0.0,
         };
         assert!(!zero_buy.is_valid());
+
+        // Unbounded magnitudes would never TP or never expire.
+        let huge_tp = RiskProfile {
+            action: Action::Buy,
+            tp_percent: 1e308,
+            sl_percent: -8.0,
+            trailing_stop: false,
+            timeout_seconds: 90,
+            moonbag_percent: 0.0,
+        };
+        assert!(!huge_tp.is_valid());
+        let huge_sl = RiskProfile {
+            action: Action::Buy,
+            tp_percent: 60.0,
+            sl_percent: -1e308,
+            trailing_stop: false,
+            timeout_seconds: 90,
+            moonbag_percent: 0.0,
+        };
+        assert!(!huge_sl.is_valid());
+        let huge_timeout = RiskProfile {
+            action: Action::Buy,
+            tp_percent: 60.0,
+            sl_percent: -8.0,
+            trailing_stop: false,
+            timeout_seconds: u64::MAX,
+            moonbag_percent: 0.0,
+        };
+        assert!(!huge_timeout.is_valid());
+
+        // Boundary values are still admitted.
+        let capped = RiskProfile {
+            action: Action::Buy,
+            tp_percent: MAX_TP_PERCENT,
+            sl_percent: MIN_SL_PERCENT,
+            trailing_stop: true,
+            timeout_seconds: MAX_TIMEOUT_SECS,
+            moonbag_percent: 100.0,
+        };
+        assert!(capped.is_valid());
 
         // Near-zero model outputs count as zeroed PASS targets.
         let dusty_pass = RiskProfile {

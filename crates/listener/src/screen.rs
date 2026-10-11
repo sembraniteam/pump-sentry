@@ -31,7 +31,7 @@ use std::{
     collections::HashSet,
     future::Future,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -189,6 +189,10 @@ pub fn extract_pump_swaps(
         let Some(wallet) = keys.get(usize::from(*account)).copied() else {
             return;
         };
+        // Amount is assumed to be the first u64 for all three variants
+        // (single-fixture evidence for `buy_v2`; a wrong layout corrupts
+        // the monopoly share, so this stays documented until the v2 IDL
+        // args are pinned by a second sample).
         let amount_base_units = raw
             .get(8..16)
             .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
@@ -294,12 +298,22 @@ struct PendingGate {
 
 /// Time-windowed buyer-quorum state machine. Pure except for the clock
 /// the caller passes in — fully unit-testable.
+///
+/// Deadlines are caller wall-clock (`unix_now` at the call sites): an NTP
+/// backward jump can only expire entries early (fail-closed abort, never
+/// a false confirm); forward jumps stretch the window, capped at
+/// `created + 3×window` per entry plus the map cap below.
 #[derive(Debug, Default)]
 pub struct EntryGate {
     window_secs: u64,
     min_buyers: u32,
     pending: HashMap<String, PendingGate>,
 }
+
+/// Watchlist cap: mint spam must not grow memory without bound when
+/// timeout sweeps stall. The entry with the nearest deadline is evicted
+/// (loudly) to make room.
+pub const MAX_PENDING_ENTRIES: usize = 10_000;
 
 impl EntryGate {
     /// New gate: entries get `window_secs` to gather `min_buyers`.
@@ -339,6 +353,16 @@ impl EntryGate {
                 entry.deadline_secs = deadline_secs.min(cap);
             }
             None => {
+                if self.pending.len() >= MAX_PENDING_ENTRIES
+                    && let Some(oldest) = self
+                        .pending
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.deadline_secs)
+                        .map(|(mint, _)| mint.clone())
+                {
+                    warn!(mint = %oldest, "watchlist full; evicting nearest-deadline entry");
+                    self.pending.remove(&oldest);
+                }
                 self.pending.insert(
                     mint.to_string(),
                     PendingGate { dev, deadline_secs, buyers: HashSet::new(), created_secs: now_secs },
@@ -350,6 +374,12 @@ impl EntryGate {
 
     /// Fold one observation round into the entry. Removes the entry on
     /// terminal outcomes. Unknown mints report [`GateOutcome::Wait`].
+    ///
+    /// Best-effort dev-dump detection: only a `Sell` authored by the dev
+    /// wallet aborts here. Dumps routed through transfers, funded sybils,
+    /// or the unmapped `sell_v2` layout (see [`SwapSide::Unknown`]) do not
+    /// abort on their own — cluster forensics in [`BundleDetector`]
+    /// covers coordinated funding instead.
     pub fn observe(&mut self, mint: &str, swaps: &[SwapRecord], now_secs: u64) -> GateOutcome {
         let Some(entry) = self.pending.get_mut(mint) else {
             return GateOutcome::Wait;
@@ -536,10 +566,11 @@ pub async fn screen_developer(
         .map(|t| now_secs.saturating_sub(t.max(0) as u64));
 
     let tx_config = json_tx_config(commitment);
-    // Concurrent fan-out with per-tx deadlines: 20 sequential fetches
-    // could consume the whole 15s budget. Failed transactions are skipped
-    // (a reverted `create` never launched), unreadable ones don't count
-    // (lower bound; the age gate carries the strictness).
+    // Bounded fan-out (5-wide): 20 sequential fetches could consume the
+    // whole 15s budget, and 20 concurrent ones hammer the node. Failed
+    // transactions are skipped (a reverted `create` never launched);
+    // unreadable ones are counted separately below — a mostly-unreadable
+    // sample must not undercount serial launchers into a pass.
     let candidates: Vec<(Signature, bool)> = sigs
         .iter()
         .take(cfg.sample_txs)
@@ -549,51 +580,88 @@ pub async fn screen_developer(
                 .map(|sig| (sig, s.err.is_some()))
         })
         .collect();
-    let fetches = futures_util::future::join_all(candidates.iter().map(|(sig, failed)| async move {
-        if *failed {
-            return 0usize;
-        }
-        let fetched = match tokio::time::timeout(
-            TX_FETCH_TIMEOUT,
-            rpc.get_transaction_with_config(sig, tx_config),
-        )
-        .await
-        {
-            Ok(Ok(fetched)) => fetched,
-            _ => return 0usize,
-        };
-        // Defensive: skip failed transactions even if the status flag was
-        // missing (a failed create never launched a token).
-        let failed_tx = fetched
-            .transaction
-            .meta
-            .as_ref()
-            .is_some_and(|m| m.err.is_some());
-        if failed_tx {
-            return 0usize;
-        }
-        count_dev_creates(&fetched, dev)
-    }))
-    .await;
-    let prior_launches: usize = fetches.iter().sum();
+    use futures_util::stream::{self, StreamExt};
+    let mut prior_launches: usize = 0;
+    let mut fetch_failed: usize = 0;
+    // Owned items through `.map()` + `.buffered()`: each future owns its
+    // `(Signature, bool)` item, so no item borrows escape into the
+    // combinator. (`.map()` over BORROWED items with an async block that
+    // also borrows the environment trips rustc's higher-ranked lifetime
+    // check (E0631) at distant spawn sites; `.then()` would be sequential
+    // and cannot take `buffered` after it.)
+    let total = candidates.len();
+    let fetched: Vec<(usize, bool)> = stream::iter(candidates)
+        .map(|(sig, failed)| async move {
+            if failed {
+                return (0usize, false);
+            }
+            let fetched = match tokio::time::timeout(
+                TX_FETCH_TIMEOUT,
+                rpc.get_transaction_with_config(&sig, tx_config),
+            )
+            .await
+            {
+                Ok(Ok(fetched)) => fetched,
+                _ => return (0usize, true),
+            };
+            // Defensive: skip failed transactions even if the status flag was
+            // missing (a failed create never launched a token).
+            let failed_tx = fetched
+                .transaction
+                .meta
+                .as_ref()
+                .is_some_and(|m| m.err.is_some());
+            if failed_tx {
+                return (0usize, false);
+            }
+            (count_dev_creates(&fetched, dev), false)
+        })
+        .buffered(DEV_SCREEN_FANOUT)
+        .collect()
+        .await;
+    for (count, failed) in fetched {
+        prior_launches += count;
+        fetch_failed += usize::from(failed);
+    }
+    if !sample_trustworthy(fetch_failed, total) {
+        // Most of the sample unreadable: the launch count is a lower
+        // bound that would let serial launchers pass — distrust the
+        // sample and fail closed with the evidence attached.
+        return Ok(DevVerdict {
+            pass: false,
+            age_secs,
+            prior_launches,
+            reason: format!(
+                "dev history unreadable ({fetch_failed} of {total} fetches failed); failing closed",
+            ),
+        });
+    }
     Ok(judge_developer(age_secs, prior_launches, cfg))
+}
+
+/// True when a dev-history sample is trustworthy enough to count:
+/// unreadable fetches must stay strictly below half the sample.
+/// Pure and unit-tested (the fail-closed boundary for serial launchers).
+fn sample_trustworthy(failed: usize, total: usize) -> bool {
+    failed == 0 || failed * 2 < total
 }
 
 /// RPC-backed swap reader for one curve: signatures since `since_sig`
 /// (newest-first walk, stop at the watermark), classified records.
-/// Returns `(records, newest_signature)`.
+/// Returns `(records, newest_signature, truncated)`.
 ///
 /// Paginated (up to [`CURVE_SWAP_MAX_PAGES`] × [`CURVE_SWAP_PAGE_LIMIT`]):
 /// when `since_sig` is not found and the last page is full, the watermark
-/// is stale — the caller keeps watching but high-velocity gaps are
-/// expected. Failed transactions are skipped; undecodable ones simply
+/// is stale — `truncated` reports it so callers must NOT advance quorum
+/// on the partial view (confirming on it would bless a high-velocity
+/// gap). Failed transactions are skipped; undecodable ones simply
 /// contribute no records (gate stays `Wait`: fail-closed for entries).
 pub async fn read_curve_swaps(
     rpc: &RpcClient,
     commitment: CommitmentConfig,
     curve: &Pubkey,
     since_sig: Option<&str>,
-) -> Result<(Vec<SwapRecord>, Option<String>), ClientError> {
+) -> Result<(Vec<SwapRecord>, Option<String>, bool), ClientError> {
     let tx_config = json_tx_config(commitment);
     let mut records = Vec::new();
     let mut newest: Option<String> = None;
@@ -661,18 +729,17 @@ pub async fn read_curve_swaps(
         before = Some(cursor);
     }
 
-    if since_sig.is_some() && !watermark_found && pages >= CURVE_SWAP_MAX_PAGES {
+    let truncated = since_sig.is_some() && !watermark_found && pages >= CURVE_SWAP_MAX_PAGES;
+    if truncated {
         // High-velocity gap: newest 75 returned, intermediates missed.
-        // Callers treat this as "keep watching"; the gate cannot confirm
-        // on a partial view with confidence, but we must not silently
-        // claim completeness.
+        // Callers must not advance quorum on this partial view.
         tracing::debug!(
             pages,
             fetched = records.len(),
             "curve read truncated at page cap; watermark stale"
         );
     }
-    Ok((records, newest))
+    Ok((records, newest, truncated))
 }
 
 /// Poll interval floor for gate rounds (not a tight loop: RPC budget).
@@ -828,7 +895,7 @@ impl DetectedMigration {
 pub const INITIALIZE2_AMM_INDEX: usize = 4;
 
 /// Resolve the new AMM id from decoded instructions given as
-/// `(program_id, resolved account keys)` pairs. Returns the accounts[1]
+/// `(program_id, resolved account keys)` pairs. Returns the accounts[4]
 /// of the first Raydium-program instruction. Pure and unit-tested.
 pub fn initialize2_amm_id(instructions: &[(Pubkey, Vec<Pubkey>)]) -> Option<Pubkey> {
     instructions
@@ -995,8 +1062,8 @@ pub struct RpcScreener {
     rpc: Arc<RpcClient>,
     commitment: CommitmentConfig,
     dev_cfg: DevScreenConfig,
-    funder_cache: Arc<Mutex<TimedCache<Option<String>>>>,
-    dev_cache: Arc<Mutex<TimedCache<DevVerdict>>>,
+    funder_cache: Arc<tokio::sync::Mutex<TimedCache<Option<String>>>>,
+    dev_cache: Arc<tokio::sync::Mutex<TimedCache<DevVerdict>>>,
 }
 
 impl RpcScreener {
@@ -1017,8 +1084,10 @@ impl RpcScreener {
             )),
             commitment,
             dev_cfg,
-            funder_cache: Arc::new(Mutex::new(TimedCache::new(FUNDER_CACHE_TTL_SECS))),
-            dev_cache: Arc::new(Mutex::new(TimedCache::new(DEV_CACHE_TTL_SECS))),
+            funder_cache: Arc::new(tokio::sync::Mutex::new(TimedCache::new(
+                FUNDER_CACHE_TTL_SECS,
+            ))),
+            dev_cache: Arc::new(tokio::sync::Mutex::new(TimedCache::new(DEV_CACHE_TTL_SECS))),
         })
     }
 
@@ -1029,12 +1098,7 @@ impl RpcScreener {
         dev: &Pubkey,
         now_secs: u64,
     ) -> Result<DevVerdict, ScreenError> {
-        if let Some(hit) = self
-            .dev_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&dev.to_string(), now_secs)
-        {
+        if let Some(hit) = self.dev_cache.lock().await.get(&dev.to_string(), now_secs) {
             return Ok(hit);
         }
         let verdict = match with_screen_timeout(screen_developer(
@@ -1051,17 +1115,19 @@ impl RpcScreener {
         };
         self.dev_cache
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .await
             .put(dev.to_string(), verdict.clone(), now_secs);
         Ok(verdict)
     }
 
-    /// Swap records for a curve since `since_sig`, plus the new watermark.
+    /// Swap records for a curve since `since_sig`, plus the new watermark
+    /// and a truncation flag (see [`read_curve_swaps`]: a truncated round
+    /// must not advance quorum).
     pub async fn curve_swaps(
         &self,
         curve: &Pubkey,
         since_sig: Option<&str>,
-    ) -> Result<(Vec<SwapRecord>, Option<String>), ScreenError> {
+    ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError> {
         match with_screen_timeout(read_curve_swaps(
             &self.rpc,
             self.commitment,
@@ -1101,109 +1167,135 @@ impl RpcScreener {
         expected_base_mint: &Pubkey,
     ) -> Result<Option<DetectedMigration>, ClientError> {
         let monitor = MigrationMonitor::new();
-        let sigs = self
-            .rpc
-            .get_signatures_for_address_with_config(
-                curve,
-                GetConfirmedSignaturesForAddress2Config {
-                    before: None,
-                    until: None,
-                    limit: Some(10),
-                    commitment: Some(self.commitment),
-                },
-            )
-            .await?;
         let tx_config = json_tx_config(self.commitment);
         // First Raydium detection whose pool cannot be resolved yet
         // (transient RPC or unparseable account): kept as a fallback and
         // returned only after every candidate is scanned, so one bad
         // account never hides the real migration behind it.
         let mut fallback: Option<(String, Option<Pubkey>)> = None;
-        for status in &sigs {
-            if status.err.is_some() {
-                continue;
+        let mut before: Option<Signature> = None;
+        let mut fetches: usize = 0;
+        for _ in 0..HUNT_MAX_PAGES {
+            let sigs = self
+                .rpc
+                .get_signatures_for_address_with_config(
+                    curve,
+                    GetConfirmedSignaturesForAddress2Config {
+                        before,
+                        until: None,
+                        limit: Some(HUNT_PAGE_LIMIT),
+                        commitment: Some(self.commitment),
+                    },
+                )
+                .await?;
+            if sigs.is_empty() {
+                break;
             }
-            let Ok(signature) = Signature::from_str(&status.signature) else {
-                continue;
-            };
-            let fetched = match tokio::time::timeout(
-                TX_FETCH_TIMEOUT,
-                self.rpc.get_transaction_with_config(&signature, tx_config),
-            )
-            .await
-            {
-                Ok(Ok(fetched)) => fetched,
-                _ => continue,
-            };
-            let Some((keys, decoded, logs)) = decode_migration_tx(&fetched) else {
-                continue;
-            };
-            let mut ix_datas: Vec<Vec<u8>> = Vec::with_capacity(decoded.len());
-            let mut pairs: Vec<(Pubkey, Vec<Pubkey>)> = Vec::with_capacity(decoded.len());
-            for ix in decoded {
-                ix_datas.push(ix.data);
-                pairs.push((ix.program, ix.accounts));
-            }
-            match monitor.classify_migration(&keys, &ix_datas, &logs) {
-                Some(MigrationDestination::RaydiumV4) => {
-                    let amm_id = initialize2_amm_id(&pairs);
-                    let pool = match amm_id {
-                        Some(amm) => {
-                            let account = match tokio::time::timeout(
-                                TX_FETCH_TIMEOUT,
-                                self.rpc.get_account(&amm),
-                            )
-                            .await
-                            {
-                                Ok(Ok(account)) => account,
-                                _ => {
-                                    debug!(%amm, "pool account fetch failed; keeping as fallback, continuing hunt");
-                                    if fallback.is_none() {
-                                        fallback = Some((status.signature.clone(), amm_id));
+            let page_full = sigs.len() >= HUNT_PAGE_LIMIT;
+            for status in &sigs {
+                if fetches >= HUNT_MAX_FETCHES {
+                    debug!("migration hunt hit fetch budget; stopping");
+                    break;
+                }
+                if status.err.is_some() {
+                    continue;
+                }
+                let Ok(signature) = Signature::from_str(&status.signature) else {
+                    continue;
+                };
+                fetches += 1;
+                let fetched = match tokio::time::timeout(
+                    TX_FETCH_TIMEOUT,
+                    self.rpc.get_transaction_with_config(&signature, tx_config),
+                )
+                .await
+                {
+                    Ok(Ok(fetched)) => fetched,
+                    _ => continue,
+                };
+                let Some((keys, decoded, logs)) = decode_migration_tx(&fetched) else {
+                    continue;
+                };
+                let mut ix_datas: Vec<Vec<u8>> = Vec::with_capacity(decoded.len());
+                let mut pairs: Vec<(Pubkey, Vec<Pubkey>)> = Vec::with_capacity(decoded.len());
+                for ix in decoded {
+                    ix_datas.push(ix.data);
+                    pairs.push((ix.program, ix.accounts));
+                }
+                match monitor.classify_migration(&keys, &ix_datas, &logs, curve, expected_base_mint)
+                {
+                    Some(MigrationDestination::RaydiumV4) => {
+                        let amm_id = initialize2_amm_id(&pairs);
+                        let pool = match amm_id {
+                            Some(amm) => {
+                                let account = match tokio::time::timeout(
+                                    TX_FETCH_TIMEOUT,
+                                    self.rpc.get_account(&amm),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(account)) => account,
+                                    _ => {
+                                        debug!(%amm, "pool account fetch failed; keeping as fallback, continuing hunt");
+                                        if fallback.is_none() {
+                                            fallback = Some((status.signature.clone(), amm_id));
+                                        }
+                                        continue;
                                     }
-                                    continue;
-                                }
-                            };
-                            match RaydiumV4Pool::parse_validated(
-                                &amm,
-                                &account.data,
-                                &account.owner,
-                                expected_base_mint,
-                            ) {
-                                Some(pool) => Some(pool),
-                                None => {
-                                    debug!(%amm, "pool failed trust gate; keeping as fallback, continuing hunt");
-                                    if fallback.is_none() {
-                                        fallback = Some((status.signature.clone(), amm_id));
+                                };
+                                match RaydiumV4Pool::parse_validated(
+                                    &amm,
+                                    &account.data,
+                                    &account.owner,
+                                    expected_base_mint,
+                                ) {
+                                    Some(pool) => Some(pool),
+                                    None => {
+                                        debug!(%amm, "pool failed trust gate; keeping as fallback, continuing hunt");
+                                        if fallback.is_none() {
+                                            fallback = Some((status.signature.clone(), amm_id));
+                                        }
+                                        continue;
                                     }
-                                    continue;
                                 }
                             }
-                        }
-                        None => {
-                            debug!("raydium migration without resolvable AMM; continuing hunt");
-                            if fallback.is_none() {
-                                fallback = Some((status.signature.clone(), None));
+                            None => {
+                                debug!("raydium migration without resolvable AMM; continuing hunt");
+                                if fallback.is_none() {
+                                    fallback = Some((status.signature.clone(), None));
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                    };
-                    return Ok(Some(DetectedMigration {
-                        signature: status.signature.clone(),
-                        destination: MigrationDestination::RaydiumV4,
-                        amm_id,
-                        pool,
-                    }));
+                        };
+                        return Ok(Some(DetectedMigration {
+                            signature: status.signature.clone(),
+                            destination: MigrationDestination::RaydiumV4,
+                            amm_id,
+                            pool,
+                        }));
+                    }
+                    Some(MigrationDestination::PumpSwap) => {
+                        return Ok(Some(DetectedMigration {
+                            signature: status.signature.clone(),
+                            destination: MigrationDestination::PumpSwap,
+                            amm_id: None,
+                            pool: None,
+                        }));
+                    }
+                    None => continue,
                 }
-                Some(MigrationDestination::PumpSwap) => {
-                    return Ok(Some(DetectedMigration {
-                        signature: status.signature.clone(),
-                        destination: MigrationDestination::PumpSwap,
-                        amm_id: None,
-                        pool: None,
-                    }));
-                }
-                None => continue,
+            }
+            if fetches >= HUNT_MAX_FETCHES {
+                break;
+            }
+            if !page_full {
+                break;
+            }
+            before = sigs
+                .last()
+                .and_then(|s| Signature::from_str(&s.signature).ok());
+            if before.is_none() {
+                break;
             }
         }
         if let Some((signature, amm_id)) = fallback {
@@ -1249,12 +1341,31 @@ impl RpcScreener {
         curve: &Pubkey,
         creation_slot: u64,
     ) -> Result<(BundleAnalysis, bool), ClientError> {
-        let (records, _) = read_curve_swaps(&self.rpc, self.commitment, curve, None).await?;
+        let (records, _, truncated) =
+            read_curve_swaps(&self.rpc, self.commitment, curve, None).await?;
+        if truncated {
+            // Partial newest-75 view: early creation-slot buys may be
+            // missing, so the monopoly share undercounts toward a false
+            // SafeOrganic. Fail closed to paper-only suspicion.
+            return Ok((
+                BundleAnalysis {
+                    is_bundled: true,
+                    creation_slot_buys: 0,
+                    shared_funder_count: 0,
+                    total_cluster_supply_pct: 0.0,
+                    verdict: BundleVerdict::SuspectLowVolume,
+                },
+                false,
+            ));
+        }
         // Fail closed on unreadable supply: a zero fallback would neuter
         // the >15% monopoly rule into a permanent Suspect.
         let total_supply = self.curve_total_supply(curve).await?;
 
         // Distinct buyers, first-seen order, bounded (RPC budget).
+        // Only proven `Buy` sides count: `Unknown` records (unmapped
+        // layouts like `sell_v2`) carry no trustworthy amount or side,
+        // so the monopoly math ignores them rather than guessing.
         let mut seen: HashSet<Pubkey> = HashSet::new();
         let mut buyers: Vec<Pubkey> = Vec::new();
         for record in records.iter().filter(|r| r.side == SwapSide::Buy) {
@@ -1330,7 +1441,7 @@ impl RpcScreener {
         let mut pairs: Vec<(Pubkey, Pubkey)> = Vec::new();
         let mut missing: Vec<Pubkey> = Vec::new();
         {
-            let cache = self.funder_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cache = self.funder_cache.lock().await;
             for buyer in buyers {
                 match cache.get(&buyer.to_string(), now) {
                     Some(Some(funder)) => {
@@ -1356,7 +1467,7 @@ impl RpcScreener {
         }))
         .await;
         {
-            let mut cache = self.funder_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cache = self.funder_cache.lock().await;
             for (buyer, funder) in &fresh {
                 cache.put(buyer.to_string(), funder.clone(), now);
                 if let Some(funder) = funder
@@ -1416,9 +1527,9 @@ impl RpcScreener {
                 debug!(%buyer, pages, "funder walk hit page cap; treating as untraceable");
                 break;
             }
-            let page = self
-                .rpc
-                .get_signatures_for_address_with_config(
+            let page = match tokio::time::timeout(
+                FUNDER_OP_TIMEOUT,
+                self.rpc.get_signatures_for_address_with_config(
                     buyer,
                     GetConfirmedSignaturesForAddress2Config {
                         before,
@@ -1426,9 +1537,13 @@ impl RpcScreener {
                         limit: Some(1000),
                         commitment: Some(self.commitment),
                     },
-                )
-                .await
-                .ok()?;
+                ),
+            )
+            .await
+            {
+                Ok(Ok(page)) => page,
+                _ => return None,
+            };
             if page.is_empty() {
                 break;
             }
@@ -1459,12 +1574,14 @@ impl RpcScreener {
             let Ok(signature) = Signature::from_str(sig) else {
                 continue;
             };
-            let Ok(fetched) = self
-                .rpc
-                .get_transaction_with_config(&signature, tx_config)
-                .await
-            else {
-                continue;
+            let fetched = match tokio::time::timeout(
+                FUNDER_OP_TIMEOUT,
+                self.rpc.get_transaction_with_config(&signature, tx_config),
+            )
+            .await
+            {
+                Ok(Ok(fetched)) => fetched,
+                _ => continue,
             };
             if let Some(funder) = find_funding_source(&fetched, buyer) {
                 return Some(funder);
@@ -1474,6 +1591,16 @@ impl RpcScreener {
     }
 }
 
+/// Migration-hunt depth: 3 pages × 10 signatures with a 10-fetch
+/// budget. A migration deeper than 30 signatures is missed (returns
+/// `None`, and the pipeline retries the hunt on later ticks) — depth is
+/// capped for RPC budget, and per-tx fetches stay under the outer 15s
+/// screening deadline instead of ballooning to 10 × 5s unsupervised.
+pub const HUNT_MAX_PAGES: usize = 3;
+/// See [`HUNT_MAX_PAGES`].
+pub const HUNT_PAGE_LIMIT: usize = 10;
+/// See [`HUNT_MAX_PAGES`].
+pub const HUNT_MAX_FETCHES: usize = 10;
 /// Maximum distinct buyers traced for funders per evaluation.
 pub const MAX_TRACED_BUYERS: usize = 8;
 /// Per-buyer genesis-trace deadline: bounds the stall when one wallet
@@ -1484,6 +1611,14 @@ pub const FUNDER_TRACE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Per-transaction fetch deadline inside fan-out reads (dev sampling,
 /// curve pages). Keeps one slow RPC from consuming the whole 15s budget.
 pub const TX_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-operation deadline inside the genesis walk (signature pages and
+/// single transaction fetches): one slow page must not eat the whole
+/// 8s [`FUNDER_TRACE_TIMEOUT`] budget. The outer timeout stays the
+/// backstop, not the primary path.
+pub const FUNDER_OP_TIMEOUT: Duration = Duration::from_secs(3);
+/// Dev-history fan-out width: 20 sequential fetches could consume the
+/// whole screening budget; 20 concurrent ones hammer the node.
+pub const DEV_SCREEN_FANOUT: usize = 5;
 /// Curve-swap signature page size and page cap: 3 pages × 25 = 75 newest
 /// signatures per round. Beyond that the watermark is stale and the
 /// caller is warned via `truncated` handling upstream.
@@ -1560,6 +1695,11 @@ fn unix_now() -> u64 {
 /// funding shapes: system `transfer` (u32 LE 2, 12 bytes, accounts
 /// `[from, to]`) and system `createAccount` (u32 LE 0, 52 bytes, accounts
 /// `[funder, new]`). Pure; `None` when no such transfer exists.
+///
+/// Best-effort by construction: SPL-token funding, `transfer_with_seed`,
+/// multisig, and exchange payouts do not match either arm and read as
+/// untraceable (callers escalate low trace rates to `Suspect`, never to
+/// organic).
 pub fn find_funding_source(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
     beneficiary: &Pubkey,
@@ -1780,6 +1920,28 @@ mod tests {
         let mut gate = EntryGate::new(60, 3);
         assert!(!gate.submit("MINT", "not-a-key", 1000));
         assert_eq!(gate.pending_count(), 0);
+    }
+
+    #[test]
+    fn unreadable_sample_majority_is_untrustworthy() {
+        assert!(sample_trustworthy(0, 0));
+        assert!(sample_trustworthy(0, 20));
+        assert!(sample_trustworthy(1, 20));
+        assert!(sample_trustworthy(9, 20));
+        // Half or more unreadable: fail closed.
+        assert!(!sample_trustworthy(10, 20));
+        assert!(!sample_trustworthy(20, 20));
+        assert!(!sample_trustworthy(1, 1));
+    }
+
+    #[test]
+    fn watchlist_evicts_oldest_past_cap() {
+        let mut gate = EntryGate::new(60, 3);
+        let dev = Pubkey::new_from_array([7; 32]).to_string();
+        for i in 0..(MAX_PENDING_ENTRIES + 5) {
+            assert!(gate.submit(&format!("MINT{i:05}"), &dev, 1000));
+        }
+        assert_eq!(gate.pending_count(), MAX_PENDING_ENTRIES);
     }
 
     #[test]
@@ -2168,8 +2330,22 @@ mod tests {
         };
         assert!(logs.iter().any(|l| l.contains("MigrateV2")));
         let ix_datas: Vec<Vec<u8>> = decoded.iter().map(|ix| ix.data.clone()).collect();
+        // Linkage inputs: the migration's own token accounts (pump-
+        // suffixed mint + curve), both present among the tx keys.
+        let pump_keys: Vec<Pubkey> = keys
+            .iter()
+            .filter(|k| k.to_string().ends_with("pump"))
+            .copied()
+            .collect();
+        assert!(pump_keys.len() >= 2, "fixture must carry mint + curve");
         assert_eq!(
-            MigrationMonitor::new().classify_migration(&keys, &ix_datas, &logs),
+            MigrationMonitor::new().classify_migration(
+                &keys,
+                &ix_datas,
+                &logs,
+                &pump_keys[0],
+                &pump_keys[1]
+            ),
             Some(MigrationDestination::PumpSwap)
         );
     }

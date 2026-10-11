@@ -5,6 +5,10 @@
 //! follow the canonical contiguous 32-byte slots anchored by the
 //! independently verified `quoteMint` memcmp offset 432
 //! (datasize 752, market-program 560, swapQuoteIn 664).
+//!
+//! Residual: the table is pinned by unit tests but not yet by a frozen
+//! mainnet `LiquidityStateV4` sample — capture one before trusting new
+//! fields beyond these five.
 
 use solana_pubkey::Pubkey;
 
@@ -133,6 +137,19 @@ mod tests {
         assert_eq!(pool.base_mint, Pubkey::new_from_array([13; 32]));
         assert_eq!(pool.quote_mint, Pubkey::new_from_array([14; 32]));
         assert_eq!(pool.lp_mint, Pubkey::new_from_array([15; 32]));
+    }
+
+    #[test]
+    fn slots_match_documented_table() {
+        // The five 32-byte slots are contiguous in documented order: a
+        // transposed offset constant breaks this before it breaks parsing.
+        // NOTE: pins code-to-table consistency, NOT table-to-chain — the
+        // offsets still want one frozen mainnet LiquidityStateV4 sample.
+        assert_eq!(OFF_BASE_VAULT + 32, OFF_QUOTE_VAULT);
+        assert_eq!(OFF_QUOTE_VAULT + 32, OFF_BASE_MINT);
+        assert_eq!(OFF_BASE_MINT + 32, OFF_QUOTE_MINT);
+        assert_eq!(OFF_QUOTE_MINT + 32, OFF_LP_MINT);
+        assert!(OFF_LP_MINT + 32 <= RAYDIUM_V4_ACCOUNT_SIZE);
     }
 
     #[test]
