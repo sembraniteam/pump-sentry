@@ -25,9 +25,10 @@ fresh pool account  ──→ RaydiumV4Pool::parse (AMM ID + base/quote
   at offset 432, contiguous 32-byte slots for vaults/mints). Tolerates
   longer buffers for forward compatibility; `is_wsol_quoted` flags
   standard Pump.fun migrations; `validate` gates trust (Raydium owner,
-  WSOL quote, expected base mint).
-- `vault` — post-migration price ticker: batched vault-balance reads
-  converted to USD spot (Pump 6dp / WSOL 9dp).
+  WSOL quote, expected base mint). `parse` alone is untrusted by
+  contract — use `parse_validated` (parse + gate in one step).
+- `vault` — post-migration price ticker: chunked batched vault-balance
+  reads (≤50 pools per round, 15s deadline) converted to USD spot (Pump 6dp / WSOL 9dp).
 
 ## Use
 
