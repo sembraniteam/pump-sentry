@@ -434,6 +434,14 @@ impl PaperPortfolio {
             if reason == ExitReason::TakeProfit {
                 open.sl_percent = open.sl_percent.max(0.0);
             }
+            // Runner freedom: the surviving slice rides on trailing stop
+            // alone — the time-stop is lifted so runners chase 5x–10x
+            // instead of expiring on schedule. Full closes (fraction >=
+            // 1.0) return early above and never reach here.
+            if fraction < 1.0 {
+                open.timeout_seconds = 0;
+                open.moonbag_percent = 0.0;
+            }
         }
         self.history.push(trade.clone());
         Ok(trade)
@@ -554,6 +562,58 @@ mod tests {
 
     fn funded() -> PaperPortfolio {
         PaperPortfolio::new(100.0, 0.0).with_fill_model(FillModel::Exact)
+    }
+
+    #[test]
+    fn moonbag_scale_out_lifts_timeout_and_disarms() {
+        // Runner freedom: after a partial TP exit the survivor has no
+        // time-stop (rides to trailing/SL/TP) and cannot scale out twice.
+        let mut pf = funded();
+        let id = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 40.0,
+                liquidity_usd: 1_000_000.0,
+                tp_percent: 60.0,
+                sl_percent: -8.0,
+                trailing: true,
+                trail_percent: 5.0,
+                timeout_seconds: 90,
+                moonbag_percent: 20.0,
+                now_secs: 1000,
+            })
+            .expect("open");
+        let trade = pf
+            .close_partial_position(id, 0.8, 1.7, 1_000_000.0, ExitReason::TakeProfit, 1001)
+            .expect("scale out");
+        assert_eq!(trade.fraction_closed, 0.8);
+        let runner = pf.position(id).expect("runner");
+        assert_eq!(runner.timeout_seconds, 0);
+        assert_eq!(runner.moonbag_percent, 0.0);
+        assert_eq!(runner.sl_percent, 0.0);
+        assert!(runner.trailing_stop);
+        // Full closes still remove the position (no survivor to lift).
+        let id2 = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "M2",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1_000_000.0,
+                tp_percent: 60.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 90,
+                moonbag_percent: 0.0,
+                now_secs: 1001,
+            })
+            .expect("open2");
+        pf.close_position(id2, 2.0, 1_000_000.0, ExitReason::TakeProfit, 1002)
+            .expect("full close");
+        assert!(pf.position(id2).is_none());
     }
 
     #[test]

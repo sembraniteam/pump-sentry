@@ -4,6 +4,7 @@
 //! [`Settings::from_map`] takes an explicit map so unit tests never touch
 //! global env state.
 
+use risk_engine::StrategyMode;
 use std::collections::HashMap;
 
 /// Runtime knobs, all overridable via env.
@@ -23,6 +24,11 @@ pub struct Settings {
     pub notional_usd: f64,
     /// Trailing-stop giveback in percent.
     pub trail_percent: f64,
+    /// Runner trailing-stop giveback in percent (default 20): moonbag
+    /// runners shake out on normal 5% pullbacks, so the runner trail is
+    /// wide enough to survive volatility on the way to 5x–10x. Used only
+    /// in `runner` mode; must be > 0 to ever fire.
+    pub runner_trail_percent: f64,
     /// Liquidity fallback in USD (used only when the reserve read fails).
     pub liquidity_usd: f64,
     /// Entry-gate window in seconds: buyer quorum must arrive in time.
@@ -61,6 +67,14 @@ pub struct Settings {
     pub inference_api_key: Option<String>,
     /// Buy/sell slippage guard in basis points.
     pub slippage_bps: u64,
+    /// Execution strategy: `adaptive` (follow the risk profile), `scalp`
+    /// (TP +25–35%, full exits), or `runner` (TP sells most, rides a
+    /// trailing moonbag). Unknown values fall back to `adaptive` with a
+    /// startup warning.
+    pub strategy_mode: String,
+    /// Runner share kept riding after TP, 0–100 (default 20 = sell 80%).
+    /// Used only in `runner` mode; clamped into range at resolve time.
+    pub runner_moonbag_percent: f64,
     /// Compute-unit price in micro-lamports for live transactions (`0` =
     /// no priority fee; standard `SetComputeUnitPrice` instruction when
     /// set). Raises landing odds under congestion at a per-tx cost.
@@ -101,6 +115,7 @@ impl Settings {
             fee_bps: get_float(vars, "FEE_BPS", 30.0),
             notional_usd: get_float(vars, "NOTIONAL_USD", 10.0),
             trail_percent: get_float(vars, "TRAIL_PERCENT", 5.0),
+            runner_trail_percent: get_float(vars, "RUNNER_TRAIL_PERCENT", 20.0),
             liquidity_usd: get_float(vars, "LIQUIDITY_USD", 0.0),
             gate_window_secs: get_int(vars, "GATE_WINDOW_SECS", 10),
             gate_min_buyers: get_int(vars, "GATE_MIN_BUYERS", 5),
@@ -123,6 +138,8 @@ impl Settings {
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300),
             inference_api_key: vars.get("INFERENCE_API_KEY").cloned(),
             slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200),
+            strategy_mode: get_string(vars, "STRATEGY_MODE", "adaptive"),
+            runner_moonbag_percent: get_float(vars, "RUNNER_MOONBAG_PERCENT", 20.0),
             priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0),
             compute_unit_limit: get_int(vars, "COMPUTE_UNIT_LIMIT", 0),
             tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000),
@@ -152,6 +169,27 @@ impl Settings {
             out.push(format!(
                 "SLIPPAGE_BPS={} exceeds 100%; buy guard will overspend massively",
                 self.slippage_bps
+            ));
+        }
+        if self.strategy_mode.parse::<StrategyMode>().is_err() {
+            out.push(format!(
+                "STRATEGY_MODE='{}' unknown; falling back to adaptive",
+                self.strategy_mode
+            ));
+        }
+        if !self.runner_moonbag_percent.is_finite()
+            || self.runner_moonbag_percent < 0.0
+            || self.runner_moonbag_percent > 100.0
+        {
+            out.push(format!(
+                "RUNNER_MOONBAG_PERCENT={} outside 0–100; clamped at resolve time",
+                self.runner_moonbag_percent
+            ));
+        }
+        if !self.runner_trail_percent.is_finite() || self.runner_trail_percent <= 0.0 {
+            out.push(format!(
+                "RUNNER_TRAIL_PERCENT={} must be positive; runners would never trail-exit",
+                self.runner_trail_percent
             ));
         }
         if self.notional_usd <= 0.0 || !self.notional_usd.is_finite() {
@@ -244,6 +282,9 @@ mod tests {
         assert_eq!(s.quote_usd, None);
         assert_eq!(s.inference_timeout_ms, 300);
         assert_eq!(s.inference_api_key, None);
+        assert_eq!(s.strategy_mode, "adaptive");
+        assert_eq!(s.runner_moonbag_percent, 20.0);
+        assert_eq!(s.runner_trail_percent, 20.0);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use listener::{
     RpcScreener, ScreenError, SwapRecord,
 };
 use migration::{PoolTick, VaultTicker};
-use risk_engine::{Action, RiskEngine, TokenMetrics, evaluate_heuristic_fallback};
+use risk_engine::{Action, RiskEngine, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics, evaluate_heuristic_fallback, resolve_strategy};
 use simulator::{ExitReason, PaperPortfolio, Side, check_exit};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -325,6 +325,9 @@ struct TrackedOpen<'a> {
     profile: &'a risk_engine::RiskProfile,
     allow_live: bool,
     creator: Option<&'a str>,
+    /// Trailing giveback resolved per strategy (runner uses its own wide
+    /// trail; everything else uses the shared setting).
+    trail_percent: f64,
 }
 
 /// Watchlist entry context alongside [`EntryGate`] decisions.
@@ -699,6 +702,33 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             info!(%mint, buyers, score = signal.score, "risk PASS at confirm");
             return;
         }
+        // Multi-strategy execution: rewrite the BUY profile per
+        // STRATEGY_MODE (adaptive = verbatim, scalp = TP band + full
+        // exits, runner = forced moonbag + trailing). Unknown modes fall
+        // back to adaptive with a startup warning (see settings).
+        let strategy = StrategyConfig {
+            mode: self.settings.strategy_mode.parse().unwrap_or_else(|e| {
+                warn!(mode = %self.settings.strategy_mode, error = %e, "bad strategy mode; using adaptive");
+                StrategyMode::Adaptive
+            }),
+            runner_moonbag_percent: self.settings.runner_moonbag_percent,
+        };
+        let profile = resolve_strategy(&profile, &strategy);
+        info!(%mint, mode = ?strategy.mode, tp = profile.tp_percent,
+            moonbag = profile.moonbag_percent, trailing = profile.trailing_stop,
+            "strategy resolved");
+        // Scalp never widens a below-band TP silently: the model wanted
+        // out early, and forcing it to wait turns winners into losers.
+        if strategy.mode == StrategyMode::ScalpQuick && profile.tp_percent < SCALP_TP_MIN {
+            warn!(%mint, tp = profile.tp_percent,
+                "scalp TP below +25% band; honoring the model's early exit");
+        }
+        // Runners trail wide (survive pullbacks toward 5x–10x); the scalp
+        // and adaptive paths share the standard trail setting.
+        let trail_percent = match strategy.mode {
+            StrategyMode::Runner => self.settings.runner_trail_percent,
+            _ => self.settings.trail_percent,
+        };
         self.open_tracked(&TrackedOpen {
             mint,
             curve: &signal.curve,
@@ -708,6 +738,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             profile: &profile,
             allow_live: req.allow_live && !priced_via_override,
             creator: signal.creator.as_deref(),
+            trail_percent,
         })
         .await;
     }
@@ -723,6 +754,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let liquidity_usd = req.liquidity_usd;
         let profile = req.profile;
         let allow_live = req.allow_live;
+        let trail_percent = req.trail_percent;
         let creator = req.creator;
         // Circuit breaker first: past the day-loss cap, no new risk —
         // paper or live. Exits are unaffected (handled on ticks).
@@ -763,7 +795,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             tp_percent: profile.tp_percent,
             sl_percent: profile.sl_percent,
             trailing: profile.trailing_stop,
-            trail_percent: self.settings.trail_percent,
+            trail_percent,
             timeout_seconds: profile.timeout_seconds,
             moonbag_percent: profile.moonbag_percent,
             now_secs: now_secs(),
@@ -1024,9 +1056,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         // past the cap — only new entries halt).
                         self.daily.lock().await.record(trade.net_pnl, now_secs());
                         let is_moonbag_exit = trade.fraction_closed < 1.0;
-                        if is_moonbag_exit && let Some(open) = portfolio.position_mut(id) {
-                            open.moonbag_percent = 0.0;
-                        }
+                        // Runner bookkeeping (stop ratchet, timeout lift,
+                        // moonbag disarm) lives in settle(); nothing to do.
                         let equity = portfolio.snapshot(&HashMap::new()).equity;
                         info!(mint = %tick.mint, id, reason = ?trade.reason,
                         net = format!("{:+.2}", trade.net_pnl),
@@ -2381,6 +2412,68 @@ mod tests {
         assert!(cards[1].contains("[LIVE BUY SENT]"));
         assert!(cards[1].contains("bundle-stub"));
         assert!(cards[3].contains("[LIVE SELL SENT]"));
+    }
+
+    #[tokio::test]
+    async fn scalp_mode_full_exits_in_tp_band() {
+        // STRATEGY_MODE=scalp: high-momentum TP 60 clamps to 35, moonbag
+        // killed → one full exit, no runner left behind.
+        let buyers: Vec<u8> = (20..55).collect();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &buyers));
+        let pipe = pipeline_screened(
+            settings(&[("STRATEGY_MODE", "scalp")]),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        // +40% clears the clamped 35% TP: full exit, nothing rides.
+        pipe.on_tick(&tick("MINT", 2.8)).await;
+        let portfolio = pipe.portfolio.lock().await;
+        assert_eq!(portfolio.history().len(), 1);
+        assert_eq!(portfolio.history()[0].fraction_closed, 1.0);
+        assert!(portfolio.position_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runner_mode_forces_moonbag_and_lifts_timeout() {
+        // STRATEGY_MODE=runner: moderate momentum (TP 35, no moonbag, no
+        // trail in profile) still scales out 80/20 with trailing armed,
+        // and the runner survives past the 90s time-stop.
+        let buyers: Vec<u8> = (20..30).collect();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &buyers));
+        let pipe = pipeline_screened(
+            settings(&[("STRATEGY_MODE", "runner")]),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        // +40% clears TP 35: 80% out, 20% runner with trailing armed
+        // and the 90s time-stop lifted (checked directly: position
+        // timeouts run on wall-clock, which tests cannot fast-forward).
+        pipe.on_tick(&tick("MINT", 2.8)).await;
+        {
+            let portfolio = pipe.portfolio.lock().await;
+            assert_eq!(portfolio.history()[0].fraction_closed, 0.8);
+            let runner = portfolio.position(portfolio.position_ids()[0]).expect("runner");
+            assert!(runner.trailing_stop);
+            assert_eq!(runner.timeout_seconds, 0);
+            assert_eq!(runner.moonbag_percent, 0.0);
+            // Runner trail is the wide one (20%), not the shared 5%.
+            assert_eq!(runner.trail_percent, 20.0);
+        }
+        // Drifting inside the trail band: no exit fires either.
+        pipe.on_tick(&tick("MINT", 2.68)).await;
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
     }
 
     #[tokio::test]
