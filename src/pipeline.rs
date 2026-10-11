@@ -203,8 +203,36 @@ pub fn resolve_entry(
     fallback_liquidity: f64,
 ) -> Option<(f64, f64)> {
     match tick {
-        Ok(tick) => Some((tick.price_usd, tick.liquidity_usd)),
-        Err(_) => quote_override.map(|quote| (quote, fallback_liquidity)),
+        Ok(tick)
+            if tick.price_usd.is_finite()
+                && tick.price_usd > 0.0
+                && tick.liquidity_usd.is_finite()
+                && tick.liquidity_usd >= 0.0 =>
+        {
+            Some((tick.price_usd, tick.liquidity_usd))
+        }
+        Ok(bad) => {
+            // A feed print of NaN/zero/negative is worse than none: it
+            // would open paper (and mirror live) at a garbage price.
+            warn!(mint = %bad.mint, price = bad.price_usd, liq = bad.liquidity_usd,
+                "ignoring degenerate curve tick; dropping signal");
+            None
+        }
+        Err(e) => match quote_override {
+            Some(quote) if quote.is_finite() && quote > 0.0 => {
+                warn!(error = %e, "curve read failed; pricing via QUOTE_USD override");
+                let liquidity = if fallback_liquidity.is_finite() && fallback_liquidity >= 0.0 {
+                    fallback_liquidity
+                } else {
+                    0.0
+                };
+                Some((quote, liquidity))
+            }
+            _ => {
+                warn!(error = %e, "curve read failed and no valid override; dropping signal");
+                None
+            }
+        },
     }
 }
 
@@ -264,9 +292,13 @@ pub struct LiveExecution<L = LiveTrader> {
     pub live_positions: Mutex<HashMap<String, LivePosition>>,
     /// Live-sell retry bookkeeping: `(attempts, last_attempt_secs)`.
     pub live_retry: Mutex<HashMap<String, (u32, u64)>>,
-    /// Serializes live dispatches: probe sizing and tracking updates
-    /// must not interleave across concurrent ticks.
-    pub live_sell_lock: Mutex<()>,
+    /// Per-mint dispatch locks: probe sizing and tracking updates must
+    /// not interleave across concurrent ticks for one mint, but a slow
+    /// confirm on mint A must never block exits on mint B (a global
+    /// lock did exactly that in volatile markets). One small mutex per
+    /// ever live-traded mint; removal is never needed for correctness
+    /// (clones keep working after eviction, so entries are kept).
+    pub live_sell_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl<L> LiveExecution<L> {
@@ -276,7 +308,7 @@ impl<L> LiveExecution<L> {
             live: None,
             live_positions: Mutex::new(HashMap::new()),
             live_retry: Mutex::new(HashMap::new()),
-            live_sell_lock: Mutex::new(()),
+            live_sell_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -813,10 +845,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.settings.notional_usd,
                 ));
                 drop(portfolio);
+                // No feed, no live leg: without the exit ticker a real bag
+                // would have no TP/SL automation, so the live mirror stays
+                // out (paper still opens for manual review).
                 if let Err(e) = self.reserves.watch(mint, curve).await {
-                    warn!(%mint, error = %e, "ticker watch failed; exits need manual review");
-                }
-                if allow_live {
+                    warn!(%mint, error = %e, "ticker watch failed; paper-only, live mirror skipped");
+                } else if allow_live {
                     self.live_buy(mint, curve, assoc_curve, entry_quote, creator).await;
                 }
             }
@@ -896,45 +930,36 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// Mirror paper closes with proportional Jito-routed sells (live mode
     /// only). Sells `fraction_closed` of the tracked amount so moonbag
     /// scale-outs mirror exactly; dust write-offs drop tracking with a
-    /// loud log. No-ops when nothing is tracked for the mint.
+    /// loud log. No-ops when nothing is tracked for the mint. Dispatches
+    /// serialize per mint; failures back off with cooldown + attempt
+    /// budget while successes reset it.
     async fn live_sell(&self, mint: &str, price_usd: f64, fraction_closed: f64) {
         let Some(trader) = &self.exec.live else { return };
-        // One live dispatch at a time: sizing and tracking stay atomic
-        // across concurrent ticks for any mint.
-        let _serial = self.exec.live_sell_lock.lock().await;
-        // Cooldown + attempt budget: never spam bundles at a dead market.
-        // Decide under one short lock, then release before any await or
-        // second lock (no nested acquisition, no lock held across await).
-        enum RetryDecision {
-            Proceed,
-            GiveUp,
-            Cooldown,
-        }
-        let decision = {
-            let mut retry = self.exec.live_retry.lock().await;
-            let entry = retry.entry(mint.to_string()).or_insert((0u32, 0u64));
-            let now = now_secs();
-            if now.saturating_sub(entry.1) < SELL_RETRY_COOLDOWN.as_secs() {
-                RetryDecision::Cooldown
-            } else {
-                entry.0 += 1;
-                entry.1 = now;
-                if entry.0 > SELL_MAX_ATTEMPTS {
-                    RetryDecision::GiveUp
-                } else {
-                    RetryDecision::Proceed
-                }
-            }
+        // Per-mint serialization: sizing and tracking stay atomic across
+        // concurrent ticks for THIS mint, while other mints exit freely.
+        let serial = {
+            let mut locks = self.exec.live_sell_locks.lock().await;
+            locks
+                .entry(mint.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
         };
-        match decision {
-            RetryDecision::Cooldown => return,
-            RetryDecision::GiveUp => {
-                self.exec.live_retry.lock().await.remove(mint);
-                self.exec.live_positions.lock().await.remove(mint);
-                warn!(%mint, "LIVE sell gave up after retries; MANUAL EXIT REQUIRED");
-                return;
-            }
-            RetryDecision::Proceed => {}
+        let _serial = serial.lock().await;
+        // Cooldown + attempt budget: never spam bundles at a dead market.
+        // Only the last FAILURE is tracked — successes reset the budget
+        // (see below), so a TP scale-out never throttles its own runner
+        // exit. Decide under one short lock, then release before any
+        // await or second lock (no nested acquisition, no lock held
+        // across await).
+        let now = now_secs();
+        let cooling = {
+            let retry = self.exec.live_retry.lock().await;
+            retry
+                .get(mint)
+                .is_some_and(|(_, last)| now.saturating_sub(*last) < SELL_RETRY_COOLDOWN.as_secs())
+        };
+        if cooling {
+            return;
         }
         let probe = {
             let guard = self.exec.live_positions.lock().await;
@@ -960,30 +985,41 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         match trader.sell(&probe, price_usd, self.settings.sol_usd).await {
             Ok(bundle) => {
                 // Confirmed on-chain by LiveTrader: mirror the fill locally.
-                let fully_closed = {
+                {
                     let mut guard = self.exec.live_positions.lock().await;
                     if let Some(tracked) = guard.get_mut(mint) {
                         tracked.amount_tokens =
                             tracked.amount_tokens.saturating_sub(probe.amount_tokens);
                         if tracked.amount_tokens == 0 {
                             guard.remove(mint);
-                            true
-                        } else {
-                            false
                         }
-                    } else {
-                        false
                     }
-                };
-                // A fully closed mint must not poison the next position's
-                // retry budget with this round's attempts.
-                if fully_closed {
-                    self.exec.live_retry.lock().await.remove(mint);
                 }
+                // Any success resets the failure budget: partial fills and
+                // later scale-outs are new attempts, never continuations
+                // of old failures (previously even successes consumed the
+                // 5-attempt budget and stamped the cooldown, throttling
+                // the runner exit after a TP scale-out).
+                self.exec.live_retry.lock().await.remove(mint);
                 warn!(%mint, %bundle, "LIVE sell dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_sell(mint, &bundle));
             }
-            Err(e) => warn!(%mint, error = %e, "LIVE sell unconfirmed; holding, will retry"),
+            Err(e) => {
+                let attempts = {
+                    let mut retry = self.exec.live_retry.lock().await;
+                    let entry = retry.entry(mint.to_string()).or_insert((0u32, 0u64));
+                    entry.0 = entry.0.saturating_add(1);
+                    entry.1 = now;
+                    entry.0
+                };
+                if attempts > SELL_MAX_ATTEMPTS {
+                    self.exec.live_retry.lock().await.remove(mint);
+                    self.exec.live_positions.lock().await.remove(mint);
+                    warn!(%mint, "LIVE sell gave up after retries; MANUAL EXIT REQUIRED");
+                } else {
+                    warn!(%mint, error = %e, "LIVE sell unconfirmed; holding, will retry");
+                }
+            }
         }
     }
 
@@ -1270,6 +1306,12 @@ mod tests {
         sells: StdMutex<Vec<(String, u64)>>,
         fail_buys: std::sync::atomic::AtomicBool,
         fail_sells: std::sync::atomic::AtomicBool,
+        /// Overlap-test hook: sells of `block_mint` wait on `unblock`
+        /// until notified; `started` records every entered sell so the
+        /// test can prove two mints overlap instead of serializing.
+        block_mint: StdMutex<Option<String>>,
+        started: StdMutex<Vec<String>>,
+        unblock: tokio::sync::Notify,
     }
 
     impl StubLive {
@@ -1280,6 +1322,9 @@ mod tests {
                     sells: StdMutex::new(vec![]),
                     fail_buys: std::sync::atomic::AtomicBool::new(false),
                     fail_sells: std::sync::atomic::AtomicBool::new(false),
+                    block_mint: StdMutex::new(None),
+                    started: StdMutex::new(vec![]),
+                    unblock: tokio::sync::Notify::new(),
                 }),
             }
         }
@@ -1338,6 +1383,16 @@ mod tests {
                 return Err(LiveError::BadOrder("stubbed sell failure".to_string()));
             }
             self.inner
+                .started
+                .lock()
+                .expect("lock")
+                .push(position.mint.clone());
+            if self.inner.block_mint.lock().expect("lock").as_deref()
+                == Some(position.mint.as_str())
+            {
+                self.inner.unblock.notified().await;
+            }
+            self.inner
                 .sells
                 .lock()
                 .expect("lock")
@@ -1351,6 +1406,8 @@ mod tests {
         tick: Option<PriceTick>,
         watched: StdMutex<Vec<(String, String)>>,
         unwatched: StdMutex<Vec<String>>,
+        /// When true, `watch` fails (exit-feed outage plumbing).
+        fail_watch: bool,
     }
 
     impl StubReserves {
@@ -1359,6 +1416,7 @@ mod tests {
                 tick: Some(tick),
                 watched: StdMutex::new(vec![]),
                 unwatched: StdMutex::new(vec![]),
+                fail_watch: false,
             }
         }
 
@@ -1367,6 +1425,7 @@ mod tests {
                 tick: None,
                 watched: StdMutex::new(vec![]),
                 unwatched: StdMutex::new(vec![]),
+                fail_watch: false,
             }
         }
     }
@@ -1380,6 +1439,9 @@ mod tests {
         }
 
         async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
+            if self.fail_watch {
+                return Err(CurveError::AccountMissing(mint.to_string()));
+            }
             self.watched
                 .lock()
                 .expect("lock")
@@ -1653,6 +1715,56 @@ mod tests {
     fn entry_is_none_without_price_or_override() {
         let err: Result<PriceTick, CurveError> = Err(CurveError::AccountMissing("M".to_string()));
         assert_eq!(resolve_entry(err, None, 0.0), None);
+    }
+
+    #[test]
+    fn entry_rejects_degenerate_tick() {
+        // A feed print of NaN/zero/negative price (or bad liquidity) is
+        // worse than none: it must drop the signal, never open on it.
+        for price in [f64::NAN, 0.0, -1.5, f64::INFINITY] {
+            let bad = PriceTick {
+                mint: "M".to_string(),
+                curve: "C".to_string(),
+                price_usd: price,
+                liquidity_usd: 30_000.0,
+                complete: false,
+                observed_at: 2_000,
+            };
+            assert_eq!(
+                resolve_entry(Ok(bad), Some(9.0), 500.0),
+                None,
+                "price {price}"
+            );
+        }
+        for liq in [f64::NAN, -100.0, f64::INFINITY] {
+            let bad = PriceTick {
+                mint: "M".to_string(),
+                curve: "C".to_string(),
+                price_usd: 2.0,
+                liquidity_usd: liq,
+                complete: false,
+                observed_at: 2_000,
+            };
+            assert_eq!(resolve_entry(Ok(bad), Some(9.0), 500.0), None, "liq {liq}");
+        }
+    }
+
+    #[test]
+    fn entry_rejects_bad_override_and_liquidity() {
+        let missing =
+            || Result::<PriceTick, CurveError>::Err(CurveError::AccountMissing("M".to_string()));
+        for quote in [f64::NAN, 0.0, -9.0] {
+            assert_eq!(
+                resolve_entry(missing(), Some(quote), 500.0),
+                None,
+                "quote {quote}"
+            );
+        }
+        // Bad fallback liquidity degrades to 0 rather than poisoning risk.
+        assert_eq!(
+            resolve_entry(missing(), Some(9.0), f64::NAN),
+            Some((9.0, 0.0))
+        );
     }
 
     #[tokio::test]
@@ -2569,11 +2681,10 @@ mod tests {
         assert_eq!(live.sells(), vec![("MINT".to_string(), 800)]);
         assert_eq!(pipe.exec.live_positions.lock().await["MINT"].amount_tokens, 200);
 
-        // Age the retry clock past the cooldown so the runner exit fires.
-        pipe.exec.live_retry
-            .lock()
-            .await
-            .insert("MINT".to_string(), (1u32, 0u64));
+        // Success resets the failure budget: the runner exit fires on the
+        // very next tick with no cooldown workaround (previously the
+        // success itself stamped the cooldown and ate the budget).
+        assert!(!pipe.exec.live_retry.lock().await.contains_key("MINT"));
         pipe.on_tick(&tick("MINT", 4.0)).await;
         assert_eq!(
             live.sells(),
@@ -2723,5 +2834,97 @@ mod tests {
         pipe.on_tick(&tick("MINT", 3.0)).await;
         assert!(pipe.exec.live_positions.lock().await.is_empty());
         assert!(live.sells().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_sells_for_different_mints_overlap() {
+        // Per-mint serialization proof: a sell blocked mid-dispatch on
+        // mint A must not hold up mint B. Under the old global lock this
+        // deadlocks (B waits for A's lock while A waits for release) and
+        // the timeouts fail the test instead of hanging CI.
+        let live = StubLive::working();
+        *live.inner.block_mint.lock().expect("lock") = Some("A".to_string());
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("A", 2.0)),
+            funded(),
+            StubScreener::passing(),
+            Some(live.clone()),
+        );
+        for mint in ["A", "B"] {
+            pipe.exec.live_positions.lock().await.insert(
+                mint.to_string(),
+                LivePosition {
+                    mint: mint.to_string(),
+                    curve: "CURVE".to_string(),
+                    assoc_curve: "ASSOC".to_string(),
+                    amount_tokens: 1_000,
+                    creator: None,
+                },
+            );
+        }
+        let secs = std::time::Duration::from_secs;
+        tokio::time::timeout(secs(10), async {
+            tokio::join!(
+                async {
+                    tokio::time::timeout(secs(5), pipe.live_sell("A", 3.0, 1.0))
+                        .await
+                        .expect("A finishes after release");
+                },
+                async {
+                    // Wait until A is inside the stub dispatch, then B
+                    // must sail through while A is still blocked.
+                    tokio::time::timeout(secs(5), async {
+                        loop {
+                            if live
+                                .inner
+                                .started
+                                .lock()
+                                .expect("lock")
+                                .iter()
+                                .any(|m| m == "A")
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("A starts");
+                    tokio::time::timeout(secs(5), pipe.live_sell("B", 3.0, 1.0))
+                        .await
+                        .expect("B proceeds while A is blocked");
+                    live.inner.unblock.notify_waiters();
+                }
+            )
+        })
+        .await
+        .expect("no deadlock");
+        assert!(live.sells().iter().any(|(m, _)| m == "A"));
+        assert!(live.sells().iter().any(|(m, _)| m == "B"));
+    }
+
+    #[tokio::test]
+    async fn live_mirror_skipped_when_watch_fails() {
+        // Exit-feed outage: paper still opens (manual review), but no
+        // real bag is bought without TP/SL automation.
+        let live = StubLive::working();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let mut reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        reserves.fail_watch = true;
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+        assert!(live.buys().is_empty());
     }
 }
