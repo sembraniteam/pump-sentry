@@ -41,4 +41,5 @@ listener = { path = "../listener" }
 solana-message = "4"
 solana-rpc-client-api = "4.3.0"
 solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }
+solana-instruction-error = "2"
 tokio = { version = "1", features = ["full"] }

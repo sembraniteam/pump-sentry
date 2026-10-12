@@ -1399,6 +1399,7 @@ dependencies = [
  "solana-commitment-config",
  "solana-hash",
  "solana-instruction 3.5.1",
+ "solana-instruction-error 2.5.0",
  "solana-keypair 3.1.2",
  "solana-message 4.6.0",
  "solana-pubkey 4.4.0",

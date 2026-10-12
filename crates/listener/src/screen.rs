@@ -2074,6 +2074,33 @@ mod tests {
     }
 
     #[test]
+    fn replay_mainnet_sell_v2_second_sample() {
+        // Second independent `sell_v2` (26 accounts, SOL-quoted this
+        // time — no quote-token legs): trader resolves to the fee payer
+        // and the amount matches the seller's token-balance delta to the
+        // unit (1_679_259_586_074). The second u64 (65_131_943) sits
+        // below the ~94.3M-lamport proceeds — min-SOL-output semantics,
+        // consistent with the first sample (107M ≥ 30,205).
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/sell_v2_second_mainnet.json"))
+                .expect("fixture");
+        let fetched: EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_value(raw["result"].clone()).expect("decode");
+        assert_eq!(fetched.slot, 455844140);
+        let records = extract_pump_swaps(&fetched, "sig");
+        let sells: Vec<_> = records
+            .iter()
+            .filter(|r| r.side == SwapSide::Sell)
+            .collect();
+        assert_eq!(sells.len(), 1);
+        assert_eq!(
+            sells[0].wallet.to_string(),
+            "GiverXMTjyePxBFbgPDareo3atUfvMosDd8di1uMgUBq"
+        );
+        assert_eq!(sells[0].amount_base_units, 1_679_259_586_074);
+    }
+
+    #[test]
     fn cohort_wallets_dump_abort_but_never_count() {
         // v2 creator cohort: their sells abort like the launcher's, and
         // their buys never count toward quorum.
@@ -2729,7 +2756,7 @@ mod tests {
     /// Build a fabricated transaction from explicit account keys,
     /// top-level instructions, and an optional meta (for inner-ix cases).
     fn funding_tx_with_meta(
-        account_keys: Vec<String>,
+        account_keys: &[String],
         instructions: Vec<UiCompiledInstruction>,
         meta: Option<UiTransactionStatusMeta>,
     ) -> EncodedConfirmedTransactionWithStatusMeta {
@@ -2744,7 +2771,7 @@ mod tests {
                             num_readonly_signed_accounts: 0,
                             num_readonly_unsigned_accounts: 1,
                         },
-                        account_keys,
+                        account_keys: account_keys.to_vec(),
                         recent_blockhash: key(99),
                         instructions,
                         address_table_lookups: None,
@@ -2781,7 +2808,7 @@ mod tests {
         for b in 1u8..=4 {
             account_keys.push(key(b));
         }
-        let tx = funding_tx_with_meta(account_keys, vec![ui], None);
+        let tx = funding_tx_with_meta(&account_keys, vec![ui], None);
         let (from, to) = (
             Pubkey::new_from_array([1; 32]),
             Pubkey::new_from_array([3; 32]),
@@ -2811,7 +2838,7 @@ mod tests {
         for b in 1u8..=4 {
             account_keys.push(key(b));
         }
-        let tx = funding_tx_with_meta(account_keys, vec![ui], None);
+        let tx = funding_tx_with_meta(&account_keys, vec![ui], None);
         let (from, new) = (
             Pubkey::new_from_array([1; 32]),
             Pubkey::new_from_array([2; 32]),
@@ -2827,7 +2854,7 @@ mod tests {
         let ata = Pubkey::new_from_array([2; 32]);
         let owner = Pubkey::new_from_array([3; 32]);
         let mint = Pubkey::new_from_array([4; 32]);
-        let order = vec![
+        let order = [
             ASSOCIATED_TOKEN_PROGRAM_ID,
             payer,
             ata,
@@ -2843,7 +2870,7 @@ mod tests {
                 stack_height: None,
             };
             let tx = funding_tx_with_meta(
-                order.iter().map(|k| k.to_string()).collect(),
+                &order.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
                 vec![ui],
                 None,
             );
@@ -2861,7 +2888,7 @@ mod tests {
             stack_height: None,
         };
         let tx = funding_tx_with_meta(
-            order.iter().map(|k| k.to_string()).collect(),
+            &order.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
             vec![ui],
             None,
         );
@@ -2888,7 +2915,7 @@ mod tests {
             stack_height: None,
         };
         let other_program = Pubkey::new_from_array([9; 32]);
-        let order = vec![
+        let order = [
             SYSTEM_PROGRAM_ID.to_string(),
             key(1),
             key(2),
@@ -2913,7 +2940,7 @@ mod tests {
             compute_units_consumed: OptionSerializer::None,
             cost_units: OptionSerializer::None,
         };
-        let tx = funding_tx_with_meta(order, vec![outer], Some(meta));
+        let tx = funding_tx_with_meta(&order, vec![outer], Some(meta));
         assert_eq!(
             find_funding_source(&tx, &Pubkey::new_from_array([2; 32])),
             Some(Pubkey::new_from_array([1; 32]))

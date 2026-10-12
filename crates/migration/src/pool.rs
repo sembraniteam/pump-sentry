@@ -39,6 +39,11 @@ pub const OFF_QUOTE_MINT: usize = 432;
 /// Byte offsets of the 32-byte address slots we parse.
 pub const OFF_LP_MINT: usize = 464;
 
+/// Compile-time guard: the slot table must fit the account. A
+/// transposed offset constant breaks the build here instead of parsing
+/// garbage on mainnet.
+const _: () = assert!(OFF_LP_MINT + 32 <= RAYDIUM_V4_ACCOUNT_SIZE);
+
 /// Fresh Raydium AMM V4 pool, ready for instant swap routing.
 ///
 /// Orientation follows the on-chain struct: on Pump.fun migration pools
@@ -161,7 +166,8 @@ mod tests {
         assert_eq!(OFF_QUOTE_VAULT + 32, OFF_BASE_MINT);
         assert_eq!(OFF_BASE_MINT + 32, OFF_QUOTE_MINT);
         assert_eq!(OFF_QUOTE_MINT + 32, OFF_LP_MINT);
-        assert!(OFF_LP_MINT + 32 <= RAYDIUM_V4_ACCOUNT_SIZE);
+        // Table end fits the account (const-checked below, not here:
+        // all-constant asserts belong in a const block).
     }
 
     #[test]

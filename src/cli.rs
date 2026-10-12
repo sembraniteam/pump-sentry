@@ -224,7 +224,15 @@ pub fn read_pid_file(path: &Path) -> Option<PidInfo> {
 
 /// True when `pid` names a live process (`kill -0` on unix; pid-file
 /// existence elsewhere — documented limitation for non-unix hosts).
+///
+/// The range guard comes first: pid 0 means "our process group" and any
+/// value above `i32::MAX` overflows `pid_t` (on Linux `u32::MAX` wraps
+/// to -1 = "all our processes") — `kill` would then succeed for a pid
+/// that can never name a daemon. Reject without invoking anything.
 pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     #[cfg(unix)]
     {
         std::process::Command::new("kill")
@@ -815,6 +823,9 @@ mod tests {
     #[test]
     fn current_process_is_alive_but_absurd_pid_is_not() {
         assert!(process_alive(std::process::id()));
+        // 0 = own process group, u32::MAX overflows pid_t to -1 = all
+        // processes: both fake success on Linux without the range guard.
+        assert!(!process_alive(0));
         assert!(!process_alive(u32::MAX));
     }
 

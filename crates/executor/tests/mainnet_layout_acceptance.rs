@@ -25,7 +25,9 @@
 //! mainnet RPC (rate limits may require a rerun):
 //! `MAINNET_LAYOUT=1 cargo test -p executor --test mainnet_layout_acceptance -- --ignored --nocapture`
 
-use executor::instructions::{PUMP_BUY_DISCRIMINATOR, PUMP_SELL_DISCRIMINATOR, PumpSwapBuilder};
+use executor::instructions::{
+    PUMP_BUY_DISCRIMINATOR, PUMP_SELL_DISCRIMINATOR, PumpSwapBuilder,
+};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
@@ -280,6 +282,382 @@ async fn mainnet_sell_layout_matches_and_simulates() {
         return;
     }
     panic!("no sell sample with seller holdings after resampling");
+}
+
+#[tokio::test]
+#[ignore]
+async fn mainnet_sell_v2_simulates_end_to_end() {
+    // sell_v2 execution gate (P0.2): the 26-account builder must not only
+    // match one frozen sample byte-for-byte (unit test) but SIMULATE
+    // clean on a FRESH curve with live-resolved accounts. Per-sample
+    // mapping asserts below prove the derivation map is universal, not
+    // fixture-fitted: any mismatch panics loudly instead of resampling
+    // past it. Dust economics (neutered amount, open guard): proves
+    // layout, not profitability. Simulation only, never sends anything.
+    if std::env::var("MAINNET_LAYOUT").as_deref() != Ok("1") {
+        eprintln!("skipped: set MAINNET_LAYOUT=1 to run the live layout probe");
+        return;
+    }
+    use executor::instructions::{
+        PUMP_SELL_V2_DISCRIMINATOR, SellV2Accounts, build_create_ata_ix, creator_vault_pda,
+        user_ata_with_program, user_volume_accumulator_pda,
+    };
+    // Endpoint override for throttled windows: the default public RPC
+    // rate-limits aggressively after bulk scans; point at any healthy
+    // mainnet HTTPS endpoint instead (same data, separate budget).
+    let rpc_url = std::env::var("MAINNET_RPC_URL").unwrap_or_else(|_| RPC_URL.to_string());
+    let rpc = RpcClient::new(rpc_url);
+    // Deep scan: sell_v2 is rarer than legacy sells (~1-2 per 100 pump
+    // txs); page until several candidates or budgets run out.
+    let mut candidates: Vec<SampledIx> = Vec::new();
+    let mut before = None;
+    for _ in 0..5usize {
+        let sigs: Vec<String> = match rpc
+            .get_signatures_for_address_with_config(
+                &Pubkey::from_str(PUMP_PROGRAM).expect("pump id"),
+                solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                    before,
+                    until: None,
+                    limit: Some(200),
+                    commitment: None,
+                },
+            )
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                eprintln!("signature scan failed ({e}); stopping scan");
+                break;
+            }
+        }
+        .into_iter()
+        .filter(|s| s.err.is_none())
+        .map(|s| s.signature)
+        .collect();
+        if sigs.is_empty() {
+            break;
+        }
+        before = sigs
+            .last()
+            .and_then(|s| solana_signature::Signature::from_str(s).ok());
+        for sig in &sigs {
+            let Ok(sig_parsed) = solana_signature::Signature::from_str(sig) else {
+                continue;
+            };
+            let fetched = match rpc
+                .get_transaction_with_config(
+                    &sig_parsed,
+                    solana_client::rpc_config::RpcTransactionConfig {
+                        encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
+                        commitment: None,
+                        max_supported_transaction_version: Some(1),
+                    },
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
+                &fetched.transaction.transaction
+            else {
+                continue;
+            };
+            let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
+                continue;
+            };
+            let mut keys: Vec<Pubkey> = raw
+                .account_keys
+                .iter()
+                .filter_map(|k| Pubkey::from_str(k).ok())
+                .collect();
+            if keys.len() != raw.account_keys.len() {
+                continue;
+            }
+            if let Some(meta) = &fetched.transaction.meta {
+                use solana_transaction_status::option_serializer::OptionSerializer;
+                if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+                    for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
+                        let Ok(p) = Pubkey::from_str(k) else { continue };
+                        keys.push(p);
+                    }
+                }
+            }
+            let pump_idx = match keys.iter().position(|k| k.to_string() == PUMP_PROGRAM) {
+                Some(i) => i as u8,
+                None => continue,
+            };
+            for cix in &raw.instructions {
+                if cix.program_id_index != pump_idx {
+                    continue;
+                }
+                let data = decode_b58(&cix.data);
+                if data.len() != 24 || data[..8] != PUMP_SELL_V2_DISCRIMINATOR {
+                    continue;
+                }
+                let accounts: Vec<Pubkey> = cix
+                    .accounts
+                    .iter()
+                    .filter_map(|i| keys.get(usize::from(*i)).copied())
+                    .collect();
+                if accounts.len() != 26 {
+                    continue;
+                }
+                println!("sampled sell_v2 in {sig} (26 accounts)");
+                candidates.push(SampledIx {
+                    signature: sig.clone(),
+                    accounts,
+                    data,
+                });
+            }
+        }
+        if candidates.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        !candidates.is_empty(),
+        "no sell_v2 in scanned window; rerun later"
+    );
+    // Same curve can appear repeatedly: probe each market once so RPC
+    // budget goes to distinct curves, not replays of one.
+    {
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|s| seen.insert((s.accounts[1], s.accounts[10])));
+    }
+    for (n, sample) in candidates.iter().enumerate() {
+        println!(
+            "candidate {n}: mint={} curve={}",
+            sample.accounts[1], sample.accounts[10]
+        );
+        let mint = sample.accounts[1];
+        let quote = sample.accounts[2];
+        let curve = sample.accounts[10];
+        // Transport errors resample (loudly); only mapping mismatch and
+        // sim failure panic — the map is either universal or wrong.
+        let token_program = match rpc.get_account(&mint).await {
+            Ok(a) => a.owner,
+            Err(e) => {
+                println!("candidate {n}: mint read failed ({e}); resampling");
+                continue;
+            }
+        };
+        let quote_program = match rpc.get_account(&quote).await {
+            Ok(a) => a.owner,
+            Err(e) => {
+                println!("candidate {n}: quote read failed ({e}); resampling");
+                continue;
+            }
+        };
+        // Mapping proof (universal, not fixture-fitted): every
+        // program-derived address must equal the chain's account at its
+        // position. Any mismatch panics — the map is either universal
+        // or wrong, never silently resampled past.
+        let chain_seller = sample.accounts[13];
+        assert_eq!(
+            user_ata_with_program(&sample.accounts[6], &quote, &quote_program),
+            sample.accounts[7],
+            "fee quote ATA mismatch"
+        );
+        assert_eq!(
+            user_ata_with_program(&curve, &quote, &quote_program),
+            sample.accounts[12],
+            "curve quote ATA mismatch"
+        );
+        // Creator reads off the curve account (mayhem tail 49..81).
+        let curve_data = match rpc.get_account(&curve).await {
+            Ok(a) => a,
+            Err(e) => {
+                println!("candidate {n}: curve read failed ({e}); resampling");
+                continue;
+            }
+        };
+        if curve_data.data.len() < 81 {
+            println!("curve too short for creator read; resampling");
+            continue;
+        }
+        let creator = Pubkey::new_from_array(curve_data.data[49..81].try_into().expect("32B"));
+        assert_eq!(
+            creator_vault_pda(&creator),
+            sample.accounts[16],
+            "creator vault mismatch"
+        );
+        assert_eq!(
+            user_volume_accumulator_pda(&chain_seller),
+            sample.accounts[19],
+            "user-vol mismatch"
+        );
+        // Wallet-convention accounts ([14]/[15]) are canonical ATAs when
+        // the seller uses them — but holders may sit in aux accounts
+        // (documented residual), which no seed derivation can reproduce.
+        // Aux sellers cannot validate our canonical path: skip loudly.
+        if user_ata_with_program(&chain_seller, &mint, &token_program) != sample.accounts[14]
+            || user_ata_with_program(&chain_seller, &quote, &quote_program) != sample.accounts[15]
+        {
+            println!("seller uses aux accounts; resampling");
+            continue;
+        }
+        // Sim seller: the SAMPLED seller itself with a 1-unit debit.
+        // Historical sellers usually exited fully, so the debit is
+        // EXPECTED to fail with token InsufficientFunds (Custom(1)) —
+        // which still proves the layout: every account resolved, every
+        // owner/program check passed, execution reached the token debit
+        // CPI. A clean sim passes outright. Anything else (6000-range
+        // pump errors, missing accounts, fee failures) is a layout
+        // problem and fails the gate. Unsigned skeleton (sig_verify
+        // off): proves layout, never authorization, never funds.
+        let seller = chain_seller;
+        // Fee-payer solvency first: a broke payer fails with a fee
+        // error that would confound the funds-only reading below.
+        match rpc.get_balance(&seller).await {
+            Ok(lamports) if lamports >= 100_000 => {}
+            _ => {
+                println!("seller lacks fee SOL; resampling");
+                continue;
+            }
+        }
+        let fee_recipient = match executor::executor::fetch_global_fee_recipient(&rpc).await {
+            Some(fee) => fee,
+            None => {
+                println!("candidate {n}: fee recipient unreadable; resampling");
+                continue;
+            }
+        };
+        let seller_base_ata = user_ata_with_program(&seller, &mint, &token_program);
+        let seller_quote_ata = user_ata_with_program(&seller, &quote, &quote_program);
+        let seller_uvol = user_volume_accumulator_pda(&seller);
+        let seller_uvol_quote_ata = user_ata_with_program(&seller_uvol, &quote, &quote_program);
+        let mut ixs = Vec::new();
+        // Idempotent ATA prefix for the derived seller accounts (the
+        // historical ones may be closed by now): existence without
+        // balance still exercises the full debit path to its
+        // funds-check conclusion.
+        for (owner, ata_mint, ata, prog) in [
+            (&seller, &mint, &seller_base_ata, &token_program),
+            (&seller, &quote, &seller_quote_ata, &quote_program),
+            (&seller_uvol, &quote, &seller_uvol_quote_ata, &quote_program),
+        ] {
+            if rpc.get_account(ata).await.is_err() {
+                ixs.push(build_create_ata_ix(&seller, owner, ata_mint, ata, prog));
+            }
+        }
+        ixs.push(PumpSwapBuilder::build_sell_v2_ix(
+            1,
+            0,
+            &SellV2Accounts {
+                payer: &seller,
+                mint: &mint,
+                quote_mint: &quote,
+                bonding_curve: &curve,
+                associated_bonding_curve: &sample.accounts[11],
+                fee_recipient: &fee_recipient,
+                base_token_program: &token_program,
+                quote_token_program: &quote_program,
+                creator: &creator,
+                pfee_vault: &sample.accounts[8],
+                pfee_quote_account: &sample.accounts[9],
+                unknown_18: &sample.accounts[18],
+            },
+        ));
+        use solana_instruction_error::InstructionError;
+        use solana_rpc_client_api::response::TransactionError;
+        // Blockhash/read-then-simulate races a load-balanced public RPC:
+        // a hash the fetch node knows may be unknown to the sim node
+        // (empty logs, BlockhashNotFound — proves nothing either way).
+        // One fresh retry separates that flake from a real verdict.
+        let mut attempt = 0u32;
+        loop {
+            let blockhash = match rpc.get_latest_blockhash().await {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("candidate {n}: blockhash failed ({e}); resampling");
+                    break;
+                }
+            };
+            let message =
+                solana_message::Message::new_with_blockhash(&ixs, Some(&seller), &blockhash);
+            let tx = Transaction {
+                signatures: vec![
+                    solana_signature::Signature::default();
+                    message.header.num_required_signatures as usize
+                ],
+                message,
+            };
+            let res = match rpc
+                .simulate_transaction_with_config(
+                    &tx,
+                    RpcSimulateTransactionConfig {
+                        sig_verify: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    println!("candidate {n}: simulate RPC failed ({e}); resampling");
+                    break;
+                }
+            };
+            let logs = res
+                .value
+                .logs
+                .as_ref()
+                .map(|l| l.join("\n"))
+                .unwrap_or_default();
+            println!("SIM logs:\n{logs}");
+            // Verdict: clean, or execution stopped ONLY on empty funds —
+            // either at the token debit (TokenError::InsufficientFunds =
+            // Custom(1) after a token-program CPI) or at the pump
+            // program's own balance gate first (`NotEnoughTokensToSell`,
+            // 6023, from sell_v2.rs — observed with `Left: 0, Right:
+            // 1`). Pump's Custom errors otherwise live at 6000+ for
+            // layout violations, so any other error is a layout-level
+            // failure and fails the gate. Either funds-conclusion proves
+            // the same thing: every account resolved, every
+            // owner/program/PDA check passed, and the program walked the
+            // layout to the debit math.
+            let token_cpi_reached = logs.contains("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+                || logs.contains("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+            let err: Option<TransactionError> = res.value.err.clone().map(TransactionError::from);
+            match err {
+                None => {
+                    println!("SELL_V2 GREEN (clean) sig={}", sample.signature);
+                    return;
+                }
+                Some(TransactionError::InstructionError(_, InstructionError::Custom(1)))
+                    if token_cpi_reached =>
+                {
+                    println!(
+                        "SELL_V2 GREEN (funds-conclusion at token debit) sig={}",
+                        sample.signature
+                    );
+                    return;
+                }
+                Some(TransactionError::InstructionError(_, InstructionError::Custom(6023)))
+                    if logs.contains("NotEnoughTokensToSell") =>
+                {
+                    println!(
+                        "SELL_V2 GREEN (funds-conclusion at pump balance gate) sig={}",
+                        sample.signature
+                    );
+                    return;
+                }
+                Some(TransactionError::BlockhashNotFound) if attempt == 0 && logs.is_empty() => {
+                    println!("candidate {n}: stale blockhash under load; one fresh retry");
+                    attempt += 1;
+                    continue;
+                }
+                Some(other) => {
+                    panic!(
+                        "sell_v2 simulation failed with layout-level error: {other:?}\nlogs:\n{logs}"
+                    );
+                }
+            }
+        }
+    }
+    panic!("no sell_v2 sample simulating clean after resampling");
 }
 
 #[tokio::test]

@@ -48,9 +48,10 @@ pub const PUMP_BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211,
 /// (same trader position as `buy_v2`), and payload bytes 8..16 are the
 /// sold base units to the unit (fee payer's token balance decreased by
 /// exactly that amount). Payload is 24 bytes: discriminator + `(amount:
-/// u64, min_sol_output: u64)` mirroring legacy `sell`. The gate
-/// classifies these as `Sell` (dev dumps abort); live sell *building*
-/// still targets the legacy shape (a v2 sell builder is future work).
+/// u64, min_sol_output: u64)` mirroring legacy `sell` (two-sample
+/// confirmed 2026-10-13). The gate classifies these as `Sell` (dev dumps
+/// abort); live exits build them via `build_sell_v2_ix` with opaque
+/// routing resolved from a same-curve reference sell.
 pub const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 /// `migrate` instruction discriminator (skill solana-raydium-migration).
 pub const PUMP_MIGRATE_DISCRIMINATOR: [u8; 8] = [155, 234, 231, 146, 236, 158, 162, 30];

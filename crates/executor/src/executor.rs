@@ -99,7 +99,116 @@ pub struct SellOrder {
     /// Jito tip budget in lamports (see [`BuyOrder::tip_lamports`]).
     pub tip_lamports: u64,
     /// Token creator, when known: selects the extended mayhem swap shape.
+    /// A known creator means a `create_v2` launch, whose curve takes the
+    /// 26-account `sell_v2` shape (see `preflight_sell_v2`); `None` keeps
+    /// the legacy core.
     pub creator: Option<Pubkey>,
+}
+
+/// Opaque v2-sell routing lifted from a same-curve reference sell:
+/// quote mint [2], pfee vault [8] + quote account [9], readonly [18].
+/// Per-curve stable (like buyback routing); never derived, never
+/// guessed — absence fails the sell closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SellV2Reference {
+    /// Reference transaction signature (base58, for logs).
+    pub signature: String,
+    /// Quote mint (position 2).
+    pub quote_mint: Pubkey,
+    /// pfee quote vault (position 8).
+    pub pfee_vault: Pubkey,
+    /// pfee vault's quote account (position 9).
+    pub pfee_quote_account: Pubkey,
+    /// Readonly reference account (position 18).
+    pub unknown_18: Pubkey,
+}
+
+/// Signature-scan depth for reference resolution (bounded RPC budget).
+pub const REFERENCE_SCAN_LIMIT: usize = 20;
+
+/// Pick the first top-level `sell_v2` on OUR curve+mint from a raw
+/// `getTransaction` Json envelope and lift its opaque routing. Pure;
+/// `None` on any shape mismatch (wrong curve/mint, short accounts,
+/// undecodable data) — callers keep scanning, never misattribute.
+/// Account keys resolve static-first then address-table order
+/// (writable, readonly), mirroring the canonical resolvers.
+pub fn select_sell_v2_reference(
+    tx: &serde_json::Value,
+    curve: &Pubkey,
+    mint: &Pubkey,
+) -> Option<SellV2Reference> {
+    let msg = tx.get("transaction")?.get("message")?;
+    let mut keys: Vec<String> = msg
+        .get("accountKeys")?
+        .as_array()?
+        .iter()
+        .filter_map(|k| k.as_str().map(str::to_string))
+        .collect();
+    if let Some(loaded) = tx
+        .get("meta")
+        .and_then(|m| m.get("loadedAddresses"))
+        .and_then(|l| l.as_object())
+    {
+        for table in ["writable", "readonly"] {
+            if let Some(addrs) = loaded.get(table).and_then(|v| v.as_array()) {
+                keys.extend(addrs.iter().filter_map(|k| k.as_str().map(str::to_string)));
+            }
+        }
+    }
+    let pump = crate::instructions::PUMP_PROGRAM_ID.to_string();
+    let pump_idx = keys.iter().position(|k| k == &pump)? as u64;
+    let ixs = msg.get("instructions")?.as_array()?;
+    let sig = tx
+        .get("transaction")?
+        .get("signatures")?
+        .as_array()?
+        .first()?
+        .as_str()?
+        .to_string();
+    for ix in ixs {
+        let Some(pi) = ix.get("programIdIndex").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if pi != pump_idx {
+            continue;
+        }
+        let Some(data_str) = ix.get("data").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(raw) = bs58::decode(data_str).into_vec() else {
+            continue;
+        };
+        if !raw.starts_with(&crate::instructions::PUMP_SELL_V2_DISCRIMINATOR) || raw.len() != 24 {
+            continue;
+        }
+        let Some(arr) = ix.get("accounts").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let idx: Vec<usize> = arr
+            .iter()
+            .filter_map(|a| a.as_u64().map(|i| i as usize))
+            .collect();
+        if idx.len() != 26 {
+            continue;
+        }
+        let at = |pos: usize| -> Option<Pubkey> {
+            keys.get(*idx.get(pos)?)
+                .and_then(|k| Pubkey::from_str(k).ok())
+        };
+        // Must be OUR curve+mint: a shared-tx stranger sell must never
+        // supply routing for another market.
+        if at(10).as_ref() != Some(curve) || at(1).as_ref() != Some(mint) {
+            continue;
+        }
+        return Some(SellV2Reference {
+            signature: sig,
+            quote_mint: at(2)?,
+            pfee_vault: at(8)?,
+            pfee_quote_account: at(9)?,
+            unknown_18: at(18)?,
+        });
+    }
+    None
 }
 
 /// Fill landing outcome for a dispatched signature.
@@ -449,6 +558,15 @@ impl SwapExecutor {
             Err(_) => return Err(ExecutorError::Timeout("sell balance read")),
         }
         let fee_recipient = self.fee_recipient().await;
+        // v2 curves (creator is only known for `create_v2` launches)
+        // reject legacy sells outright — route them at the verified
+        // 26-account `sell_v2` shape instead of burning fees. v1 keeps
+        // the legacy core below.
+        if let Some(creator) = order.creator.as_ref() {
+            return self
+                .preflight_sell_v2(order, &payer, &token_program, &ata, &fee_recipient, creator)
+                .await;
+        }
         Ok(vec![PumpSwapBuilder::build_swap_ix(
             SwapKind::Sell { amount: order.amount_tokens, min_sol_output: order.min_sol_output },
             &crate::instructions::SwapAccounts {
@@ -459,9 +577,142 @@ impl SwapExecutor {
                 user_ata: &ata,
                 fee_recipient: &fee_recipient,
                 token_program: &token_program,
-                creator: order.creator.as_ref(),
+                // Always None here: creator-carrying orders return via
+                // the v2 path above (legacy sells die on v2 curves).
+                creator: None,
             },
         )])
+    }
+
+    /// v2 sell path: the verified 26-account `sell_v2` shape. Opaque
+    /// routing (quote mint, pfee vault + account, [18]) resolves from a
+    /// recent same-curve reference sell — per-curve stable like buyback
+    /// routing — and fails closed when none scans. The SOL floor is the
+    /// order's own `min_sol_output` (two-sample confirmed semantics),
+    /// never a copied value.
+    ///
+    /// Young-curve edge: a curve with zero prior sells has no reference
+    /// yet — the sell fails closed here and the caller's retry path
+    /// (cooldown + budget, then manual exit) covers the wait, exactly
+    /// like any other unconfirmed live sell.
+    async fn preflight_sell_v2(
+        &self,
+        order: &SellOrder,
+        payer: &Pubkey,
+        token_program: &Pubkey,
+        base_ata: &Pubkey,
+        fee_recipient: &Pubkey,
+        creator: &Pubkey,
+    ) -> Result<Vec<solana_instruction::Instruction>, ExecutorError> {
+        let reference = self
+            .resolve_sell_v2_reference(&order.bonding_curve, &order.mint)
+            .await?;
+        let Some(quote_program) = self.token_program(&reference.quote_mint).await else {
+            return Err(ExecutorError::BadOrder(
+                "quote mint account unreadable; token program unknown".to_string(),
+            ));
+        };
+        warn!(mint = %order.mint, curve = %order.bonding_curve, ref_sig = %reference.signature,
+            quote = %reference.quote_mint, floor = order.min_sol_output,
+            "v2 sell routed via same-curve reference (opaque routing copied, guard computed)");
+        let quote_ata = crate::instructions::user_ata_with_program(
+            payer,
+            &reference.quote_mint,
+            &quote_program,
+        );
+        let mut ixs = self
+            .maybe_create_ata_ix(payer, &order.mint, base_ata, token_program)
+            .await;
+        ixs.extend(
+            self.maybe_create_ata_ix(payer, &reference.quote_mint, &quote_ata, &quote_program)
+                .await,
+        );
+        ixs.push(PumpSwapBuilder::build_sell_v2_ix(
+            order.amount_tokens,
+            order.min_sol_output,
+            &crate::instructions::SellV2Accounts {
+                payer,
+                mint: &order.mint,
+                quote_mint: &reference.quote_mint,
+                bonding_curve: &order.bonding_curve,
+                associated_bonding_curve: &order.associated_bonding_curve,
+                fee_recipient,
+                base_token_program: token_program,
+                quote_token_program: &quote_program,
+                creator,
+                pfee_vault: &reference.pfee_vault,
+                pfee_quote_account: &reference.pfee_quote_account,
+                unknown_18: &reference.unknown_18,
+            },
+        ));
+        Ok(ixs)
+    }
+
+    /// Scan recent curve transactions for a top-level `sell_v2` on OUR
+    /// curve+mint and lift its opaque routing (quote mint/fee, pfee
+    /// vault + account, [18]). Bounded (signature page + per-tx
+    /// deadline); fail-closed `BadOrder` when nothing resolves — a v2
+    /// sell without a reference is unroutable, never guessed.
+    async fn resolve_sell_v2_reference(
+        &self,
+        curve: &Pubkey,
+        mint: &Pubkey,
+    ) -> Result<SellV2Reference, ExecutorError> {
+        use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+        let sigs = match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.rpc.get_signatures_for_address_with_config(
+                curve,
+                GetConfirmedSignaturesForAddress2Config {
+                    before: None,
+                    until: None,
+                    limit: Some(REFERENCE_SCAN_LIMIT),
+                    commitment: None,
+                },
+            ),
+        )
+        .await
+        {
+            Ok(Ok(sigs)) => sigs,
+            Ok(Err(e)) => return Err(ExecutorError::Rpc(e)),
+            Err(_) => return Err(ExecutorError::Timeout("reference signature scan")),
+        };
+        for status in sigs {
+            if status.err.is_some() {
+                continue;
+            }
+            let tx = match self.fetch_tx_json(&status.signature).await {
+                Some(tx) => tx,
+                None => continue,
+            };
+            if let Some(reference) = select_sell_v2_reference(&tx, curve, mint) {
+                return Ok(reference);
+            }
+        }
+        Err(ExecutorError::BadOrder(
+            "no reference sell_v2 on curve; v2 sell unroutable".to_string(),
+        ))
+    }
+
+    /// One raw `getTransaction` (Json + v1 envelopes, like every other
+    /// reader in the tree). `None` on any transport/timeout/shape
+    /// failure — callers skip loudly, never misparse.
+    async fn fetch_tx_json(&self, signature: &str) -> Option<serde_json::Value> {
+        use solana_client::rpc_request::RpcRequest;
+        let params = serde_json::json!([
+            signature,
+            {"encoding": "json", "maxSupportedTransactionVersion": 1},
+        ]);
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.rpc
+                .send::<serde_json::Value>(RpcRequest::GetTransaction, params),
+        )
+        .await
+        {
+            Ok(Ok(tx)) => Some(tx),
+            _ => None,
+        }
     }
 
     /// Create-ATA prefix when the user's token account for `mint` is not
@@ -688,5 +939,47 @@ mod tests {
         // Builder plumbing enables the policy.
         assert!(!executor().strict_sim);
         assert!(executor().with_strict_sim(true).strict_sim);
+    }
+
+    #[test]
+    fn select_sell_v2_reference_lifts_opaque_routing() {
+        // Frozen sample: opaque routing ([2] quote, [8]/[9] pfee, [18])
+        // extracts against OUR curve+mint; strangers and shapes mismatch.
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../listener/tests/fixtures/sell_v2_mainnet.json"
+        ))
+        .expect("fixture");
+        let tx = &raw["result"];
+        let curve =
+            Pubkey::from_str("8rRGZTqPSSwbSsGPagUrYzJf1dHZ33QdxQkWEzpEnsKx").expect("curve");
+        let mint = Pubkey::from_str("GmixVU6E1xeQWjEM8LAYsiFt9dJj27Ji4oDGKkmEpump").expect("mint");
+        let reference = select_sell_v2_reference(tx, &curve, &mint).expect("reference");
+        assert!(!reference.signature.is_empty());
+        assert_eq!(
+            reference.quote_mint.to_string(),
+            "RACEyWiM2ztEZcJx2AHXU2eWjhxU57x3vXn92b39dLD"
+        );
+        assert_eq!(
+            reference.pfee_vault.to_string(),
+            "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"
+        );
+        assert_eq!(
+            reference.pfee_quote_account.to_string(),
+            "6vquTehtsUfPNbYKQ6McujXLnye6dsvkhTnDtoN2rNbA"
+        );
+        assert_eq!(
+            reference.unknown_18.to_string(),
+            "CaJUjUeQ63qAgzV6kvW64phwkGfA5V6hRyma8A2C7Ab7"
+        );
+        // Wrong curve or mint: never misattribute a stranger sell.
+        let stranger = Pubkey::from_str("11111111111111111111111111111111").expect("key");
+        assert!(select_sell_v2_reference(tx, &stranger, &mint).is_none());
+        assert!(select_sell_v2_reference(tx, &curve, &stranger).is_none());
+        // Garbage JSON: None, never a panic.
+        assert!(select_sell_v2_reference(&serde_json::Value::Null, &curve, &mint).is_none());
+        assert!(
+            select_sell_v2_reference(&serde_json::json!({"transaction": {}}), &curve, &mint)
+                .is_none()
+        );
     }
 }

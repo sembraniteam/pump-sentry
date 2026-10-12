@@ -95,12 +95,18 @@ engine (`result` UUID, no `-32602`), proving base64 decode with the
   from `getTipAccounts` with static fallback.
 - Unconfirmed buys are tracked as pending and re-polled, never assumed
   unfilled; sells retry with cooldown + attempt budget, then escalate.
+- Sell routing follows the launch version: orders carrying a creator
+  (i.e. `create_v2` launches) build the 26-account `sell_v2` shape with
+  opaque routing resolved from a same-curve reference sell (fail-closed
+  when none scans); creator-less orders keep the legacy core.
 
 ## TODO before mainnet
 
 - Mainnet tip calibration for `tip_lamports` under real bundle competition.
 - Mayhem `[16]/[17]` buyback-routing sourcing (see `instructions` docs);
   the ignored `mainnet_layout_acceptance` probe is the gate.
-- `sell_v2` discriminator/layout (chain-verified for detection since
-  2026-10-11: 26 accounts, trader at 13, amount = first u64 — see the
-  `sell_v2_mainnet` replay test; a v2 sell *builder* is still future work).
+- `sell_v2` exits: builder byte-exact vs frozen sample + sim GREEN on a
+  fresh curve (funds-conclusion at the pump balance gate — program walked
+  the full layout to the debit math); opaque `[8]`/`[9]`/`[18]`
+  still resolve per trade from a same-curve reference sell (derivation
+  research is the remaining work, not a blocker — reference is stable).

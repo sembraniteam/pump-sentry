@@ -50,9 +50,14 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   envelopes**: fetch configs must allow v1 or RPC refuses them.
 - Swaps come in legacy (`buy`/`sell`) and v2 (`buy_v2` `[184,23,…]` /
   `sell_v2` `[93,246,…]`, trader at index 13 = fee payer) shapes. Both v2
-  sides are frozen-sample proven (two `buy_v2` txs + one `sell_v2`;
-  amount = first u64 exact to the unit via balance-delta cross-checks).
-  Dev dumps through either abort the gate.
+  sides are frozen-sample proven (two `buy_v2` txs + two `sell_v2` txs;
+  amount = first u64 exact to the unit via balance-delta cross-checks,
+  second u64 = min-SOL-output floor).
+  Dev dumps through either abort the gate. Live v2 exits build the
+  26-account `sell_v2` shape (`build_sell_v2_ix`, byte-exact + sim GREEN
+  on a fresh curve via funds-conclusion at the debit math) with opaque
+  routing from a same-curve reference sell — legacy sells
+  are rejected on v2 curves.
 - Token program is per-mint (classic SPL vs Token-2022); ATA derivation
   must use it. Fee recipient rotates — resolve from Global bytes
   41..73 (NOT 33; the old doc ignored the Anchor discriminator).
@@ -69,7 +74,10 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   mint and drops anything else (fail-closed). Live dispatch preflight is
   warn-and-proceed unless `SIM_STRICT=true` (strict refuses unproven).
 - Fee payer ≠ `user` happens (relayers); holders may sit in aux
-  accounts, not the canonical ATA. Simulation with `sig_verify:false`
+  accounts, not the canonical ATA (a live `sell_v2` probe hit exactly
+  this: one seller's `[14]` was aux, so the builder's canonical-ATA
+  assumption fails closed there — our own holdings are always canonical
+  via the idempotent ATA prefix). Simulation with `sig_verify:false`
   proves layout/logic, never authorization.
 - Mainnet fixtures live in `crates/listener/tests/fixtures/`; replay
   tests are the gate that must stay green.

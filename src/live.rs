@@ -58,9 +58,10 @@ pub struct LivePosition {
     pub assoc_curve: String,
     /// Bought base units (for full-size exits).
     pub amount_tokens: u64,
-    /// Token creator (base58), when known: selects the extended mayhem
-    /// swap shape (creator vault + volume routing). `None` keeps the
-    /// legacy core (classic curves; rejected on mayhem curves).
+    /// Token creator (base58), when known: selects v2 execution shapes
+    /// (buys use the extended mayhem shape; sells use the 26-account
+    /// `sell_v2` shape with reference-resolved routing). `None` keeps
+    /// the legacy core (classic curves; rejected on mayhem curves).
     pub creator: Option<String>,
 }
 
