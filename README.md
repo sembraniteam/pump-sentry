@@ -85,20 +85,20 @@ override the default paths; run every command from the same directory.
 With knobs:
 
 ```sh
-WS_URL="wss://api.mainnet-beta.solana.com" \
-HTTP_URL="https://api.mainnet-beta.solana.com" \
+MAINNET_WSS_RPC_URL="wss://api.mainnet-beta.solana.com" \
+MAINNET_RPC_URL="https://api.mainnet-beta.solana.com" \
 COMMITMENT="confirmed" \
 START_BALANCE="100" FEE_BPS="30" NOTIONAL_USD="10" TRAIL_PERCENT="5" \
 INFERENCE_ENDPOINT="http://127.0.0.1:11434/v1/chat/completions" \
 INFERENCE_MODEL="llama3.2:1b" INFERENCE_TIMEOUT_MS="300" \
 QUOTE_USD="0.000001" \
-SOL_USD="150" TICK_INTERVAL_MS="1000" \
+TICK_INTERVAL_MS="1000" \
 cargo run
 ```
 
 | Env                                                                     | Default                       | Meaning                                                                            |
 |-------------------------------------------------------------------------|-------------------------------|------------------------------------------------------------------------------------|
-| `WS_URL` / `HTTP_URL`                                                   | mainnet-beta                  | RPC endpoints                                                                      |
+| `MAINNET_WSS_RPC_URL` / `MAINNET_RPC_URL`                           | mainnet-beta                  | RPC endpoints (`WS_URL` / `HTTP_URL` retired, still honored once with a warning) |
 | `COMMITMENT`                                                            | `confirmed`                   | `processed` \| `confirmed` \| `finalized`                                          |
 | `START_BALANCE`                                                         | `100`                         | Virtual USD balance                                                                |
 | `FEE_BPS`                                                               | `30`                          | Commission per side (bps)                                                          |
@@ -110,7 +110,7 @@ cargo run
 | `DEV_MIN_AGE_SECS` / `DEV_MAX_PRIOR_LAUNCHES` / `DEV_SCREEN_SAMPLE_TXS` | `3600` / `1` / `20`           | Dev-wallet minimum age, tolerated prior launches, sampled transactions             |
 | `LIQUIDITY_USD`                                                         | `0`                           | Liquidity fallback when the reserve read fails (normally live from reserves)       |
 | `DISCORD_ALERTS`                                                        | `true`                        | Trade cards via `hermes send --to discord`; `false` silences                       |
-| `SOL_USD` / `TICK_INTERVAL_MS`                                          | `150` / `1000`                | Curve pricing conversion / exit-poll interval                                      |
+| `TICK_INTERVAL_MS`                                                        | `1000`                        | Curve exit-poll interval                                                           |
 | `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine inference (OpenAI-compatible; Hermes Agent ready)                      |
 | `INFERENCE_API_KEY`                                                     | *(unset)*                     | Bearer token for providers that require auth                                       |
 | `IS_LIVE` / `--live`                                                    | *(unset)*                     | Live mode: mirror signals with real Jito-routed swaps (needs `SOLANA_PRIVATE_KEY`) |
@@ -122,7 +122,6 @@ cargo run
 | `DISCORD_CHANNEL`                                                       | *(unset)*                     | Hermes `--to discord:<id>` target; unset = host-configured channel                 |
 | `HERMES_BIN`                                                            | `hermes`                      | Hermes binary path; prefer absolute (bare name resolves via `PATH`)                |
 | `PRIORITY_FEE_MICRO_LAMPORTS` / `COMPUTE_UNIT_LIMIT`                    | `0` / `0`                     | Live compute budget (0 = off); priority price + unit limit                         |
-| `FEE_RECIPIENT`                                                         | *(unset)*                     | Override swap fee-recipient; unset = live Global account read                      |
 
 ## Live mode
 
@@ -132,8 +131,9 @@ sells the tracked
 amount — the paper book stays the system of record while live legs are
 best-effort with loud errors. Live startup waits 5s before dispatching
 (Ctrl-C aborts; automation-safe, no prompt). Sizing derives from the USD notional at
-curve spot with a `SLIPPAGE_BPS` guard; sells floor proceeds the same
-way. Start on devnet-sized notionals and watch bundle UUIDs in logs.
+curve spot through the same fill model as paper (fee + impact, fee-only
+on unknown liquidity), with a `SLIPPAGE_BPS` ceiling guard on buys and a
+floored margin on sells. Start on devnet-sized notionals and watch bundle UUIDs in logs.
 
 ## Strategies
 
@@ -145,15 +145,16 @@ the risk profile runs verbatim):
   warning) — widening a model's early exit is never done silently.
 - `runner` — moonbag: at TP sells `(100 - RUNNER_MOONBAG)%`
   (default 20 → sells 80%), arms the trailing stop, ratchets the
-  runner to breakeven, and lifts the time-stop so the remaining 20%
-  rides toward 5x–10x instead of expiring. The runner trails wide (`RUNNER_TRAIL_PERCENT`, default 20%) so normal
+  runner to breakeven, and lifts the time-stop to a 24h backstop so the remaining 20%
+  rides toward 5x–10x instead of expiring (but still expires if trailing
+  never fires). The runner trails wide (`RUNNER_TRAIL_PERCENT`, default 20%) so normal
   pullbacks don't shake
   it out — the shared 5% `TRAIL_PERCENT` would.
 
 ## Testing
 
 ```sh
-cargo test --workspace                    # 297 tests across all crates, live probes ignored by default
+cargo test --workspace                    # 321 tests across all crates, live probes ignored by default
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -207,4 +208,6 @@ crates/migration/       # graduation detector + Raydium pool parser
   per-mint cooldown after a close.
 - Day-loss breaker (`MAX_DAILY_LOSS_USD`): past the cap no new entries
   open (paper or live); exits and live-sell retries keep working. Live
-  mode without a cap logs a startup warning.
+  mode without a cap refuses to start (`exit(1)`) — like missing
+  `SIM_STRICT=true`, zero tip, `processed` commitment, or a `QUOTE_USD`
+  override.

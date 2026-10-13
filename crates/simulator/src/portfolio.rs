@@ -11,6 +11,11 @@ use crate::types::{ClosedTrade, ExitReason, Position, PositionId, Side};
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// Moonbag-runner backstop: a TakeProfit scale-out lifts the position
+/// time-stop to 24h from open (not zero) so a sideways runner still
+/// expires when trailing never fires.
+pub const RUNNER_BACKSTOP_SECS: u64 = 86_400;
+
 /// Portfolio failures: no leverage, no partial fills — every violation is
 /// an explicit error.
 #[derive(Error, Debug, PartialEq)]
@@ -455,17 +460,19 @@ impl PaperPortfolio {
             open.entry_fee -= slice.entry_fee;
             // Moonbag protection, TakeProfit scale-outs ONLY: the runner's
             // stop ratchets to breakeven (never loosens an already-tighter
-            // stop) and the time-stop lifts plus the moonbag disarms so it
-            // rides on trailing alone. A Manual trim must not do any of
-            // this — otherwise a 1% rebalance accidentally creates a
-            // never-expiring, never-scalable position.
+            // stop) and the moonbag disarms so it rides on trailing alone.
+            // The time-stop lifts to a 24h backstop (not zero): an old
+            // runner must still expire instead of riding sideways
+            // forever when trailing never fires. A Manual trim must not
+            // do any of this — otherwise a 1% rebalance accidentally
+            // creates a never-expiring, never-scalable position.
             //
             // Note the ratchet is move-breakeven, not net-breakeven:
             // entry+exit fees and slippage still apply, so a stopped
             // runner nets a small bounded loss by design.
             if reason == ExitReason::TakeProfit && fraction < 1.0 {
                 open.sl_percent = open.sl_percent.max(0.0);
-                open.timeout_seconds = 0;
+                open.timeout_seconds = RUNNER_BACKSTOP_SECS;
                 open.moonbag_percent = 0.0;
             }
         }
@@ -616,7 +623,7 @@ mod tests {
             .expect("scale out");
         assert_eq!(trade.fraction_closed, 0.8);
         let runner = pf.position(id).expect("runner");
-        assert_eq!(runner.timeout_seconds, 0);
+        assert_eq!(runner.timeout_seconds, RUNNER_BACKSTOP_SECS);
         assert_eq!(runner.moonbag_percent, 0.0);
         assert_eq!(runner.sl_percent, 0.0);
         assert!(runner.trailing_stop);
@@ -1069,12 +1076,13 @@ mod tests {
         assert_eq!(p.sl_percent, -8.0);
         assert_eq!(p.timeout_seconds, 90);
         assert_eq!(p.moonbag_percent, 20.0);
-        // ...while a TakeProfit scale-out transforms all three.
+        // ...while a TakeProfit scale-out transforms all three (stop to
+        // breakeven, timeout to the 24h backstop, moonbag disarmed).
         pf.close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::TakeProfit, 2)
             .expect("partial");
         let p = pf.position(id).expect("runner");
         assert_eq!(p.sl_percent, 0.0);
-        assert_eq!(p.timeout_seconds, 0);
+        assert_eq!(p.timeout_seconds, RUNNER_BACKSTOP_SECS);
         assert_eq!(p.moonbag_percent, 0.0);
     }
 

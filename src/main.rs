@@ -108,8 +108,10 @@ async fn replay_live_wal(
     }
     {
         let mut guard = pipeline.exec.live_manual.lock().await;
-        for pos in replay.manual {
+        for item in replay.manual {
+            let pos = item.position;
             watched.push((pos.mint.clone(), pos.curve.clone()));
+            warn!(mint = %pos.mint, note = %item.note, "WAL replay: manual bag needs human exit (lookup above on explorer)");
             if guard.contains_key(&pos.mint) {
                 let key = format!("{}#wal-{n_manual}", pos.mint);
                 guard.insert(key, pos);
@@ -330,22 +332,10 @@ async fn run_pipeline(live_arg: bool) {
             }
         };
         let executor = match SwapExecutor::new(&settings.http_url, commitment, wallet) {
-            Ok(executor) => {
-                let executor = executor
-                    .with_jito(jito)
-                    .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports)
-                    .with_strict_sim(settings.sim_strict);
-                match &settings.fee_recipient {
-                    Some(recipient) => match executor::parse_pubkey(recipient) {
-                        Ok(pubkey) => executor.with_fee_recipient(pubkey),
-                        Err(e) => {
-                            eprintln!("bad FEE_RECIPIENT: {e}");
-                            std::process::exit(1);
-                        }
-                    },
-                    None => executor,
-                }
-            }
+            Ok(executor) => executor
+                .with_jito(jito)
+                .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports)
+                .with_strict_sim(settings.sim_strict),
             Err(e) => {
                 eprintln!("bad executor config: {e}");
                 std::process::exit(1);

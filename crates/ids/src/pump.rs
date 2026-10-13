@@ -66,8 +66,8 @@ pub const PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR: [u8; 8] =
 /// exactly that amount). Payload is 24 bytes: discriminator + `(amount:
 /// u64, min_sol_output: u64)` mirroring legacy `sell` (two-sample
 /// confirmed 2026-10-13). The gate classifies these as `Sell` (dev dumps
-/// abort); live exits build them via `build_sell_v2_ix` with opaque
-/// routing resolved from a same-curve reference sell.
+/// abort); live dispatch is v3-only, so cashback-era `sell_v2` curves
+/// fail closed to manual exit (no v2 builder remains).
 pub const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 /// `migrate` instruction discriminator (skill solana-raydium-migration).
 pub const PUMP_MIGRATE_DISCRIMINATOR: [u8; 8] = [155, 234, 231, 146, 236, 158, 162, 30];

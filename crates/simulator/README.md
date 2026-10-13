@@ -12,7 +12,7 @@ PaperPortfolio::new(100.0, fee_bps)
   ├─ check_exit(&mut position, price, now) → TP / SL / trailing / timeout
   ├─ close_position(id, quote, liquidity, reason) → ClosedTrade{gross,fees,net}
   │    └─ partial TP close scales out, ratchets the runner to breakeven,
-  │       disarms moonbag, and lifts the time-stop (runners ride trailing)
+  │       disarms moonbag, and lifts the time-stop to a 24h backstop
   └─ snapshot(quotes) → {cash, locked, equity, realized, unrealized}
        (open legs valued at exit proceeds: fill-model price minus exit fee)
 ```
@@ -22,7 +22,8 @@ PaperPortfolio::new(100.0, fee_bps)
 - `market` — `FillModel::{Exact,BondingCurve}` cost model (default 125 bps
   venue fee per side + exact constant-product impact, 25% cap; buys fill
   high, sells fill low — ~2.9% round trip on a $10 ticket into $4500),
-  `move_percent`, `check_exit` with trailing ratchet.
+  `move_percent`, `check_exit` with trailing ratchet (fires
+  timeout → TP → SL → trailing, in that order).
 - `portfolio` — cash ledger (no leverage: entries need
   `notional + fee ≤ cash`), position map, trade history, `realized_pnl`,
   `win_rate`, mark-to-market `snapshot`.

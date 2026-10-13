@@ -82,12 +82,12 @@ pub enum SwapSide {
     Buy,
     /// Tokens sold for SOL.
     Sell,
-    /// Pump.fun instruction with an unmapped discriminator (no known case
-    /// left: `sell_v2` is classified since its frozen-sample verification).
-    /// Side and trader layout are unproven: the wallet is the ix's first
-    /// listed account (best-effort attribution), the amount is always 0,
-    /// and quorum never counts these — they exist only for the dev
-    /// fail-closed rule in [`EntryGate::observe`].
+    /// Pump.fun instruction with an unmapped discriminator. Still a live
+    /// fail-closed path for future discriminators: side and trader layout
+    /// are unproven (the wallet is the ix's first listed account as a
+    /// best-effort attribution), the amount is always 0, and quorum never
+    /// counts these — they exist only for the dev fail-closed rule in
+    /// [`EntryGate::observe`].
     Unknown,
 }
 

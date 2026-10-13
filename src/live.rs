@@ -7,6 +7,7 @@
 
 use crate::settings::now_secs;
 use executor::{BuyOrder, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, parse_pubkey};
+use simulator::FillModel;
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
@@ -72,10 +73,8 @@ pub struct LivePosition {
     pub assoc_curve: String,
     /// Bought base units (for full-size exits).
     pub amount_tokens: u64,
-    /// Token creator (base58), when known: selects v2 execution shapes
-    /// (buys use the extended mayhem shape; sells use the 26-account
-    /// `sell_v2` shape with reference-resolved routing). `None` keeps
-    /// the legacy core (classic curves; rejected on mayhem curves).
+    /// Token creator (base58): required for v3 dispatch (cross-checked
+    /// against curve state). `None` fails closed downstream.
     pub creator: Option<String>,
 }
 
@@ -95,13 +94,11 @@ pub struct LiveBuyParams<'a> {
     pub price_usd: f64,
     /// SOL price in USD (lamport conversion).
     pub sol_usd: f64,
+    /// Curve liquidity in USD for impact sizing (mirrors the paper
+    /// [`FillModel`](simulator::FillModel): unknown/zero pays fee-only).
+    pub liquidity_usd: f64,
     /// Token creator (base58), when the launch carried one.
     pub creator: Option<&'a str>,
-    /// Watchlist-gate reference hint: first successful buy signature
-    /// observed while waiting for buyer quorum. Carried through to
-    /// [`BuyOrder::mayhem_ref_sig`] so the executor copies `[16]`/`[17]`
-    /// without a full curve scan. `None` keeps scan-only behavior.
-    pub mayhem_ref_sig: Option<&'a str>,
 }
 
 /// Planned buy: integer amounts ready for [`BuyOrder`].
@@ -131,18 +128,21 @@ pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> 
     executor::quote::slippage_ceiling(quoted_cost_incl_fees, slippage_bps)
 }
 
-/// Size a buy from USD notional at spot: tokens from `notional/price`,
-/// spend cap from `notional/sol` plus `slippage_bps` (clamped to 10_000 =
-/// 100% like the sell floor, so a misconfigured `SLIPPAGE_BPS` cannot
-/// authorize unbounded overspend). `None` on non-positive inputs, zero
-/// quantity, or amounts that do not fit `u64` (`as`-casts saturate
-/// silently past the max — a garbage print must fail closed, never size
-/// a jumbo order).
+/// Size a buy from USD notional at spot: tokens from `notional/price`
+/// through the paper [`FillModel`](simulator::FillModel) (fee + impact,
+/// fee-only when liquidity is unknown — identical inputs give identical
+/// sizes on both legs), spend cap from `notional/sol` plus
+/// `slippage_bps` (clamped to 10_000 = 100% like the sell floor, so a
+/// misconfigured `SLIPPAGE_BPS` cannot authorize unbounded overspend).
+/// `None` on non-positive inputs, zero quantity, or amounts that do not
+/// fit `u64` (`as`-casts saturate silently past the max — a garbage
+/// print must fail closed, never size a jumbo order).
 pub fn plan_buy(
     notional_usd: f64,
     price_usd: f64,
     sol_usd: f64,
     slippage_bps: u64,
+    liquidity_usd: f64,
 ) -> Option<LiveBuyPlan> {
     if !notional_usd.is_finite() || notional_usd <= 0.0 {
         return None;
@@ -153,8 +153,11 @@ pub fn plan_buy(
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
         return None;
     }
+    // Paper parity: the ledger fills at quote*(1+slip), so size from the
+    // filled price (floored — never oversize custody past 2^53 either).
+    let slip = FillModel::default().slip_fraction(notional_usd, liquidity_usd);
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
-    let amount_f = (notional_usd / price_usd * scale).floor();
+    let amount_f = (notional_usd / price_usd / (1.0 + slip) * scale).floor();
     if !amount_f.is_finite() || amount_f <= 0.0 || amount_f > u64::MAX as f64 {
         return None;
     }
@@ -176,16 +179,18 @@ pub fn plan_buy(
     })
 }
 
-/// Floor for a sell: expected proceeds minus `slippage_bps`. `None` on
-/// degenerate inputs — and on a zero floor: `min_sol_output = 0`
-/// authorizes the slot leader to fill at any price (sandwich drain), so
-/// full-slippage configs and sub-lamport dust fail closed instead of
-/// dispatching unprotected.
+/// Floor for a sell: model proceeds (paper [`FillModel`](simulator::FillModel)
+/// at the same inputs, so the floor tracks what the ledger books) minus
+/// `slippage_bps`. `None` on degenerate inputs — and on a zero floor:
+/// `min_sol_output = 0` authorizes the slot leader to fill at any price
+/// (sandwich drain), so full-slippage configs and sub-lamport dust fail
+/// closed instead of dispatching unprotected.
 pub fn plan_sell_floor(
     amount_tokens: u64,
     price_usd: f64,
     sol_usd: f64,
     slippage_bps: u64,
+    liquidity_usd: f64,
 ) -> Option<u64> {
     if amount_tokens == 0 || !price_usd.is_finite() || price_usd <= 0.0 {
         return None;
@@ -197,7 +202,12 @@ pub fn plan_sell_floor(
         return None;
     }
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
-    let lamports = amount_tokens as f64 / scale * price_usd / sol_usd * LAMPORTS_PER_SOL;
+    // Paper parity: fills land BELOW the quote by the model slip, so the
+    // floor starts from modeled proceeds (a bare-quote floor would price
+    // above reality and fail the fill on-chain).
+    let gross_notional = amount_tokens as f64 / scale * price_usd;
+    let slip = FillModel::default().slip_fraction(gross_notional, liquidity_usd);
+    let lamports = gross_notional * (1.0 - slip).max(0.0) / sol_usd * LAMPORTS_PER_SOL;
     if !lamports.is_finite() || lamports <= 0.0 || lamports > u64::MAX as f64 {
         return None;
     }
@@ -258,6 +268,8 @@ pub struct PendingRecheck {
     pub position: LivePosition,
     /// Engine bundle UUID.
     pub bundle_id: String,
+    /// Transaction signature (what to look up on-chain on GiveUp).
+    pub signature: String,
     /// What the re-poll found.
     pub outcome: RecheckOutcome,
 }
@@ -305,6 +317,15 @@ pub mod wal {
         pub bundle_id: String,
     }
 
+    /// One replayed human-exit bag: position plus its lookup note.
+    #[derive(Debug, Clone)]
+    pub struct WalManual {
+        /// Held bag.
+        pub position: LivePosition,
+        /// Lookup identifier (bundle, signature, or cause).
+        pub note: String,
+    }
+
     /// Replayed boot state.
     #[derive(Debug, Default, Clone)]
     pub struct WalReplay {
@@ -313,7 +334,7 @@ pub mod wal {
         /// Tracked fills (`live_positions`).
         pub positions: Vec<LivePosition>,
         /// Human-exit bags (`live_manual`).
-        pub manual: Vec<LivePosition>,
+        pub manual: Vec<WalManual>,
         /// Corrupt lines skipped (operator should inspect the file).
         pub skipped: usize,
     }
@@ -357,7 +378,7 @@ pub mod wal {
         use std::collections::HashMap;
         let mut pending: HashMap<String, WalPending> = HashMap::new();
         let mut positions: HashMap<String, LivePosition> = HashMap::new();
-        let mut manual: HashMap<String, LivePosition> = HashMap::new();
+        let mut manual: HashMap<String, WalManual> = HashMap::new();
         let mut skipped = 0usize;
         let add = |map: &mut HashMap<String, LivePosition>, p: LivePosition| {
             map.entry(p.mint.clone())
@@ -427,7 +448,16 @@ pub mod wal {
                         skipped += 1;
                         continue;
                     };
-                    add(&mut manual, pos);
+                    // Pre-note WALs (and hand-written lines) carry no
+                    // note: default empty, never skip a real bag.
+                    let note = field(line, "note").unwrap_or_default();
+                    manual
+                        .entry(pos.mint.clone())
+                        .and_modify(|e: &mut WalManual| {
+                            e.position.amount_tokens =
+                                e.position.amount_tokens.saturating_add(pos.amount_tokens);
+                        })
+                        .or_insert(WalManual { position: pos, note });
                 }
                 _ => skipped += 1,
             }
@@ -475,9 +505,6 @@ pub mod wal {
                 super::now_secs(),
             );
         }
-        for p in replay.positions.iter().chain(replay.manual.iter()) {
-            let _ = p;
-        }
         for p in &replay.positions {
             let _ = writeln!(
                 out,
@@ -493,10 +520,11 @@ pub mod wal {
                 super::now_secs(),
             );
         }
-        for p in &replay.manual {
+        for m in &replay.manual {
+            let p = &m.position;
             let _ = writeln!(
                 out,
-                "{{\"t\":\"manual\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"ts\":{}}}",
+                "{{\"t\":\"manual\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"note\":\"{}\",\"ts\":{}}}",
                 p.mint,
                 p.curve,
                 p.assoc_curve,
@@ -505,6 +533,7 @@ pub mod wal {
                     .as_ref()
                     .map(|c| format!("\"{c}\""))
                     .unwrap_or_else(|| "null".to_string()),
+                m.note,
                 super::now_secs(),
             );
         }
@@ -676,6 +705,7 @@ impl LiveTrader {
             out.push(PendingRecheck {
                 position: entry.position,
                 bundle_id: entry.bundle_id,
+                signature: entry.signature,
                 outcome,
             });
         }
@@ -713,10 +743,16 @@ impl LiveTrader {
             }
             None => None,
         };
-        let plan =
-            plan_buy(notional_usd, price_usd, sol_usd, self.slippage_bps).ok_or_else(|| {
-                LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
-            })?;
+        let plan = plan_buy(
+            notional_usd,
+            price_usd,
+            sol_usd,
+            self.slippage_bps,
+            req.liquidity_usd,
+        )
+        .ok_or_else(|| {
+            LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
+        })?;
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.buy_jito(&BuyOrder {
@@ -731,7 +767,6 @@ impl LiveTrader {
                 tip_lamports: self.tip_lamports,
                 creator,
                 slippage_bps: self.slippage_bps,
-                mayhem_ref_sig: req.mayhem_ref_sig.map(|s| s.to_string()),
             }),
         )
         .await
@@ -976,12 +1011,14 @@ impl LiveTrader {
     }
 
     /// Record a human-exit bag (write-ahead of the `live_manual` insert).
-    pub fn record_manual(&self, position: &LivePosition) {
+    /// `note` is a lookup identifier (bundle, signature, or cause) with
+    /// no quotes/backslashes/commas (base58/UUID/plain words only).
+    pub fn record_manual(&self, position: &LivePosition, note: &str) {
         if self.wal_path.is_none() {
             return;
         }
         self.wal_append(format!(
-            "{{\"t\":\"manual\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"ts\":{}}}",
+            "{{\"t\":\"manual\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"note\":\"{note}\",\"ts\":{}}}",
             position.mint,
             position.curve,
             position.assoc_curve,
@@ -1029,12 +1066,14 @@ impl LiveTrader {
         position: &LivePosition,
         price_usd: f64,
         sol_usd: f64,
+        liquidity_usd: f64,
     ) -> Result<String, LiveError> {
         let floor = plan_sell_floor(
             position.amount_tokens,
             price_usd,
             sol_usd,
             self.slippage_bps,
+            liquidity_usd,
         )
         .ok_or_else(|| LiveError::BadOrder(format!("cannot floor sell of {}", position.mint)))?;
         let receipt = match tokio::time::timeout(
@@ -1125,53 +1164,87 @@ mod tests {
 
     #[test]
     fn buy_plan_math() {
-        // $10 at $0.0000042 ≈ 2.38M tokens → 2_380_952_380_952 base units.
-        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200).expect("plan");
-        assert_eq!(plan.amount_tokens, 2_380_952_380_952);
+        // $10 at $0.0000042 into $30k liquidity: the paper fill model
+        // takes fee + impact first, so live sizes ~2.3508M tokens
+        // (2_350_783_986_459 base units) — identical inputs size
+        // identically on both legs.
+        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0).expect("plan");
+        assert_eq!(plan.amount_tokens, 2_350_783_986_459);
         // $10 ≈ 66.67M lamports + 2% slippage guard.
         assert_eq!(plan.max_sol_cost, 68_000_000);
     }
 
     #[test]
     fn buy_plan_rejects_degenerate() {
-        assert_eq!(plan_buy(0.0, 1.0, 150.0, 200), None);
-        assert_eq!(plan_buy(10.0, 0.0, 150.0, 200), None);
-        assert_eq!(plan_buy(10.0, 1.0, 0.0, 200), None);
-        assert_eq!(plan_buy(f64::NAN, 1.0, 150.0, 200), None);
+        assert_eq!(plan_buy(0.0, 1.0, 150.0, 200, 30_000.0), None);
+        assert_eq!(plan_buy(10.0, 0.0, 150.0, 200, 30_000.0), None);
+        assert_eq!(plan_buy(10.0, 1.0, 0.0, 200, 30_000.0), None);
+        assert_eq!(plan_buy(f64::NAN, 1.0, 150.0, 200, 30_000.0), None);
         // Dust that rounds to zero units.
-        assert_eq!(plan_buy(1e-12, 1.0, 150.0, 200), None);
+        assert_eq!(plan_buy(1e-12, 1.0, 150.0, 200, 30_000.0), None);
     }
 
     #[test]
     fn sell_floor_math() {
-        // 1e6 units (1 token) at $2, SOL $150 → 13_333_333 lamports − 2%.
-        let floor = plan_sell_floor(1_000_000, 2.0, 150.0, 200).expect("floor");
-        assert_eq!(floor, 13_066_666);
+        // 1e6 units (1 token) at $2, SOL $150: model proceeds land
+        // below quote (fee + impact), then − 2% margin → 12_902_462.
+        let floor = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0).expect("floor");
+        assert_eq!(floor, 12_902_462);
     }
 
     #[test]
     fn buy_plan_rejects_overflow() {
         // 1e36 base units does not fit u64: fail closed, never saturate.
-        assert_eq!(plan_buy(1e20, 1e-10, 150.0, 200), None);
+        assert_eq!(plan_buy(1e20, 1e-10, 150.0, 200, 30_000.0), None);
         // Oversized spend cap (amount fits, cap does not): same treatment.
-        assert_eq!(plan_buy(1e13, 1e6, 150.0, 200), None);
+        assert_eq!(plan_buy(1e13, 1e6, 150.0, 200, 30_000.0), None);
     }
 
     #[test]
     fn sell_floor_rejects_zero_floor() {
         // 100% slippage authorizes any fill price: rejected outright.
-        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_000), None);
-        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_001), None);
+        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_000, 30_000.0), None);
+        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_001, 30_000.0), None);
         // Sub-lamport dust floors to 0: no unprotected dispatch.
-        assert_eq!(plan_sell_floor(1, 1e-9, 1e9, 200), None);
+        assert_eq!(plan_sell_floor(1, 1e-9, 1e9, 200, 30_000.0), None);
     }
 
     #[test]
     fn sell_floor_rejects_degenerate() {
-        assert_eq!(plan_sell_floor(0, 2.0, 150.0, 200), None);
-        assert_eq!(plan_sell_floor(100, 0.0, 150.0, 200), None);
+        assert_eq!(plan_sell_floor(0, 2.0, 150.0, 200, 30_000.0), None);
+        assert_eq!(plan_sell_floor(100, 0.0, 150.0, 200, 30_000.0), None);
         // Absurd proceeds that don't fit u64: fail closed, never saturate.
-        assert_eq!(plan_sell_floor(u64::MAX, 1e12, 1e-6, 0), None);
+        assert_eq!(plan_sell_floor(u64::MAX, 1e12, 1e-6, 0, 30_000.0), None);
+    }
+
+    #[test]
+    fn live_sizes_match_paper_ledger() {
+        // Parity lock: identical inputs must size identically on both
+        // legs (paper fills at quote*(1+slip); live sizes from the same
+        // filled price, floored to base units). Commission stays 0 here
+        // to isolate the fill model — live dispatch costs ride the
+        // day-loss breaker, not the sizing math.
+        use simulator::{PaperPortfolio, Side};
+        let mut paper = PaperPortfolio::new(1_000.0, 0.0);
+        let id = paper
+            .open_position(
+                "MINT", Side::Long, 0.000_004_2, 10.0, 30_000.0, 75.0, -8.0, false, 0.0,
+                0, 0.0, 1_000,
+            )
+            .expect("open");
+        let qty = paper.position(id).expect("pos").quantity;
+        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0).expect("plan");
+        // Paper quantity is whole tokens; live tracks base units (1e6).
+        assert_eq!(plan.amount_tokens, (qty * 1e6).floor() as u64);
+        // Sell floor sits below modeled gross proceeds (conservative by
+        // construction: model slip first, then the slippage margin).
+        // One token at $3 into $30k liquidity: slip ≈ fee-only, so the
+        // floor lands just under gross (the full-size plan above would
+        // pin the 25% impact cap instead — same model, both legs).
+        let floor = plan_sell_floor(1_000_000, 3.0, 150.0, 200, 30_000.0).expect("floor");
+        let gross = 1_000_000_f64 / 1e6 * 3.0 / 150.0 * LAMPORTS_PER_SOL;
+        assert!((floor as f64) < gross, "floor {floor} vs gross {gross}");
+        assert!((floor as f64) > gross * 0.9, "floor {floor} vs gross {gross}");
     }
 
     #[test]
@@ -1196,7 +1269,8 @@ mod tests {
         assert_eq!(replay.positions[0].mint, "HELD");
         assert_eq!(replay.positions[0].amount_tokens, 500);
         assert_eq!(replay.manual.len(), 1);
-        assert_eq!(replay.manual[0].mint, "STUCK");
+        assert_eq!(replay.manual[0].position.mint, "STUCK");
+        assert_eq!(replay.manual[0].note, "");
         assert_eq!(replay.skipped, 2);
     }
 }

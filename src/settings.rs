@@ -91,10 +91,6 @@ pub struct Settings {
     pub compute_unit_limit: u32,
     /// Jito tip budget per bundle in lamports.
     pub tip_lamports: u64,
-    /// Override fee-recipient account for swap instructions (base58).
-    /// `None` uses the canonical recipient. Set when the program rotates
-    /// recipients; the IDL takes it as a caller-supplied account.
-    pub fee_recipient: Option<String>,
     /// Jito block-engine base URL (region).
     pub jito_endpoint: String,
     /// Discord trade alerts via Hermes CLI (needs `hermes` on PATH).
@@ -152,7 +148,6 @@ impl std::fmt::Debug for Settings {
             .field("priority_fee_micro_lamports", &self.priority_fee_micro_lamports)
             .field("compute_unit_limit", &self.compute_unit_limit)
             .field("tip_lamports", &self.tip_lamports)
-            .field("fee_recipient", &self.fee_recipient)
             .field("jito_endpoint", &self.jito_endpoint)
             .field("discord_alerts", &self.discord_alerts)
             .field("discord_channel", &self.discord_channel)
@@ -171,8 +166,8 @@ impl Settings {
     /// Build knobs from an explicit map (test-friendly, no global state).
     pub fn from_map(vars: &HashMap<String, String>) -> Self {        let mut notes = Vec::new();
         Self {
-            ws_url: get_string(vars, "WS_URL", "wss://api.mainnet-beta.solana.com"),
-            http_url: get_string(vars, "HTTP_URL", "https://api.mainnet-beta.solana.com"),
+            ws_url: parse_wss_url(vars, &mut notes),
+            http_url: parse_rpc_url(vars, &mut notes),
             commitment: get_string(vars, "COMMITMENT", "confirmed"),
             start_balance: get_float(vars, "START_BALANCE", 100.0, &mut notes),
             fee_bps: get_float(vars, "FEE_BPS", 30.0, &mut notes),
@@ -206,10 +201,6 @@ impl Settings {
             priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0, &mut notes),
             compute_unit_limit: get_int(vars, "COMPUTE_UNIT_LIMIT", 0, &mut notes),
             tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000, &mut notes),
-            fee_recipient: vars
-                .get("FEE_RECIPIENT")
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty()),
             jito_endpoint: get_string(
                 vars,
                 "JITO_ENDPOINT",
@@ -420,6 +411,50 @@ fn parse_retired_sol_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>
     }
 }
 
+/// Canonical WebSocket RPC URL: `MAINNET_WSS_RPC_URL` is the only
+/// configured name. A legacy `WS_URL` is still honored once with a loud
+/// retirement note (same grace as `HTTP_URL` → `MAINNET_RPC_URL`).
+/// Unset = public mainnet.
+fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
+    const DEFAULT: &str = "wss://api.mainnet-beta.solana.com";
+    let clean = |v: &String| v.replace('\\', "").trim().to_string();
+    match vars.get("MAINNET_WSS_RPC_URL").map(clean).filter(|v| !v.is_empty()) {
+        Some(url) => url,
+        None => match vars.get("WS_URL").map(clean).filter(|v| !v.is_empty()) {
+            Some(legacy) => {
+                notes.push(
+                    "WS_URL is retired: rename it to MAINNET_WSS_RPC_URL (honored this run)".to_string(),
+                );
+                legacy
+            }
+            None => DEFAULT.to_string(),
+        },
+    }
+}
+
+/// Canonical HTTP RPC URL: `MAINNET_RPC_URL` is the only configured
+/// name. A legacy `HTTP_URL` is still honored once with a loud
+/// retirement note (so a running deployment is never silently dropped
+/// to the rate-limited public endpoint); backslash escapes are stripped
+/// from either (Helius lines arrive escaped through some shells).
+/// Unset = public mainnet.
+fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
+    const DEFAULT: &str = "https://api.mainnet-beta.solana.com";
+    let clean = |v: &String| v.replace('\\', "").trim().to_string();
+    match vars.get("MAINNET_RPC_URL").map(clean).filter(|v| !v.is_empty()) {
+        Some(url) => url,
+        None => match vars.get("HTTP_URL").map(clean).filter(|v| !v.is_empty()) {
+            Some(legacy) => {
+                notes.push(
+                    "HTTP_URL is retired: rename it to MAINNET_RPC_URL (honored this run)".to_string(),
+                );
+                legacy
+            }
+            None => DEFAULT.to_string(),
+        },
+    }
+}
+
 /// Manual entry-quote override: only a positive finite price is honored.
 /// Anything else is ignored with a note (a NaN/negative override would
 /// otherwise price paper opens — and live mirrors — at garbage).
@@ -490,6 +525,37 @@ mod tests {
         assert_eq!(s.runner_trail_percent, 20.0);
         assert!(!s.sim_strict);
         assert!(s.parse_notes.is_empty());
+    }
+
+    #[test]
+    fn rpc_urls_prefer_mainnet_vars_strip_escapes_and_retire_legacy() {
+        // Canonical var wins.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://helius/abc"),
+            ("HTTP_URL", "https://legacy/xyz"),
+        ]));
+        assert_eq!(s.http_url, "https://helius/abc");
+        assert!(s.parse_notes.is_empty());
+        // Backslash escapes stripped.
+        let s = Settings::from_map(&vars(&[("MAINNET_RPC_URL", "https:\\\\/\\\\/helius")]));
+        assert_eq!(s.http_url, "https://helius");
+        // Legacy honored once, loudly.
+        let s = Settings::from_map(&vars(&[("HTTP_URL", "https://legacy/xyz")]));
+        assert_eq!(s.http_url, "https://legacy/xyz");
+        assert!(s.warnings().iter().any(|w| w.contains("HTTP_URL is retired")), "{:?}", s.warnings());
+        // Unset = public default.
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.http_url, "https://api.mainnet-beta.solana.com");
+        assert_eq!(s.ws_url, "wss://api.mainnet-beta.solana.com");
+        // WSS mirrors the HTTP rule: canonical wins, legacy warns.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_WSS_RPC_URL", "wss://helius/abc"),
+            ("WS_URL", "wss://legacy/xyz"),
+        ]));
+        assert_eq!(s.ws_url, "wss://helius/abc");
+        let s = Settings::from_map(&vars(&[("WS_URL", "wss://legacy/xyz")]));
+        assert_eq!(s.ws_url, "wss://legacy/xyz");
+        assert!(s.warnings().iter().any(|w| w.contains("WS_URL is retired")), "{:?}", s.warnings());
     }
 
     #[test]

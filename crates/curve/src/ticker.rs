@@ -456,7 +456,6 @@ fn tick_from_account(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
     fn ticker() -> CurveTicker {

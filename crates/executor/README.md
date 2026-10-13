@@ -1,34 +1,32 @@
 # executor
 
-Live Pump.fun buy/sell executor. **Moves real funds** — deliberately not
-wired into the paper binary. Fund a dedicated wallet, review every
-parameter, and dry-run instruction inspection before mainnet use.
+Live Pump.fun buy/sell executor (v3 only). **Moves real funds** —
+deliberately not wired into the paper binary. Fund a dedicated wallet,
+review every parameter, and dry-run instruction inspection before
+mainnet use.
 
 ## Architecture
 
 ```
 WalletGuard::load_from_env (SOLANA_PRIVATE_KEY, zeroized buffer)
-  → assert_solvency(balance ≥ trade + tip + 0.05 SOL reserve)
-  → PumpSwapBuilder::build_swap_ix (explicit SwapAccounts: live fee
-    recipient + per-mint token program + creator; legacy build_buy_ix /
-    build_sell_ix wrappers are deprecated — mayhem routing needs the full shape)
-  → sign + send_and_confirm_transaction
+  → assert_solvency (route-aware: tip + reserve natively; trade funds
+    from the WSOL ATA on SOL pairs)
+  → PumpSwapBuilder::build_buy_v3_ix / build_sell_v3_ix (17 accounts:
+    derived addresses + listed buyback pick, no fee recipient)
+  → sign + simulateTransaction preflight + Jito bundle
 ```
 
 - `wallet` — skill `solana-wallet-guard`: env-only secrets (64-byte
   secret or 32-byte seed), `MIN_SOL_RESERVE_LAMPORTS` floor, pre-flight
   solvency check with saturating math.
 - `instructions` — skill `solana-pumpfun-swap` + live mainnet replays:
-  buy `[102,6,61,18,1,218,235,234]` / sell `[51,230,133,164,1,127,131,173]`,
-  Borsh `(amount, limit[, track_volume])` args, program-bound ATA derivation (classic vs Token-2022 per mint owner).
-  Legacy 12-account core; creator curves route via the v3 fast path
-  (17 accounts, derived + listed buyback), the 18-account mayhem tail
-  ([16]/[17] from a same-curve reference), or 27-account `buy_v2`
-  (opaque routing from a same-curve reference). The bare 16-account
-  prefix is RETIRED as a dispatch shape (buyback-enforcing curves
-  reject it with 6062) — it survives only as the shared builder body
-  behind the 18-account construction and its byte-proof. SPL program
-  IDs cross-checked against the `spl-token` crates in tests.
+  v3 `buy_v3` / `sell_v3` (17 accounts, TRADE_V3.md), Borsh
+  `(amount, limit)` args, program-bound ATA derivation (classic vs
+  Token-2022 per mint owner). Retired shapes (legacy 12-account core,
+  18-account mayhem, 27/26-account v2) are deleted: legacy fills are
+  extinct and 18/v2 fills occur only on old curves, while every new
+  launch is a v3 curve. SPL program IDs cross-checked against the
+  `spl-token` crates in tests.
 - `executor` — `SwapExecutor::{buy,sell}` over standard RPC confirmation,
   plus `buy_jito` / `sell_jito` over Jito bundles when configured with
   `with_jito` (skill `jito-mev-execution`; wired into the live binary via
@@ -47,7 +45,7 @@ interoperability goes through raw `[u8; 32]` bytes for the same reason.
 
 ```rust
 use executor::{BuyOrder, PumpSwapBuilder, SwapExecutor, WalletGuard, parse_pubkey};
-use executor::instructions::{BuyV3Accounts, SwapKind};
+use executor::instructions::BuyV3Accounts;
 use solana_commitment_config::CommitmentConfig;
 
 let executor = SwapExecutor::new(
@@ -74,7 +72,6 @@ let buy_v3 = PumpSwapBuilder::build_buy_v3_ix(
         buyback_recipient: &parse_pubkey("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD")?, // one of BUYBACK_FEE_RECIPIENTS (ids)
     },
 )?;
-let _ = SwapKind::Buy { amount: 1_000_000, max_sol_cost: 10_000_000, track_volume: true };
 
 let receipt = executor.buy(&BuyOrder {
     mint: parse_pubkey("MINT")?,
@@ -83,8 +80,7 @@ let receipt = executor.buy(&BuyOrder {
     amount_tokens: 1_000_000,      // base units
     max_sol_cost: 10_000_000,      // guard: recompute via internal quote_buy_guard
     tip_lamports: 0,               // Jito tip (used by buy_jito/sell_jito)
-    creator: None,                 // Some(..) selects the extended mayhem shape
-    mayhem_ref_sig: None,          // gate hint for [16]/[17] (None = scan)
+    creator: Some(parse_pubkey("CREATOR")?), // required: cross-checked vs curve state
     slippage_bps: 200,             // guard margin over the fee-inclusive quote
 }).await?;
 println!("confirmed: {}", receipt.signature);
@@ -116,10 +112,11 @@ engine (`result` UUID, no `-32602`), proving base64 decode with the
 - Every dispatch runs `simulateTransaction` preflight first: definitive
   failures refuse before fees burn; transport trouble proceeds with a log
   unless `SIM_STRICT=true` (`with_strict_sim`), which refuses unproven
-  dispatches — enable it for live funds.
-- Fee recipient resolves live from the Global account (override with
-  `FEE_RECIPIENT` / `with_fee_recipient`); tip accounts refresh hourly
-  from `getTipAccounts` with static fallback.
+  dispatches — enable it for live funds. One fresh-blockhash resample
+  covers `BlockhashNotFound` under load.
+- v3 needs no fee recipient (fees stay on the curve); only the buyback
+  pick travels. Tip accounts refresh every 15 minutes from
+  `getTipAccounts` with static fallback.
 - Wallet funding is two-part: native SOL (fees + solvency guard) AND a
   WSOL float in the wallet's WSOL ATA (every v3 buy debits WSOL via
   `TransferChecked` — a SOL-only wallet sim-fails with token
@@ -129,45 +126,22 @@ engine (`result` UUID, no `-32602`), proving base64 decode with the
   short, and always idempotently pre-creates the payer quote ATA.
 - Unconfirmed buys are tracked as pending and re-polled, never assumed
   unfilled; sells retry with cooldown + attempt budget, then escalate.
-- Buy routing follows curve state: complete curves refuse; cashback
-  coins use the v2 reference path (`BuyRouting`: 18-account or `buy_v2`
-  from the curve's own buys, gate hint first); every other creator
-  curve uses the v3 fast path (derived + listed buyback, no scan);
-  creator-less orders keep the legacy core. Every buy recomputes its
-  guard from a fee-inclusive on-chain quote (`quote` module: tier
-  schedule + ceiling + slippage, fallback to the sized guard with a
-  loud log) — the 6002 class is priced out before simulation, which
-  still refuses the truly short remainder.
-- Sell routing follows curve state, not the launch version: complete
-  curves refuse without burning fees (exits belong to migration/manual);
-  cashback coins build `sell_v2` from a same-curve reference sell
-  (fail-closed when none scans); every other creator curve builds the
-  17-account `sell_v3` from derived addresses plus the listed buyback;
-  creator-less orders keep the legacy core.
+  A crash-recovery WAL (`live-wal.jsonl`) replays pending/positions/
+  manual bags on the next boot.
+- Buy routing follows curve state (v3-only): creatorless orders,
+  complete curves, cashback-era curves, and unreadable curve state all
+  refuse fail-closed (loud diverged/manual upstream, never an unproven
+  dispatch). Every buy recomputes its guard from a fee-inclusive
+  on-chain quote (`quote` module: tier schedule + ceiling + slippage,
+  fallback to the sized guard with a loud log) — the 6002 class is
+  priced out before simulation, which still refuses the truly short
+  remainder.
+- Sell routing follows curve state, not the launch version: anything
+  but a live creator v3 curve refuses fail-closed (exits belong to
+  migration/manual); creator-less orders fail closed too.
 
 ## TODO before mainnet
 
 - Mainnet tip calibration for `tip_lamports` under real bundle competition.
-- Buy-shape gates must turn GREEN before funding entries: the 18-shape
-  sim probe (`mainnet_mayhem_buy_18_simulates`), the 27-shape probe
-  (`mainnet_buy_v2_27_simulates`), and the 17-shape probe
-  (`mainnet_v3_17_simulates`).
-  Routing, corrected Oct-2026 against docs + chain: the `[16]`/`[17]`
-  tail is the universal post-Sept-1 buyback tail (mandatory on every
-  curve — 6002 `TooMuchSolRequired` on the frozen failed sample is a
-  1.15%-short guard, proven by its logs, NOT a shape error). Buyback
-  vaults come from the 8 published wallets (on-chain Global array
-  verified in order); `[16]` is per-curve unique — copy, never hardcode.
-  Position `[18]` (v2 shapes) is the derived sharing-config PDA (bump
-  255, proven on all four frozen v2 samples), not reference routing.
-  Live router: v3 fast path (derived + listed buyback, no scan) unless
-  cashback (v2 reference path) or complete (refuse); creator curves
-  without state fall back to the v2 reference scan (`BuyRouting` picks
-  18-account or `buy_v2` from whatever the curve's buyers used);
-  absence fails closed (paper-only, never a guessed dispatch).
-- `sell_v2` exits: builder byte-exact vs frozen sample + sim GREEN on a
-  fresh curve (funds-conclusion at the pump balance gate — program walked
-  the full layout to the debit math); opaque `[8]`/`[9]` still resolve
-  per trade from a same-curve reference sell (fail-closed when none
-  scans); `[18]` is the derived sharing-config PDA (proven bump 255 on
-  both frozen samples).
+- Buy-shape gate must turn GREEN before funding entries: the 17-shape
+  probe (`mainnet_v3_17_simulates`, both sides simulated clean).

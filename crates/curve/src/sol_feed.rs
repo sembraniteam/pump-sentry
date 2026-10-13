@@ -98,6 +98,14 @@ impl SolUsdFeed {
 
     /// Current price if fresh (finite >0 and age < `stale_secs`).
     pub fn price(&self) -> Option<f64> {
+        self.stamped_price().map(|(price, _)| price)
+    }
+
+    /// Current price with its observation timestamp, if fresh. Lets
+    /// sizing share ONE sol reading with entry pricing instead of
+    /// re-reading seconds later (two reads of a moving price size the
+    /// amount and the guard from different markets).
+    pub fn stamped_price(&self) -> Option<(f64, u64)> {
         let bits = self.inner.price_bits.load(Ordering::Relaxed);
         if bits == 0 {
             return None;
@@ -114,7 +122,14 @@ impl SolUsdFeed {
         if age >= self.stale_secs {
             return None;
         }
-        Some(price)
+        Some((price, updated))
+    }
+
+    /// True when a timestamp read from [`SolUsdFeed::stamped_price`] is
+    /// still inside the freshness window (call at USE time, not read
+    /// time — a gate quorum can age a reading past the deadline).
+    pub fn age_ok(&self, updated_at: u64) -> bool {
+        now_secs().saturating_sub(updated_at) < self.stale_secs
     }
 
     /// Seconds since last successful fetch (u64::MAX if never).

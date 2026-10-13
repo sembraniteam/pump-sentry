@@ -41,6 +41,15 @@ use tracing::{debug, info, warn};
 /// Upper bound on concurrent `getTransaction` workers.
 const MAX_CONCURRENT_FETCHES: usize = 32;
 
+/// Backfill page: signatures pulled per reconnect to cover the socket
+/// gap (newest-first from RPC, replayed oldest-first).
+const BACKFILL_SIG_LIMIT: usize = 100;
+
+/// Seen-signature memory cap. Cleared wholesale past it (a duplicate
+/// across the clear is possible but harmless: the gate re-submits and
+/// confirm guards — holding, cooldown — absorb it).
+const SEEN_SIG_CAP: usize = 4_000;
+
 /// Deadline for the WebSocket handshake (`connect` + `logs_subscribe`):
 /// a hung handshake must trip the reconnect loop (with backoff) instead
 /// of stalling it forever with no metric and no retry.
@@ -102,14 +111,17 @@ pub enum ListenerError {
 /// from the current time (no extra RNG dependency, no blocking).
 pub fn backoff_duration(attempt: u32) -> Duration {
     let exp_ms = 100u64.saturating_mul(1u64 << attempt.min(6)).min(5_000);
-    let total = exp_ms.saturating_add(jitter_ms()).min(5_000);
+    let total = exp_ms.saturating_add(jitter_ms(100)).min(5_000);
     Duration::from_millis(total)
 }
 
-fn jitter_ms() -> u64 {
+fn jitter_ms(max: u64) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
+    if max == 0 {
+        return 0;
+    }
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => u64::from(d.subsec_nanos() % 100),
+        Ok(d) => u64::from(d.subsec_nanos() % (max as u32)),
         Err(_) => 0,
     }
 }
@@ -118,6 +130,8 @@ fn jitter_ms() -> u64 {
 pub struct PumpFunListener {
     config: ListenerConfig,
     stats: Arc<ListenerStats>,
+    /// Recently seen signatures (dedup for gap backfill; bounded).
+    seen: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl PumpFunListener {
@@ -129,12 +143,108 @@ impl PumpFunListener {
         Ok(Self {
             config,
             stats: Arc::new(ListenerStats::new()),
+            seen: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
     /// Shared stats handle.
     pub fn stats(&self) -> Arc<ListenerStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Record a signature as seen (bounded dedup memory).
+    fn mark_seen(&self, sig: &str) {
+        match self.seen.lock() {
+            Ok(mut guard) => {
+                if guard.len() >= SEEN_SIG_CAP {
+                    guard.clear();
+                }
+                guard.insert(sig.to_string());
+            }
+            Err(_) => debug!("seen-set lock poisoned; dedup skipped"),
+        }
+    }
+
+    /// Gap backfill after a reconnect: pull the latest program
+    /// signatures and replay any the socket never delivered, oldest
+    /// first through the same bounded workers. Best-effort and
+    /// deadline-bound — a failed backfill warns and the live loop
+    /// continues (a gap is a miss, never a stall). Skipped on first
+    /// boot (live-only start preserves current boot semantics).
+    async fn backfill_gap(
+        &self,
+        tx: &mpsc::Sender<ListenerEvent>,
+        rpc: &Arc<RpcClient>,
+        semaphore: &Arc<Semaphore>,
+    ) {
+        let Some(commitment) = self.config.commitment_config() else {
+            debug!("unknown commitment; skipping backfill");
+            return;
+        };
+        let pump = match Pubkey::from_str(PUMP_PROGRAM_ID_STR) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let sigs = match tokio::time::timeout(
+            Duration::from_secs(30),
+            rpc.get_signatures_for_address_with_config(
+                &pump,
+                solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                    before: None,
+                    until: None,
+                    limit: Some(BACKFILL_SIG_LIMIT),
+                    commitment: Some(commitment),
+                },
+            ),
+        )
+        .await
+        {
+            Ok(Ok(sigs)) => sigs,
+            Ok(Err(e)) => {
+                warn!(error = %e, "backfill signature page failed; gap stays");
+                return;
+            }
+            Err(_) => {
+                warn!("backfill signature page timed out; gap stays");
+                return;
+            }
+        };
+        // Oldest first: quorum order should follow chain order.
+        let mut missed = 0u32;
+        for info in sigs.iter().rev() {
+            if info.err.is_some() {
+                continue;
+            }
+            let fresh = match self.seen.lock() {
+                Ok(guard) => !guard.contains(&info.signature),
+                Err(_) => true,
+            };
+            if !fresh {
+                continue;
+            }
+            self.mark_seen(&info.signature);
+            missed += 1;
+            let tx_clone = tx.clone();
+            let rpc_clone = Arc::clone(rpc);
+            let stats_clone = Arc::clone(&self.stats);
+            let sem_clone = Arc::clone(semaphore);
+            let sig = info.signature.clone();
+            let slot = info.slot;
+            let Some(commitment) = self.config.commitment_config() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                fetch_and_emit(
+                    &sig, slot, &rpc_clone, &tx_clone, &stats_clone, &sem_clone, commitment,
+                )
+                .await;
+            });
+        }
+        if missed > 0 {
+            warn!(missed, "backfilled socket-gap launches (reconnect)");
+        } else {
+            debug!("backfill: no missed launches in page");
+        }
     }
 
     /// Run the reconnect loop forever, emitting events into `tx`.
@@ -145,12 +255,23 @@ impl PumpFunListener {
         let rpc = Arc::new(RpcClient::new(self.config.http_url.clone()));
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
         let mut attempt: u32 = 0;
+        // First session starts live-only (current boot semantics); every
+        // later session backfills the gap the dead socket missed.
+        let mut first_session = true;
 
         loop {
             if tx.is_closed() {
                 info!("downstream closed; listener shutting down");
                 return Ok(());
             }
+            if !first_session {
+                self.backfill_gap(&tx, &rpc, &semaphore).await;
+                if tx.is_closed() {
+                    info!("downstream closed during backfill; listener shutting down");
+                    return Ok(());
+                }
+            }
+            first_session = false;
             let seen_before = self.stats.logs_seen();
             let session_start = std::time::Instant::now();
             let outcome = self.run_once(&tx, &rpc, &semaphore).await;
@@ -235,6 +356,7 @@ impl PumpFunListener {
             self.stats.inc_logs_seen();
             let sig_str = response.value.signature.clone();
             let slot_hint = response.context.slot;
+            self.mark_seen(&sig_str);
 
             // Only successful transactions are interesting.
             if response.value.err.is_some() {
@@ -365,11 +487,14 @@ async fn fetch_tx_permit_bound(
             match rpc.get_transaction_with_config(signature, tx_config).await {
                 Ok(v) => Some(v),
                 // Rate limits get one last, longer tier: the 250ms retry
-                // usually lands inside the same window, while a 1s pause
-                // often clears it. Other transients stop here (two RPCs
-                // per candidate is the quota budget).
+                // usually lands inside the same window, while a ~1s pause
+                // often clears it. Jittered (RPC hides Retry-After, so a
+                // fixed delay would re-collide with other clients'
+                // retries). Other transients stop here (two RPCs per
+                // candidate is the quota budget).
                 Err(e) if is_rate_limited(&e) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    let jitter = jitter_ms(500);
+                    tokio::time::sleep(std::time::Duration::from_millis(1000 + jitter)).await;
                     let _permit = acquire("rate-limit retry")?;
                     match rpc.get_transaction_with_config(signature, tx_config).await {
                         Ok(v) => Some(v),
@@ -398,8 +523,7 @@ async fn fetch_tx_permit_bound(
 /// True for rate-limit rejections specifically (`429`): worth a longer
 /// second backoff tier, since the first 250ms retry usually lands inside
 /// the same limit window.
-fn is_rate_limited(e: &ClientError) -> bool {
-    use solana_client::client_error::ClientErrorKind;
+fn is_rate_limited(e: &ClientError) -> bool {    use solana_client::client_error::ClientErrorKind;
     matches!(
         e.kind(),
         ClientErrorKind::RpcError(solana_client::rpc_request::RpcError::RpcResponseError {
@@ -804,6 +928,23 @@ mod tests {
             commitment: "confirmed".to_string(),
         };
         assert!(PumpFunListener::new(cfg).is_err());
+    }
+
+    #[test]
+    fn seen_set_dedups_and_bounds_memory() {
+        let cfg = ListenerConfig {
+            ws_url: "wss://api.mainnet-beta.solana.com".to_string(),
+            http_url: "https://api.mainnet-beta.solana.com".to_string(),
+            commitment: "confirmed".to_string(),
+        };
+        let listener = PumpFunListener::new(cfg).expect("config");
+        listener.mark_seen("sig-a");
+        listener.mark_seen("sig-a");
+        assert_eq!(listener.seen.lock().expect("lock").len(), 1);
+        for i in 0..(SEEN_SIG_CAP + 10) {
+            listener.mark_seen(&format!("sig-{i}"));
+        }
+        assert!(listener.seen.lock().expect("lock").len() <= SEEN_SIG_CAP + 10);
     }
 
     #[test]

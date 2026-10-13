@@ -16,7 +16,7 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 297 tests; live probes stay ignored
+cargo test --workspace            # 321 tests; live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
@@ -48,19 +48,18 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 
 - New launches are `create_v2` (disc `[214,144,…]`), **version-1
   envelopes**: fetch configs must allow v1 or RPC refuses them.
-- Swaps come in legacy (`buy`/`sell`) and v2 (`buy_v2` `[184,23,…]` /
-  `sell_v2` `[93,246,…]`, trader at index 13 = fee payer) shapes. Both v2
-  sides are frozen-sample proven (two `buy_v2` txs + two `sell_v2` txs;
-  amount = first u64 exact to the unit via balance-delta cross-checks,
-  second u64 = min-SOL-output floor).
-  Dev dumps through either abort the gate. Live v2 exits build the
-  26-account `sell_v2` shape (`build_sell_v2_ix`, byte-exact + sim GREEN
-  on a fresh curve via funds-conclusion at the debit math) with opaque
-  routing from a same-curve reference sell — legacy sells
-  are rejected on v2 curves.
+- Dispatch is v3-only (`buy_v3`/`sell_v3`, 17 accounts, fees stay on the
+  curve). The legacy 12-account core, 18-account mayhem buy, and
+  27/26-account `buy_v2`/`sell_v2` shapes are RETIRED from dispatch
+  (deleted, Oct-2026): legacy fills are extinct on mainnet and 18/v2
+  fills occur only on old curves, while every new launch is a v3 curve.
+  Non-v3 curves fail closed (diverged/manual, no funds move). The
+  listener still parses all historical shapes (screening + quorum need
+  them); only dispatch builders are gone. Do NOT re-add a retired shape
+  without a frozen v3-era sample proving a NEW launch uses it.
 - Token program is per-mint (classic SPL vs Token-2022); ATA derivation
-  must use it. Fee recipient rotates — resolve from Global bytes
-  41..73 (NOT 33; the old doc ignored the Anchor discriminator).
+  must use it. Ticks price with real mint decimals (cached); the confirm
+  gate still drops non-6 mints fail-closed.
 - Raydium migration pools are WSOL-**based** (WSOL at slot 400, token at
   432; vault contents prove it) — the old code assumed WSOL-quoted and
   rejected every real pool at both the trust gate and the vault pricer.
