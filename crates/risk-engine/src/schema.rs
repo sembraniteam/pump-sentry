@@ -43,7 +43,9 @@ pub struct RiskProfile {
     pub trailing_stop: bool,
     /// Position exit timeout in seconds (`0` for [`Action::Pass`]).
     pub timeout_seconds: u64,
-    /// Moonbag runner in percent (0–100): share left riding after TP.
+    /// Moonbag runner in percent [0–100): share left riding after TP.
+    /// 100 is rejected by [`RiskProfile::is_valid`]: a TP that sells
+    /// nothing could never exit.
     /// Skill `adaptive-risk-prompting`: 20 on high momentum, else 0.
     #[serde(default)]
     pub moonbag_percent: f64,
@@ -61,7 +63,7 @@ impl RiskProfile {
         }
         if !self.moonbag_percent.is_finite()
             || self.moonbag_percent < 0.0
-            || self.moonbag_percent > 100.0
+            || self.moonbag_percent >= 100.0
         {
             return false;
         }
@@ -235,16 +237,18 @@ mod tests {
         };
         assert!(!huge_timeout.is_valid());
 
-        // Boundary values are still admitted.
+        // Boundary values are still admitted (moonbag stays below
+        // 100%: a TP that sells nothing could never exit).
         let capped = RiskProfile {
             action: Action::Buy,
             tp_percent: MAX_TP_PERCENT,
             sl_percent: MIN_SL_PERCENT,
             trailing_stop: true,
             timeout_seconds: MAX_TIMEOUT_SECS,
-            moonbag_percent: 100.0,
+            moonbag_percent: 99.0,
         };
         assert!(capped.is_valid());
+        assert!(!RiskProfile { moonbag_percent: 100.0, ..capped }.is_valid());
 
         // Near-zero model outputs count as zeroed PASS targets.
         let dusty_pass = RiskProfile {

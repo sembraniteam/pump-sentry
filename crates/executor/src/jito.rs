@@ -56,9 +56,11 @@ pub struct JitoClient {
     tips: std::sync::Arc<std::sync::Mutex<(Vec<String>, u64)>>,
 }
 
-/// Tip-account list TTL in seconds (one refresh per hour at most; a
-/// refresh failure silently keeps the previous list).
-pub const TIP_ACCOUNTS_TTL_SECS: u64 = 3_600;
+/// Tip-account list TTL in seconds (one refresh per 15 min at most; a
+/// refresh failure silently keeps the previous list). Short enough that
+/// a disjoint-rejected rotation (hijack guard pins the old list) heals
+/// within a quarter hour, long enough that the engine is not spammed.
+pub const TIP_ACCOUNTS_TTL_SECS: u64 = 900;
 
 impl JitoClient {
     /// Build against a regional base URL, e.g.
@@ -137,7 +139,7 @@ pub fn select_tip_account(seed: u64) -> Pubkey {
 
 impl JitoClient {
     /// Tip account for this dispatch: the live `getTipAccounts` set when
-    /// fresh (refreshed at most hourly, 2s budget, silent fallback), else
+    /// fresh (refreshed at most every 15 min, 2s budget, silent fallback), else
     /// the compiled-in constants. Never fails: worst case is the old
     /// static rotation.
     pub async fn tip_account(&self, seed: u64) -> Pubkey {
@@ -148,7 +150,11 @@ impl JitoClient {
             return select_tip_account(seed);
         }
         let account = &list[(seed as usize) % list.len()];
-        Pubkey::from_str_const(account.as_str())
+        // Never `from_str_const` here: the list is engine-supplied at
+        // runtime and one bad string must fall back, not panic the task.
+        account
+            .parse::<Pubkey>()
+            .unwrap_or_else(|_| select_tip_account(seed))
     }
 
     /// Refresh the tip set when stale. Best-effort: any failure (timeout,
@@ -202,14 +208,17 @@ impl JitoClient {
             .as_array()?
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .filter(|s| Pubkey::from_str_const(s.as_str()).to_string() == *s)
+            // Never `from_str_const` on engine-supplied strings: an
+            // invalid entry is skipped, not panicked (fail-closed keeps
+            // the previous list when nothing usable remains).
+            .filter(|s| s.parse::<Pubkey>().is_ok_and(|p| p.to_string() == *s))
             .collect();
         if accounts.is_empty() {
             return None;
         }
         // Trust-but-verify: a rotated-but-legitimate list still overlaps
         // the compiled set; a disjoint list smells hijacked/stale and is
-        // rejected loudly rather than poisoning tips for an hour.
+        // rejected loudly rather than poisoning tips for a quarter hour.
         let overlaps = accounts
             .iter()
             .any(|a| JITO_TIP_ACCOUNTS.contains(&a.as_str()));
@@ -279,7 +288,7 @@ mod tests {
     fn tip_accounts_are_valid_pubkeys() {
         for account in JITO_TIP_ACCOUNTS {
             select_tip_account(0);
-            assert!(Pubkey::from_str_const(account).to_string() == account);
+            assert_eq!(Pubkey::from_str_const(account).to_string(), account);
         }
     }
 

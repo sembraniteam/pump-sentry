@@ -7,20 +7,45 @@
 //!
 //! SHAPES BUILT HERE:
 //! - 12-account legacy `buy`/`sell` core (classic curves).
-//! - 16/14-account extended mayhem shape when the creator is known
-//!   (creator vault + volume/fee-config routing; extended BUY verified
-//!   byte-exact against a frozen mainnet mayhem buy, extended SELL
-//!   mirrors the published SDK order and stays experimental).
+//! - 16-account extended mayhem buy prefix (RETIRED as a dispatch
+//!   shape — buyback-enforcing curves reject it with 6062, proven live
+//!   2026-10-13 off a fresh `create_v2` launch): positions 0..16 stay
+//!   byte-exact against a frozen mainnet mayhem buy, and the
+//!   [`MayhemRouting`] tail ([16]/[17]) grows the prefix to the chain's
+//!   full 18 accounts. Dispatch never sends the bare prefix —
+//!   [`SwapExecutor::preflight_buy`] fails closed without a same-curve
+//!   reference, and creator curves otherwise take the v3 fast path or
+//!   the 27-account `buy_v2` path. The prefix builder arm exists so the
+//!   18-account construction and its byte-proof share one body.
+//! - 27-account v2 `buy_v2` shape ([`PumpSwapBuilder::build_buy_v2_ix`]):
+//!   the exact v2-buy layout — the `sell_v2` layout plus the global
+//!   volume accumulator at [19] — verified byte-exact (positions +
+//!   payload, two frozen samples). Required for entries on v2 curves,
+//!   where the 18-account mayhem buy fails (frozen failed sample).
 //! - 26-account v2 `sell_v2` shape ([`PumpSwapBuilder::build_sell_v2_ix`]):
 //!   the exact mayhem-sell layout, verified byte-exact (positions AND
 //!   mutability) against the frozen `sell_v2_mainnet` sample. Required
 //!   for exits on v2 curves — legacy sells are rejected there.
+//! - 17-account v3 `buy_v3`/`sell_v3` shapes
+//!   ([`PumpSwapBuilder::build_buy_v3_ix`]/[`PumpSwapBuilder::build_sell_v3_ix`]):
+//!   the official TRADE_V3.md layouts — fees stay on the curve, so no
+//!   fee recipient, creator vault, or sharing config travels. `sell_v3`
+//!   is byte-exact vs a frozen mainnet sample (positions + payload +
+//!   re-derived PDA/ATAs); `buy_v3` awaits its frozen sample (same 17
+//!   positions by construction — one shared body builds both sides).
 //!
 //! ASSUMPTIONS REQUIRING MAINNET PROOF BEFORE FUNDING:
-//! - Mayhem buyback-routing accounts [16]/[17] are still unmapped
-//!   (per-token sourcing is the candidate next step; the ignored
+//! - Mayhem buyback-routing accounts [16]/[17] have no static derivation:
+//!   resolve per trade from a same-curve reference buy (the ignored
 //!   layout-acceptance test is the gate).
-//! - `sell_v2` opaque routing accounts [8]/[9]/[18] have no proven
+//! - `buy_v2` opaque routing accounts [6] (fee recipient), [2] (quote
+//!   mint), [8]/[9] (pfee vault + quote account) have no proven
+//!   derivation: resolve per trade from a same-curve reference buy_v2,
+//!   never guess. Position [18] is the derived sharing-config PDA
+//!   (bump 255, proven on all four frozen v2 samples). Writability
+//!   flags mirror the proven `sell_v2` set plus writable global-vol at
+//!   [19] — the 27-shape sim probe is the gate that proves the flags.
+//! - `sell_v2` opaque routing accounts [8]/[9] have no proven
 //!   derivation (pfee vault, its quote account, one readonly): resolve
 //!   per trade from curve state or a same-curve reference sell_v2.
 //!   Quote-token fills may additionally route a filler leg (seen once);
@@ -29,7 +54,11 @@
 //!
 //! RUNTIME (not build-time) ROUTING — never hardcoded here:
 //! - Fee recipient resolves live (override → Global account → canonical
-//!   constant); the program rotates recipients.
+//!   constant) on classic paths; the program rotates recipients.
+//!   Mayhem paths (v2 buys, `sell_v2`) take the fee from the same-curve
+//!   reference instead: fee sets rotate globally while curves keep
+//!   working, and a mixed-era set fails authorization — only the
+//!   reference set simulates clean (proven both ways on mainnet).
 //! - Token program resolves per mint (classic SPL vs Token-2022); the
 //!   ATA derives bound to it (a 2022 mint through the classic program
 //!   fails with `IncorrectProgramId`, verified live).
@@ -40,11 +69,16 @@ use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
 pub use ids::{
-    ASSOCIATED_TOKEN_PROGRAM_ID, CREATOR_VAULT_SEED, EVENT_AUTHORITY, FEE_CONFIG_ACCOUNT,
-    FEE_CONFIG_PROGRAM, FEE_RECIPIENT, GLOBAL_ACCOUNT, GLOBAL_VOLUME_ACCUMULATOR,
-    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_SELL_DISCRIMINATOR,
-    PUMP_SELL_V2_DISCRIMINATOR, RENT_SYSVAR_ID, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
-    USER_VOLUME_ACCUMULATOR_SEED,
+    ASSOCIATED_TOKEN_PROGRAM_ID, BUYBACK_FEE_RECIPIENTS, CREATOR_VAULT_SEED,
+    CURVE_CASHBACK_FLAG_OFFSET, CURVE_COMPLETE_OFFSET, CURVE_CREATOR_END, CURVE_CREATOR_OFFSET,
+    CURVE_MAYHEM_FLAG_OFFSET, CURVE_MIN_LEN, CURVE_QUOTE_MINT_END, CURVE_QUOTE_MINT_OFFSET,
+    DEFAULT_BUYBACK_FEE_RECIPIENT, EVENT_AUTHORITY, FEE_CONFIG_ACCOUNT, FEE_CONFIG_PROGRAM,
+    FEE_RECIPIENT, GLOBAL_ACCOUNT, GLOBAL_VOLUME_ACCUMULATOR, PUMP_BUY_DISCRIMINATOR,
+    PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR, PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR,
+    PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR,
+    PUMP_SELL_V3_DISCRIMINATOR, RENT_SYSVAR_ID, SHARING_CONFIG_SEED, SYSTEM_PROGRAM_ID,
+    TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, USDC_MINT, USER_VOLUME_ACCUMULATOR_SEED,
+    WSOL_MINT,
 };
 
 /// Buy args: token units requested plus max SOL spend (slippage guard
@@ -85,21 +119,88 @@ pub struct PumpSellV2Args {
     pub min_sol_output: u64,
 }
 
+/// v2 buy args: token units requested plus max SOL spend (slippage
+/// guard). Payload is 24 bytes (discriminator + two u64s): NO trailing
+/// `track_volume` bool, unlike legacy `buy` (both frozen `buy_v2`
+/// samples end after the second u64). The first u64 is chain-proven
+/// exact (buyer token-balance delta to the unit, two independent
+/// samples); the second u64 is `u64::MAX` in both samples (open ape,
+/// no slippage cap) — the caller always sets its own guard, never a
+/// copied value.
+#[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
+pub struct PumpBuyV2Args {
+    /// Token base units requested.
+    pub amount: u64,
+    /// Maximum SOL in lamports allowed (slippage guard).
+    pub max_sol_cost: u64,
+}
+
+/// v3 buy args: token units requested plus max quote spend (slippage
+/// guard, fees included per TRADE_V3.md). Payload is 24 bytes when the
+/// trailing `partial_fill` flag is omitted (the safe default on mayhem
+/// coins: over-left buys fail with `NotEnoughTokensToBuy` instead of
+/// running past the curve end).
+#[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
+pub struct PumpBuyV3Args {
+    /// Token base units requested.
+    pub amount: u64,
+    /// Maximum quote in base units allowed (slippage guard, fees in).
+    pub max_sol_cost: u64,
+}
+
+/// v3 sell args: token units to sell plus the quote floor. Payload is
+/// 24 bytes (discriminator + two u64s), like `sell_v2`.
+#[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
+pub struct PumpSellV3Args {
+    /// Token base units to sell.
+    pub amount: u64,
+    /// Minimum quote in base units to receive (slippage guard).
+    pub min_sol_output: u64,
+}
+
+/// v3 exact-quote buy args: spend exactly `spendable_quote_in` for at
+/// least `min_tokens_out` tokens. Payload is 24 bytes (no
+/// `partial_fill` tail). Same 17 accounts as `buy_v3` — enable in
+/// dispatch only after its frozen-sample byte test + sim probe turn
+/// green (the saved `buy_exact_quote_in_v3_mainnet.json` fixture is
+/// that future test's input).
+#[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
+pub struct PumpBuyExactQuoteInV3Args {
+    /// Exact quote to spend, fees included.
+    pub spendable_quote_in: u64,
+    /// Fewest base tokens accepted.
+    pub min_tokens_out: u64,
+}
+
 /// Stateless builder for Pump.fun swap instructions.
 ///
-/// LIVE SHAPE STATUS (verified 2026-10-11 against mainnet; see the
-/// ignored layout-acceptance tests, the gate that must turn green):
+/// LIVE SHAPE STATUS (verified 2026-10-11 against mainnet, extended
+/// 2026-10-13/14; see the ignored layout-acceptance tests, the gates
+/// that must turn green):
 /// the program's current mayhem buy is 18 accounts. Positions 0–15 are
 /// FULLY MAPPED and byte-proven against frozen samples (legacy core +
 /// live token program + Global recipient + creator vault + volume/fee
-/// routing). Positions [16],[17] are per-token buyback-routing accounts
-/// whose derivation is still unknown: [17] is a pfee-owned vault
-/// (receives SOL in successful buys), [16] does not exist pre-first-buy.
-/// Omitting them fails simulation with `BuybackFeeRecipientMissing`
-/// (6062) — the gate stays red until they resolve. ~100 PDA seed
-/// combinations across pump/mayhem/pfee programs found nothing.
-/// Candidate next step: copy [16],[17] from a same-token reference buy
-/// at trade time (proven per-token stable across transactions).
+/// routing). Positions [16],[17] are per-curve buyback-routing accounts
+/// with no static derivation: [17] is a pfee-owned vault from a small
+/// rotating set shared across curves AND across the 27-account buy_v2
+/// shape at [8] (three landed 18-account buys, Oct-2026 block scan:
+/// three curves, three distinct [16]s, vaults EHAAi/5eHhj/5YxQF —
+/// per-curve copying, never hardcoding); [16] is unmapped (per-curve
+/// unique). Omitting them fails simulation with
+/// `BuybackFeeRecipientMissing` (6062) on enforcing curves. ~100 PDA
+/// seed combinations across pump/mayhem/pfee programs found nothing.
+/// Resolution, not derivation: copy [16],[17] from a same-curve
+/// reference buy at trade time (`MayhemRouting` +
+/// `select_mayhem_routing`), preferably the watchlist gate's first
+/// successful buy; without a reference the dispatch fails closed
+/// (every static shape is rejected on creator curves).
+///
+/// V2 curves take `buy_v2` (27 accounts, own discriminator) instead of
+/// the 18-account buy — the 18-account shape fails there (frozen failed
+/// sample, 6002). The builder covers it
+/// ([`PumpSwapBuilder::build_buy_v2_ix`], byte-exact vs two frozen
+/// samples); opaque routing resolves per trade from a same-curve
+/// reference buy_v2, fail-closed when none scans.
 ///
 /// NOTE — live shape drift (verified 2026-10-11 against mainnet): the
 /// program's current mayhem flow extends this 12-account core to 18
@@ -137,7 +238,9 @@ pub struct SwapAccounts<'a> {
     pub associated_bonding_curve: &'a Pubkey,
     /// Trader's associated token account.
     pub user_ata: &'a Pubkey,
-    /// Fee recipient (resolved live: override, Global, then constant).
+    /// Fee recipient: live resolution (override, Global, then constant)
+    /// on classic paths; the same-curve reference on mayhem paths
+    /// (live Global fails authorization there — see [`MayhemRouting`]).
     pub fee_recipient: &'a Pubkey,
     /// Token program owning `mint` (classic SPL vs Token-2022).
     pub token_program: &'a Pubkey,
@@ -146,6 +249,27 @@ pub struct SwapAccounts<'a> {
     /// against live mayhem buys. `None` keeps the legacy 12-account
     /// core (classic curves; rejected on mayhem curves).
     pub creator: Option<&'a Pubkey>,
+    /// Mayhem buyback tail ([16]/[17]) for buys on mayhem curves:
+    /// appended after the 16-account shape to reach the chain's full
+    /// 18 accounts. Resolved per trade from a same-curve reference buy
+    /// (see [`MayhemRouting`]); `None` keeps the 16-account shape and
+    /// lets preflight simulation decide (6062 where enforced).
+    pub mayhem_routing: Option<MayhemRouting<'a>>,
+}
+
+/// Mayhem buyback-routing tail for the 18-account buy shape: position
+/// [16] (unmapped pre-first-buy ephemeral) and [17] (pfee-owned
+/// buyback vault — the same vault appears as buy_v2 position [8],
+/// verified identical across curves). No static derivation exists for
+/// either: resolve per trade from a same-curve reference buy
+/// ([`select_mayhem_routing`]), never guess. Mutability follows vault
+/// convention (writable); preflight simulation gates every build.
+#[derive(Debug, Clone, Copy)]
+pub struct MayhemRouting<'a> {
+    /// Position 16 account from the reference buy.
+    pub unknown_16: &'a Pubkey,
+    /// Position 17 pfee buyback vault from the reference buy.
+    pub pfee_vault: &'a Pubkey,
 }
 
 /// Account set for a v2 (`sell_v2`) mayhem-curve sell: the full
@@ -162,9 +286,11 @@ pub struct SwapAccounts<'a> {
 ///   creator vault + user-vol-accum PDAs (verified: derived addresses
 ///   match the fixture's [16]/[19] exactly);
 /// - reference-sourced (no proven derivation — resolve per trade from
-///   curve state or a same-curve reference sell_v2): quote mint [2]
-///   (also readable at curve-account offset 83), pfee vault [8], its
-///   quote account [9], readonly [18].
+///   a same-curve reference sell_v2): quote mint [2] (also readable at
+///   curve-account offset 83, zero → WSOL), pfee vault [8], its quote
+///   account [9];
+/// - builder-derived: sharing-config PDA [18] (verified bump 255 on both
+///   frozen samples).
 #[derive(Debug, Clone, Copy)]
 pub struct SellV2Accounts<'a> {
     /// Fee payer and signer (also the trader, position 13).
@@ -177,7 +303,9 @@ pub struct SellV2Accounts<'a> {
     pub bonding_curve: &'a Pubkey,
     /// Curve's base-inventory ATA (position 11).
     pub associated_bonding_curve: &'a Pubkey,
-    /// Fee recipient (resolved live: override, Global, then constant).
+    /// Fee recipient (position 6). Resolve from the same-curve
+    /// reference, NOT live Global (see [`MayhemReference`]
+    /// era-consistency).
     pub fee_recipient: &'a Pubkey,
     /// Token program owning `mint` (classic SPL vs Token-2022).
     pub base_token_program: &'a Pubkey,
@@ -189,8 +317,112 @@ pub struct SellV2Accounts<'a> {
     pub pfee_vault: &'a Pubkey,
     /// pfee vault's quote account, position 9 (reference-sourced).
     pub pfee_quote_account: &'a Pubkey,
-    /// Readonly reference account, position 18 (reference-sourced).
-    pub unknown_18: &'a Pubkey,
+}
+
+/// Account set for a v2 (`buy_v2`) mayhem-curve buy: the full 27-account
+/// shape — the `sell_v2` layout plus the global volume accumulator at
+/// [19] (buys track volume globally; sells don't). Verified byte-exact
+/// (positions + payload, both frozen `buy_v2` samples; creator vault +
+/// user-vol PDA + all six base/quote ATAs re-derived, not copied).
+/// Required for entries on v2 curves — the 18-account mayhem buy fails
+/// there (frozen failed sample), and legacy 12-account buys fail with
+/// `BuybackFeeRecipientMissing` (6062).
+///
+/// Provenance per position (verified 2026-10-14, two samples):
+/// - caller-supplied: payer, base/quote mints, curve, assoc curve, fee
+///   recipient, per-mint token programs, creator;
+/// - builder-derived: creator vault [16] + user-vol accumulator [20]
+///   PDAs (verified: derived addresses match both fixtures exactly),
+///   all six base/quote ATAs ([7] fee, [12] curve, [14] user base,
+///   [15] user quote, [17] creator-vault, [21] user-vol — verified at
+///   exact bumps, which vary per address);
+/// - reference-sourced (no proven derivation — resolve per trade from
+///   a same-curve reference buy_v2): quote mint [2], fee recipient [6],
+///   pfee vault [8], its quote account [9];
+/// - builder-derived: sharing-config PDA [18] (verified bump 255 on both
+///   frozen samples).
+#[derive(Debug, Clone, Copy)]
+pub struct BuyV2Accounts<'a> {
+    /// Fee payer and signer (also the trader, position 13).
+    pub payer: &'a Pubkey,
+    /// Bought token mint (position 1).
+    pub mint: &'a Pubkey,
+    /// Quote mint for fee routing (position 2; WSOL in both samples).
+    pub quote_mint: &'a Pubkey,
+    /// Bonding-curve PDA (position 10).
+    pub bonding_curve: &'a Pubkey,
+    /// Curve's base-inventory ATA (position 11).
+    pub associated_bonding_curve: &'a Pubkey,
+    /// Fee recipient (position 6). Resolve from the same-curve
+    /// reference, NOT live Global (era-consistency, like mayhem buys
+    /// and `sell_v2`: a mixed-era set fails authorization).
+    pub fee_recipient: &'a Pubkey,
+    /// Token program owning `mint` (classic SPL vs Token-2022; v2 mints
+    /// live under Token-2022).
+    pub base_token_program: &'a Pubkey,
+    /// Token program owning `quote_mint`.
+    pub quote_token_program: &'a Pubkey,
+    /// Token creator (creator-vault PDA derives from it; in both frozen
+    /// samples the creator is the launcher — create_v2 position 5).
+    pub creator: &'a Pubkey,
+    /// pfee quote vault, position 8 (reference-sourced).
+    pub pfee_vault: &'a Pubkey,
+    /// pfee vault's quote account, position 9 (reference-sourced).
+    pub pfee_quote_account: &'a Pubkey,
+}
+
+/// Account set for a v3 (`buy_v3`) buy: the 17-account shape from the
+/// official TRADE_V3.md table. No fee recipient (fees stay on the
+/// curve), no creator vault, no sharing config — the only external
+/// fee-side account is the buyback recipient (any of the 8 published
+/// [`BUYBACK_FEE_RECIPIENTS`]; must exist — pre-create its quote ATA
+/// idempotently for token-paired quotes).
+///
+/// Provenance: caller-supplied (payer, mints, curve, assoc curve,
+/// per-mint programs, buyback pick); builder-derived (user-vol PDA
+/// [11], base/quote user ATAs [9]/[10], curve base/quote ATAs [6]/[7]).
+#[derive(Debug, Clone, Copy)]
+pub struct BuyV3Accounts<'a> {
+    /// Fee payer and signer (also the trader, position 8).
+    pub payer: &'a Pubkey,
+    /// Bought token mint (position 1).
+    pub mint: &'a Pubkey,
+    /// Quote mint (position 2; WSOL for SOL-paired coins).
+    pub quote_mint: &'a Pubkey,
+    /// Bonding-curve PDA (position 5).
+    pub bonding_curve: &'a Pubkey,
+    /// Curve's base-inventory ATA (position 6).
+    pub associated_bonding_curve: &'a Pubkey,
+    /// Token program owning `mint`.
+    pub base_token_program: &'a Pubkey,
+    /// Token program owning `quote_mint`.
+    pub quote_token_program: &'a Pubkey,
+    /// Buyback recipient (position 13): one of [`BUYBACK_FEE_RECIPIENTS`]
+    /// for SOL-paired coins, its quote ATA for token-paired quotes.
+    pub buyback_recipient: &'a Pubkey,
+}
+
+/// Account set for a v3 (`sell_v3`) sell: same 17 accounts as
+/// [`BuyV3Accounts`], drain direction.
+#[derive(Debug, Clone, Copy)]
+pub struct SellV3Accounts<'a> {
+    /// Fee payer and signer (also the trader, position 8).
+    pub payer: &'a Pubkey,
+    /// Sold token mint (position 1).
+    pub mint: &'a Pubkey,
+    /// Quote mint (position 2; WSOL for SOL-paired coins).
+    pub quote_mint: &'a Pubkey,
+    /// Bonding-curve PDA (position 5).
+    pub bonding_curve: &'a Pubkey,
+    /// Curve's base-inventory ATA (position 6).
+    pub associated_bonding_curve: &'a Pubkey,
+    /// Token program owning `mint`.
+    pub base_token_program: &'a Pubkey,
+    /// Token program owning `quote_mint`.
+    pub quote_token_program: &'a Pubkey,
+    /// Buyback recipient (position 13): one of [`BUYBACK_FEE_RECIPIENTS`]
+    /// for SOL-paired coins, its quote ATA for token-paired quotes.
+    pub buyback_recipient: &'a Pubkey,
 }
 
 /// Creator-vault PDA for `creator`: `["creator-vault", creator]`.
@@ -209,6 +441,18 @@ pub fn user_volume_accumulator_pda(user: &Pubkey) -> Pubkey {
     let (pda, _) = Pubkey::find_program_address(
         &[USER_VOLUME_ACCUMULATOR_SEED, user.as_ref()],
         &PUMP_PROGRAM_ID,
+    );
+    pda
+}
+
+/// Sharing-config PDA for `mint`: `["sharing-config", mint]` under the
+/// fee program (official BUY.md row 19). Verified byte-exact (bump 255)
+/// against both frozen `buy_v2` samples AND both frozen `sell_v2`
+/// samples at position [18] — derived, never reference-copied.
+pub fn sharing_config_pda(mint: &Pubkey) -> Pubkey {
+    let (pda, _) = Pubkey::find_program_address(
+        &[SHARING_CONFIG_SEED, mint.as_ref()],
+        &FEE_CONFIG_PROGRAM,
     );
     pda
 }
@@ -320,78 +564,25 @@ impl PumpSwapBuilder {
                 ]);
             }
         }
+        // Mayhem buyback tail: buyback-enforcing curves reject the
+        // bare 16-account prefix with 6062 (proven live off a fresh
+        // launch), so append the reference-resolved [16]/[17] when
+        // present (buys on mayhem curves only — the arm above already
+        // requires a creator). Without routing the 16-account prefix
+        // still builds (the 18-account byte-proof shares this body),
+        // but dispatch never sends it: no reference fails closed
+        // upstream in [`SwapExecutor::preflight_buy`].
+        if matches!(kind, SwapKind::Buy { .. })
+            && accts.creator.is_some()
+            && let Some(routing) = &accts.mayhem_routing
+        {
+            accounts.extend_from_slice(&[
+                AccountMeta::new(*routing.unknown_16, false),
+                AccountMeta::new(*routing.pfee_vault, false),
+            ]);
+        }
 
         Instruction { program_id: PUMP_PROGRAM_ID, accounts, data }
-    }
-
-    /// Buy instruction: spends SOL for `amount` tokens, capped at
-    /// `max_sol_cost` lamports.
-    ///
-    /// Deprecated: bakes in the canonical fee recipient, classic token
-    /// program, no creator, and untracked volume. Prefer
-    /// [`PumpSwapBuilder::build_swap_ix`] with an explicit
-    /// [`SwapAccounts`] (live recipient + per-mint program + creator).
-    #[deprecated(
-        since = "0.1.0",
-        note = "use build_swap_ix with explicit SwapAccounts; this wrapper cannot express mayhem routing"
-    )]
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_buy_ix(
-        payer: &Pubkey,
-        mint: &Pubkey,
-        bonding_curve: &Pubkey,
-        associated_bonding_curve: &Pubkey,
-        user_ata: &Pubkey,
-        amount: u64,
-        max_sol_cost: u64,
-    ) -> Instruction {
-        Self::build_swap_ix(
-            SwapKind::Buy { amount, max_sol_cost, track_volume: false },
-            &SwapAccounts {
-                payer,
-                mint,
-                bonding_curve,
-                associated_bonding_curve,
-                user_ata,
-                fee_recipient: &FEE_RECIPIENT,
-                token_program: &TOKEN_PROGRAM_ID,
-                creator: None,
-            },
-        )
-    }
-
-    /// Sell instruction: sells `amount` tokens for at least
-    /// `min_sol_output` lamports.
-    ///
-    /// Deprecated: same legacy defaults as [`PumpSwapBuilder::build_buy_ix`];
-    /// prefer [`PumpSwapBuilder::build_swap_ix`].
-    #[deprecated(
-        since = "0.1.0",
-        note = "use build_swap_ix with explicit SwapAccounts; this wrapper cannot express mayhem routing"
-    )]
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_sell_ix(
-        payer: &Pubkey,
-        mint: &Pubkey,
-        bonding_curve: &Pubkey,
-        associated_bonding_curve: &Pubkey,
-        user_ata: &Pubkey,
-        amount: u64,
-        min_sol_output: u64,
-    ) -> Instruction {
-        Self::build_swap_ix(
-            SwapKind::Sell { amount, min_sol_output },
-            &SwapAccounts {
-                payer,
-                mint,
-                bonding_curve,
-                associated_bonding_curve,
-                user_ata,
-                fee_recipient: &FEE_RECIPIENT,
-                token_program: &TOKEN_PROGRAM_ID,
-                creator: None,
-            },
-        )
     }
 
     /// v2 sell instruction: the full 26-account mayhem shape for exits
@@ -441,7 +632,7 @@ impl PumpSwapBuilder {
             AccountMeta::new(quote_ata(accts.payer), false),                     // [15]
             AccountMeta::new(creator_vault, false),                              // [16]
             AccountMeta::new(quote_ata(&creator_vault), false),                  // [17]
-            AccountMeta::new_readonly(*accts.unknown_18, false),                 // [18]
+            AccountMeta::new_readonly(sharing_config_pda(accts.mint), false),    // [18]
             AccountMeta::new(user_vol, false),                                   // [19]
             AccountMeta::new(quote_ata(&user_vol), false),                       // [20]
             AccountMeta::new_readonly(FEE_CONFIG_ACCOUNT, false),                // [21]
@@ -452,6 +643,171 @@ impl PumpSwapBuilder {
         ];
         debug_assert_eq!(accounts.len(), 26);
         Instruction { program_id: PUMP_PROGRAM_ID, accounts, data }
+    }
+
+    /// v2 buy instruction: the full 27-account mayhem shape for entries
+    /// on v2 curves (the 18-account mayhem buy fails there — frozen
+    /// failed sample — and legacy 12-account buys fail with 6062).
+    ///
+    /// Account order mirrors [`PumpSwapBuilder::build_sell_v2_ix`] with
+    /// the global volume accumulator inserted at [19] (buys track volume
+    /// globally; sells don't). Derived addresses (creator vault [16],
+    /// user-vol accumulator [20], all six base/quote ATAs) are computed
+    /// inside and verified byte-exact against both frozen `buy_v2`
+    /// samples; opaque routing comes from the caller (a same-curve
+    /// reference buy_v2). Writability mirrors the proven `sell_v2` set
+    /// plus writable [19]/[20]/[21] — preflight simulation gates every
+    /// build (the 27-shape sim probe is the gate that proves the flags).
+    pub fn build_buy_v2_ix(
+        amount: u64,
+        max_sol_cost: u64,
+        accts: &BuyV2Accounts<'_>,
+    ) -> Instruction {
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&PUMP_BUY_V2_DISCRIMINATOR);
+        PumpBuyV2Args { amount, max_sol_cost }
+            .serialize(&mut data)
+            .expect("in-memory Borsh encode cannot fail");
+
+        let creator_vault = creator_vault_pda(accts.creator);
+        let user_vol = user_volume_accumulator_pda(accts.payer);
+        let quote_ata = |owner: &Pubkey| {
+            user_ata_with_program(owner, accts.quote_mint, accts.quote_token_program)
+        };
+        let accounts = vec![
+            AccountMeta::new_readonly(GLOBAL_ACCOUNT, false),                    // [0]
+            AccountMeta::new_readonly(*accts.mint, false),                       // [1]
+            AccountMeta::new_readonly(*accts.quote_mint, false),                 // [2]
+            AccountMeta::new_readonly(*accts.base_token_program, false),         // [3]
+            AccountMeta::new_readonly(*accts.quote_token_program, false),        // [4]
+            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false),       // [5]
+            AccountMeta::new(*accts.fee_recipient, false),                       // [6]
+            AccountMeta::new(quote_ata(accts.fee_recipient), false),             // [7]
+            AccountMeta::new(*accts.pfee_vault, false),                          // [8]
+            AccountMeta::new(*accts.pfee_quote_account, false),                  // [9]
+            AccountMeta::new(*accts.bonding_curve, false),                       // [10]
+            AccountMeta::new(*accts.associated_bonding_curve, false),            // [11]
+            AccountMeta::new(quote_ata(accts.bonding_curve), false),             // [12]
+            AccountMeta::new(*accts.payer, true),                                // [13]
+            AccountMeta::new(
+                user_ata_with_program(accts.payer, accts.mint, accts.base_token_program),
+                false,
+            ), // [14]
+            AccountMeta::new(quote_ata(accts.payer), false),                     // [15]
+            AccountMeta::new(creator_vault, false),                              // [16]
+            AccountMeta::new(quote_ata(&creator_vault), false),                  // [17]
+            AccountMeta::new_readonly(sharing_config_pda(accts.mint), false),    // [18]
+            AccountMeta::new(GLOBAL_VOLUME_ACCUMULATOR, false),                  // [19]
+            AccountMeta::new(user_vol, false),                                   // [20]
+            AccountMeta::new(quote_ata(&user_vol), false),                       // [21]
+            AccountMeta::new_readonly(FEE_CONFIG_ACCOUNT, false),                // [22]
+            AccountMeta::new_readonly(FEE_CONFIG_PROGRAM, false),                // [23]
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),                 // [24]
+            AccountMeta::new_readonly(EVENT_AUTHORITY, false),                   // [25]
+            AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),                   // [26]
+        ];
+        debug_assert_eq!(accounts.len(), 27);
+        Instruction { program_id: PUMP_PROGRAM_ID, accounts, data }
+    }
+
+    /// v3 buy instruction: the 17-account shape for entries on any curve
+    /// (mayhem included; cashback coins excepted — they fail v3 with
+    /// `CashbackCoinNotSupported` and must use v2). Fees stay on the
+    /// curve, so neither a fee recipient nor a same-curve reference is
+    /// needed — only the buyback pick plus derived addresses.
+    /// Writability mirrors the v2 convention minus the removed
+    /// accounts; preflight simulation gates every build (the 17-shape
+    /// sim probe is the gate that proves the flags).
+    pub fn build_buy_v3_ix(
+        amount: u64,
+        max_sol_cost: u64,
+        accts: &BuyV3Accounts<'_>,
+    ) -> Instruction {
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&PUMP_BUY_V3_DISCRIMINATOR);
+        PumpBuyV3Args { amount, max_sol_cost }
+            .serialize(&mut data)
+            .expect("in-memory Borsh encode cannot fail");
+        Self::build_v3_ix(data, accts.payer, accts.mint, accts.quote_mint, accts.bonding_curve,
+            accts.associated_bonding_curve, accts.base_token_program, accts.quote_token_program,
+            accts.buyback_recipient)
+    }
+
+    /// v3 sell instruction: the 17-account shape for exits on any curve
+    /// (same cashback exception as [`PumpSwapBuilder::build_buy_v3_ix`]).
+    pub fn build_sell_v3_ix(
+        amount: u64,
+        min_sol_output: u64,
+        accts: &SellV3Accounts<'_>,
+    ) -> Instruction {
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&PUMP_SELL_V3_DISCRIMINATOR);
+        PumpSellV3Args { amount, min_sol_output }
+            .serialize(&mut data)
+            .expect("in-memory Borsh encode cannot fail");
+        Self::build_v3_ix(data, accts.payer, accts.mint, accts.quote_mint, accts.bonding_curve,
+            accts.associated_bonding_curve, accts.base_token_program, accts.quote_token_program,
+            accts.buyback_recipient)
+    }
+
+    /// Shared 17-account v3 body: `data` selects the side, everything
+    /// else is positionally identical across `buy_v3`/`sell_v3`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_v3_ix(
+        data: Vec<u8>,
+        payer: &Pubkey,
+        mint: &Pubkey,
+        quote_mint: &Pubkey,
+        bonding_curve: &Pubkey,
+        associated_bonding_curve: &Pubkey,
+        base_token_program: &Pubkey,
+        quote_token_program: &Pubkey,
+        buyback_recipient: &Pubkey,
+    ) -> Instruction {
+        let user_vol = user_volume_accumulator_pda(payer);
+        let base_ata = || user_ata_with_program(payer, mint, base_token_program);
+        let quote_ata = |owner: &Pubkey| user_ata_with_program(owner, quote_mint, quote_token_program);
+        let accounts = vec![
+            AccountMeta::new_readonly(GLOBAL_ACCOUNT, false),                    // [0]
+            AccountMeta::new_readonly(*mint, false),                             // [1]
+            AccountMeta::new_readonly(*quote_mint, false),                       // [2]
+            AccountMeta::new_readonly(*base_token_program, false),               // [3]
+            AccountMeta::new_readonly(*quote_token_program, false),              // [4]
+            AccountMeta::new(*bonding_curve, false),                             // [5]
+            AccountMeta::new(*associated_bonding_curve, false),                  // [6]
+            AccountMeta::new(quote_ata(bonding_curve), false),                   // [7]
+            AccountMeta::new(*payer, true),                                      // [8]
+            AccountMeta::new(base_ata(), false),                                 // [9]
+            AccountMeta::new(quote_ata(payer), false),                           // [10]
+            AccountMeta::new(user_vol, false),                                   // [11]
+            AccountMeta::new_readonly(FEE_CONFIG_ACCOUNT, false),                // [12]
+            AccountMeta::new(*buyback_recipient, false),                         // [13]
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),                 // [14]
+            AccountMeta::new_readonly(EVENT_AUTHORITY, false),                   // [15]
+            AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),                   // [16]
+        ];
+        debug_assert_eq!(accounts.len(), 17);
+        Instruction { program_id: PUMP_PROGRAM_ID, accounts, data }
+    }
+
+    /// v3 exact-quote buy instruction: spend exactly `spendable_quote_in`
+    /// for at least `min_tokens_out` tokens (same 17 accounts as
+    /// [`PumpSwapBuilder::build_buy_v3_ix`]). Suited to fixed-notional
+    /// sniping (exact spend, floor on proceeds) — enable in dispatch
+    /// only after its frozen-sample byte test + sim probe turn green.
+    pub fn build_buy_exact_quote_in_v3_ix(
+        spendable_quote_in: u64,
+        min_tokens_out: u64,
+        accts: &BuyV3Accounts<'_>,
+    ) -> Instruction {
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR);
+        PumpBuyExactQuoteInV3Args { spendable_quote_in, min_tokens_out }
+            .serialize(&mut data)
+            .expect("in-memory Borsh encode cannot fail");
+        Self::build_v3_ix(data, accts.payer, accts.mint, accts.quote_mint, accts.bonding_curve,
+            accts.associated_bonding_curve, accts.base_token_program, accts.quote_token_program,
+            accts.buyback_recipient)
     }
 }
 
@@ -484,8 +840,8 @@ pub fn user_ata_with_program(owner: &Pubkey, mint: &Pubkey, token_program: &Pubk
     Pubkey::new_from_array(theirs.to_bytes())
 }
 
-fn pubkey_into_theirs(key: &Pubkey) -> solana_pubkey::Pubkey {
-    solana_pubkey::Pubkey::new_from_array(key.to_bytes())
+fn pubkey_into_theirs(key: &Pubkey) -> Pubkey {
+    Pubkey::new_from_array(key.to_bytes())
 }
 
 /// Compute Budget program (canonical, stable across SDK versions).
@@ -677,9 +1033,9 @@ mod tests {
                 creator: &creator,
                 pfee_vault: &key(8),
                 pfee_quote_account: &key(9),
-                unknown_18: &key(18),
             },
         );
+        assert_eq!(sharing_config_pda(&key(1)), key(18));
         assert_eq!(built.accounts.len(), 26);
         // Writable set from the jsonParsed flags (13 is the only signer).
         let writable: HashSet<usize> = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20]
@@ -695,6 +1051,455 @@ mod tests {
                 AccountMeta::new_readonly(key(i), false)
             };
             assert_eq!(*meta, expect, "flags {i}");
+        }
+        assert_eq!(built.data, data);
+    }
+
+    #[test]
+    fn buy_v2_matches_frozen_samples() {
+        // Byte-equality against TWO real mainnet `buy_v2` fills (27
+        // accounts each): our builder must reproduce every position plus
+        // the payload. Derived addresses double as independent anchors:
+        // creator vault ([16]) recomputed from the create_v2 author
+        // (position 5, launcher in both samples) and user-vol accumulator
+        // ([20]) from the payer — neither copied. Reference-sourced
+        // routing ([2]/[6]/[8]/[9]/[18]) is lifted from the fixture, like
+        // production lifts it from a same-curve reference buy. Flags
+        // follow the proven `sell_v2` set plus writable global-vol [19]:
+        // the 27-shape sim probe (not this test) proves the flags.
+        use std::collections::HashSet;
+        let fixtures: [(&str, &str, u64); 2] = [
+            (
+                include_str!("../../listener/tests/fixtures/create_v2_mainnet.json"),
+                "../../listener/tests/fixtures/create_v2_mainnet.json",
+                3_485_709_524_202u64,
+            ),
+            (
+                include_str!("../../listener/tests/fixtures/buy_v2_second_mainnet.json"),
+                "../../listener/tests/fixtures/buy_v2_second_mainnet.json",
+                8_671_591_758_466u64,
+            ),
+        ];
+        for (contents, path, want_amount) in fixtures {
+            let raw: serde_json::Value =
+                serde_json::from_str(contents).expect("fixture");
+            let result = &raw["result"];
+            let msg = &result["transaction"]["message"];
+            let mut keys: Vec<String> =
+                serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+            if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
+                for table in ["writable", "readonly"] {
+                    for addr in loaded
+                        .get(table)
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        keys.push(addr.as_str().expect("addr").to_string());
+                    }
+                }
+            }
+            let pump = PUMP_PROGRAM_ID.to_string();
+            let pi = keys.iter().position(|k| k == &pump).expect("pump key");
+            let ixs = msg["instructions"].as_array().expect("ixs");
+            // Creator from the same-tx `create_v2` author (position 5):
+            // the vault match below proves the provenance.
+            let mut creator = None;
+            for ix in ixs {
+                if ix["programIdIndex"].as_u64() != Some(pi as u64) {
+                    continue;
+                }
+                let data = bs58::decode(ix["data"].as_str().expect("data"))
+                    .into_vec()
+                    .expect("b58");
+                if !data.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR) {
+                    continue;
+                }
+                let accounts: Vec<usize> =
+                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
+                creator = Some(
+                    Pubkey::from_str(&keys[accounts[5]].clone()).expect("creator"),
+                );
+                break;
+            }
+            let creator = creator.expect("create_v2 in fixture");
+            let mut found = None;
+            for ix in ixs {
+                if ix["programIdIndex"].as_u64() != Some(pi as u64) {
+                    continue;
+                }
+                let data = bs58::decode(ix["data"].as_str().expect("data"))
+                    .into_vec()
+                    .expect("b58");
+                if data.starts_with(&PUMP_BUY_V2_DISCRIMINATOR) && data.len() == 24 {
+                    let accounts: Vec<usize> =
+                        serde_json::from_value(ix["accounts"].clone()).expect("accts");
+                    found = Some((accounts, data));
+                    break;
+                }
+            }
+            let (idx, data) = found.expect("buy_v2 in fixture");
+            assert_eq!(idx.len(), 27, "{path}");
+            let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
+            assert_eq!(creator_vault_pda(&creator), key(16), "{path} creator vault");
+            assert_eq!(
+                user_volume_accumulator_pda(&key(13)),
+                key(20),
+                "{path} user-vol"
+            );
+            let amount = u64::from_le_bytes(data[8..16].try_into().expect("u64"));
+            let max_sol_cost = u64::from_le_bytes(data[16..24].try_into().expect("u64"));
+            assert_eq!(amount, want_amount, "{path}");
+            let built = PumpSwapBuilder::build_buy_v2_ix(
+                amount,
+                max_sol_cost,
+                &BuyV2Accounts {
+                    payer: &key(13),
+                    mint: &key(1),
+                    quote_mint: &key(2),
+                    bonding_curve: &key(10),
+                    associated_bonding_curve: &key(11),
+                    fee_recipient: &key(6),
+                    base_token_program: &key(3),
+                    quote_token_program: &key(4),
+                    creator: &creator,
+                    pfee_vault: &key(8),
+                    pfee_quote_account: &key(9),
+                },
+            );
+            assert_eq!(sharing_config_pda(&key(1)), key(18), "{path}");
+            assert_eq!(built.accounts.len(), 27, "{path}");
+            // Inferred writable set (sell_v2 set + [19]/[20]/[21];
+            // position 13 is the only signer).
+            let writable: HashSet<usize> = [
+                6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21,
+            ]
+            .into_iter()
+            .collect();
+            for (i, meta) in built.accounts.iter().enumerate() {
+                assert_eq!(meta.pubkey, key(i), "{path} position {i}");
+                let expect = if i == 13 {
+                    AccountMeta::new(key(i), true)
+                } else if writable.contains(&i) {
+                    AccountMeta::new(key(i), false)
+                } else {
+                    AccountMeta::new_readonly(key(i), false)
+                };
+                assert_eq!(*meta, expect, "{path} flags {i}");
+            }
+            assert_eq!(built.data, data, "{path}");
+        }
+    }
+
+    #[test]
+    fn sell_v3_matches_frozen_sample() {
+        // Byte-equality against a real mainnet `sell_v3` fill (17
+        // accounts): our builder must reproduce every position plus the
+        // payload. Derived addresses double as independent anchors:
+        // user-vol accumulator ([11]) from the payer plus all four
+        // base/quote ATAs ([6]/[7]/[9]/[10]) recomputed, not copied. The
+        // buyback recipient ([13]) must be a member of the published
+        // 8-list — asserted explicitly (both frozen v3 fills use index
+        // 1). Flags follow the v2 convention minus the removed
+        // accounts; the 17-shape sim probe (not this test) proves them.
+        use std::collections::HashSet;
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../listener/tests/fixtures/sell_v3_mainnet.json"
+        ))
+        .expect("fixture");
+        // Shape: bare getTransaction result (no RPC envelope), like the
+        // mayhem fixtures.
+        let result = &raw;
+        // Landed transaction only: a failed fill proves nothing.
+        assert!(
+            result
+                .get("meta")
+                .and_then(|m| m.get("err"))
+                .is_some_and(|e| e.is_null()),
+            "success fixture must carry a landed transaction"
+        );
+        let msg = &result["transaction"]["message"];
+        let mut keys: Vec<String> =
+            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
+            for table in ["writable", "readonly"] {
+                for addr in loaded
+                    .get(table)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    keys.push(addr.as_str().expect("addr").to_string());
+                }
+            }
+        }
+        let pump = PUMP_PROGRAM_ID.to_string();
+        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
+        let mut found = None;
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
+                continue;
+            }
+            let data = bs58::decode(ix["data"].as_str().expect("data"))
+                .into_vec()
+                .expect("b58");
+            if data.starts_with(&PUMP_SELL_V3_DISCRIMINATOR) && data.len() == 24 {
+                let accounts: Vec<usize> =
+                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
+                found = Some((accounts, data));
+                break;
+            }
+        }
+        let (idx, data) = found.expect("sell_v3 in fixture");
+        assert_eq!(idx.len(), 17);
+        let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
+        assert_eq!(user_volume_accumulator_pda(&key(8)), key(11));
+        assert!(
+            BUYBACK_FEE_RECIPIENTS.contains(&key(13)),
+            "buyback recipient must come from the published 8-list"
+        );
+        let amount = u64::from_le_bytes(data[8..16].try_into().expect("u64"));
+        let min_sol_output = u64::from_le_bytes(data[16..24].try_into().expect("u64"));
+        assert_eq!(amount, 30_952_762_059);
+        let built = PumpSwapBuilder::build_sell_v3_ix(
+            amount,
+            min_sol_output,
+            &SellV3Accounts {
+                payer: &key(8),
+                mint: &key(1),
+                quote_mint: &key(2),
+                bonding_curve: &key(5),
+                associated_bonding_curve: &key(6),
+                base_token_program: &key(3),
+                quote_token_program: &key(4),
+                buyback_recipient: &key(13),
+            },
+        );
+        assert_eq!(built.accounts.len(), 17);
+        // Inferred writable set (positions 5–11 + 13; 8 is the signer).
+        let writable: HashSet<usize> = [5, 6, 7, 8, 9, 10, 11, 13].into_iter().collect();
+        for (i, meta) in built.accounts.iter().enumerate() {
+            assert_eq!(meta.pubkey, key(i), "position {i}");
+            let expect = if i == 8 {
+                AccountMeta::new(key(i), true)
+            } else if writable.contains(&i) {
+                AccountMeta::new(key(i), false)
+            } else {
+                AccountMeta::new_readonly(key(i), false)
+            };
+            assert_eq!(*meta, expect, "flags {i}");
+        }
+        assert_eq!(built.data, data);
+    }
+
+    #[test]
+    fn buy_v3_matches_frozen_sample() {
+        // Byte-equality against a real mainnet `buy_v3` fill (17
+        // accounts, no `partial_fill` tail): our builder must reproduce
+        // every position plus the payload. Same shared 17-account body
+        // as `sell_v3` — user-vol accumulator ([11]) plus all four
+        // base/quote ATAs ([6]/[7]/[9]/[10]) recomputed, buyback ([13])
+        // pinned to the published 8-list. Flags are the same inferred
+        // set as `sell_v3`; the 17-shape sim probe proves them.
+        use std::collections::HashSet;
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../listener/tests/fixtures/buy_v3_mainnet.json"
+        ))
+        .expect("fixture");
+        // Shape: bare getTransaction result (no RPC envelope), like the
+        // mayhem fixtures.
+        let result = &raw;
+        // Landed transaction only: a failed fill proves nothing.
+        assert!(
+            result
+                .get("meta")
+                .and_then(|m| m.get("err"))
+                .is_some_and(|e| e.is_null()),
+            "success fixture must carry a landed transaction"
+        );
+        let msg = &result["transaction"]["message"];
+        let mut keys: Vec<String> =
+            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
+            for table in ["writable", "readonly"] {
+                for addr in loaded
+                    .get(table)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    keys.push(addr.as_str().expect("addr").to_string());
+                }
+            }
+        }
+        let pump = PUMP_PROGRAM_ID.to_string();
+        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
+        let mut found = None;
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
+                continue;
+            }
+            let data = bs58::decode(ix["data"].as_str().expect("data"))
+                .into_vec()
+                .expect("b58");
+            if data.starts_with(&PUMP_BUY_V3_DISCRIMINATOR) && data.len() == 24 {
+                let accounts: Vec<usize> =
+                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
+                found = Some((accounts, data));
+                break;
+            }
+        }
+        let (idx, data) = found.expect("buy_v3 in fixture");
+        assert_eq!(idx.len(), 17);
+        let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
+        assert_eq!(user_volume_accumulator_pda(&key(8)), key(11));
+        assert!(
+            BUYBACK_FEE_RECIPIENTS.contains(&key(13)),
+            "buyback recipient must come from the published 8-list"
+        );
+        let amount = u64::from_le_bytes(data[8..16].try_into().expect("u64"));
+        let max_sol_cost = u64::from_le_bytes(data[16..24].try_into().expect("u64"));
+        assert_eq!(amount, 34_612_903_225_806);
+        assert_eq!(max_sol_cost, 1_100_000_000);
+        let built = PumpSwapBuilder::build_buy_v3_ix(
+            amount,
+            max_sol_cost,
+            &BuyV3Accounts {
+                payer: &key(8),
+                mint: &key(1),
+                quote_mint: &key(2),
+                bonding_curve: &key(5),
+                associated_bonding_curve: &key(6),
+                base_token_program: &key(3),
+                quote_token_program: &key(4),
+                buyback_recipient: &key(13),
+            },
+        );
+        assert_eq!(built.accounts.len(), 17);
+        // Same inferred writable set as `sell_v3` (8 is the signer).
+        let writable: HashSet<usize> = [5, 6, 7, 8, 9, 10, 11, 13].into_iter().collect();
+        for (i, meta) in built.accounts.iter().enumerate() {
+            assert_eq!(meta.pubkey, key(i), "position {i}");
+            let expect = if i == 8 {
+                AccountMeta::new(key(i), true)
+            } else if writable.contains(&i) {
+                AccountMeta::new(key(i), false)
+            } else {
+                AccountMeta::new_readonly(key(i), false)
+            };
+            assert_eq!(*meta, expect, "flags {i}");
+        }
+        assert_eq!(built.data, data);
+    }
+
+    #[test]
+    fn buy_exact_quote_in_v3_matches_frozen_sample() {
+        // Byte-equality against a real mainnet `buy_exact_quote_in_v3`
+        // fill (17 accounts): same shared body as `buy_v3`/`sell_v3`,
+        // payload (spend, min_out). Spend was exactly 1 SOL, floor
+        // 12_211_736_678_104. Derivation anchors mirror the `buy_v3`
+        // test (uvol PDA, 8-list buyback, four ATAs).
+        use std::collections::HashSet;
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../listener/tests/fixtures/buy_exact_quote_in_v3_mainnet.json"
+        ))
+        .expect("fixture");
+        // Shape: bare getTransaction result (no RPC envelope).
+        let result = &raw;
+        assert!(
+            result
+                .get("meta")
+                .and_then(|m| m.get("err"))
+                .is_some_and(|e| e.is_null()),
+            "success fixture must carry a landed transaction"
+        );
+        let msg = &result["transaction"]["message"];
+        let mut keys: Vec<String> =
+            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
+            for table in ["writable", "readonly"] {
+                for addr in loaded
+                    .get(table)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    keys.push(addr.as_str().expect("addr").to_string());
+                }
+            }
+        }
+        let pump = PUMP_PROGRAM_ID.to_string();
+        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
+        let mut found = None;
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
+                continue;
+            }
+            let data = bs58::decode(ix["data"].as_str().expect("data"))
+                .into_vec()
+                .expect("b58");
+            if data.starts_with(&PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR) && data.len() == 24
+            {
+                let accounts: Vec<usize> =
+                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
+                found = Some((accounts, data));
+                break;
+            }
+        }
+        let (idx, data) = found.expect("buy_exact_quote_in_v3 in fixture");
+        assert_eq!(idx.len(), 17);
+        let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
+        assert_eq!(user_volume_accumulator_pda(&key(8)), key(11));
+        assert!(
+            BUYBACK_FEE_RECIPIENTS.contains(&key(13)),
+            "buyback recipient must come from the published 8-list"
+        );
+        let spend = u64::from_le_bytes(data[8..16].try_into().expect("u64"));
+        let min_out = u64::from_le_bytes(data[16..24].try_into().expect("u64"));
+        assert_eq!(spend, 1_000_000_000);
+        assert_eq!(min_out, 12_211_736_678_104);
+        let built = PumpSwapBuilder::build_buy_exact_quote_in_v3_ix(
+            spend,
+            min_out,
+            &BuyV3Accounts {
+                payer: &key(8),
+                mint: &key(1),
+                quote_mint: &key(2),
+                bonding_curve: &key(5),
+                associated_bonding_curve: &key(6),
+                base_token_program: &key(3),
+                quote_token_program: &key(4),
+                buyback_recipient: &key(13),
+            },
+        );
+        assert_eq!(built.accounts.len(), 17);
+        // Same inferred set as the other v3 sides (8 is the signer).
+        let writable: HashSet<usize> = [5, 6, 7, 8, 9, 10, 11, 13].into_iter().collect();
+        for (i, meta) in built.accounts.iter().enumerate() {
+            // Position 9 excepted: this fill's buyer spent from an AUX
+            // base account, not the canonical ATA (same class as the
+            // sim probes' aux-buyer resample rule). OUR builds always
+            // use the canonical ATA — the idempotent prefix guarantees
+            // it exists — so the builder is correct and the sample
+            // simply isn't byte-equal there.
+            if i != 9 {
+                assert_eq!(meta.pubkey, key(i), "position {i}");
+            }
+            let expect = if i == 8 {
+                AccountMeta::new(key(i), true)
+            } else if writable.contains(&i) {
+                AccountMeta::new(key(i), false)
+            } else {
+                AccountMeta::new_readonly(key(i), false)
+            };
+            if i != 9 {
+                assert_eq!(*meta, expect, "flags {i}");
+            } else {
+                // Aux position: flags convention still asserted,
+                // pubkey excluded (see above).
+                assert_eq!(meta.is_signer, expect.is_signer, "flags {i}");
+                assert_eq!(meta.is_writable, expect.is_writable, "flags {i}");
+            }
         }
         assert_eq!(built.data, data);
     }
@@ -753,12 +1558,79 @@ mod tests {
                 fee_recipient: &key(1),
                 token_program: &key(8),
                 creator: Some(&creator),
+                // No routing: locks the retired 16-account prefix
+                // (positions 0..16 of the 18-account chain shape).
+                // Dispatch never sends this standalone (6062); the
+                // next test proves the dispatched 18-account form.
+                mayhem_routing: None,
             },
         );
         assert_eq!(built.accounts.len(), 16);
         for (i, meta) in built.accounts.iter().enumerate() {
             assert_eq!(meta.pubkey, key(i), "position {i}");
         }
+        assert_eq!(built.data, data);
+    }
+
+    #[test]
+    fn mayhem_buy_appends_routing_to_18() {
+        // Same frozen mayhem buy, full 18 accounts: with reference
+        // routing the builder reproduces [16]/[17] exactly. Positions
+        // 0..16 reuse the proof above; flags for the appended pair
+        // follow vault convention (writable) — the sim gate, not this
+        // test, proves the flags (the fixture carries no flag table).
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../listener/tests/fixtures/mayhem_buy_mainnet.json"
+        ))
+        .expect("fixture");
+        let msg = &raw["transaction"]["message"];
+        let keys: Vec<String> = serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        let pump = PUMP_PROGRAM_ID.to_string();
+        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
+        let mut found = None;
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
+                continue;
+            }
+            let data = bs58::decode(ix["data"].as_str().expect("data"))
+                .into_vec()
+                .expect("b58");
+            if data.starts_with(&PUMP_BUY_DISCRIMINATOR) && data.len() == 25 {
+                let accounts: Vec<usize> = serde_json::from_value(ix["accounts"].clone()).expect("accts");
+                found = Some((accounts, data));
+                break;
+            }
+        }
+        let (idx, data) = found.expect("mayhem buy in fixture");
+        assert_eq!(idx.len(), 18);
+        let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
+        let creator = Pubkey::new_from_array([
+            181, 33, 156, 169, 71, 74, 115, 4, 142, 47, 129, 175, 116, 186, 124, 26, 181, 141,
+            124, 30, 200, 103, 36, 11, 1, 87, 83, 217, 77, 172, 67, 38,
+        ]);
+        let amount = u64::from_le_bytes(data[8..16].try_into().expect("u64"));
+        let max = u64::from_le_bytes(data[16..24].try_into().expect("u64"));
+        let routing = MayhemRouting { unknown_16: &key(16), pfee_vault: &key(17) };
+        let built = PumpSwapBuilder::build_swap_ix(
+            SwapKind::Buy { amount, max_sol_cost: max, track_volume: true },
+            &SwapAccounts {
+                payer: &key(6),
+                mint: &key(2),
+                bonding_curve: &key(3),
+                associated_bonding_curve: &key(4),
+                user_ata: &key(5),
+                fee_recipient: &key(1),
+                token_program: &key(8),
+                creator: Some(&creator),
+                mayhem_routing: Some(routing),
+            },
+        );
+        assert_eq!(built.accounts.len(), 18);
+        for (i, meta) in built.accounts.iter().enumerate() {
+            assert_eq!(meta.pubkey, key(i), "position {i}");
+        }
+        assert!(built.accounts[16].is_writable && !built.accounts[16].is_signer);
+        assert!(built.accounts[17].is_writable && !built.accounts[17].is_signer);
         assert_eq!(built.data, data);
     }
 
@@ -822,6 +1694,7 @@ mod tests {
                 fee_recipient: &custom,
                 token_program: &TOKEN_PROGRAM_ID,
                 creator: None,
+                mayhem_routing: None,
             },
         );
         assert_eq!(ix.accounts[1], AccountMeta::new(custom, false));
@@ -829,10 +1702,22 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn buy_layout_and_accounts() {
         let (payer, mint, curve, assoc, ata) = keys();
-        let ix = PumpSwapBuilder::build_buy_ix(&payer, &mint, &curve, &assoc, &ata, 1_000, 500);
+        let ix = PumpSwapBuilder::build_swap_ix(
+            SwapKind::Buy { amount: 1_000, max_sol_cost: 500, track_volume: false },
+            &SwapAccounts {
+                payer: &payer,
+                mint: &mint,
+                bonding_curve: &curve,
+                associated_bonding_curve: &assoc,
+                user_ata: &ata,
+                fee_recipient: &FEE_RECIPIENT,
+                token_program: &TOKEN_PROGRAM_ID,
+                creator: None,
+                mayhem_routing: None,
+            },
+        );
         assert_eq!(ix.program_id, PUMP_PROGRAM_ID);
         assert_eq!(&ix.data[..8], PUMP_BUY_DISCRIMINATOR);
         // 8 disc + 8 amount + 8 max + 1 bool flag.
@@ -873,10 +1758,22 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn sell_layout_and_accounts() {
         let (payer, mint, curve, assoc, ata) = keys();
-        let ix = PumpSwapBuilder::build_sell_ix(&payer, &mint, &curve, &assoc, &ata, 700, 300);
+        let ix = PumpSwapBuilder::build_swap_ix(
+            SwapKind::Sell { amount: 700, min_sol_output: 300 },
+            &SwapAccounts {
+                payer: &payer,
+                mint: &mint,
+                bonding_curve: &curve,
+                associated_bonding_curve: &assoc,
+                user_ata: &ata,
+                fee_recipient: &FEE_RECIPIENT,
+                token_program: &TOKEN_PROGRAM_ID,
+                creator: None,
+                mayhem_routing: None,
+            },
+        );
         assert_eq!(&ix.data[..8], PUMP_SELL_DISCRIMINATOR);
         let args = PumpSellArgs::try_from_slice(&ix.data[8..]).expect("decode");
         assert_eq!(

@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use alert::Alerter;
 use auditor::{RugCheckClient, RugCheckError, RugCheckReport};
-use curve::{CurveError, CurveTicker, PriceTick};
+use curve::{CurveError, CurveTicker, PriceTick, SolUsdFeed};
 use executor::ExecutorError;
 use listener::{
     BundleAnalysis, BundleVerdict, DevVerdict, EntryGate, GateOutcome, MigrationReport,
-    RpcScreener, ScreenError, SwapRecord,
+    RpcScreener, ScreenError, SwapRecord, SwapSide,
 };
 use migration::{PoolTick, VaultTicker};
 use risk_engine::{Action, RiskEngine, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics, evaluate_heuristic_fallback, resolve_strategy};
@@ -86,6 +86,31 @@ pub trait LiveSink {
         false
     }
 
+    /// Mints with buys awaiting confirmation (default: none).
+    /// Used by the shutdown snapshot and heat cap so pending bags are
+    /// never invisible while the recheck loop still owns them.
+    fn pending_mints(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Per-dispatch on-chain overhead in lamports (tip + priority fee;
+    /// default: none). Used for day-loss cost accounting.
+    fn dispatch_cost_lamports(&self) -> u64 {
+        0
+    }
+
+    /// Record a tracked fill in the crash-recovery WAL (default: none).
+    /// Call AFTER inserting into `live_positions`.
+    fn acknowledge_buy(&self, _position: &LivePosition, _bundle_id: &str) {}
+
+    /// Record a human-exit bag in the crash-recovery WAL (default: none).
+    /// Call BEFORE inserting into `live_manual`.
+    fn record_manual(&self, _position: &LivePosition) {}
+
+    /// Record a confirmed sell in the crash-recovery WAL (default: none).
+    /// Call BEFORE subtracting custody.
+    fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {}
+
     /// Re-poll pending buys once (default: nothing pending).
     async fn recheck_pending(&self) -> Vec<PendingRecheck> {
         Vec::new()
@@ -108,6 +133,26 @@ impl LiveSink for LiveTrader {
 
     fn has_pending(&self) -> bool {
         self.has_pending()
+    }
+
+    fn pending_mints(&self) -> Vec<String> {
+        self.pending_mints()
+    }
+
+    fn dispatch_cost_lamports(&self) -> u64 {
+        self.dispatch_cost_lamports()
+    }
+
+    fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
+        self.acknowledge_buy(position, bundle_id)
+    }
+
+    fn record_manual(&self, position: &LivePosition) {
+        self.record_manual(position)
+    }
+
+    fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
+        self.record_sell(mint, amount_tokens, bundle_id)
     }
 
     async fn recheck_pending(&self) -> Vec<PendingRecheck> {
@@ -227,15 +272,19 @@ pub fn dev_reputation_score(
     (0.6 + 0.4 * age_factor - 0.05 * prior_launches as f64).clamp(0.4, 1.0)
 }
 
-/// Resolve an entry price and sizing liquidity from a reserve read.
+/// Resolve an entry price and sizing liquidity from a reserve read, plus
+/// the paper-only flag (true when the price came from the manual
+/// `QUOTE_USD` override — the live mirror must stay out).
 ///
-/// Live tick wins; on failure the manual `QUOTE_USD` override applies;
-/// `None` means "cannot price — skip the signal".
-pub fn resolve_entry(
+/// Live tick wins; on failure the manual override applies; `None` means
+/// "cannot price — skip the signal". Single source: callers must take
+/// the flag from here, never re-derive it from `tick_result.is_err()`
+/// (a future caller doing that would let a static price leak live).
+pub fn resolve_entry_with_flag(
     tick: Result<PriceTick, CurveError>,
     quote_override: Option<f64>,
     fallback_liquidity: f64,
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, bool)> {
     match tick {
         Ok(tick)
             if tick.price_usd.is_finite()
@@ -243,7 +292,7 @@ pub fn resolve_entry(
                 && tick.liquidity_usd.is_finite()
                 && tick.liquidity_usd >= 0.0 =>
         {
-            Some((tick.price_usd, tick.liquidity_usd))
+            Some((tick.price_usd, tick.liquidity_usd, false))
         }
         Ok(bad) => {
             // A feed print of NaN/zero/negative is worse than none: it
@@ -260,7 +309,7 @@ pub fn resolve_entry(
                 } else {
                     0.0
                 };
-                Some((quote, liquidity))
+                Some((quote, liquidity, true))
             }
             _ => {
                 warn!(error = %e, "curve read failed and no valid override; dropping signal");
@@ -309,6 +358,8 @@ pub struct Pipeline<
     pub followed: Mutex<HashMap<String, FollowState>>,
     /// Raydium vault ticker for followed pools.
     pub vaults: VaultTicker,
+    /// Shared SOL/USD feed (dynamic, stale-gated) for live sizing.
+    pub sol_feed: Arc<SolUsdFeed>,
     /// On-chain screening source (dev history + curve reads).
     pub screener: S,
     /// Watchlist state plus per-mint signal context (single lock).
@@ -333,6 +384,18 @@ pub struct LiveExecution<L = LiveTrader> {
     pub live_positions: Mutex<HashMap<String, LivePosition>>,
     /// Live-sell retry bookkeeping: `(attempts, last_attempt_secs)`.
     pub live_retry: Mutex<HashMap<String, (u32, u64)>>,
+    /// Mints that gave up the automated exit: the position is still held
+    /// on-chain (never silently dropped) but needs a human exit — kept
+    /// here (not in `live_positions`) so the tick loop stops probing
+    /// while the shutdown snapshot still reports them.
+    pub live_manual: Mutex<HashMap<String, LivePosition>>,
+    /// Paper-open but live-missing: the live buy definitively failed
+    /// (bad order / dispatch error, no fill, no pending) while paper
+    /// stayed open. No funds at risk, but paper PnL is live-fake — kept
+    /// here so the shutdown snapshot and heat cap see the divergence
+    /// instead of silently trusting paper. Unknown fills (no signature)
+    /// park in `live_manual` instead (may hold, needs exit review).
+    pub live_diverged: Mutex<HashMap<String, String>>,
     /// Per-mint dispatch locks: probe sizing and tracking updates must
     /// not interleave across concurrent ticks for one mint, but a slow
     /// confirm on mint A must never block exits on mint B (a global
@@ -349,6 +412,8 @@ impl<L> LiveExecution<L> {
             live: None,
             live_positions: Mutex::new(HashMap::new()),
             live_retry: Mutex::new(HashMap::new()),
+            live_manual: Mutex::new(HashMap::new()),
+            live_diverged: Mutex::new(HashMap::new()),
             live_sell_locks: Mutex::new(HashMap::new()),
         }
     }
@@ -365,6 +430,10 @@ pub const FOLLOW_SPIKE_MULT: f64 = 2.0;
 /// Pool ticks older than this (seconds) are ignored: a stale baseline or
 /// spike check is worse than none (thin/manipulated prints linger).
 pub const POOL_TICK_STALE_SECS: u64 = 300;
+/// Curve ticks older than this (seconds) are ignored: a hung ticker round
+/// (15s budget + 60s overall timeout) must not drive TP/SL/trailing exits
+/// on a stale print. Mirrors the pool rule above.
+pub const CURVE_TICK_STALE_SECS: u64 = 120;
 
 /// Post-migration follow state per mint.
 #[derive(Debug, Clone)]
@@ -410,6 +479,10 @@ struct TrackedOpen<'a> {
     profile: &'a risk_engine::RiskProfile,
     allow_live: bool,
     creator: Option<&'a str>,
+    /// Watchlist-gate mayhem hint: first successful buy signature seen
+    /// while waiting for quorum. Carried to the live buy so the executor
+    /// copies `[16]`/`[17]` without a full curve scan.
+    mayhem_ref_sig: Option<&'a str>,
     /// Trailing giveback resolved per strategy (runner uses its own wide
     /// trail; everything else uses the shared setting).
     trail_percent: f64,
@@ -431,6 +504,15 @@ pub struct PendingSignal {
     pub creation_slot: u64,
     /// Signature watermark for incremental curve reads.
     pub last_sig: Option<String>,
+    /// First successful buy signature observed while waiting for buyer
+    /// quorum. Gate observations only record successful transactions
+    /// (failed ones are skipped in `read_curve_swaps`), so this names a
+    /// same-curve buy whose `[16]`/`[17]` mayhem routing the live buy
+    /// can copy before sending its bundle — the fix for 6062
+    /// (`BuybackFeeRecipientMissing`) on mayhem curves, where neither
+    /// account derives from a static seed. `None` until the first buy
+    /// is seen; the executor falls back to its bounded curve scan.
+    pub mayhem_ref_sig: Option<String>,
     /// Continuous dev-trust score (0.4–1.0) from the launch-time screen,
     /// carried to confirm time for the risk input. On v2 launches with a
     /// distinct creator this is the WORST of both insider screens.
@@ -524,6 +606,7 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         screener: S,
         alerts: Option<T>,
         vaults: VaultTicker,
+        sol_feed: Arc<SolUsdFeed>,
     ) -> Arc<Self> {
         let gate = EntryGate::new(settings.gate_window_secs, settings.gate_min_buyers);
         let strategy = settings.strategy_mode.parse().unwrap_or_else(|e| {
@@ -546,6 +629,7 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             strategy,
             alerts,
             vaults,
+            sol_feed,
         })
     }
 
@@ -567,14 +651,26 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
 
     /// Mints with tracked live fills (shutdown snapshot: these need
     /// manual review when the drain does not finish them).
-    pub async fn live_tracked_mints(&self) -> Vec<String> {
-        self.exec
+    pub async fn live_tracked_mints(&self) -> Vec<String>
+    where
+        L: LiveSink,
+    {
+        let mut mints: Vec<String> = self
+            .exec
             .live_positions
             .lock()
             .await
             .keys()
             .cloned()
-            .collect()
+            .collect();
+        mints.extend(self.exec.live_manual.lock().await.keys().cloned());
+        mints.extend(self.exec.live_diverged.lock().await.keys().cloned());
+        if let Some(trader) = &self.exec.live {
+            mints.extend(trader.pending_mints());
+        }
+        mints.sort();
+        mints.dedup();
+        mints
     }
 
     /// Claim the gate-poll slot; false when a round is already running.
@@ -684,6 +780,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 score: report.score,
                 creation_slot: slot,
                 last_sig: None,
+                mayhem_ref_sig: None,
                 creator: creator.map(|c| c.to_string()),
                 dev_trust: trust,
             },
@@ -790,8 +887,24 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 if stale {
                     GateStep::Stale
                 } else {
+                    // Watchlist-gate mayhem hint: cache the first successful
+                    // buy signature seen while waiting for quorum. Gate
+                    // observations only record successful transactions, so
+                    // this names a same-curve buy whose `[16]`/`[17]`
+                    // routing the live buy copies before sending its
+                    // bundle (6062 fix). First buy wins and survives
+                    // across rounds until confirm/abort removes the entry.
+                    let mut hint_changed = false;
+                    if signal.mayhem_ref_sig.is_none()
+                        && let Some(first_buy) = swaps.iter().find(|s| s.side == SwapSide::Buy)
+                    {
+                        signal.mayhem_ref_sig = Some(first_buy.signature.clone());
+                        hint_changed = true;
+                    }
                     if let Some(sig) = newest {
                         signal.last_sig = Some(sig);
+                        state.meta.insert(mint.clone(), signal.clone());
+                    } else if hint_changed {
                         state.meta.insert(mint.clone(), signal.clone());
                     }
                     match state.gate.observe(&mint, &swaps, now_secs()) {
@@ -875,11 +988,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let tick_result = self.reserves.fetch_tick(mint, &signal.curve).await;
         // A manual QUOTE_USD fallback is for paper/tests only: never let
         // real funds ride on an operator-set price when the feed is down.
-        let priced_via_override = tick_result.is_err();
-        if priced_via_override {
-            warn!(%mint, "reserve read failed; trying QUOTE_USD override (paper-only)");
-        }
-        let Some((entry_quote, liquidity_usd)) = resolve_entry(
+        // The flag comes from the resolver itself (single source), so a
+        // future caller cannot misderive it from `tick_result.is_err()`.
+        let Some((entry_quote, liquidity_usd, priced_via_override)) = resolve_entry_with_flag(
             tick_result,
             self.settings.quote_usd,
             self.settings.liquidity_usd,
@@ -957,6 +1068,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             profile: &profile,
             allow_live: req.allow_live && !priced_via_override,
             creator: signal.creator.as_deref(),
+            mayhem_ref_sig: signal.mayhem_ref_sig.as_deref(),
             trail_percent,
         })
         .await;
@@ -975,6 +1087,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let allow_live = req.allow_live;
         let trail_percent = req.trail_percent;
         let creator = req.creator;
+        let mayhem_ref_sig = req.mayhem_ref_sig;
         // Circuit breaker first: past the day-loss cap, no new risk —
         // paper or live. Exits are unaffected (handled on ticks).
         if self.daily.lock().await.tripped(self.settings.max_daily_loss_usd, now_secs()) {
@@ -1040,8 +1153,24 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // out (paper still opens for manual review).
                 if let Err(e) = self.reserves.watch(mint, curve).await {
                     warn!(%mint, error = %e, "ticker watch failed; paper-only, live mirror skipped");
+                    if allow_live {
+                        self.exec
+                            .live_diverged
+                            .lock()
+                            .await
+                            .insert(mint.to_string(), "live buy skipped: ticker watch failed".to_string());
+                        self.emit(format!("ticker watch failed on {mint}; paper open WITHOUT live cover"));
+                    }
                 } else if allow_live {
-                    self.live_buy(mint, curve, assoc_curve, entry_quote, creator).await;
+                    self.live_buy(
+                        mint,
+                        curve,
+                        assoc_curve,
+                        entry_quote,
+                        creator,
+                        mayhem_ref_sig,
+                    )
+                    .await;
                 }
             }
             Err(e) => warn!(%mint, error = %e, "paper open failed"),
@@ -1049,7 +1178,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     }
 
     /// Mirror a paper open with a real Jito-routed buy (live mode only).
-    /// Paper state is authoritative; live failures only log loudly.
+    /// Paper opens first; live failures park explicitly (diverged for
+    /// definitive no-fill, manual for unknown fills) so paper never
+    /// silently poses as live. Fail-closed on stale SOL/USD.
+    /// Note: `entry_quote` embeds fetch-time SOL while `sol_usd` is
+    /// fresh — two reads of a moving price. The slippage-ceiling guard
+    /// absorbs normal intra-tick drift, and the 120s staleness gates on
+    /// both legs bound the worst case (a missed guard fails closed at
+    /// simulation with 6002, never as an unprotected dispatch).
     async fn live_buy(
         &self,
         mint: &str,
@@ -1057,8 +1193,77 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         assoc_curve: &str,
         entry_quote: f64,
         creator: Option<&str>,
+        mayhem_ref_sig: Option<&str>,
     ) {
         let Some(trader) = &self.exec.live else { return };
+        let Some(sol_usd) = self.sol_feed.price() else {
+            warn!(%mint, "stale SOL/USD — live buy skipped (no static fallback)");
+            // Buys are one-shot at open (never retried), so a skip leaves
+            // paper permanently uncovered — mark it diverged like every
+            // other skip path. Healed by a later successful buy; cleared
+            // when the paper position closes (see `on_tick`).
+            self.exec
+                .live_diverged
+                .lock()
+                .await
+                .insert(mint.to_string(), "live buy skipped: stale SOL/USD".to_string());
+            self.emit(format!("LIVE buy skipped on {mint} (stale SOL/USD); paper open WITHOUT live cover"));
+            return;
+        };
+        // Per-mint serialization (same lock map as `live_sell`): two
+        // concurrent buys for one mint must not both dispatch (the
+        // second fill would orphan), and a buy racing a sell for the
+        // same mint must not interleave sizing with custody updates.
+        // Other mints proceed freely.
+        let serial = {
+            let mut locks = self.exec.live_sell_locks.lock().await;
+            locks
+                .entry(mint.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _serial = serial.lock().await;
+        // Live heat: paper heat caps paper slots exactly, but live bags
+        // outlive paper (failed sells park to manual/pending while the
+        // paper slot frees). Count distinct live-exposure mints so real
+        // funds cannot stack past the cap while paper looks empty.
+        {
+            let mut exposure: Vec<String> = self
+                .exec
+                .live_positions
+                .lock()
+                .await
+                .keys()
+                .cloned()
+                .collect();
+            exposure.extend(self.exec.live_manual.lock().await.keys().cloned());
+            exposure.extend(trader.pending_mints());
+            exposure.sort();
+            exposure.dedup();
+            let already_exposed = exposure.iter().any(|m| m == mint);
+            if !already_exposed && exposure.len() >= self.settings.max_open_positions {
+                warn!(%mint, cap = self.settings.max_open_positions, "live heat limit: paper opens, live mirror skipped (real exposure at cap)");
+                self.exec
+                    .live_diverged
+                    .lock()
+                    .await
+                    .insert(mint.to_string(), "live buy skipped: heat limit".to_string());
+                self.emit(format!("live heat limit on {mint}: paper-only, live skipped (exposure at cap)"));
+                return;
+            }
+        }
+        // Pre-dispatch duplicate guard: never spend a bundle on a mint
+        // already tracked / manual / pending. The post-dispatch check
+        // below stays as defense-in-depth (a concurrent buy may have
+        // landed first while this one was in flight).
+        if self.exec.live_positions.lock().await.contains_key(mint)
+            || self.exec.live_manual.lock().await.contains_key(mint)
+            || trader.pending_mints().iter().any(|m| m == mint)
+        {
+            warn!(%mint, "LIVE buy skipped: mint already tracked/manual/pending; no dispatch (paper stays open, no new funds)");
+            self.emit(format!("LIVE buy skipped on already-tracked {mint}; no dispatch"));
+            return;
+        }
         match trader
             .buy(&LiveBuyParams {
                 mint,
@@ -1066,21 +1271,85 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 assoc_curve,
                 notional_usd: self.settings.notional_usd,
                 price_usd: entry_quote,
-                sol_usd: self.settings.sol_usd,
+                sol_usd,
                 creator,
+                mayhem_ref_sig,
             })
             .await
         {
             Ok((position, bundle)) => {
+                // Defense-in-depth: the pre-dispatch guard above passed,
+                // but a concurrent buy may have landed first while this
+                // dispatch was in flight. The second fill is REAL on-chain
+                // custody — park it in `live_manual` (human exit), never
+                // drop it silently.
+                if self.exec.live_positions.lock().await.contains_key(mint)
+                    || self.exec.live_manual.lock().await.contains_key(mint)
+                    || trader.pending_mints().iter().any(|m| m == mint)
+                {
+                    warn!(%mint, %bundle, amount = position.amount_tokens, "LIVE buy landed for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
+                    trader.record_manual(&position);
+                    self.exec
+                        .live_manual
+                        .lock()
+                        .await
+                        .insert(format!("{mint}#2-{}", &bundle[..bundle.len().min(8)]), position);
+                    self.emit(format!("second LIVE bag on {mint} ({bundle}); MANUAL EXIT REQUIRED"));
+                    return;
+                }
                 let amount = position.amount_tokens;
-                self.exec.live_positions
+                // WAL first (write-ahead): a crash between here and the
+                // insert below replays to a tracked fill, never to loss.
+                trader.acknowledge_buy(&position, &bundle);
+                self.exec
+                    .live_positions
                     .lock()
                     .await
                     .insert(mint.to_string(), position);
+                // A belated live fill heals a prior diverged mark for the
+                // same mint (paper is live-backed again).
+                self.exec.live_diverged.lock().await.remove(mint);
+                // Real dispatch cost hits the day-loss gate now (tip +
+                // priority fee left the wallet whether or not the trade
+                // wins).
+                let buy_tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
+                if buy_tip_usd.is_finite() && buy_tip_usd > 0.0 {
+                    self.daily.lock().await.record(-buy_tip_usd, now_secs());
+                }
                 warn!(%mint, "LIVE buy dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_buy(mint, &bundle, amount));
             }
-            Err(e) => warn!(%mint, error = %e, "LIVE buy FAILED or unconfirmed; paper position still open (unconfirmed fills are rechecked automatically)"),
+            Err(LiveError::UnknownDispatch { position, reason }) => {
+                // No signature, no recheck possible: the fill may or may
+                // not exist. Park the intended bag as manual (possibly
+                // holding — needs an exit review), never drop it.
+                warn!(%mint, error = %reason, "LIVE buy dispatch unknown; parked for manual review (may hold)");
+                trader.record_manual(&position);
+                self.exec
+                    .live_manual
+                    .lock()
+                    .await
+                    .insert(mint.to_string(), *position);
+                self.emit(format!("LIVE buy dispatch unknown on {mint}; MANUAL REVIEW REQUIRED (fill unknown)"));
+            }
+            Err(LiveError::Unconfirmed(msg)) => {
+                // Pending is already tracked inside the trader for the
+                // receipt-bearing path: the recheck loop owns it. Warn
+                // only; GiveUp later parks it to manual (never silent).
+                warn!(%mint, error = %msg, "LIVE buy unconfirmed; tracked as pending, rechecking");
+            }
+            Err(e) => {
+                // Definitive no-fill (bad order / dispatch reject): paper
+                // stays open but is explicitly diverged — no funds at
+                // risk, paper PnL must not be read as live.
+                warn!(%mint, error = %e, "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
+                self.exec
+                    .live_diverged
+                    .lock()
+                    .await
+                    .insert(mint.to_string(), e.to_string());
+                self.emit(format!("LIVE buy failed on {mint} ({e}); paper open WITHOUT live cover"));
+            }
         }
     }
 
@@ -1096,11 +1365,29 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             let mint = recheck.position.mint.clone();
             match recheck.outcome {
                 RecheckOutcome::Confirmed => {
+                    // Same no-overwrite rule as the fast buy path: a
+                    // late confirmation never clobbers a newer bag. The
+                    // late fill is still real custody — park it manual.
+                    if self.exec.live_positions.lock().await.contains_key(&mint)
+                        || self.exec.live_manual.lock().await.contains_key(&mint)
+                    {
+                        warn!(mint = %mint, bundle = %recheck.bundle_id, amount = recheck.position.amount_tokens, "late LIVE buy confirm for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
+                        trader.record_manual(&recheck.position);
+                        self.exec.live_manual.lock().await.insert(
+                            format!("{mint}#late-{}", &recheck.bundle_id[..recheck.bundle_id.len().min(8)]),
+                            recheck.position,
+                        );
+                        self.emit(format!("late LIVE buy confirm on already-tracked {mint}; MANUAL REVIEW REQUIRED"));
+                        continue;
+                    }
                     let amount = recheck.position.amount_tokens;
+                    // WAL first (write-ahead), then track.
+                    trader.acknowledge_buy(&recheck.position, &recheck.bundle_id);
                     self.exec.live_positions
                         .lock()
                         .await
                         .insert(mint.clone(), recheck.position);
+                    self.exec.live_diverged.lock().await.remove(&mint);
                     warn!(mint = %mint, "LIVE buy confirmed late; now tracked with exits");
                     self.emit(Alerter::format_live_buy(&mint, &recheck.bundle_id, amount));
                 }
@@ -1111,22 +1398,43 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     warn!(mint = %mint, bundle = %recheck.bundle_id, "pending LIVE buy still unconfirmed; keeping for next round");
                 }
                 RecheckOutcome::GiveUp => {
-                    warn!(mint = %mint, bundle = %recheck.bundle_id, "pending LIVE buy unconfirmed after retries; MANUAL REVIEW REQUIRED");
+                    // Out of rechecks with no verdict: the fill may exist
+                    // on-chain. Park the intended bag as manual (possibly
+                    // holding) so the shutdown snapshot reports it —
+                    // never drop custody silently.
+                    warn!(mint = %mint, bundle = %recheck.bundle_id, "pending LIVE buy unconfirmed after retries; parked for MANUAL REVIEW (may hold)");
+                    trader.record_manual(&recheck.position);
+                    self.exec
+                        .live_manual
+                        .lock()
+                        .await
+                        .insert(mint.clone(), recheck.position);
+                    self.emit(format!("LIVE buy unconfirmed on {mint}; MANUAL REVIEW REQUIRED (may hold)"));
                 }
             }
         }
     }
 
     /// Mirror paper closes with proportional Jito-routed sells (live mode
-    /// only). Sells `fraction_closed` of the tracked amount so moonbag
-    /// scale-outs mirror exactly; dust write-offs drop tracking with a
-    /// loud log. No-ops when nothing is tracked for the mint. Dispatches
-    /// serialize per mint; failures back off with cooldown + attempt
-    /// budget while successes reset it. Deterministic pre-dispatch
-    /// rejects (bad keys, dust floor) re-probe on cooldown without
-    /// consuming budget.
-    async fn live_sell(&self, mint: &str, price_usd: f64, fraction_closed: f64) {
-        let Some(trader) = &self.exec.live else { return };
+    /// only). Fail-closed on stale SOL/USD. Returns true when the live
+    /// leg is settled (sold, parked to manual, or nothing held) and the
+    /// paper PnL may feed the breaker; false when live still holds and
+    /// the breaker must defer (recording paper profit while holding the
+    /// bag would make the day-loss gate optimistic vs real loss).
+    async fn live_sell(&self, mint: &str, price_usd: f64, fraction_closed: f64) -> bool {
+        let Some(trader) = &self.exec.live else { return true };
+        let Some(sol_usd) = self.sol_feed.price() else {
+            // No stamp: the next tick must retry immediately when the
+            // feed recovers (a cooldown stamp here would delay exits
+            // past recovery by 30s). Loud warn + card instead.
+            warn!(%mint, "stale SOL/USD — live sell skipped (no static fallback); will retry next tick");
+            self.emit(format!("stale SOL/USD — live sell stalled on {mint}; exits resume when feed recovers"));
+            // Still holding iff a live bag exists anywhere (positions,
+            // manual, or pending) — else nothing to defer.
+            return !self.exec.live_positions.lock().await.contains_key(mint)
+                && !self.exec.live_manual.lock().await.contains_key(mint)
+                && !trader.pending_mints().iter().any(|m| m == mint);
+        };
         // Per-mint serialization: sizing and tracking stay atomic across
         // concurrent ticks for THIS mint, while other mints exit freely.
         let serial = {
@@ -1151,20 +1459,39 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .is_some_and(|(_, last)| now.saturating_sub(*last) < SELL_RETRY_COOLDOWN.as_secs())
         };
         if cooling {
-            return;
+            return false;
         }
         let probe = {
             let guard = self.exec.live_positions.lock().await;
             let Some(tracked) = guard.get(mint) else {
-                return;
+                return true;
             };
-            let sell_amount =
-                ((tracked.amount_tokens as f64) * fraction_closed.clamp(0.0, 1.0)) as u64;
+            // Integer sell math: (amount * numer)/10000, never f64 truncation
+            // past 2^53 — floor, never ceiling (oversell is unauthorized).
+            let numer = (fraction_closed.clamp(0.0, 1.0) * 10_000.0).floor() as u64;
+            let held = tracked.amount_tokens;
+            let sell_amount = ((held as u128 * numer as u128) / 10_000u128) as u64;
+            if sell_amount > held {
+                warn!(mint = %mint, sell_amount, held, "live sell sizing overflow; refusing");
+                return false;
+            }
             // Floor (never ceiling): the live leg must never oversell
             // custody — any dust shortfall self-heals via the no-paper
             // retry path, which re-sells the remainder at full fraction.
+            // Settled for the breaker (dust value is ~0) but stamp the
+            // cooldown so re-probes don't spam every tick. Guard drops
+            // before the retry lock (never nested, never across await).
             if sell_amount == 0 {
-                return;
+                drop(guard);
+                warn!(mint = %mint, fraction_closed, held, "live sell sizes to zero dust; holding, will re-probe");
+                self.exec
+                    .live_retry
+                    .lock()
+                    .await
+                    .entry(mint.to_string())
+                    .or_insert((0u32, 0u64))
+                    .1 = now;
+                return true;
             }
             LivePosition {
                 mint: tracked.mint.clone(),
@@ -1174,8 +1501,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 creator: tracked.creator.clone(),
             }
         };
-        match trader.sell(&probe, price_usd, self.settings.sol_usd).await {
+        match trader.sell(&probe, price_usd, sol_usd).await {
             Ok(bundle) => {
+                // WAL first (write-ahead): a crash between here and the
+                // subtract below replays to a subtracted position, never
+                // to a resurrected bag (which would double-sell).
+                trader.record_sell(mint, probe.amount_tokens, &bundle);
                 // Confirmed on-chain by LiveTrader: mirror the fill locally.
                 {
                     let mut guard = self.exec.live_positions.lock().await;
@@ -1193,30 +1524,28 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // 5-attempt budget and stamped the cooldown, throttling
                 // the runner exit after a TP scale-out).
                 self.exec.live_retry.lock().await.remove(mint);
+                // Real dispatch cost: tip + priority fee left the wallet,
+                // so the day-loss gate sees live bleed, not paper-only
+                // profit.
+                let tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
+                if tip_usd.is_finite() && tip_usd > 0.0 {
+                    self.daily.lock().await.record(-tip_usd, now_secs());
+                }
                 warn!(%mint, %bundle, "LIVE sell dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_sell(mint, &bundle));
+                true
             }
             Err(e) => {
                 // Deterministic pre-dispatch rejects (bad keys, dust
-                // floor) would never succeed on retry: re-probe at the
-                // cooldown cadence (a later tick may price out of dust)
-                // without consuming the attempt budget.
+                // floor) re-probe at the cooldown cadence — a later tick
+                // may price out of dust — but bounded: a permanently
+                // unroutable bag parks to manual after the budget instead
+                // of holding the feed forever.
                 let deterministic = matches!(
                     &e,
                     LiveError::BadOrder(_)
                         | LiveError::Dispatch(ExecutorError::BadOrder(_))
                 );
-                if deterministic {
-                    self.exec
-                        .live_retry
-                        .lock()
-                        .await
-                        .entry(mint.to_string())
-                        .or_insert((0u32, 0u64))
-                        .1 = now;
-                    warn!(%mint, error = %e, "LIVE sell rejected before dispatch; holding, will re-probe");
-                    return;
-                }
                 let attempts = {
                     let mut retry = self.exec.live_retry.lock().await;
                     let entry = retry.entry(mint.to_string()).or_insert((0u32, 0u64));
@@ -1224,12 +1553,36 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     entry.1 = now;
                     entry.0
                 };
-                if attempts > SELL_MAX_ATTEMPTS {
+                if attempts >= SELL_MAX_ATTEMPTS {
+                    // Give up the AUTOMATED exit, not the position: the
+                    // bag is still held on-chain, so park it in
+                    // `live_manual` (reported by the shutdown snapshot)
+                    // and stop probing — never silently drop custody.
                     self.exec.live_retry.lock().await.remove(mint);
-                    self.exec.live_positions.lock().await.remove(mint);
-                    warn!(%mint, "LIVE sell gave up after retries; MANUAL EXIT REQUIRED");
+                    // WAL first (write-ahead): record before removing from
+                    // `live_positions`, so a crash replays to manual, not loss.
+                    let held = self.exec.live_positions.lock().await.get(mint).cloned();
+                    if let Some(held) = held {
+                        trader.record_manual(&held);
+                    }
+                    if let Some(held) = self.exec.live_positions.lock().await.remove(mint) {
+                        self.exec.live_manual.lock().await.insert(mint.to_string(), held);
+                    }
+                    if deterministic {
+                        warn!(%mint, error = %e, "LIVE sell deterministically rejected after budget; parked for manual exit (still HELD)");
+                    } else {
+                        warn!(%mint, "LIVE sell gave up after retries; parked for manual exit (still HELD)");
+                    }
+                    self.emit(format!("LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"));
+                    // Auto-exit is over (human owns it): the paper PnL may
+                    // settle — the bag is still reported via live_manual.
+                    true
+                } else if deterministic {
+                    warn!(%mint, error = %e, attempts, "LIVE sell rejected before dispatch; holding, will re-probe");
+                    false
                 } else {
                     warn!(%mint, error = %e, "LIVE sell unconfirmed; holding, will retry");
+                    false
                 }
             }
         }
@@ -1277,6 +1630,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.exec.live_positions.lock().await.contains_key(&tick.mint) {
             return;
         }
+        if self.exec.live_manual.lock().await.contains_key(&tick.mint) {
+            return;
+        }
         if self.gate_state.lock().await.gate.contains(&tick.mint) {
             return;
         }
@@ -1294,6 +1650,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// close on trigger, retry failed live exits, unwatch when nothing
     /// remains.
     pub async fn on_tick(&self, tick: &PriceTick) {
+        // Stale curve ticks must not drive exits: a hung ticker round
+        // (60s overall timeout) would otherwise TP/SL on an old print.
+        let age = now_secs().saturating_sub(tick.observed_at);
+        if age >= CURVE_TICK_STALE_SECS {
+            warn!(mint = %tick.mint, age, observed_at = tick.observed_at, "stale curve tick — dropped");
+            return;
+        }
         // Per-mint serialization: two ticks for one mint must not
         // interleave close math and live probes (fractions computed from
         // divergent views would double-sell or strand dust).
@@ -1321,6 +1684,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             self.maybe_unwatch(tick).await;
             return;
         } else {
+            // `tick.price_usd` embeds the SOL price from fetch time, and
+            // SOL may be staler than the curve print (up to ~240s
+            // combined). Never fire price-triggered TP/SL on a USD value
+            // whose FX leg is dead — defer the round. Migration closes
+            // bypass this (the curve is gone; `live_sell` still gates on
+            // fresh SOL itself).
+            if !tick.complete && self.sol_feed.price().is_none() {
+                drop(portfolio);
+                warn!(mint = %tick.mint, "stale SOL/USD — paper exits deferred (no static fallback)");
+                self.recheck_live_pending().await;
+                self.maybe_unwatch(tick).await;
+                return;
+            }
             if tick.complete {
                 warn!(mint = %tick.mint, "curve migrated; closing positions (spot stale)");
             }
@@ -1373,7 +1749,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             equity,
                             is_moonbag_exit,
                         ));
-                        closed_fraction = closed_fraction.max(trade.fraction_closed);
+                        closed_fraction = (closed_fraction + trade.fraction_closed).min(1.0);
                     }
                     Err(e) => warn!(mint = %tick.mint, id, error = %e, "paper close failed"),
                 }
@@ -1381,26 +1757,48 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
 
         drop(portfolio);
-        // Feed the day-loss breaker with the guard released. Lock order
-        // is now uniform everywhere (breaker and portfolio are never held
-        // together), so concurrent opens and ticks cannot deadlock.
-        // Exits keep working even past the cap — only new entries halt.
-        for pnl in closed_pnls {
-            self.daily.lock().await.record(pnl, now);
-        }
         for (reason, pnl, pct, equity, moonbag) in closed_cards {
             self.emit(Alerter::format_exit(
                 &tick.mint, &reason, pnl, pct, equity, moonbag,
             ));
         }
-        if closed_fraction > 0.0 {
+        // Live leg first, breaker second: when live still holds after a
+        // paper close, the paper profit must NOT feed the day-loss gate
+        // yet (it would mask real loss). Defer until the live leg
+        // settles (sold / manual / nothing held).
+        let live_settled = if closed_fraction > 0.0 {
             self.live_sell(&tick.mint, tick.price_usd, closed_fraction)
-                .await;
+                .await
+        } else {
+            true
+        };
+        // Feed the day-loss breaker with the guard released. Lock order
+        // is now uniform everywhere (breaker and portfolio are never held
+        // together), so concurrent opens and ticks cannot deadlock.
+        // Exits keep working even past the cap — only new entries halt.
+        if live_settled {
+            for pnl in closed_pnls {
+                self.daily.lock().await.record(pnl, now);
+            }
+        } else {
+            warn!(mint = %tick.mint, "paper closed but live still holds; breaker PnL deferred until live settles");
         }
         // Pending buys recheck before the unwatch decision so a late
         // confirmation keeps its feed (cheap when a round is already in
         // flight: late callers skip).
         self.recheck_live_pending().await;
+        // Divergence ends with the paper lifecycle: no open paper
+        // position, nothing to be diverged from. Bounds `live_diverged`
+        // growth (skips heal here if they never got a buy).
+        if self
+            .portfolio
+            .lock()
+            .await
+            .positions_for_mint(&tick.mint)
+            .is_empty()
+        {
+            self.exec.live_diverged.lock().await.remove(&tick.mint);
+        }
         // Shared tail (see above): re-checks under fresh locks, so a
         // position opened by the gate task during the awaits above is
         // never unwatched from under it.
@@ -1585,6 +1983,7 @@ mod tests {
 
     struct StubLiveInner {
         buys: StdMutex<Vec<(String, String, String, f64)>>,
+        mayhem_hints: StdMutex<Vec<Option<String>>>,
         sells: StdMutex<Vec<(String, u64)>>,
         fail_buys: std::sync::atomic::AtomicBool,
         fail_sells: std::sync::atomic::AtomicBool,
@@ -1605,6 +2004,7 @@ mod tests {
             Self {
                 inner: Arc::new(StubLiveInner {
                     buys: StdMutex::new(vec![]),
+                    mayhem_hints: StdMutex::new(vec![]),
                     sells: StdMutex::new(vec![]),
                     fail_buys: std::sync::atomic::AtomicBool::new(false),
                     fail_sells: std::sync::atomic::AtomicBool::new(false),
@@ -1618,6 +2018,10 @@ mod tests {
 
         fn buys(&self) -> Vec<(String, String, String, f64)> {
             self.inner.buys.lock().expect("lock").clone()
+        }
+
+        fn mayhem_hints(&self) -> Vec<Option<String>> {
+            self.inner.mayhem_hints.lock().expect("lock").clone()
         }
 
         fn sells(&self) -> Vec<(String, u64)> {
@@ -1644,6 +2048,11 @@ mod tests {
                 assoc_curve.to_string(),
                 notional_usd,
             ));
+            self.inner
+                .mayhem_hints
+                .lock()
+                .expect("lock")
+                .push(req.mayhem_ref_sig.map(|s| s.to_string()));
             Ok((
                 LivePosition {
                     mint: mint.to_string(),
@@ -1787,7 +2196,7 @@ mod tests {
             price_usd: price,
             liquidity_usd: 30_000.0,
             complete: false,
-            observed_at: 2_000,
+            observed_at: now_secs(),
         }
     }
 
@@ -2009,7 +2418,7 @@ mod tests {
             "https://api.mainnet-beta.solana.com",
             curve::CurveTicker::parse_commitment("confirmed").expect("known commitment"),
             std::time::Duration::from_millis(500),
-            150.0,
+            curve::SolUsdFeed::new_for_test(150.0),
         )
         .expect("vault ticker");
         Pipeline::shared(
@@ -2022,6 +2431,7 @@ mod tests {
             screener,
             alerts,
             vaults,
+            curve::SolUsdFeed::new_for_test(150.0),
         )
     }
 
@@ -2033,21 +2443,24 @@ mod tests {
     fn entry_prefers_live_tick_over_override() {
         let live = tick("M", 2.0);
         assert_eq!(
-            resolve_entry(Ok(live), Some(9.0), 500.0),
-            Some((2.0, 30_000.0))
+            resolve_entry_with_flag(Ok(live), Some(9.0), 500.0),
+            Some((2.0, 30_000.0, false))
         );
     }
 
     #[test]
     fn entry_falls_back_to_override() {
         let err: Result<PriceTick, CurveError> = Err(CurveError::AccountMissing("M".to_string()));
-        assert_eq!(resolve_entry(err, Some(9.0), 500.0), Some((9.0, 500.0)));
+        assert_eq!(
+            resolve_entry_with_flag(err, Some(9.0), 500.0),
+            Some((9.0, 500.0, true))
+        );
     }
 
     #[test]
     fn entry_is_none_without_price_or_override() {
         let err: Result<PriceTick, CurveError> = Err(CurveError::AccountMissing("M".to_string()));
-        assert_eq!(resolve_entry(err, None, 0.0), None);
+        assert_eq!(resolve_entry_with_flag(err, None, 0.0), None);
     }
 
     #[test]
@@ -2082,7 +2495,7 @@ mod tests {
                 observed_at: 2_000,
             };
             assert_eq!(
-                resolve_entry(Ok(bad), Some(9.0), 500.0),
+                resolve_entry_with_flag(Ok(bad), Some(9.0), 500.0),
                 None,
                 "price {price}"
             );
@@ -2096,7 +2509,7 @@ mod tests {
                 complete: false,
                 observed_at: 2_000,
             };
-            assert_eq!(resolve_entry(Ok(bad), Some(9.0), 500.0), None, "liq {liq}");
+            assert_eq!(resolve_entry_with_flag(Ok(bad), Some(9.0), 500.0), None, "liq {liq}");
         }
     }
 
@@ -2106,15 +2519,15 @@ mod tests {
             || Result::<PriceTick, CurveError>::Err(CurveError::AccountMissing("M".to_string()));
         for quote in [f64::NAN, 0.0, -9.0] {
             assert_eq!(
-                resolve_entry(missing(), Some(quote), 500.0),
+                resolve_entry_with_flag(missing(), Some(quote), 500.0),
                 None,
                 "quote {quote}"
             );
         }
         // Bad fallback liquidity degrades to 0 rather than poisoning risk.
         assert_eq!(
-            resolve_entry(missing(), Some(9.0), f64::NAN),
-            Some((9.0, 0.0))
+            resolve_entry_with_flag(missing(), Some(9.0), f64::NAN),
+            Some((9.0, 0.0, true))
         );
     }
 
@@ -2182,6 +2595,7 @@ mod tests {
         assert!(pipe.live_tracked_mints().await.is_empty());
         assert_eq!(pipe.pending_count().await, 0);
         // Manual paper open + tracked live fill surface by mint.
+        let opened_now = now_secs();
         pipe.portfolio
             .lock()
             .await
@@ -2197,7 +2611,7 @@ mod tests {
                 0.0,
                 0,
                 0.0,
-                1000,
+                opened_now,
             )
             .expect("manual open");
         pipe.exec.live_positions.lock().await.insert(
@@ -2826,7 +3240,7 @@ mod tests {
                     0.0,
                     0,
                     0.0,
-                    1000,
+                    now_secs(),
                 )
                 .expect("open B");
         }
@@ -2844,6 +3258,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_timeout_closes_stale_position() {
+        let now = now_secs();
         let mut portfolio = funded();
         portfolio
             .open_position(
@@ -2858,7 +3273,7 @@ mod tests {
                 0.0,
                 60,
                 0.0,
-                1000,
+                now,
             )
             .expect("open");
         let pipe = pipeline_screened(
@@ -2871,7 +3286,7 @@ mod tests {
         );
 
         let mut timeout_tick = tick("MINT", 2.0);
-        timeout_tick.observed_at = 1061;
+        timeout_tick.observed_at = now + 61;
         pipe.on_tick(&timeout_tick).await;
 
         let portfolio = pipe.portfolio.lock().await;
@@ -2935,6 +3350,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gate_caches_first_buy_as_mayhem_hint() {
+        // Watchlist gate (1/5): the first successful buy observed while
+        // waiting for quorum is cached on the signal, so the live buy
+        // can copy [16]/[17] before sending its bundle (6062 fix).
+        // Gate observations only record successful transactions, so the
+        // cached signature names a successful same-curve buy.
+        let live = StubLive::working();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        // Quorum confirm forwards the first observed buy sig as hint.
+        assert_eq!(live.buys().len(), 1);
+        assert_eq!(live.mayhem_hints(), vec![Some("MINT-sig11".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn gate_caches_hint_below_quorum() {
+        // Below quorum the entry stays watchlisted, but the hint is
+        // already cached for the later confirm round (first buy wins).
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        assert_eq!(pipe.pending_count().await, 1);
+        let hint = pipe
+            .gate_state
+            .lock()
+            .await
+            .meta
+            .get("MINT")
+            .and_then(|s| s.mayhem_ref_sig.clone());
+        assert_eq!(hint, Some("MINT-sig11".to_string()));
+    }
+
+    #[tokio::test]
     async fn live_buy_failure_keeps_paper_position() {
         let live = StubLive::working();
         live.inner
@@ -2954,9 +3423,12 @@ mod tests {
             .await;
         pipe.poll_gates().await;
 
-        // Paper record survives; nothing tracked for exits.
+        // Paper record survives; nothing tracked for exits, but the
+        // divergence is explicit (paper WITHOUT live cover).
         assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
         assert!(pipe.exec.live_positions.lock().await.is_empty());
+        assert!(pipe.exec.live_diverged.lock().await.contains_key("MINT"));
+        assert!(pipe.live_tracked_mints().await.contains(&"MINT".to_string()));
     }
 
     #[tokio::test]
@@ -3255,7 +3727,7 @@ mod tests {
                     0.0,
                     0,
                     0.0,
-                    1000,
+                    now_secs(),
                 )
                 .expect("open");
         }
@@ -3291,7 +3763,7 @@ mod tests {
                 0.0,
                 0,
                 0.0,
-                1000,
+                now_secs(),
             )
             .expect("open");
         let id = portfolio.position_ids()[0];
@@ -3339,7 +3811,7 @@ mod tests {
         drop(attempts);
 
         // Pre-seed attempts at the cap with a stale timestamp: next tick
-        // gives up, drops tracking, and stops watching the mint.
+        // parks to manual (still HELD) and stops auto-probing the mint.
         {
             let mut retry = pipe.exec.live_retry.lock().await;
             retry.insert("MINT".to_string(), (5u32, 0u64));
@@ -3347,14 +3819,16 @@ mod tests {
         // Paper already closed; drive another tick to trigger the retry path.
         pipe.on_tick(&tick("MINT", 3.0)).await;
         assert!(pipe.exec.live_positions.lock().await.is_empty());
+        assert!(pipe.exec.live_manual.lock().await.contains_key("MINT"));
+        assert!(pipe.live_tracked_mints().await.contains(&"MINT".to_string()));
         assert!(live.sells().is_empty());
     }
 
     #[tokio::test]
-    async fn live_sell_deterministic_reject_skips_budget() {
-        // Pre-dispatch rejects (bad order, dust) re-probe without
-        // consuming the 5-attempt budget: attempts stay empty no matter
-        // how many ticks fail this way.
+    async fn live_sell_deterministic_reject_is_bounded_then_manual() {
+        // Pre-dispatch rejects (bad order, dust) re-probe at the cooldown
+        // cadence but bounded: after the 5-attempt budget the bag parks
+        // to manual instead of holding the feed forever.
         use std::sync::atomic::Ordering;
         let live = StubLive::working();
         live.inner.fail_sells.store(true, Ordering::Relaxed);
@@ -3373,10 +3847,20 @@ mod tests {
         pipe.on_tick(&tick("MINT", 3.0)).await;
         assert!(live.sells().is_empty());
         let retry = pipe.exec.live_retry.lock().await;
-        assert!(retry.get("MINT").is_none_or(|(attempts, _)| *attempts == 0));
+        assert_eq!(retry.get("MINT").map(|(a, _)| *a), Some(1));
         drop(retry);
-        // Still tracked for later re-probes (never given up on).
+        // Still tracked for later re-probes (not yet given up).
         assert!(pipe.exec.live_positions.lock().await.contains_key("MINT"));
+        // Pre-seed at the cap with a stale timestamp: next tick parks to
+        // manual (still HELD) instead of retrying forever.
+        {
+            let mut retry = pipe.exec.live_retry.lock().await;
+            retry.insert("MINT".to_string(), (5u32, 0u64));
+        }
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+        assert!(pipe.exec.live_positions.lock().await.is_empty());
+        assert!(pipe.exec.live_manual.lock().await.contains_key("MINT"));
+        assert!(pipe.live_tracked_mints().await.contains(&"MINT".to_string()));
     }
 
     #[tokio::test]

@@ -28,15 +28,15 @@ pub const RAYDIUM_V4_ACCOUNT_SIZE: usize = 752;
 /// Minimum prefix holding every field we read (through `lpMintAddress`).
 pub const RAYDIUM_V4_MIN_PREFIX: usize = 496;
 
-/// Byte offsets of the 32-byte address slots we parse.
+/// Byte offset of the base-vault address slot.
 pub const OFF_BASE_VAULT: usize = 336;
-/// Byte offsets of the 32-byte address slots we parse.
+/// Byte offset of the quote-vault address slot.
 pub const OFF_QUOTE_VAULT: usize = 368;
-/// Byte offsets of the 32-byte address slots we parse.
+/// Byte offset of the base-mint address slot (WSOL on migrations).
 pub const OFF_BASE_MINT: usize = 400;
-/// Byte offsets of the 32-byte address slots we parse.
+/// Byte offset of the quote-mint address slot (migrated token).
 pub const OFF_QUOTE_MINT: usize = 432;
-/// Byte offsets of the 32-byte address slots we parse.
+/// Byte offset of the LP-mint address slot.
 pub const OFF_LP_MINT: usize = 464;
 
 /// Compile-time guard: the slot table must fit the account. A
@@ -229,10 +229,13 @@ mod tests {
     }
 
     /// Frozen pool fixture shape: `{amm, owner, data: [u8; 752]}`.
+    /// Unknown names panic: silently mapping a typo to the wrong pool
+    /// would green-light a test against unintended bytes.
     fn frozen_pool(name: &str) -> (Pubkey, Pubkey, Vec<u8>) {
         let raw = match name {
             "fartcoin" => include_str!("../tests/fixtures/raydium_pool_fartcoin.json"),
-            _ => include_str!("../tests/fixtures/raydium_pool_mainnet.json"),
+            "mainnet" => include_str!("../tests/fixtures/raydium_pool_mainnet.json"),
+            unknown => panic!("unknown pool fixture: {unknown}"),
         };
         let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
         let parse = |s: &str| {

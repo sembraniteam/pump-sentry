@@ -8,6 +8,7 @@
 //! SPL token account layout (only bytes 64..72 are read):
 //! `mint(32) owner(32) amount(u64 LE) ...` — 165 bytes total.
 
+use curve::SolUsdFeed;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
@@ -34,9 +35,9 @@ pub enum VaultError {
     /// Address is not a valid pubkey: {0}
     #[error("invalid address: {0}")]
     BadAddress(String),
-    /// SOL→USD conversion is not a positive finite price.
-    #[error("invalid SOL/USD price: {0}")]
-    BadSolUsd(f64),
+    /// SOL→USD feed has no fresh price (stale or never fetched).
+    #[error("SOL/USD feed stale: no fresh price")]
+    StaleSolUsd,
 }
 
 /// One pool price observation in USD.
@@ -71,28 +72,23 @@ pub struct VaultTicker {
     rpc: Arc<RpcClient>,
     subs: Arc<RwLock<HashMap<String, WatchedPool>>>,
     interval: Duration,
-    sol_usd: f64,
+    sol_feed: Arc<SolUsdFeed>,
     /// Ticks dropped on a full downstream queue (see `run`).
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl VaultTicker {
     /// Build a ticker: `http_url` + commitment for reads, `interval`
-    /// between poll rounds, `sol_usd` for conversion. A non-positive or
-    /// non-finite `sol_usd` is rejected (it would price every pool at
-    /// nothing or NaN).
+    /// between poll rounds, `sol_feed` for SOL→USD (dynamic, stale-gated).
     pub fn new(
         http_url: &str,
         commitment: CommitmentConfig,
         interval: Duration,
-        sol_usd: f64,
+        sol_feed: Arc<SolUsdFeed>,
     ) -> Result<Self, VaultError> {
         match url::Url::parse(http_url) {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             _ => return Err(VaultError::BadUrl(http_url.to_string())),
-        }
-        if !sol_usd.is_finite() || sol_usd <= 0.0 {
-            return Err(VaultError::BadSolUsd(sol_usd));
         }
         Ok(Self {
             rpc: Arc::new(RpcClient::new_with_commitment(
@@ -101,7 +97,7 @@ impl VaultTicker {
             )),
             subs: Arc::new(RwLock::new(HashMap::new())),
             interval,
-            sol_usd,
+            sol_feed,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -198,6 +194,11 @@ impl VaultTicker {
             if watched.is_empty() {
                 continue;
             }
+            let Some(sol_usd) = self.sol_feed.price() else {
+                debug!("sol_usd stale; skipping pool round");
+                tokio::time::sleep(self.interval).await;
+                continue;
+            };
             // Flatten to chunked batched calls: [base0, quote0, ...] per
             // chunk so pool growth cannot breach per-request limits.
             // Chunks preserve pool order; results are concatenated. The
@@ -235,7 +236,7 @@ impl VaultTicker {
                     &base.owner,
                     &quote.data,
                     &quote.owner,
-                    self.sol_usd,
+                    sol_usd,
                 ) else {
                     debug!(mint = %pool.mint, "pool price uncomputable");
                     continue;
@@ -514,36 +515,26 @@ mod tests {
 
     #[test]
     fn rejects_bad_config() {
+        use curve::SolUsdFeed;
         assert!(
             VaultTicker::new(
                 "notaurl",
                 solana_commitment_config::CommitmentConfig::confirmed(),
                 Duration::from_millis(500),
-                150.0
+                SolUsdFeed::new_for_test(150.0),
             )
             .is_err()
         );
-        for bad in [0.0, -150.0, f64::NAN, f64::INFINITY] {
-            assert!(
-                VaultTicker::new(
-                    "https://api.mainnet-beta.solana.com",
-                    solana_commitment_config::CommitmentConfig::confirmed(),
-                    Duration::from_millis(500),
-                    bad,
-                )
-                .is_err(),
-                "sol {bad}"
-            );
-        }
     }
 
     #[tokio::test]
     async fn watch_unwatch_roundtrip() {
+        use curve::SolUsdFeed;
         let ticker = VaultTicker::new(
             "https://api.mainnet-beta.solana.com",
             solana_commitment_config::CommitmentConfig::confirmed(),
             Duration::from_millis(500),
-            150.0,
+            SolUsdFeed::new_for_test(150.0),
         )
         .expect("ticker");
         assert_eq!(ticker.watched_count().await, 0);

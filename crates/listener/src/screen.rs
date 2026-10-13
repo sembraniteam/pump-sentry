@@ -13,8 +13,9 @@ use crate::parser::{
 };
 pub use ids::{
     ASSOCIATED_TOKEN_PROGRAM_ID, PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR,
+    PUMP_BUY_V3_DISCRIMINATOR, PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR,
     PUMP_MIGRATE_DISCRIMINATOR, PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR,
-    SYSTEM_PROGRAM_ID,
+    PUMP_SELL_V3_DISCRIMINATOR, SYSTEM_PROGRAM_ID,
 };
 use migration::{MigrationDestination, MigrationMonitor, RAYDIUM_V4_PROGRAM_ID, RaydiumV4Pool};
 use solana_client::{
@@ -50,6 +51,10 @@ pub const IDX_SWAP_V2_USER: usize = 13;
 /// Previous name of [`IDX_SWAP_V2_USER`] (kept: the position covers both
 /// v2 sides, not buys only).
 pub const IDX_BUY_V2_USER: usize = IDX_SWAP_V2_USER;
+/// Account index of the trader in v3 (`buy_v3`/`sell_v3`/
+/// `buy_exact_quote_in_v3`) instructions: position 8 (row 9 `user` of
+/// the official 17-account TRADE_V3.md table).
+pub const IDX_SWAP_V3_USER: usize = 8;
 /// Account index of the creator (`user`) in create instructions.
 pub const IDX_CREATE_USER: usize = 7;
 
@@ -155,16 +160,26 @@ pub fn extract_pump_swaps(
         let Some(raw) = decode_ix_data(data_b58) else {
             return;
         };
-        // (side, trader account index): v2 swaps share the side but not
-        // the layout.
-        let (side, user_idx) = if raw.starts_with(&PUMP_BUY_DISCRIMINATOR) {
-            (SwapSide::Buy, IDX_SWAP_USER)
+        // (side, trader account index, amount-u64 offset): each shape
+        // shares the side but not the layout. v3 rows come from the
+        // official TRADE_V3.md 17-account table (user at index 8).
+        let (side, user_idx, amount_off) = if raw.starts_with(&PUMP_BUY_DISCRIMINATOR) {
+            (SwapSide::Buy, IDX_SWAP_USER, 8)
         } else if raw.starts_with(&PUMP_SELL_DISCRIMINATOR) {
-            (SwapSide::Sell, IDX_SWAP_USER)
+            (SwapSide::Sell, IDX_SWAP_USER, 8)
         } else if raw.starts_with(&PUMP_BUY_V2_DISCRIMINATOR) {
-            (SwapSide::Buy, IDX_SWAP_V2_USER)
+            (SwapSide::Buy, IDX_SWAP_V2_USER, 8)
         } else if raw.starts_with(&PUMP_SELL_V2_DISCRIMINATOR) {
-            (SwapSide::Sell, IDX_SWAP_V2_USER)
+            (SwapSide::Sell, IDX_SWAP_V2_USER, 8)
+        } else if raw.starts_with(&PUMP_BUY_V3_DISCRIMINATOR) {
+            (SwapSide::Buy, IDX_SWAP_V3_USER, 8)
+        } else if raw.starts_with(&PUMP_SELL_V3_DISCRIMINATOR) {
+            (SwapSide::Sell, IDX_SWAP_V3_USER, 8)
+        } else if raw.starts_with(&PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR) {
+            // Exact-spend buys carry (spend, min_out): attribute the
+            // conservative token-side bound (`min_tokens_out`, second
+            // u64) so monopoly math never overcounts a bundler.
+            (SwapSide::Buy, IDX_SWAP_V3_USER, 16)
         } else {
             // Unmapped Pump.fun instruction: the trader layout is
             // unproven, so never attribute a side or an amount.
@@ -199,13 +214,16 @@ pub fn extract_pump_swaps(
         let Some(wallet) = keys.get(usize::from(*account)).copied() else {
             return;
         };
-        // Amount is the first u64 for all four variants. Chain-proven for
-        // both v2 sides from frozen samples (trader = fee payer at index
-        // 13; token-balance delta equals bytes 8..16 to the unit — two
+        // Amount is the first u64 for every variant except exact-quote
+        // v3 (second u64, `min_tokens_out`). Chain-proven for both v2
+        // sides from frozen samples (trader = fee payer at index 13;
+        // token-balance delta equals bytes 8..16 to the unit — two
         // independent `buy_v2` txs plus one `sell_v2`) and per the skill
-        // for legacy `buy`/`sell`.
+        // for legacy `buy`/`sell`. v3 first-u64 semantics come from the
+        // official TRADE_V3.md argument tables; v3 frozen samples are
+        // still open work (no replay test pins them yet).
         let amount_base_units = raw
-            .get(8..16)
+            .get(amount_off..amount_off + 8)
             .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0);
@@ -791,7 +809,7 @@ pub async fn read_curve_swaps(
     if truncated {
         // High-velocity gap: newest 75 returned, intermediates missed.
         // Callers must not advance quorum on this partial view.
-        tracing::debug!(
+        debug!(
             pages,
             fetched = records.len(),
             "curve read truncated at page cap; watermark stale"
@@ -829,7 +847,8 @@ fn resolve_keys(
 /// Accepts transaction versions through v1: current Pump.fun launches
 /// are v1 envelopes, and `Some(0)` makes the RPC refuse them outright
 /// (-32015). The Json wire shape decodes identically across versions
-/// (proven by the mainnet `create_v2` replay fixture).
+/// (proven by the mainnet `create_v2` replay fixture). A future v2
+/// envelope fails deterministically here (-32015, loud) — bump then.
 pub fn json_tx_config(commitment: CommitmentConfig) -> RpcTransactionConfig {
     RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Json),
@@ -1968,6 +1987,51 @@ mod tests {
         // account_keys[13] = key(13) in the fabricated tx.
         assert_eq!(records[0].wallet, Pubkey::new_from_array([13; 32]));
         assert_eq!(records[0].amount_base_units, u64::from_le_bytes([7; 8]));
+    }
+
+    #[test]
+    fn classifies_v3_shapes_with_trader_at_index_8() {
+        // v3 layout (official TRADE_V3.md 17-account table): trader
+        // (`user`, row 9) at account position 8 for all three v3 sides.
+        // `buy_v3`/`sell_v3` attribute the first u64; exact-quote
+        // attributes `min_tokens_out` (second u64, conservative bound).
+        let cases = [
+            (PUMP_BUY_V3_DISCRIMINATOR.to_vec(), [7u8; 16], SwapSide::Buy),
+            (PUMP_SELL_V3_DISCRIMINATOR.to_vec(), [7u8; 16], SwapSide::Sell),
+        ];
+        for (disc, payload, want_side) in cases {
+            let mut data = disc;
+            data.extend_from_slice(&payload);
+            let v3_ix = UiCompiledInstruction {
+                program_id_index: 0,
+                accounts: (0u8..17).collect(),
+                data: bs58::encode(data).into_string(),
+                stack_height: None,
+            };
+            let tx = swap_tx(vec![v3_ix]);
+            let records = extract_pump_swaps(&tx, "sig");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].side, want_side);
+            // account_keys[8] = key(8) in the fabricated tx.
+            assert_eq!(records[0].wallet, Pubkey::new_from_array([8; 32]));
+            assert_eq!(records[0].amount_base_units, u64::from_le_bytes([7; 8]));
+        }
+        // Exact-quote: (spendable_quote_in, min_tokens_out).
+        let mut data = PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&[9u8; 8]);
+        data.extend_from_slice(&[3u8; 8]);
+        let exact_ix = UiCompiledInstruction {
+            program_id_index: 0,
+            accounts: (0u8..17).collect(),
+            data: bs58::encode(data).into_string(),
+            stack_height: None,
+        };
+        let tx = swap_tx(vec![exact_ix]);
+        let records = extract_pump_swaps(&tx, "sig");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].side, SwapSide::Buy);
+        assert_eq!(records[0].wallet, Pubkey::new_from_array([8; 32]));
+        assert_eq!(records[0].amount_base_units, u64::from_le_bytes([3; 8]));
     }
 
     #[test]

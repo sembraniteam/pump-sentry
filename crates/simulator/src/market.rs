@@ -84,16 +84,12 @@ impl FillModel {
     /// fall back to the quote as-is (including a non-finite quote, which
     /// passes through so callers — not this pure function — decide the
     /// fail-closed policy; every production caller validates first).
+    /// Unknown liquidity pays the venue fee (no size basis): `slip_fraction`
+    /// already does fee-only there, so no early return here — returning
+    /// the bare quote would understate costs ~1.25% vs the snapshot path.
     pub fn fill_price(&self, side: Side, quote: f64, notional_usd: f64, liquidity_usd: f64) -> f64 {
         if !quote.is_finite() || quote <= 0.0 || !notional_usd.is_finite() || notional_usd <= 0.0 {
             return quote;
-        }
-        if !liquidity_usd.is_finite() || liquidity_usd <= 0.0 {
-            match *self {
-                // Unknown liquidity: no cost basis, fill at quote.
-                FillModel::Exact => {}
-                FillModel::BondingCurve { .. } => return quote,
-            }
         }
         let slip = self.slip_fraction(notional_usd, liquidity_usd);
         match side {
@@ -124,14 +120,16 @@ pub fn move_percent(side: Side, entry_price: f64, price: f64) -> f64 {
 /// Callers close the position themselves via
 /// [`PaperPortfolio::close_position`](crate::PaperPortfolio::close_position).
 pub fn check_exit(position: &mut Position, price: f64, now_secs: u64) -> Option<ExitReason> {
-    if !price.is_finite() || price <= 0.0 {
-        return None;
-    }
-
+    // Timeout first, even on a degenerate print: a broken feed must not
+    // trap a timed position forever (price-gated exits below still need a
+    // finite positive print).
     if position.timeout_seconds > 0
         && now_secs.saturating_sub(position.opened_at) >= position.timeout_seconds
     {
         return Some(ExitReason::Timeout);
+    }
+    if !price.is_finite() || price <= 0.0 {
+        return None;
     }
 
     let moved = move_percent(position.side, position.entry_price, price);
@@ -228,7 +226,10 @@ mod tests {
     fn degenerate_inputs_fall_back_to_quote() {
         let model = FillModel::default();
         assert_eq!(model.fill_price(Side::Long, 0.0, 100.0, 10_000.0), 0.0);
-        assert_eq!(model.fill_price(Side::Long, 1.0, 100.0, 0.0), 1.0);
+        // Unknown liquidity pays the venue fee (consistent with
+        // `slip_fraction` and the equity snapshot — the bare quote would
+        // understate a fill ~1.25%).
+        assert!((model.fill_price(Side::Long, 1.0, 100.0, 0.0) - 1.0125).abs() < 1e-12);
         assert!(
             !model
                 .fill_price(Side::Long, f64::NAN, 100.0, 10_000.0)
@@ -264,6 +265,18 @@ mod tests {
         let mut p = long(75.0, -8.0);
         p.timeout_seconds = 60;
         assert_eq!(check_exit(&mut p, 5.0, 1060), Some(ExitReason::Timeout));
+    }
+
+    #[test]
+    fn timeout_fires_on_degenerate_price() {
+        // A broken feed must not trap a timed position: timeout is
+        // evaluated before the finite-price gate.
+        let mut p = long(75.0, -8.0);
+        p.timeout_seconds = 60;
+        assert_eq!(check_exit(&mut p, 0.0, 1060), Some(ExitReason::Timeout));
+        let mut p = long(75.0, -8.0);
+        p.timeout_seconds = 60;
+        assert_eq!(check_exit(&mut p, f64::NAN, 1060), Some(ExitReason::Timeout));
     }
 
     #[test]

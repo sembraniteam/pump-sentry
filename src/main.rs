@@ -56,6 +56,91 @@ async fn main() {
     }
 }
 
+/// WAL path next to the log file (same dir as shutdown snapshots).
+fn live_wal_path() -> std::path::PathBuf {
+    let (_, log_file) = cli::resolve_paths();
+    log_file
+        .parent()
+        .map(|d| d.join("live-wal.jsonl"))
+        .unwrap_or_else(|| "live-wal.jsonl".into())
+}
+
+/// Boot replay of the live WAL (live mode only): restores custody that a
+/// SIGKILL/abort stranded mid-dispatch. Pending buys re-enter the recheck
+/// loop, tracked/manual bags regain exit automation via re-watch (the
+/// ticker watch set is in-memory and starts empty). Loud by design: any
+/// recovery means the last shutdown was unclean.
+async fn replay_live_wal(
+    pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
+    ticker: &CurveTicker,
+) {
+    use crate::live::wal;
+    let path = live_wal_path();
+    let replay = wal::replay_file(&path);
+    if replay.pending.is_empty() && replay.positions.is_empty() && replay.manual.is_empty() {
+        return;
+    }
+    let mut watched: Vec<(String, String)> = Vec::new();
+    let mut n_pending = 0usize;
+    let mut n_positions = 0usize;
+    let mut n_manual = 0usize;
+    for p in &replay.pending {
+        watched.push((p.position.mint.clone(), p.position.curve.clone()));
+    }
+    // Compact first: the file is rewritten to the surviving state before
+    // any in-memory import, so a crash mid-import replays identically.
+    wal::compact_file(&path, &replay);
+    if let Some(trader) = pipeline.exec.live.as_ref() {
+        n_pending = trader.import_pending(replay.pending);
+    }
+    {
+        let mut guard = pipeline.exec.live_positions.lock().await;
+        for pos in replay.positions {
+            watched.push((pos.mint.clone(), pos.curve.clone()));
+            if guard.contains_key(&pos.mint) {
+                let key = format!("{}#wal-{n_positions}", pos.mint);
+                guard.insert(key, pos);
+            } else {
+                guard.insert(pos.mint.clone(), pos);
+            }
+            n_positions += 1;
+        }
+    }
+    {
+        let mut guard = pipeline.exec.live_manual.lock().await;
+        for pos in replay.manual {
+            watched.push((pos.mint.clone(), pos.curve.clone()));
+            if guard.contains_key(&pos.mint) {
+                let key = format!("{}#wal-{n_manual}", pos.mint);
+                guard.insert(key, pos);
+            } else {
+                guard.insert(pos.mint.clone(), pos);
+            }
+            n_manual += 1;
+        }
+    }
+    // Re-watch BEFORE the loops start (no ticks otherwise, no exits).
+    // A failed watch keeps the bag tracked + reported (same posture as
+    // the open-time watch failure: custody first, feed second).
+    let mut unwatched = 0usize;
+    watched.sort();
+    watched.dedup();
+    for (mint, curve) in &watched {
+        if let Err(e) = ticker.watch(mint, curve).await {
+            unwatched += 1;
+            warn!(%mint, error = %e, "WAL replay: re-watch failed; bag tracked without exit feed (manual review)");
+        }
+    }
+    warn!(
+        pending = n_pending,
+        positions = n_positions,
+        manual = n_manual,
+        unwatched,
+        file = %path.display(),
+        "WAL replay: recovered live custody from unclean shutdown; MANUAL REVIEW REQUIRED (delete the file to clear resolved bags)"
+    );
+}
+
 /// Foreground pipeline: the body the old bare binary ran. `live_arg`
 /// comes from `run --live` (the daemon child passes it through); the
 /// `IS_LIVE=true` environment fallback is honored as before.
@@ -92,6 +177,19 @@ async fn run_pipeline(live_arg: bool) {
     // `--live` now arrives via `run --live` (or `start --live` through
     // the daemon child); the `IS_LIVE=true` fallback is unchanged.
     let live_mode = live_arg || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
+    // `get_bool` elsewhere accepts 1/yes, but the live gate accepts ONLY
+    // the exact string `true`: a set-but-unrecognized value (e.g.
+    // `IS_LIVE=1`) must never silently paper-trade when the operator
+    // meant live — say so loudly at startup.
+    if !live_mode
+        && let Ok(v) = std::env::var("IS_LIVE")
+        && !v.is_empty()
+        && v != "false"
+        && v != "0"
+        && v != "no"
+    {
+        warn!("config: IS_LIVE='{v}' ignored (only the exact value 'true' enables live; paper mode)");
+    }
     // Startup banner: the supervisor log records WHEN this boot happened
     // and whether it was a first run or a re-run/restart, so the uptime
     // question is answered by reading the log, not by memory.
@@ -124,19 +222,53 @@ async fn run_pipeline(live_arg: bool) {
     for warning in settings.warnings() {
         warn!("config: {warning}");
     }
-    if live_mode && !(settings.max_daily_loss_usd.is_finite() && settings.max_daily_loss_usd > 0.0) {
-        warn!("config: live mode without MAX_DAILY_LOSS_USD — no portfolio circuit breaker; set one");
+    // Live fail-closed gates: real funds never run on warn-and-proceed
+    // defaults (no breaker, unproven sims, unbounded guards, tipless
+    // bundles, reorgable prints, or static fallback prices).
+    if live_mode {
+        if !(settings.max_daily_loss_usd.is_finite() && settings.max_daily_loss_usd > 0.0) {
+            eprintln!("live mode requires MAX_DAILY_LOSS_USD>0 (portfolio circuit breaker)");
+            std::process::exit(1);
+        }
+        if !settings.sim_strict {
+            eprintln!("live mode requires SIM_STRICT=true (unproven sims must refuse, not warn-and-proceed)");
+            std::process::exit(1);
+        }
+        if settings.slippage_bps >= 10_000 {
+            eprintln!("live mode refuses SLIPPAGE_BPS={} (>=100%: buys would authorize 2x spend while every sell fails closed)", settings.slippage_bps);
+            std::process::exit(1);
+        }
+        if settings.tip_lamports == 0 {
+            eprintln!("live mode requires JITO_TIP_LAMPORTS>0 (tipless bundles may never land)");
+            std::process::exit(1);
+        }
+        if settings.commitment == "processed" {
+            eprintln!("live mode refuses COMMITMENT=processed (reorgable prints drive exits); use confirmed/finalized");
+            std::process::exit(1);
+        }
+        if settings.quote_usd.is_some() {
+            eprintln!("live mode refuses QUOTE_USD override (static fallback is paper-only by construction)");
+            std::process::exit(1);
+        }
+        if settings.priority_fee_micro_lamports == 0 {
+            warn!("config: live without PRIORITY_FEE_MICRO_LAMPORTS — landing odds drop under congestion");
+        }
     }
 
     let commitment = CurveTicker::parse_commitment(&settings.commitment).unwrap_or_else(|| {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
         std::process::exit(1);
     });
+    // One dynamic SOL/USD feed for all pricing + live sizing (no statics).
+    let sol_feed = curve::SolUsdFeed::with_defaults();
+    // Background refresher: runs for process lifetime (handle aborts on
+    // shutdown below).
+    let sol_handle = sol_feed.clone().spawn();
     let ticker = match CurveTicker::new(
         &settings.http_url,
         commitment,
         Duration::from_millis(settings.tick_interval_ms),
-        settings.sol_usd,
+        Arc::clone(&sol_feed),
     ) {
         Ok(ticker) => ticker,
         Err(e) => {
@@ -223,7 +355,7 @@ async fn run_pipeline(live_arg: bool) {
             executor,
             settings.slippage_bps,
             settings.tip_lamports,
-        ))
+        ).with_dispatch_fees(settings.compute_unit_limit, settings.priority_fee_micro_lamports).with_wal(live_wal_path()))
     } else {
         None
     };
@@ -273,7 +405,7 @@ async fn run_pipeline(live_arg: bool) {
         &settings.http_url,
         commitment,
         Duration::from_millis(settings.tick_interval_ms),
-        settings.sol_usd,
+        Arc::clone(&sol_feed),
     ) {
         Ok(ticker) => ticker,
         Err(e) => {
@@ -300,7 +432,18 @@ async fn run_pipeline(live_arg: bool) {
         screener,
         alerts,
         vault_ticker.clone(),
+        sol_feed,
     );
+
+    // Crash-recovery replay (live only): the WAL restores custody that a
+    // SIGKILL/abort stranded mid-dispatch — pending buys re-enter the
+    // recheck loop, tracked/manual bags regain exit automation. Every
+    // recovered mint is re-watched (the ticker watch set is in-memory)
+    // and reported loudly; delete the WAL file to clear resolved manual
+    // bags (compaction rewrites it to the surviving state).
+    if live_mode {
+        replay_live_wal(&pipeline, &ticker).await;
+    }
 
     // Ticker loop: poll watched curves → auto-close on TP/SL.
     let (tick_tx, mut tick_rx) = mpsc::channel::<PriceTick>(1024);
@@ -322,9 +465,10 @@ async fn run_pipeline(live_arg: bool) {
     //
     // Concurrency is bounded by a semaphore: every event fans out to
     // RPC-heavy work, and an unbounded spawn lets a Pump.fun burst open
-    // thousands of concurrent RPCs (rate-limit + FD exhaustion). Tasks
-    // hold a permit for their whole run, so at most 32 dispatch at once;
-    // the rest wait without touching the network.
+    // thousands of concurrent RPCs (rate-limit + FD exhaustion). Permits
+    // are `try_acquire`d — never awaited — so saturation drops (loudly)
+    // instead of queueing an unbounded JoinSet backlog that only burns
+    // memory while the RPCs stay throttled anyway.
     let mut in_flight = tokio::task::JoinSet::new();
     const MAX_IN_FLIGHT: usize = 32;
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
@@ -345,7 +489,7 @@ async fn run_pipeline(live_arg: bool) {
                 let stats = Arc::clone(&stats_task);
                 let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
-                    let Ok(_permit) = permits.acquire_owned().await else {
+                    let Ok(_permit) = permits.try_acquire_owned() else {
                         debug!(mint = %event.mint, "launch dropped: dispatch saturated");
                         return;
                     };
@@ -377,8 +521,11 @@ async fn run_pipeline(live_arg: bool) {
                 let pipeline = Arc::clone(&pipeline);
                 let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
-                    let Ok(_permit) = permits.acquire_owned().await else {
-                        debug!(mint = %tick.mint, "tick dropped: dispatch saturated");
+                    let Ok(_permit) = permits.try_acquire_owned() else {
+                        // Ticks drive TP/SL exits: dropping one delays a
+                        // live exit, so this is warn (launches are
+                        // fail-closed drops and stay debug below).
+                        warn!(mint = %tick.mint, "tick dropped: dispatch saturated; exit delayed");
                         return;
                     };
                     pipeline.on_tick(&tick).await;
@@ -389,7 +536,7 @@ async fn run_pipeline(live_arg: bool) {
                 let pipeline = Arc::clone(&pipeline);
                 let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
-                    let Ok(_permit) = permits.acquire_owned().await else {
+                    let Ok(_permit) = permits.try_acquire_owned() else {
                         debug!(mint = %pool.mint, "pool tick dropped: dispatch saturated");
                         return;
                     };
@@ -431,6 +578,7 @@ async fn run_pipeline(live_arg: bool) {
     tick_handle.abort();
     pool_handle.abort();
     listener_handle.abort();
+    sol_handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
 
     // Snapshot BEFORE the drain: paper opens, tracked live fills, and
@@ -502,10 +650,32 @@ async fn run_pipeline(live_arg: bool) {
         warn!("shutdown drain timed out; aborting in-flight units");
         in_flight.abort_all();
     }
+    // Re-snapshot AFTER the drain/abort: the pre-drain picture is stale —
+    // an abort can cancel a confirm mid-flight (fill unknown) and the
+    // drain may have settled paper/live state. The rewritten file is the
+    // source of truth; `clean: false` plus the abort warning below tells
+    // the operator to check the explorer for in-flight live mints.
+    let paper_open = pipeline.open_position_mints().await;
+    let live_tracked = pipeline.live_tracked_mints().await;
+    let watchlist_pending = pipeline.pending_count().await;
+    summary.paper_open = paper_open.clone();
+    summary.live_tracked = live_tracked.clone();
+    summary.watchlist_pending = watchlist_pending;
     // Record the true outcome in the snapshot (a timed-out/force-aborted
     // drain leaves `clean: false` for the operator to notice).
     summary.clean = drained && clean_shutdown;
     write_snapshot(&summary);
+    if !paper_open.is_empty() || !live_tracked.is_empty() {
+        warn!(
+            "shutdown final state: {} open paper, {} tracked live {:?} — MANUAL REVIEW REQUIRED",
+            paper_open.len(),
+            live_tracked.len(),
+            live_tracked
+        );
+    }
+    if !drained {
+        warn!("in-flight units were aborted; any live dispatch mid-confirm has an UNKNOWN fill — check the explorer for the tracked mints above");
+    }
 
     if clean_shutdown {
         info!("shutdown complete (drained={drained})");

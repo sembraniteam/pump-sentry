@@ -57,8 +57,10 @@ pub struct Settings {
     pub dev_screen_sample_txs: usize,
     /// Manual entry-quote override for tests.
     pub quote_usd: Option<f64>,
-    /// SOL→USD conversion for curve pricing.
-    pub sol_usd: f64,
+    /// SOL→USD conversion for curve pricing (retired: feed is dynamic).
+    /// Kept parsed so stale `SOL_USD=...` env lines warn instead of
+    /// silently doing nothing; value is unused.
+    pub _sol_usd_retired: f64,
     /// Bonding-curve poll interval in milliseconds.
     pub tick_interval_ms: u64,
     /// OpenAI-compatible chat-completions endpoint.
@@ -135,7 +137,7 @@ impl std::fmt::Debug for Settings {
             .field("dev_max_prior_launches", &self.dev_max_prior_launches)
             .field("dev_screen_sample_txs", &self.dev_screen_sample_txs)
             .field("quote_usd", &self.quote_usd)
-            .field("sol_usd", &self.sol_usd)
+            .field("sol_usd", &self._sol_usd_retired)
             .field("tick_interval_ms", &self.tick_interval_ms)
             .field("inference_endpoint", &self.inference_endpoint)
             .field("inference_model", &self.inference_model)
@@ -188,7 +190,7 @@ impl Settings {
             dev_max_prior_launches: get_int(vars, "DEV_MAX_PRIOR_LAUNCHES", 1, &mut notes),
             dev_screen_sample_txs: get_int(vars, "DEV_SCREEN_SAMPLE_TXS", 20, &mut notes),
             quote_usd: parse_quote_usd(vars, &mut notes),
-            sol_usd: get_float(vars, "SOL_USD", 150.0, &mut notes),
+            _sol_usd_retired: parse_retired_sol_usd(vars, &mut notes),
             tick_interval_ms: get_int(vars, "TICK_INTERVAL_MS", 1000, &mut notes),
             inference_endpoint: get_string(
                 vars,
@@ -278,8 +280,11 @@ impl Settings {
         if self.gate_min_buyers == 0 {
             out.push("GATE_MIN_BUYERS=0 behaves as 1 (quorum floor)".to_string());
         }
-        if self.sol_usd <= 0.0 || !self.sol_usd.is_finite() {
-            out.push(format!("SOL_USD={} is not positive; pricing is garbage", self.sol_usd));
+        if self._sol_usd_retired > 0.0 && self._sol_usd_retired.is_finite() {
+            out.push(format!(
+                "SOL_USD={} is retired: pricing now uses a live Jupiter feed (dynamic, stale-gated); this env value is ignored",
+                self._sol_usd_retired
+            ));
         }
         if self.commitment == "processed" {
             out.push(
@@ -388,6 +393,30 @@ fn get_bool(
             notes.push(format!("{key}='{v}' unrecognized; using default {default}"));
             default
         }
+    }
+}
+
+/// Retired static price: returns a positive finite sentinel or 0 when
+/// unset, with a note when a stale env line is ignored.
+fn parse_retired_sol_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> f64 {
+    match vars.get("SOL_USD") {
+        None => 0.0,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => {
+                notes.push(format!(
+                    "SOL_USD={v} is retired: pricing uses the live Jupiter feed; ignoring"
+                ));
+                v
+            }
+            Ok(_) => {
+                notes.push("SOL_USD is retired and not a positive price; ignoring".to_string());
+                0.0
+            }
+            Err(_) => {
+                notes.push(format!("SOL_USD='{raw}' is not a number; ignoring"));
+                0.0
+            }
+        },
     }
 }
 

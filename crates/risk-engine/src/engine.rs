@@ -60,7 +60,7 @@ pub struct RiskDecision {
 }
 
 /// Builder for [`RiskEngine`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RiskEngineBuilder {
     endpoint: String,
     model: String,
@@ -68,6 +68,19 @@ pub struct RiskEngineBuilder {
     timeout: Duration,
     temperature: f32,
     max_tokens: u32,
+}
+
+impl std::fmt::Debug for RiskEngineBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RiskEngineBuilder")
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("timeout", &self.timeout)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .finish()
+    }
 }
 
 impl Default for RiskEngineBuilder {
@@ -123,7 +136,9 @@ impl RiskEngineBuilder {
 }
 
 /// Quantitative risk engine. Cheap to clone (pooled HTTP client).
-#[derive(Debug, Clone)]
+/// Custom [`std::fmt::Debug`]: the bearer token never appears in logs,
+/// even on a careless whole-struct debug-print.
+#[derive(Clone)]
 pub struct RiskEngine {
     client: Client,
     endpoint: String,
@@ -132,6 +147,19 @@ pub struct RiskEngine {
     timeout: Duration,
     temperature: f32,
     max_tokens: u32,
+}
+
+impl std::fmt::Debug for RiskEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RiskEngine")
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("timeout", &self.timeout)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .finish()
+    }
 }
 
 impl RiskEngine {
@@ -391,6 +419,19 @@ mod tests {
         assert_eq!(FALLBACK_TIMEOUT, Duration::from_millis(300));
         let engine = RiskEngineBuilder::default().build().expect("engine");
         assert_eq!(engine.timeout, FALLBACK_TIMEOUT);
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        let engine = RiskEngine::builder()
+            .api_key("super-secret")
+            .build()
+            .expect("engine");
+        let dbg = format!("{engine:?}");
+        assert!(!dbg.contains("super-secret"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        let builder = format!("{:?}", RiskEngine::builder().api_key("super-secret"));
+        assert!(!builder.contains("super-secret"), "{builder}");
     }
 
     #[test]

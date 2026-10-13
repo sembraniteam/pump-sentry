@@ -5,7 +5,9 @@
 //! (unit-tested); only [`LiveTrader::buy`] / [`sell`](LiveTrader::sell)
 //! touch the network.
 
+use crate::settings::now_secs;
 use executor::{BuyOrder, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, parse_pubkey};
+use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -30,6 +32,18 @@ pub enum LiveError {
     /// Bundle accepted but never confirmed (still holding / never filled).
     #[error("unconfirmed live fill: {0}")]
     Unconfirmed(String),
+    /// Dispatch timed out with no signature: the bundle may or may not
+    /// have reached the engine. Carries the intended position so the
+    /// pipeline can park it for manual review instead of losing it.
+    /// Boxed: `LivePosition` holds five `String`s, and an unboxed
+    /// variant trips `clippy::result_large_err` on every live call.
+    #[error("unknown dispatch fill: {reason}")]
+    UnknownDispatch {
+        /// Intended fill (amounts as sized, fill unknown).
+        position: Box<LivePosition>,
+        /// Human-readable cause.
+        reason: String,
+    },
 }
 
 /// Fill-confirmation deadline per dispatch (bundles land in seconds or
@@ -83,6 +97,11 @@ pub struct LiveBuyParams<'a> {
     pub sol_usd: f64,
     /// Token creator (base58), when the launch carried one.
     pub creator: Option<&'a str>,
+    /// Watchlist-gate reference hint: first successful buy signature
+    /// observed while waiting for buyer quorum. Carried through to
+    /// [`BuyOrder::mayhem_ref_sig`] so the executor copies `[16]`/`[17]`
+    /// without a full curve scan. `None` keeps scan-only behavior.
+    pub mayhem_ref_sig: Option<&'a str>,
 }
 
 /// Planned buy: integer amounts ready for [`BuyOrder`].
@@ -92,6 +111,24 @@ pub struct LiveBuyPlan {
     pub amount_tokens: u64,
     /// Slippage guard in lamports.
     pub max_sol_cost: u64,
+}
+
+/// Guard ceiling over a fee-inclusive quote: `quoted_cost_incl_fees`
+/// plus `slippage_bps`, rounded UP (a floored guard underfunds the buy
+/// by a lamport and fails with 6002 `TooMuchSolRequired` — the frozen
+/// failed sample missed by 18,969 lamports, 1.15%). `None` on zero
+/// quotes and on `u64` overflow: an unguardable cost fails closed,
+/// never dispatches unprotected. `slippage_bps` is clamped to 10_000
+/// like every other sizing path. This is THE guard constructor: once a
+/// fee-inclusive on-chain quote engine lands, its output feeds this
+/// function directly (fees must never be added twice — the quote
+/// already includes protocol+creator fees, like the 1_668_970-lamport
+/// `Right` in the frozen 6002 log).
+pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option<u64> {
+    // Single constructor lives in the executor crate so binary and
+    // executor can never drift apart; this wrapper keeps the
+    // pipeline-facing name stable.
+    executor::quote::slippage_ceiling(quoted_cost_incl_fees, slippage_bps)
 }
 
 /// Size a buy from USD notional at spot: tokens from `notional/price`,
@@ -126,17 +163,16 @@ pub fn plan_buy(
         return None;
     }
     let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
-    if !lamports.is_finite() || lamports <= 0.0 {
+    if !lamports.is_finite() || lamports <= 0.0 || lamports > u64::MAX as f64 {
         return None;
     }
-    let max_f =
-        (lamports * (10_000.0 + slippage_bps.min(10_000) as f64) / 10_000.0).ceil();
-    if !max_f.is_finite() || max_f <= 0.0 || max_f > u64::MAX as f64 {
-        return None;
-    }
+    // One guard constructor everywhere (ceiling math): the float quote
+    // here stands in for a fee-inclusive on-chain quote until the quote
+    // engine lands — the helper, not ad-hoc math, sets every guard.
+    let max_sol_cost = apply_slippage_ceiling(lamports as u64, slippage_bps)?;
     Some(LiveBuyPlan {
         amount_tokens,
-        max_sol_cost: max_f as u64,
+        max_sol_cost,
     })
 }
 
@@ -162,9 +198,13 @@ pub fn plan_sell_floor(
     }
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
     let lamports = amount_tokens as f64 / scale * price_usd / sol_usd * LAMPORTS_PER_SOL;
-    if !lamports.is_finite() || lamports <= 0.0 {
+    if !lamports.is_finite() || lamports <= 0.0 || lamports > u64::MAX as f64 {
         return None;
     }
+    // `as u64` saturates past the max — the check above fails closed
+    // first, like `plan_buy` (a saturating floor would authorize a jumbo
+    // `min_sol_output`... which fails closed downstream anyway, but an
+    // unguardable quote must never dispatch).
     let floor = (lamports * (10_000.0 - slippage_bps as f64) / 10_000.0).floor() as u64;
     if floor == 0 {
         return None;
@@ -178,6 +218,14 @@ pub struct LiveTrader {
     executor: SwapExecutor,
     slippage_bps: u64,
     tip_lamports: u64,
+    /// Priority-fee price for cost accounting (set from the same knobs
+    /// as the executor's compute budget; see `with_dispatch_fees`).
+    priority_fee_micro_lamports: u64,
+    /// Compute-unit limit for cost accounting.
+    compute_unit_limit: u32,
+    /// Write-ahead log for crash/restart recovery (see [`WalReplay`]).
+    /// `None` (tests, paper) disables all WAL IO.
+    wal_path: Option<PathBuf>,
     /// Buys accepted by the engine but unconfirmed when the deadline hit.
     /// A timed-out bundle may still land late; dropping it here would leave
     /// real tokens untracked (no exit automation). Entries are re-polled
@@ -227,6 +275,250 @@ pub enum RecheckOutcome {
     GiveUp,
 }
 
+/// Crash-recovery write-ahead log (JSONL, hand-rolled like
+/// [`crate::cli::PidInfo`]: base58 values never need escaping).
+///
+/// Every custody-changing event appends BEFORE the in-memory map is
+/// touched, so a SIGKILL/abort between dispatch and bookkeeping replays
+/// to the same state on the next boot instead of stranding funds:
+///
+/// - `pending` after a bundle receipt (re-polled on boot),
+/// - `settled` once a pending bundle is proven failed (stops re-poll),
+/// - `position` once a fill is tracked (restores `live_positions`),
+/// - `sell` once a sell confirms (subtracts on replay),
+/// - `manual` once a bag parks for human exit (restores `live_manual`).
+///
+/// Boot replays in file order (ordered fold) and compacts back to the
+/// surviving state. Corrupt lines are skipped with a loud log, never a
+/// panic. `None` path (tests, paper) disables all WAL IO.
+pub mod wal {
+    use super::LivePosition;
+
+    /// One replayed pending buy: position plus both identifiers.
+    #[derive(Debug, Clone)]
+    pub struct WalPending {
+        /// Intended fill.
+        pub position: LivePosition,
+        /// Transaction signature for `confirm_signature` re-polls.
+        pub signature: String,
+        /// Engine bundle UUID (dedup key).
+        pub bundle_id: String,
+    }
+
+    /// Replayed boot state.
+    #[derive(Debug, Default, Clone)]
+    pub struct WalReplay {
+        /// Pending buys whose bundle never settled (recheck on boot).
+        pub pending: Vec<WalPending>,
+        /// Tracked fills (`live_positions`).
+        pub positions: Vec<LivePosition>,
+        /// Human-exit bags (`live_manual`).
+        pub manual: Vec<LivePosition>,
+        /// Corrupt lines skipped (operator should inspect the file).
+        pub skipped: usize,
+    }
+
+    fn field(line: &str, key: &str) -> Option<String> {
+        for part in line
+            .trim()
+            .strip_prefix('{')?
+            .strip_suffix('}')?
+            .split(',')
+        {
+            let (k, v) = part.split_once(':')?;
+            if k.trim().trim_matches('"') == key {
+                let v = v.trim();
+                if v == "null" {
+                    return None;
+                }
+                return Some(v.trim_matches('"').to_string());
+            }
+        }
+        None
+    }
+
+    fn num(line: &str, key: &str) -> Option<u64> {
+        field(line, key)?.parse().ok()
+    }
+
+    fn position_from(line: &str) -> Option<LivePosition> {
+        Some(LivePosition {
+            mint: field(line, "mint")?,
+            curve: field(line, "curve")?,
+            assoc_curve: field(line, "assoc")?,
+            amount_tokens: num(line, "amount")?,
+            creator: field(line, "creator"),
+        })
+    }
+
+    /// Fold WAL lines (in order) into boot state. Pure over lines: the
+    /// file read stays in `replay_file` so this is unit-tested directly.
+    pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
+        use std::collections::HashMap;
+        let mut pending: HashMap<String, WalPending> = HashMap::new();
+        let mut positions: HashMap<String, LivePosition> = HashMap::new();
+        let mut manual: HashMap<String, LivePosition> = HashMap::new();
+        let mut skipped = 0usize;
+        let add = |map: &mut HashMap<String, LivePosition>, p: LivePosition| {
+            map.entry(p.mint.clone())
+                .and_modify(|e| {
+                    e.amount_tokens = e.amount_tokens.saturating_add(p.amount_tokens);
+                })
+                .or_insert(p);
+        };
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some(kind) = field(line, "t") else {
+                skipped += 1;
+                continue;
+            };
+            match kind.as_str() {
+                "pending" => {
+                    let (Some(pos), sig, bundle) = (
+                        position_from(line),
+                        field(line, "sig"),
+                        field(line, "bundle"),
+                    ) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    let (Some(signature), Some(bundle_id)) = (sig, bundle) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    pending.insert(
+                        bundle_id.clone(),
+                        WalPending { position: pos, signature, bundle_id },
+                    );
+                }
+                "settled" => {
+                    let Some(bundle) = field(line, "bundle") else {
+                        skipped += 1;
+                        continue;
+                    };
+                    pending.remove(&bundle);
+                }
+                "position" => {
+                    let (Some(pos), bundle) = (position_from(line), field(line, "bundle")) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    let _ = bundle;
+                    add(&mut positions, pos);
+                }
+                "sell" => {
+                    let (Some(mint), Some(amount)) = (field(line, "mint"), num(line, "amount"))
+                    else {
+                        skipped += 1;
+                        continue;
+                    };
+                    if let Some(p) = positions.get_mut(&mint) {
+                        p.amount_tokens = p.amount_tokens.saturating_sub(amount);
+                        if p.amount_tokens == 0 {
+                            positions.remove(&mint);
+                        }
+                    }
+                }
+                "manual" => {
+                    let Some(pos) = position_from(line) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    add(&mut manual, pos);
+                }
+                _ => skipped += 1,
+            }
+        }
+        WalReplay {
+            pending: pending.into_values().collect(),
+            positions: positions.into_values().collect(),
+            manual: manual.into_values().collect(),
+            skipped,
+        }
+    }
+
+    /// Read + replay a WAL file. Missing file = empty replay (first
+    /// boot), never an error. Corrupt lines count in `skipped`.
+    pub fn replay_file(path: &std::path::Path) -> WalReplay {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let replay = replay_lines(raw.lines());
+        if replay.skipped > 0 {
+            tracing::warn!(file = %path.display(), skipped = replay.skipped, "live WAL has corrupt lines; skipped (inspect the file)");
+        }
+        replay
+    }
+
+    /// Compact back to the surviving state (pending + positions +
+    /// manual). Called once per boot after import so the file stays
+    /// bounded; in-run appends keep it current after that.
+    pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for p in &replay.pending {
+            let _ = writeln!(
+                out,
+                "{{\"t\":\"pending\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"sig\":\"{}\",\"bundle\":\"{}\",\"ts\":{}}}",
+                p.position.mint,
+                p.position.curve,
+                p.position.assoc_curve,
+                p.position.amount_tokens,
+                p.position
+                    .creator
+                    .as_ref()
+                    .map(|c| format!("\"{c}\""))
+                    .unwrap_or_else(|| "null".to_string()),
+                p.signature,
+                p.bundle_id,
+                super::now_secs(),
+            );
+        }
+        for p in replay.positions.iter().chain(replay.manual.iter()) {
+            let _ = p;
+        }
+        for p in &replay.positions {
+            let _ = writeln!(
+                out,
+                "{{\"t\":\"position\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"ts\":{}}}",
+                p.mint,
+                p.curve,
+                p.assoc_curve,
+                p.amount_tokens,
+                p.creator
+                    .as_ref()
+                    .map(|c| format!("\"{c}\""))
+                    .unwrap_or_else(|| "null".to_string()),
+                super::now_secs(),
+            );
+        }
+        for p in &replay.manual {
+            let _ = writeln!(
+                out,
+                "{{\"t\":\"manual\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"ts\":{}}}",
+                p.mint,
+                p.curve,
+                p.assoc_curve,
+                p.amount_tokens,
+                p.creator
+                    .as_ref()
+                    .map(|c| format!("\"{c}\""))
+                    .unwrap_or_else(|| "null".to_string()),
+                super::now_secs(),
+            );
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(path, out) {
+            tracing::warn!(file = %path.display(), error = %e, "live WAL compaction failed; file keeps growing (non-fatal)");
+        }
+    }
+}
+
 impl LiveTrader {
     /// Wrap an executor (already Jito-attached) with sizing policy.
     pub fn new(executor: SwapExecutor, slippage_bps: u64, tip_lamports: u64) -> Self {
@@ -234,11 +526,46 @@ impl LiveTrader {
             executor,
             slippage_bps,
             tip_lamports,
+            priority_fee_micro_lamports: 0,
+            compute_unit_limit: 0,
+            wal_path: None,
             pending: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             recheck_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Enable the crash-recovery write-ahead log at `path` (live boot
+    /// sets this next to the log file; tests leave it `None`).
+    pub fn with_wal(mut self, path: PathBuf) -> Self {
+        self.wal_path = Some(path);
+        self
+    }
+
+    /// Compute-budget knobs for cost accounting (mirrors the executor's
+    /// `with_compute_budget`; the trader never builds instructions).
+    pub fn with_dispatch_fees(
+        mut self,
+        compute_unit_limit: u32,
+        priority_fee_micro_lamports: u64,
+    ) -> Self {
+        self.compute_unit_limit = compute_unit_limit;
+        self.priority_fee_micro_lamports = priority_fee_micro_lamports;
+        self
+    }
+
+    /// Per-dispatch on-chain overhead in lamports: Jito tip plus the
+    /// priority fee (`ceil(limit * price / 1e6)`), saturating instead of
+    /// wrapping on absurd configs. The breaker prices this into USD so
+    /// the day-loss gate sees live bleed, not paper-only profit.
+    pub fn dispatch_cost_lamports(&self) -> u64 {
+        let prio = (self.compute_unit_limit as u128)
+            .saturating_mul(self.priority_fee_micro_lamports as u128)
+            .saturating_add(999_999)
+            / 1_000_000;
+        let prio = u64::try_from(prio).unwrap_or(u64::MAX);
+        self.tip_lamports.saturating_add(prio)
     }
 
     /// True when at least one buy awaits confirmation.
@@ -248,6 +575,17 @@ impl LiveTrader {
             Err(_) => {
                 tracing::warn!("pending-tracker lock poisoned; assuming pending");
                 true
+            }
+        }
+    }
+
+    /// Mints pending confirmation (cloned).
+    pub fn pending_mints(&self) -> Vec<String> {
+        match self.pending.lock() {
+            Ok(guard) => guard.keys().cloned().collect(),
+            Err(_) => {
+                tracing::warn!("pending-tracker lock poisoned; pending mints unknown");
+                Vec::new()
             }
         }
     }
@@ -262,6 +600,10 @@ impl LiveTrader {
             .recheck_busy
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            // Ticks fire every second while a round can take up to the
+            // confirm timeout: skips are routine, not lost work. Debug
+            // (not warn) so a slow mint does not spam the ops log.
+            tracing::debug!("pending recheck already in flight; skipping round");
             return Vec::new();
         }
         // Reset on every exit path, including panic unwinds: a stuck flag
@@ -388,6 +730,8 @@ impl LiveTrader {
                 max_sol_cost: plan.max_sol_cost,
                 tip_lamports: self.tip_lamports,
                 creator,
+                slippage_bps: self.slippage_bps,
+                mayhem_ref_sig: req.mayhem_ref_sig.map(|s| s.to_string()),
             }),
         )
         .await
@@ -396,33 +740,66 @@ impl LiveTrader {
             Err(_) => {
                 // Dispatch hung: the bundle may or may not have reached
                 // the engine, and there is no signature to re-poll — the
-                // fill is unknown and needs a human.
-                return Err(LiveError::Unconfirmed(format!(
-                    "buy dispatch of {mint} timed out after {:?}; fill unknown, MANUAL REVIEW REQUIRED",
-                    LIVE_DISPATCH_TIMEOUT
-                )));
+                // fill is unknown and needs a human. Carry the intended
+                // position so the pipeline parks it (never drops it).
+                let position = Self::pending_position(
+                    mint,
+                    curve,
+                    assoc_curve,
+                    plan.amount_tokens,
+                    req.creator.map(|c| c.to_string()),
+                );
+                return Err(LiveError::UnknownDispatch {
+                    position: Box::new(position),
+                    reason: format!(
+                        "buy dispatch of {mint} timed out after {:?}; fill unknown, MANUAL REVIEW REQUIRED",
+                        LIVE_DISPATCH_TIMEOUT
+                    ),
+                });
             }
         };
         tracing::info!(%mint, bundle = %receipt.bundle_id, amount = plan.amount_tokens, "LIVE buy dispatched");
+        // Write-ahead tracking: the receipt exists from here on, so an
+        // abort/crash during `confirm_signature` below must not lose it.
+        // Fast-path confirm/failure removes the entry again; timeouts and
+        // transport errors keep it for the recheck loop.
+        let intended = Self::pending_position(
+            mint,
+            curve,
+            assoc_curve,
+            plan.amount_tokens,
+            creator.map(|c| c.to_string()),
+        );
+        Self::track_pending(&self.pending, mint, intended.clone(), &receipt);
+        self.write_wal_pending(&intended, &receipt.signature, &receipt.bundle_id);
         match self
             .executor
             .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
             .await
         {
-            Ok(ConfirmOutcome::Confirmed) => Ok((
-                Self::pending_position(
-                    mint,
-                    curve,
-                    assoc_curve,
-                    plan.amount_tokens,
-                    creator.map(|c| c.to_string()),
-                ),
-                receipt.bundle_id,
-            )),
-            Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
-                "buy bundle {} errored on-chain; no fill",
-                receipt.bundle_id
-            ))),
+            Ok(ConfirmOutcome::Confirmed) => {
+                Self::untrack_pending(&self.pending, mint);
+                Ok((
+                    Self::pending_position(
+                        mint,
+                        curve,
+                        assoc_curve,
+                        plan.amount_tokens,
+                        creator.map(|c| c.to_string()),
+                    ),
+                    receipt.bundle_id,
+                ))
+            }
+            Ok(ConfirmOutcome::FailedOnChain) => {
+                Self::untrack_pending(&self.pending, mint);
+                // Proven no-fill: retire the WAL pending line so boot
+                // replay never re-polls a dead bundle.
+                self.write_wal_settled(&receipt.bundle_id);
+                Err(LiveError::Unconfirmed(format!(
+                    "buy bundle {} errored on-chain; no fill",
+                    receipt.bundle_id
+                )))
+            }
             Ok(ConfirmOutcome::Timeout) => {
                 // A timed-out bundle may still land late: track it for the
                 // recheck loop instead of assuming no fill (an untracked bag
@@ -502,6 +879,149 @@ impl LiveTrader {
         }
     }
 
+    /// Remove a write-ahead pending entry once the fast path settles
+    /// (confirmed fill or proven on-chain failure). Timeouts and
+    /// transport errors keep the entry for the recheck loop.
+    fn untrack_pending(
+        pending: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+        mint: &str,
+    ) {
+        match pending.lock() {
+            Ok(mut guard) => {
+                guard.remove(mint);
+            }
+            Err(_) => tracing::warn!(mint = %mint,
+                "pending-tracker lock poisoned; settled entry not removed"),
+        }
+    }
+
+    /// Append one WAL line (best-effort: IO failure warns, never fails
+    /// the dispatch — the in-memory map stays authoritative this run).
+    fn wal_append(&self, line: String) {
+        let Some(path) = self.wal_path.as_ref() else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write as _;
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(mut f) => {
+                if writeln!(f, "{line}").is_err() {
+                    tracing::warn!("live WAL append failed (non-fatal)");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "live WAL unwritable (non-fatal)"),
+        }
+    }
+
+    /// JSON value for an optional creator (`null` when unknown).
+    fn wal_creator(creator: Option<&String>) -> String {
+        creator
+            .map(|c| format!("\"{c}\""))
+            .unwrap_or_else(|| "null".to_string())
+    }
+
+    /// Record a dispatched bundle BEFORE confirming it (write-ahead: a
+    /// crash during confirm replays to recheck, never to silence).
+    fn write_wal_pending(&self, position: &LivePosition, signature: &str, bundle_id: &str) {
+        if self.wal_path.is_none() {
+            return;
+        }
+        self.wal_append(format!(
+            "{{\"t\":\"pending\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"sig\":\"{signature}\",\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
+            position.mint,
+            position.curve,
+            position.assoc_curve,
+            position.amount_tokens,
+            Self::wal_creator(position.creator.as_ref()),
+            now_secs(),
+        ));
+    }
+
+    /// Record a proven-dead bundle so boot replay stops re-polling it.
+    /// (Fast-path confirms are recorded by [`LiveTrader::acknowledge_buy`]
+    /// instead — only AFTER the pipeline tracks the fill, so a crash in
+    /// between replays to a recheck that re-confirms rather than to loss.)
+    fn write_wal_settled(&self, bundle_id: &str) {
+        if self.wal_path.is_none() {
+            return;
+        }
+        self.wal_append(format!(
+            "{{\"t\":\"settled\",\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
+            now_secs(),
+        ));
+    }
+
+    /// Record a tracked fill + retire its pending line. Call AFTER
+    /// inserting into `live_positions` (write-behind for the position,
+    /// so a crash replays to recheck-then-track, never to a settled
+    /// tombstone over an untracked bag).
+    pub fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
+        if self.wal_path.is_none() {
+            return;
+        }
+        self.wal_append(format!(
+            "{{\"t\":\"position\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
+            position.mint,
+            position.curve,
+            position.assoc_curve,
+            position.amount_tokens,
+            Self::wal_creator(position.creator.as_ref()),
+            now_secs(),
+        ));
+        self.write_wal_settled(bundle_id);
+    }
+
+    /// Record a human-exit bag (write-ahead of the `live_manual` insert).
+    pub fn record_manual(&self, position: &LivePosition) {
+        if self.wal_path.is_none() {
+            return;
+        }
+        self.wal_append(format!(
+            "{{\"t\":\"manual\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"ts\":{}}}",
+            position.mint,
+            position.curve,
+            position.assoc_curve,
+            position.amount_tokens,
+            Self::wal_creator(position.creator.as_ref()),
+            now_secs(),
+        ));
+    }
+
+    /// Record a confirmed sell (write-ahead of the custody subtract).
+    pub fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
+        if self.wal_path.is_none() {
+            return;
+        }
+        self.wal_append(format!(
+            "{{\"t\":\"sell\",\"mint\":\"{mint}\",\"amount\":{amount_tokens},\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
+            now_secs(),
+        ));
+    }
+
+    /// Import boot-replayed pendings into the recheck loop.
+    pub fn import_pending(&self, items: Vec<wal::WalPending>) -> usize {
+        let mut n = 0usize;
+        match self.pending.lock() {
+            Ok(mut guard) => {
+                for item in items {
+                    guard.entry(item.position.mint.clone()).or_insert(PendingBuy {
+                        position: item.position,
+                        signature: item.signature,
+                        bundle_id: item.bundle_id,
+                        attempts: 1,
+                    });
+                    n += 1;
+                }
+            }
+            Err(_) => tracing::warn!("pending-tracker lock poisoned; WAL import dropped"),
+        }
+        n
+    }
+
     /// Sell the full tracked amount at `price_usd` via Jito bundle.
     /// Returns the bundle UUID.
     pub async fn sell(
@@ -554,7 +1074,13 @@ impl LiveTrader {
             .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
             .await
         {
-            Ok(ConfirmOutcome::Confirmed) => Ok(receipt.bundle_id),
+            Ok(ConfirmOutcome::Confirmed) => {
+                // Write-ahead of the pipeline's custody subtract: a crash
+                // in between replays to a subtracted position, never to a
+                // resurrected bag (which would double-sell on retry).
+                self.record_sell(&position.mint, position.amount_tokens, &receipt.bundle_id);
+                Ok(receipt.bundle_id)
+            }
             Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
                 "sell bundle {} errored on-chain; still holding",
                 receipt.bundle_id
@@ -577,6 +1103,25 @@ impl LiveTrader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slippage_ceiling_covers_fee_inclusive_quotes() {
+        // The frozen 6002 log: quote required 1_668_970, guard sent
+        // 1_650_001 (1.15% short). At 100bps the guard must be
+        // ceil(1_668_970 * 1.01) = 1_685_660 — above `Right`, never
+        // equal-or-below it.
+        assert_eq!(apply_slippage_ceiling(1_668_970, 100), Some(1_685_660));
+        // Ceiling, not floor: 1 lamport of fraction rounds the guard up.
+        assert_eq!(apply_slippage_ceiling(10_001, 0), Some(10_001));
+        assert_eq!(apply_slippage_ceiling(10_000, 1), Some(10_001));
+        // Degenerate quotes fail closed; bps clamps at 100%.
+        assert_eq!(apply_slippage_ceiling(0, 200), None);
+        assert_eq!(apply_slippage_ceiling(1_000, 10_000), Some(2_000));
+        assert_eq!(apply_slippage_ceiling(1_000, 99_999), Some(2_000));
+        // Overflow fails closed instead of saturating into a jumbo guard.
+        assert_eq!(apply_slippage_ceiling(u64::MAX, 10_000), None);
+        assert_eq!(apply_slippage_ceiling(u64::MAX, 0), Some(u64::MAX));
+    }
 
     #[test]
     fn buy_plan_math() {
@@ -625,5 +1170,33 @@ mod tests {
     fn sell_floor_rejects_degenerate() {
         assert_eq!(plan_sell_floor(0, 2.0, 150.0, 200), None);
         assert_eq!(plan_sell_floor(100, 0.0, 150.0, 200), None);
+        // Absurd proceeds that don't fit u64: fail closed, never saturate.
+        assert_eq!(plan_sell_floor(u64::MAX, 1e12, 1e-6, 0), None);
+    }
+
+    #[test]
+    fn wal_replay_folds_pending_settled_positions_sells() {
+        // Ordered fold: pending survives, settled retires, sells subtract,
+        // manual restores, corrupt lines count (never panic).
+        let lines = [
+            r#"{"t":"pending","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}"#,
+            r#"{"t":"pending","mint":"DEAD","curve":"CURVE","assoc":"ASSOC","amount":500,"creator":null,"sig":"SIG2","bundle":"B2","ts":2}"#,
+            r#"{"t":"settled","bundle":"B2","ts":3}"#,
+            r#"{"t":"position","mint":"HELD","curve":"CURVE","assoc":"ASSOC","amount":700,"creator":null,"bundle":"B3","ts":4}"#,
+            r#"{"t":"sell","mint":"HELD","amount":200,"bundle":"B4","ts":5}"#,
+            r#"{"t":"manual","mint":"STUCK","curve":"CURVE","assoc":"ASSOC","amount":300,"creator":null,"ts":6}"#,
+            "not json at all",
+            r#"{"t":"pending","mint":"BROKEN","ts":7}"#,
+        ];
+        let replay = wal::replay_lines(lines.into_iter());
+        assert_eq!(replay.pending.len(), 1);
+        assert_eq!(replay.pending[0].bundle_id, "B1");
+        assert_eq!(replay.pending[0].signature, "SIG1");
+        assert_eq!(replay.positions.len(), 1);
+        assert_eq!(replay.positions[0].mint, "HELD");
+        assert_eq!(replay.positions[0].amount_tokens, 500);
+        assert_eq!(replay.manual.len(), 1);
+        assert_eq!(replay.manual[0].mint, "STUCK");
+        assert_eq!(replay.skipped, 2);
     }
 }

@@ -63,7 +63,8 @@ impl FromStr for StrategyMode {
 pub struct StrategyConfig {
     /// Execution shape selector.
     pub mode: StrategyMode,
-    /// Runner share kept riding after TP, 0–100 (default 20).
+    /// Runner share kept riding after TP, 0–100 (default 20). Values
+    /// >= 100 coerce to a full exit (a TP selling nothing never exits).
     pub runner_moonbag_percent: f64,
 }
 
@@ -92,7 +93,7 @@ pub fn resolve_strategy(profile: &RiskProfile, cfg: &StrategyConfig) -> RiskProf
     if profile.action != Action::Buy || !profile.is_valid() {
         return *profile;
     }
-    match cfg.mode {
+    let mut resolved = match cfg.mode {
         StrategyMode::Adaptive => *profile,
         StrategyMode::ScalpQuick => RiskProfile {
             action: Action::Buy,
@@ -110,10 +111,24 @@ pub fn resolve_strategy(profile: &RiskProfile, cfg: &StrategyConfig) -> RiskProf
             timeout_seconds: profile.timeout_seconds,
             // `f64::clamp` on NaN yields NaN (never the range): normalize
             // non-finite config to the default first.
-            moonbag_percent: finite_or(cfg.runner_moonbag_percent, RUNNER_MOONBAG_DEFAULT)
-                .clamp(0.0, 100.0),
+            moonbag_percent: {
+                let moonbag = finite_or(cfg.runner_moonbag_percent, RUNNER_MOONBAG_DEFAULT)
+                    .clamp(0.0, 100.0);
+                // 100% moonbag sells NOTHING at TP (`close_partial`
+                // rejects fraction 0), so the position could never exit
+                // on its profit trigger — coerce to a full exit.
+                if moonbag >= 100.0 { 0.0 } else { moonbag }
+            },
         },
+    };
+    // A moonbag runner without a trailing stop never exits sideways:
+    // settle lifts the timeout and disarms the moonbag, leaving only
+    // SL/TP — force the trail on (the trail percent itself resolves
+    // downstream per mode). Applies to every mode, not just runner.
+    if resolved.moonbag_percent > 0.0 {
+        resolved.trailing_stop = true;
     }
+    resolved
 }
 
 /// Finite `v`, else `default` (for pre-clamp normalization).
@@ -148,6 +163,17 @@ mod tests {
     fn adaptive_is_passthrough() {
         let p = buy(60.0, 20.0, true);
         assert_eq!(resolve_strategy(&p, &StrategyConfig::default()), p);
+    }
+
+    #[test]
+    fn moonbag_without_trailing_gets_a_trail() {
+        // An LLM moonbag on adaptive/scalp passthrough would otherwise
+        // ride sideways forever (settle lifts the timeout): coerce the
+        // trail on in every mode.
+        let cfg = StrategyConfig::default();
+        let p = resolve_strategy(&buy(60.0, 20.0, false), &cfg);
+        assert!(p.trailing_stop);
+        assert_eq!(p.moonbag_percent, 20.0);
     }
 
     #[test]
@@ -238,14 +264,15 @@ mod tests {
         assert_eq!((p.tp_percent, p.moonbag_percent), (60.0, 20.0));
         assert!(p.trailing_stop);
         assert!(p.is_valid());
-        // Custom moonbag share honored and clamped.
+        // Custom moonbag share honored, clamped, and never 100% (a
+        // TP that sells nothing could never exit — coerced to full).
         let custom = StrategyConfig {
             mode: StrategyMode::Runner,
             runner_moonbag_percent: 150.0,
         };
         assert_eq!(
             resolve_strategy(&buy(60.0, 0.0, false), &custom).moonbag_percent,
-            100.0
+            0.0
         );
     }
 }

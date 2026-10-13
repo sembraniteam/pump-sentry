@@ -16,9 +16,10 @@ use thiserror::Error;
 /// here so the whole workspace shares one definition (a program upgrade
 /// edits exactly one file).
 pub use ids::{
-    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_CREATE_DISCRIMINATOR,
+    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR,
+    PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_CREATE_DISCRIMINATOR,
     PUMP_CREATE_V2_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR,
-    PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR,
+    PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR, PUMP_SELL_V3_DISCRIMINATOR,
 };
 
 /// Minimum number of accounts expected on a `create` instruction.
@@ -368,7 +369,8 @@ pub fn decode_ix_data(data_str: &str) -> Option<Vec<u8>> {
 }
 
 /// True when `data` opens with any known Pump.fun discriminator
-/// (create/create_v2/buy/sell/buy_v2/sell_v2/migrate).
+/// (create/create_v2/buy/sell/buy_v2/sell_v2/buy_v3/sell_v3/
+/// buy_exact_quote_in_v3/migrate).
 fn starts_with_known_discriminator(data: &[u8]) -> bool {
     data.starts_with(&PUMP_CREATE_DISCRIMINATOR)
         || data.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
@@ -376,6 +378,9 @@ fn starts_with_known_discriminator(data: &[u8]) -> bool {
         || data.starts_with(&PUMP_SELL_DISCRIMINATOR)
         || data.starts_with(&PUMP_BUY_V2_DISCRIMINATOR)
         || data.starts_with(&PUMP_SELL_V2_DISCRIMINATOR)
+        || data.starts_with(&PUMP_BUY_V3_DISCRIMINATOR)
+        || data.starts_with(&PUMP_SELL_V3_DISCRIMINATOR)
+        || data.starts_with(&PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR)
         || data.starts_with(&PUMP_MIGRATE_DISCRIMINATOR)
 }
 

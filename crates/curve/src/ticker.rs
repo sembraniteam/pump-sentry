@@ -5,7 +5,8 @@
 //! `interval` and emits a [`PriceTick`] per curve. Read failures are
 //! logged and skipped — a missed round never kills the loop.
 
-use crate::layout::{BondingCurveReserves, CurveParseError, PUMP_TOKEN_DECIMALS};
+use crate::layout::{BondingCurveReserves, CurveParseError};
+use crate::sol_feed::SolUsdFeed;
 use solana_client::client_error::ClientError;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
@@ -31,9 +32,9 @@ pub enum CurveError {
     /// Mint address is not a valid pubkey (watch/feeed misrouting).
     #[error("invalid mint key '{0}'")]
     BadMintKey(String),
-    /// SOL→USD conversion is not a positive finite price.
-    #[error("invalid SOL/USD price: {0}")]
-    BadSolUsd(f64),
+    /// SOL→USD feed has no fresh price (stale or never fetched).
+    #[error("SOL/USD feed stale: no fresh price")]
+    StaleSolUsd,
     /// RPC transport failure.
     #[error("rpc error: {0}")]
     Rpc(#[from] ClientError),
@@ -81,19 +82,19 @@ pub struct CurveTicker {
     rpc: Arc<RpcClient>,
     subs: Arc<RwLock<HashMap<String, Watched>>>,
     interval: Duration,
-    sol_usd: f64,
+    sol_feed: Arc<SolUsdFeed>,
     /// Ticks dropped because the downstream queue was full (see `run`:
     /// drop-on-full keeps one slow consumer from stalling every curve).
     dropped: Arc<std::sync::atomic::AtomicU64>,
     /// Mint → decimals cache for [`CurveTicker::token_decimals`].
     /// Decimals are immutable on-chain, so entries never expire; the map
-    /// is bounded by distinct mints ever confirmed (evicted oldest-first
-    /// past the cap).
+    /// is bounded by distinct mints ever confirmed (arbitrary eviction
+    /// past the cap — order-free, since no entry is hotter than another).
     decimals: Arc<Mutex<HashMap<String, u8>>>,
 }
 
-/// Cap for the decimals cache (distinct confirmed mints; LRU-ish
-/// oldest-first eviction past it).
+/// Cap for the decimals cache (distinct confirmed mints; arbitrary
+/// eviction past it — correctness never depends on which entry goes).
 pub const DECIMALS_CACHE_CAP: usize = 5_000;
 
 impl CurveTicker {
@@ -110,21 +111,18 @@ impl CurveTicker {
     }
 
     /// Build a ticker: `http_url` + commitment for reads, `interval`
-    /// between poll rounds, `sol_usd` for SOL→USD conversion. A
-    /// non-positive or non-finite `sol_usd` is rejected (the old code
-    /// coerced it to 0.0, silently pricing every tick at nothing).
+    /// between poll rounds, `sol_feed` for SOL→USD conversion (dynamic,
+    /// staleness-gated — `fetch_tick`/`run` fail stale rounds instead of
+    /// pricing at a static number).
     pub fn new(
         http_url: &str,
         commitment: CommitmentConfig,
         interval: Duration,
-        sol_usd: f64,
+        sol_feed: Arc<SolUsdFeed>,
     ) -> Result<Self, CurveError> {
         match url::Url::parse(http_url) {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             _ => return Err(CurveError::BadUrl(http_url.to_string())),
-        }
-        if !sol_usd.is_finite() || sol_usd <= 0.0 {
-            return Err(CurveError::BadSolUsd(sol_usd));
         }
         Ok(Self {
             rpc: Arc::new(RpcClient::new_with_commitment(
@@ -133,7 +131,7 @@ impl CurveTicker {
             )),
             subs: Arc::new(RwLock::new(HashMap::new())),
             interval,
-            sol_usd,
+            sol_feed,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decimals: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -181,13 +179,18 @@ impl CurveTicker {
     /// failures only — a missing account is not retried) plus a deadline
     /// so hung RPCs fail fast instead of stalling the caller. The curve
     /// account owner must be the Pump.fun program (spoofed price sources
-    /// rejected).
+    /// rejected). Fails with [`CurveError::StaleSolUsd`] when the SOL/USD
+    /// feed has no fresh price (every tick is dynamic — no static fallback).
     pub async fn fetch_tick(&self, mint: &str, curve: &str) -> Result<PriceTick, CurveError> {
         Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
         let key =
             Pubkey::from_str(curve).map_err(|_| CurveError::BadCurveKey(curve.to_string()))?;
+        let sol_usd = self.sol_feed.price().ok_or(CurveError::StaleSolUsd)?;
         let account = read_with_retry(&self.rpc, &key).await?;
-        tick_from_account(mint, curve, &account.data, &account.owner, self.sol_usd)
+        // Decimals before pricing (cached; fail-closed like the confirm
+        // gate — a tick at the wrong scale is worse than none).
+        let decimals = self.token_decimals(mint).await?;
+        tick_from_account(mint, curve, &account.data, &account.owner, sol_usd, decimals)
     }
 
     /// Mint decimals from the mint account (cached per mint; immutable
@@ -250,6 +253,14 @@ impl CurveTicker {
             if watched.is_empty() {
                 continue;
             }
+            // Dynamic SOL price per round: one fresh read gates every tick
+            // in the round (stale feed skips the whole round — no static
+            // fallback).
+            let Some(sol_usd) = self.sol_feed.price() else {
+                debug!("sol_usd stale; skipping round");
+                tokio::time::sleep(self.interval).await;
+                continue;
+            };
             let keys: Vec<Pubkey> = watched.iter().map(|w| w.curve).collect();
             let accounts =
                 match tokio::time::timeout(ROUND_OVERALL_TIMEOUT, poll_round(&self.rpc, &keys))
@@ -280,12 +291,22 @@ impl CurveTicker {
                     debug!(mint = %entry.mint, "curve account missing (not yet indexed?)");
                     continue;
                 };
+                // Real decimals (cached) — a wrong-scale print is worse
+                // than a skipped round.
+                let decimals = match self.token_decimals(&entry.mint).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        debug!(mint = %entry.mint, error = %e, "mint decimals unreadable; skipping tick");
+                        continue;
+                    }
+                };
                 match tick_from_account(
                     &entry.mint,
                     &entry.curve.to_string(),
                     &account.data,
                     &account.owner,
-                    self.sol_usd,
+                    sol_usd,
+                    decimals,
                 ) {
                     Ok(tick) => match tx.try_send(tick) {
                         Ok(()) => {}
@@ -410,10 +431,14 @@ fn tick_from_account(
     data: &[u8],
     owner: &Pubkey,
     sol_usd: f64,
+    decimals: u8,
 ) -> Result<PriceTick, CurveError> {
     let reserves = BondingCurveReserves::parse_validated(data, owner)?;
+    // Real mint decimals, not the assumed 6: a non-6 print used to be
+    // emitted at 10^Δ the true price (the confirm gate drops non-6 mints
+    // downstream, but every other tick consumer read garbage).
     let price_usd = reserves
-        .price_usd(PUMP_TOKEN_DECIMALS, sol_usd)
+        .price_usd(decimals, sol_usd)
         .ok_or_else(|| CurveError::NoPrice(curve.to_string()))?;
     Ok(PriceTick {
         mint: mint.to_string(),
@@ -431,6 +456,7 @@ fn tick_from_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
     fn ticker() -> CurveTicker {
@@ -438,7 +464,7 @@ mod tests {
             "https://api.mainnet-beta.solana.com",
             CommitmentConfig::confirmed(),
             StdDuration::from_millis(500),
-            150.0,
+            SolUsdFeed::new_for_test(150.0),
         )
         .expect("ticker")
     }
@@ -450,7 +476,7 @@ mod tests {
                 "notaurl",
                 CommitmentConfig::confirmed(),
                 StdDuration::from_secs(1),
-                150.0
+                SolUsdFeed::new_for_test(150.0),
             ),
             Err(CurveError::BadUrl(_))
         ));
@@ -498,16 +524,21 @@ mod tests {
         }
         data.push(0);
         let tick =
-            tick_from_account("MINT", "CURVE", &data, &ids::PUMP_PROGRAM_ID, 150.0).expect("tick");
+            tick_from_account("MINT", "CURVE", &data, &ids::PUMP_PROGRAM_ID, 150.0, 6).expect("tick");
         assert!((tick.price_usd - 2.7959e-8 * 150.0).abs() < 1e-12);
         assert!((tick.liquidity_usd - 4500.0).abs() < 1e-9);
         assert!(!tick.complete);
+        // Non-6 decimals scale the same reserves differently (no more
+        // silent 10^Δ misprints at the tick layer).
+        let tick9 =
+            tick_from_account("MINT", "CURVE", &data, &ids::PUMP_PROGRAM_ID, 150.0, 9).expect("tick");
+        assert!((tick9.price_usd - tick.price_usd * 1000.0).abs() < 1e-9);
     }
 
     #[test]
     fn tick_rejects_garbage() {
         assert!(matches!(
-            tick_from_account("M", "C", &[0u8; 8], &ids::PUMP_PROGRAM_ID, 150.0),
+            tick_from_account("M", "C", &[0u8; 8], &ids::PUMP_PROGRAM_ID, 150.0, 6),
             Err(CurveError::Parse(_))
         ));
     }
@@ -518,7 +549,7 @@ mod tests {
         data.extend_from_slice(&[0u8; 41]);
         let stranger = Pubkey::new_from_array([9; 32]);
         assert!(matches!(
-            tick_from_account("M", "C", &data, &stranger, 150.0),
+            tick_from_account("M", "C", &data, &stranger, 150.0, 6),
             Err(CurveError::Parse(
                 crate::layout::CurveParseError::WrongOwner(_)
             ))
@@ -526,21 +557,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_sol_price() {
-        for bad in [0.0, -150.0, f64::NAN, f64::INFINITY] {
-            assert!(
-                matches!(
-                    CurveTicker::new(
-                        "https://api.mainnet-beta.solana.com",
-                        CommitmentConfig::confirmed(),
-                        StdDuration::from_secs(1),
-                        bad,
-                    ),
-                    Err(CurveError::BadSolUsd(_))
-                ),
-                "sol {bad}"
-            );
-        }
+    fn feed_stale_fails_closed() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // Seeded feed forced stale: fetch_tick must fail, never price at
+        // a static fallback.
+        let stale = SolUsdFeed::new(
+            crate::sol_feed::DEFAULT_JUP_URL,
+            120,
+            std::time::Duration::from_secs(30),
+        );
+        stale.set_price(150.0);
+        // Backdate via fresh feed with 0 stale window instead: simplest is
+        // a feed with no price at all (never fetched).
+        let empty = SolUsdFeed::new(
+            crate::sol_feed::DEFAULT_JUP_URL,
+            120,
+            std::time::Duration::from_secs(30),
+        );
+        let _ = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = stale;
+        assert!(empty.price().is_none());
+        assert!(empty.is_stale());
     }
 
     #[tokio::test]

@@ -324,10 +324,12 @@ impl PumpFunListener {
     }
 }
 
-/// Fetch one transaction with a single retry for transient failures.
+/// Fetch one transaction with retries for transient failures.
 /// Permits are held only across live RPCs, never across the backoff
-/// sleep: attempt 1 runs under a permit, the 250ms sleep runs free, and
-/// attempt 2 re-acquires (giving up with a metric when saturated).
+/// sleeps: each attempt runs under a fresh permit (giving up with a
+/// metric when saturated). Tiers: 250ms retry for any transient error,
+/// plus a 1s third attempt for `429` alone (the fast retry usually lands
+/// inside the same limit window).
 /// Returns `None` on any terminal outcome (metrics recorded inside).
 /// Deterministic errors (unknown transaction, bad params, rejected
 /// encoding) return immediately without burning an extra RPC.
@@ -344,7 +346,10 @@ async fn fetch_tx_permit_bound(
             Ok(permit) => Some(permit),
             Err(_) => {
                 stats.inc_dropped_throttled();
-                debug!(signature = %sig_str, why, "fetch saturated; dropping candidate");
+                // Warn, not debug: sustained throttling is a systemic
+                // miss-trade signal during Pump.fun bursts (fail-closed
+                // for funds, but the sniper is blind while this fires).
+                warn!(signature = %sig_str, why, "fetch saturated; dropping candidate");
                 None
             }
         }
@@ -359,6 +364,22 @@ async fn fetch_tx_permit_bound(
             let _permit = acquire("retry")?;
             match rpc.get_transaction_with_config(signature, tx_config).await {
                 Ok(v) => Some(v),
+                // Rate limits get one last, longer tier: the 250ms retry
+                // usually lands inside the same window, while a 1s pause
+                // often clears it. Other transients stop here (two RPCs
+                // per candidate is the quota budget).
+                Err(e) if is_rate_limited(&e) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    let _permit = acquire("rate-limit retry")?;
+                    match rpc.get_transaction_with_config(signature, tx_config).await {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            stats.inc_fetch_err();
+                            debug!(signature = %sig_str, error = %e, "getTransaction rate-limit retry failed");
+                            None
+                        }
+                    }
+                }
                 Err(e) => {
                     stats.inc_fetch_err();
                     debug!(signature = %sig_str, error = %e, "getTransaction retry failed");
@@ -372,6 +393,20 @@ async fn fetch_tx_permit_bound(
             None
         }
     }
+}
+
+/// True for rate-limit rejections specifically (`429`): worth a longer
+/// second backoff tier, since the first 250ms retry usually lands inside
+/// the same limit window.
+fn is_rate_limited(e: &ClientError) -> bool {
+    use solana_client::client_error::ClientErrorKind;
+    matches!(
+        e.kind(),
+        ClientErrorKind::RpcError(solana_client::rpc_request::RpcError::RpcResponseError {
+            code: 429,
+            ..
+        })
+    )
 }
 
 /// True for failures worth one retry: transport-level trouble plus
@@ -430,6 +465,8 @@ async fn fetch_and_emit(
     // (`UnsupportedEncoding`) — a node forcing binary drops launches.
     // Version through v1: current Pump.fun launches are v1 envelopes and
     // `Some(0)` makes the RPC refuse them (-32015); see `json_tx_config`.
+    // If the program ever ships v2 envelopes, every fetch here fails
+    // deterministically (-32015) — loud in logs, unmissable in sims.
     let tx_config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Json),
         commitment: Some(commitment),
