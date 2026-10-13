@@ -2,10 +2,15 @@
 //!
 //! Invariants:
 //! 1. Secrets only enter via `SOLANA_PRIVATE_KEY` (base58 64-byte secret
-//!    or 32-byte seed); env-string and decode buffers are zeroized after
-//!    use (best-effort: allocator copies are out of scope).
-//! 2. A hard 0.05 SOL floor ([`MIN_SOL_RESERVE_LAMPORTS`]) is never spent.
-//! 3. [`WalletGuard::assert_solvency`] checks
+//!    or 32-byte seed); the env string and every decode buffer are
+//!    zeroized after use (best-effort: allocator copies are out of
+//!    scope). Both lengths decode through ONE zeroizing buffer — the
+//!    keypair crate's own base58 helper is deliberately not used (its
+//!    stack buffer is never wiped).
+//! 2. The loaded key lives for the process lifetime with no `mlock`
+//!    (swappable — run on a host with encrypted swap for live funds).
+//! 3. A hard 0.05 SOL floor ([`MIN_SOL_RESERVE_LAMPORTS`]) is never spent.
+//! 4. [`WalletGuard::assert_solvency`] checks
 //!    `balance >= trade + tip + reserve` before any swap is built.
 
 use solana_client::{client_error::ClientError, nonblocking::rpc_client::RpcClient};
@@ -70,15 +75,17 @@ impl WalletGuard {
     }
 
     /// Build from a base58 string: 64-byte secret or 32-byte seed.
-    /// Decode buffers are zeroized before returning; the input `&str` is
-    /// caller-owned (see [`Self::load_from_env`] for the zeroized path).
+    /// Decodes once into a zeroizing buffer and validates through
+    /// [`TryFrom`]: a 64-byte input with a mismatched embedded pubkey
+    /// reports [`WalletGuardError::BadSecret`] (not `BadKeyLength`).
+    /// The input `&str` is caller-owned (see [`Self::load_from_env`]
+    /// for the zeroized path).
     pub fn from_base58(s: &str) -> Result<Self, WalletGuardError> {
-        // Fast path: standard 64-byte secret strings (also validates ed25519).
-        if let Ok(keypair) = Keypair::try_from_base58_string(s) {
-            return Ok(Self { keypair });
-        }
         let mut bytes = Zeroizing::new(bs58::decode(s).into_vec()?);
         let result = match bytes.len() {
+            64 => Keypair::try_from(bytes.as_slice())
+                .map_err(|e| WalletGuardError::BadSecret(e.to_string()))
+                .map(|keypair| Self { keypair }),
             32 => keypair_from_seed(&bytes)
                 .map_err(|e| WalletGuardError::BadSecret(e.to_string()))
                 .map(|keypair| Self { keypair }),

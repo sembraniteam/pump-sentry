@@ -61,6 +61,7 @@ cargo run -- start            # background daemon, logs to logs/bot.log
 cargo run -- status           # check the daemon (pid, mode, log)
 cargo run -- logs -n 50       # tail the log (add --follow to follow it)
 cargo run -- restart --live   # stop + restart in live mode
+cargo run -- sell <MINT>      # manual full exit now (no restart needed)
 cargo run -- stop             # stop the daemon (SIGTERM, drain, snapshot)
 
 # Foreground (debugging):
@@ -81,6 +82,9 @@ restarted. `stop` sends SIGTERM (bounded 30s in-flight drain + a
 `logs/shutdown-<ts>.json` snapshot of still-open paper/live positions
 for manual review), then SIGKILL past 45s. `LOG_FILE` / `PID_FILE`
 override the default paths; run every command from the same directory.
+A heartbeat card (logs/candidates/cash/equity) fires at boot and every
+6h so quiet markets still prove liveness; `sell <MINT>` exits one mint
+now without stopping the daemon.
 
 With knobs:
 
@@ -154,7 +158,7 @@ the risk profile runs verbatim):
 ## Testing
 
 ```sh
-cargo test --workspace                    # 321 tests across all crates, live probes ignored by default
+cargo test --workspace                    # 333 tests across all crates, live probes ignored by default
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

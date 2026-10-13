@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use live::LiveTrader;
-use pipeline::Pipeline;
+use pipeline::{AlertSink, Pipeline};
 use settings::Settings;
 
 #[tokio::main]
@@ -46,6 +46,7 @@ async fn main() {
         cli::CliAction::Stop => cli::cmd_stop(),
         cli::CliAction::Status => cli::cmd_status(),
         cli::CliAction::Logs { lines, follow } => cli::cmd_logs(lines, follow).await,
+        cli::CliAction::Sell { mint } => cli::cmd_sell(&mint),
         cli::CliAction::Help { error } => {
             if let Some(cause) = error {
                 eprintln!("error: {cause}\n");
@@ -449,6 +450,15 @@ async fn run_pipeline(live_arg: bool) {
     let mut gate_timer = tokio::time::interval(gate_interval);
     gate_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Heartbeat (P3.2): proof-of-life on quiet markets — a card every
+    // 6h with throughput counters + cash so silence reads as "alive",
+    // never "hung". First tick fires immediately (boot card).
+    /// Heartbeat cadence in seconds.
+    const HEARTBEAT_SECS: u64 = 6 * 3_600;
+    let boot_ts = settings::now_secs();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // In-flight units run as JoinSet tasks so Ctrl-C never cancels a
     // half-applied launch/exit mid-await (paper-open without live mirror
     // and similar partial commits). Shutdown drains them bounded.
@@ -533,7 +543,54 @@ async fn run_pipeline(live_arg: bool) {
                     pipeline.on_pool_tick(&pool).await;
                 });
             }
+            _ = heartbeat.tick() => {
+                let snap = stats_task.snapshot();
+                let pending = pipeline.pending_count().await;
+                let open = pipeline.open_position_mints().await.len();
+                let (cash, equity) = pipeline.paper_cash_equity().await;
+                let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
+                    mode: if live_mode { "live" } else { "paper" },
+                    uptime_secs: settings::now_secs().saturating_sub(boot_ts),
+                    logs_seen: snap.logs_seen,
+                    candidates: snap.candidates,
+                    parse_ok: snap.parse_ok,
+                    dropped: snap.dropped_full.saturating_add(snap.dropped_throttled),
+                    watchlist_pending: pending,
+                    open_positions: open,
+                    cash_usd: cash,
+                    equity_usd: equity,
+                });
+                info!("heartbeat: logs={} candidates={} watchlist={} open={} equity={:.2}",
+                    snap.logs_seen, snap.candidates, pending, open, equity);
+                if let Some(alerts) = pipeline.alerts.as_ref() {
+                    alerts.alert(card);
+                }
+            }
             _ = gate_timer.tick() => {
+                // Manual-sell drain (`sell <MINT>` request files): every
+                // round, unconditionally — exits must not wait on the
+                // gate slot. Settled requests are deleted; holding ones
+                // stay for the next round.
+                {
+                    let (_, log_file) = cli::resolve_paths();
+                    for (mint, path) in cli::pending_sell_requests(&log_file) {
+                        // Body must name the same mint as the filename:
+                        // anything else is forged or torn — drop loudly,
+                        // never act on it, never retry it.
+                        let body_ok = std::fs::read_to_string(&path)
+                            .ok()
+                            .and_then(|b| cli::sell_request_body_mint(&b))
+                            .is_some_and(|m| m == mint);
+                        if !body_ok {
+                            warn!(%mint, path = %path.display(), "manual sell request body mismatch; dropping request");
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
+                        if pipeline.manual_sell(&mint).await {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
                 if pipeline.try_begin_poll().await {
                     let pipeline = Arc::clone(&pipeline);
                     in_flight.spawn(async move {
@@ -596,7 +653,7 @@ async fn run_pipeline(live_arg: bool) {
             .unwrap_or_else(|| format!("shutdown-{snap_ts}.json").into())
     };
     let write_snapshot = |summary: &cli::ShutdownSummary| {
-        if let Err(e) = std::fs::write(&snap_path, summary.to_json()) {
+        if let Err(e) = cli::write_private_file(&snap_path, summary.to_json().as_bytes()) {
             warn!(
                 "shutdown snapshot unwritable ({}): {e}",
                 snap_path.display()

@@ -26,6 +26,27 @@ pub enum RugCheckError {
     BadUrl(String),
 }
 
+impl RugCheckError {
+    /// Retryable at the pipeline watchlist: transport trouble, rate
+    /// limits, server errors, unparseable bodies, and HTTP 400. A 400
+    /// on a seconds-old mint almost always means "not indexed yet"
+    /// (our requests are fixed-format, so a malformed-request 400 is
+    /// not a live case) — dropping it instantly burns real launches.
+    /// Only policy rejections and client misconfiguration drop at once.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::SecurityRejection(_) | Self::BadUrl(_) => false,
+            Self::Network(_) | Self::Deserialization(_) => true,
+            Self::HttpStatus(s) => {
+                s.is_server_error()
+                    || *s == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || *s == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *s == reqwest::StatusCode::BAD_REQUEST
+            }
+        }
+    }
+}
+
 /// Risk report for one mint, as returned by
 /// `GET /tokens/{mint}/report`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -121,5 +142,24 @@ mod tests {
         // No score must not parse as 0 (a free pass through the gate).
         let err = serde_json::from_str::<RugCheckReport>(r#"{"mint": "ABC"}"#).expect_err("must fail");
         assert!(err.to_string().contains("score"));
+    }
+
+    #[test]
+    fn retryable_covers_indexing_latency_not_policy() {
+        use reqwest::StatusCode;
+        // Fresh-mint 400s, rate limits, server errors, transport and
+        // unparseable bodies: retry at the watchlist, never drop at 0s.
+        assert!(RugCheckError::HttpStatus(StatusCode::BAD_REQUEST).is_retryable());
+        assert!(RugCheckError::HttpStatus(StatusCode::TOO_MANY_REQUESTS).is_retryable());
+        assert!(RugCheckError::HttpStatus(StatusCode::REQUEST_TIMEOUT).is_retryable());
+        assert!(RugCheckError::HttpStatus(StatusCode::INTERNAL_SERVER_ERROR).is_retryable());
+        assert!(RugCheckError::Deserialization(
+            serde_json::from_str::<u32>("bogus").expect_err("must fail")
+        )
+        .is_retryable());
+        // Policy and config: drop at once, never queue.
+        assert!(!RugCheckError::SecurityRejection("rug".to_string()).is_retryable());
+        assert!(!RugCheckError::BadUrl(":::".to_string()).is_retryable());
+        assert!(!RugCheckError::HttpStatus(StatusCode::FORBIDDEN).is_retryable());
     }
 }

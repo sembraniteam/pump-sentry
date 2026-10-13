@@ -7,4 +7,4 @@
 
 pub mod discord;
 
-pub use discord::Alerter;
+pub use discord::{Alerter, HeartbeatReport};

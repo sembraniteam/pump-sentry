@@ -1,6 +1,6 @@
 //! Live execution sink: USD sizing math plus Jito-routed dispatch.
 //!
-//! [`LiveTrader`] wraps [`SwapExecutor`](executor::SwapExecutor) with the
+//! [`LiveTrader`] wraps [`SwapExecutor`](SwapExecutor) with the
 //! pipeline's USD-denominated sizing. [`plan_buy`] / [`plan_sell`] are pure
 //! (unit-tested); only [`LiveTrader::buy`] / [`sell`](LiveTrader::sell)
 //! touch the network.
@@ -20,6 +20,12 @@ use thiserror::Error;
 pub const TOKEN_DECIMALS: u32 = 6;
 /// Lamports per SOL.
 pub const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+/// Pump.fun venue fee priced into every spend guard (protocol + creator,
+/// 125 bps total — matches the simulator's per-side fee and the on-chain
+/// fee schedule). Applied BEFORE the slippage ceiling: the chain debits
+/// trade + fees, so a fee-blind guard spends the slippage budget on
+/// baseline cost (a 1.15%-short guard failed live with 6002).
+pub const VENUE_FEE_BPS: u64 = 125;
 
 /// Live-trade failures: bad inputs or dispatch errors.
 #[derive(Error, Debug)]
@@ -95,7 +101,7 @@ pub struct LiveBuyParams<'a> {
     /// SOL price in USD (lamport conversion).
     pub sol_usd: f64,
     /// Curve liquidity in USD for impact sizing (mirrors the paper
-    /// [`FillModel`](simulator::FillModel): unknown/zero pays fee-only).
+    /// [`FillModel`](FillModel): unknown/zero pays fee-only).
     pub liquidity_usd: f64,
     /// Token creator (base58), when the launch carried one.
     pub creator: Option<&'a str>,
@@ -129,7 +135,7 @@ pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> 
 }
 
 /// Size a buy from USD notional at spot: tokens from `notional/price`
-/// through the paper [`FillModel`](simulator::FillModel) (fee + impact,
+/// through the paper [`FillModel`](FillModel) (fee + impact,
 /// fee-only when liquidity is unknown — identical inputs give identical
 /// sizes on both legs), spend cap from `notional/sol` plus
 /// `slippage_bps` (clamped to 10_000 = 100% like the sell floor, so a
@@ -169,17 +175,26 @@ pub fn plan_buy(
     if !lamports.is_finite() || lamports <= 0.0 || lamports > u64::MAX as f64 {
         return None;
     }
+    // Venue fee first (exact integer ceil in u128; the narrowing
+    // `try_from` fails closed if the fee tips a near-max guard over
+    // u64::MAX), then the slippage ceiling. The fee engine downstream
+    // recomputes fee-inclusively and only ever RAISES this guard, so
+    // pre-paying the fee here never double-counts.
+    let with_fee = u64::try_from(
+        (lamports as u64 as u128 * (10_000 + VENUE_FEE_BPS) as u128).div_ceil(10_000),
+    )
+    .ok()?;
     // One guard constructor everywhere (ceiling math): the float quote
     // here stands in for a fee-inclusive on-chain quote until the quote
     // engine lands — the helper, not ad-hoc math, sets every guard.
-    let max_sol_cost = apply_slippage_ceiling(lamports as u64, slippage_bps)?;
+    let max_sol_cost = apply_slippage_ceiling(with_fee, slippage_bps)?;
     Some(LiveBuyPlan {
         amount_tokens,
         max_sol_cost,
     })
 }
 
-/// Floor for a sell: model proceeds (paper [`FillModel`](simulator::FillModel)
+/// Floor for a sell: model proceeds (paper [`FillModel`](FillModel)
 /// at the same inputs, so the floor tracks what the ledger books) minus
 /// `slippage_bps`. `None` on degenerate inputs — and on a zero floor:
 /// `min_sol_output = 0` authorizes the slot leader to fill at any price
@@ -542,7 +557,7 @@ pub mod wal {
         {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::write(path, out) {
+        if let Err(e) = crate::cli::write_private_file(path, out.as_bytes()) {
             tracing::warn!(file = %path.display(), error = %e, "live WAL compaction failed; file keeps growing (non-fatal)");
         }
     }
@@ -942,7 +957,14 @@ impl LiveTrader {
             let _ = std::fs::create_dir_all(parent);
         }
         use std::io::Write as _;
-        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(path) {
             Ok(mut f) => {
                 if writeln!(f, "{line}").is_err() {
                     tracing::warn!("live WAL append failed (non-fatal)");
@@ -1170,8 +1192,8 @@ mod tests {
         // identically on both legs.
         let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0).expect("plan");
         assert_eq!(plan.amount_tokens, 2_350_783_986_459);
-        // $10 ≈ 66.67M lamports + 2% slippage guard.
-        assert_eq!(plan.max_sol_cost, 68_000_000);
+        // $10 ≈ 66.67M lamports + 1.25% venue fee, then + 2% slippage guard.
+        assert_eq!(plan.max_sol_cost, 68_850_000);
     }
 
     #[test]

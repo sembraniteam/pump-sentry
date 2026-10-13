@@ -39,6 +39,31 @@ pub struct Alerter {
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Heartbeat payload: counters + cash snapshot, bundled so new
+/// fields cannot grow the formatter arity again.
+pub struct HeartbeatReport<'a> {
+    /// `live` or `paper`.
+    pub mode: &'a str,
+    /// Seconds since boot.
+    pub uptime_secs: u64,
+    /// Listener throughput counters.
+    pub logs_seen: u64,
+    /// Launch candidates seen.
+    pub candidates: u64,
+    /// Candidates parsed.
+    pub parse_ok: u64,
+    /// Dropped events (full + throttled).
+    pub dropped: u64,
+    /// Watchlisted mints awaiting quorum.
+    pub watchlist_pending: usize,
+    /// Open paper positions.
+    pub open_positions: usize,
+    /// Free paper cash (USD).
+    pub cash_usd: f64,
+    /// Mark-to-market paper equity (USD).
+    pub equity_usd: f64,
+}
+
 /// Resolve the Hermes binary: explicit override first, `HERMES_BIN` env
 /// second, bare `"hermes"` on `PATH` last.
 fn resolve_binary() -> String {
@@ -283,6 +308,36 @@ impl Alerter {
         )
     }
 
+    /// Heartbeat card: periodic proof-of-life for quiet markets. All
+    /// inputs are counters (no addresses), so nothing needs sanitizing
+    /// beyond the mode label.
+    pub fn format_heartbeat(r: &HeartbeatReport<'_>) -> String {
+        let mode = Self::sanitize(r.mode);
+        let uptime_h = r.uptime_secs / 3_600;
+        let uptime_m = (r.uptime_secs % 3_600) / 60;
+        format!(
+            "💚 **[BOT HEARTBEAT]**\n\
+             • **Mode:** `{mode}`\n\
+             • **Uptime:** `{uptime_h}h {uptime_m}m`\n\
+             • **Logs seen:** `{}`\n\
+             • **Candidates:** `{}`\n\
+             • **Parsed:** `{}`\n\
+             • **Dropped:** `{}`\n\
+             • **Watchlist:** `{}` pending\n\
+             • **Open:** `{}` position(s)\n\
+             • **Cash:** `${:.2}`\n\
+             • **Equity:** `${:.2}`",
+            r.logs_seen,
+            r.candidates,
+            r.parse_ok,
+            r.dropped,
+            r.watchlist_pending,
+            r.open_positions,
+            r.cash_usd,
+            r.equity_usd,
+        )
+    }
+
     /// Post-migration spike card: price crossed `multiple` off the first
     /// pool tick after migration.
     pub fn format_follow_spike(mint: &str, multiple: f64, price_usd: f64) -> String {
@@ -340,6 +395,28 @@ mod tests {
         assert!(card.contains("[POST-MIGRATION SPIKE]"));
         assert!(card.contains("2.0x"));
         assert!(card.contains("explorer.solana.com/address/M"));
+    }
+
+    #[test]
+    fn heartbeat_card_marks_counters() {
+        let card = Alerter::format_heartbeat(&HeartbeatReport {
+            mode: "live",
+            uptime_secs: 7_500,
+            logs_seen: 1000,
+            candidates: 50,
+            parse_ok: 48,
+            dropped: 2,
+            watchlist_pending: 3,
+            open_positions: 1,
+            cash_usd: 90.5,
+            equity_usd: 102.25,
+        });
+        assert!(card.contains("[BOT HEARTBEAT]"));
+        assert!(card.contains("`live`"));
+        assert!(card.contains("2h 5m"));
+        assert!(card.contains("`1000`"));
+        assert!(card.contains("$90.50"));
+        assert!(card.contains("$102.25"));
     }
 
     #[test]

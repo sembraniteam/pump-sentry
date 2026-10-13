@@ -406,6 +406,13 @@ pub struct LiveExecution<L = LiveTrader> {
     /// trip — or mask — the gate). Cleared with `live_diverged` when no
     /// paper position remains.
     pub synthetic_mints: Mutex<std::collections::HashSet<String>>,
+    /// Paper PnL closed while the live leg still holds: recording it
+    /// immediately would let paper profit mask real live loss at the
+    /// day-loss gate, but dropping it (as before) undercounts the loss
+    /// forever. Stashed here on defer, flushed into the breaker when the
+    /// live leg settles (sold / manual-parked / gone). Bounded: one entry
+    /// per mint, removed on flush and on book-empty cleanup.
+    pub deferred_pnl: Mutex<HashMap<String, Vec<f64>>>,
     /// Per-mint dispatch locks: probe sizing and tracking updates must
     /// not interleave across concurrent ticks for one mint, but a slow
     /// confirm on mint A must never block exits on mint B (a global
@@ -425,6 +432,7 @@ impl<L> LiveExecution<L> {
             live_manual: Mutex::new(HashMap::new()),
             live_diverged: Mutex::new(HashMap::new()),
             synthetic_mints: Mutex::new(std::collections::HashSet::new()),
+            deferred_pnl: Mutex::new(HashMap::new()),
             live_sell_locks: Mutex::new(HashMap::new()),
         }
     }
@@ -512,8 +520,13 @@ pub struct PendingSignal {
     pub creator: Option<String>,
     /// Curve ATA address (base58) for live exits.
     pub assoc_curve: String,
-    /// RugCheck score captured at signal time.
-    pub score: u32,
+    /// RugCheck score captured at signal time (`None` while the audit
+    /// is still pending retry — RugCheck 400s fresh mints during
+    /// indexing; see `AUDIT_RETRY_SECS`). Quorum can never confirm
+    /// without a score (fail-closed at confirm, deadline aborts).
+    pub audit_score: Option<u32>,
+    /// Last audit attempt (`now_secs`): throttles re-polls.
+    pub last_audit_secs: u64,
     /// Creation slot for the bundle rule.
     pub creation_slot: u64,
     /// Signature watermark for incremental curve reads.
@@ -543,6 +556,11 @@ pub struct GateState {
 /// Age after which a gate-poll claim is considered leaked and eligible
 /// for takeover (normal rounds finish in seconds; margin is generous).
 pub const STALE_POLL_SECS: u64 = 120;
+
+/// Minimum spacing between audit retries for one watchlisted mint.
+/// RugCheck 400s on seconds-old mints (indexing latency) resolve in
+/// seconds — faster polling would spam a struggling third party.
+pub const AUDIT_RETRY_SECS: u64 = 3;
 
 /// Day-loss circuit breaker: halts *new entries* once the UTC-day
 /// realized net passes the configured loss cap. Exits always keep
@@ -643,6 +661,13 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         self.gate_state.lock().await.gate.pending_count()
     }
 
+    /// Paper cash + mark-to-market equity (heartbeat cards).
+    pub async fn paper_cash_equity(&self) -> (f64, f64) {
+        let portfolio = self.portfolio.lock().await;
+        let snap = portfolio.snapshot(&HashMap::new());
+        (snap.cash, snap.equity)
+    }
+
     /// Mints with open paper positions (shutdown snapshot: nothing open
     /// may vanish silently on SIGTERM).
     pub async fn open_position_mints(&self) -> Vec<String> {
@@ -736,12 +761,21 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // screening parses defensively (`parse_address` at each RPC
         // boundary), so a bad string degrades to per-round warnings until
         // the gate sweep, never to a mispriced open.
-        // 1. Audit — fail closed.
-        let report = match self.auditor.evaluate_token(mint).await {
-            Ok(report) => report,
+        // 1. Audit — fail closed, with indexing-latency retry. A fresh
+        // mint's 400 ("not indexed yet") must not burn the launch at
+        // second 0: retryable failures watchlist with no score and
+        // re-poll on the gate cadence until the deadline aborts.
+        // Policy rejections and misconfiguration still drop at once.
+        let now = now_secs();
+        let (audit_score, last_audit_secs) = match self.auditor.evaluate_token(mint).await {
+            Ok(report) => (Some(report.score), now),
             Err(RugCheckError::SecurityRejection(reason)) => {
                 info!(%mint, "audit reject: {reason}");
                 return;
+            }
+            Err(e) if e.is_retryable() => {
+                warn!(%mint, error = %e, "audit unresolved (indexing/transport); watchlisting for retry within gate window");
+                (None, now)
             }
             Err(e) => {
                 warn!(%mint, error = %e, "audit error; skipping (fail-closed)");
@@ -792,14 +826,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             PendingSignal {
                 curve: curve.to_string(),
                 assoc_curve: assoc_curve.to_string(),
-                score: report.score,
+                audit_score,
+                last_audit_secs,
                 creation_slot: slot,
                 last_sig: None,
                 creator: creator.map(|c| c.to_string()),
                 dev_trust: trust,
             },
         );
-        info!(%mint, score = report.score, "watchlisted; awaiting buyer quorum");
+        match audit_score {
+            Some(score) => info!(%mint, score, "watchlisted; awaiting buyer quorum"),
+            None => info!(%mint, "watchlisted without audit score; awaiting buyer quorum + audit retry"),
+        }
     }
 
     /// Screen one insider wallet (launcher or creator): audit-logged
@@ -881,6 +919,43 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 debug!(%mint, "curve observation truncated; holding watch without quorum");
                 continue;
             }
+            // Audit retry (P1.2): a `None` score means RugCheck was still
+            // indexing at launch. Re-poll throttled to `AUDIT_RETRY_SECS`;
+            // the gate deadline aborts unresolvable mints (fail-closed
+            // after the window, never at second 0). The watermark below
+            // is deliberately NOT advanced while the score is missing:
+            // post-resolve quorum must observe the whole window,
+            // including insider dumps during the wait.
+            // Snapshot the score BEFORE retrying: the staleness check
+            // below must compare meta against the pre-retry snapshot, or
+            // our own retry would read as a concurrent relaunch.
+            let audit_at_snapshot = signal.audit_score;
+            let mut audit_changed = false;
+            if signal.audit_score.is_none() {
+                let now = now_secs();
+                if now.saturating_sub(signal.last_audit_secs) >= AUDIT_RETRY_SECS {
+                    match self.auditor.evaluate_token(&mint).await {
+                        Ok(report) => {
+                            info!(%mint, score = report.score, "audit resolved on retry");
+                            signal.audit_score = Some(report.score);
+                            signal.last_audit_secs = now;
+                            audit_changed = true;
+                        }
+                        Err(e) if e.is_retryable() => {
+                            debug!(%mint, error = %e, "audit still unresolved; keeping watch");
+                            signal.last_audit_secs = now;
+                            audit_changed = true;
+                        }
+                        Err(e) => {
+                            warn!(%mint, error = %e, "audit resolved non-retryable; dropping watch");
+                            let mut state = self.gate_state.lock().await;
+                            state.gate.remove(&mint);
+                            state.meta.remove(&mint);
+                            continue;
+                        }
+                    }
+                }
+            }
             // Single critical section: skip the round when a concurrent
             // relaunch replaced the snapshot (never clobber fresh signal
             // context), then observe and remove atomically on terminal
@@ -891,11 +966,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // Any identity drift (curve, ATA, creator, score, slot)
                 // means a concurrent relaunch replaced the snapshot: never
                 // clobber fresh signal context or confirm on stale reads.
+                // The score compares against its SNAPSHOT value (a retry
+                // above may have filled it in — that is progress, and
+                // must not read as a relaunch).
                 let stale = fresh.is_some_and(|current| {
                     current.curve != signal.curve
                         || current.assoc_curve != signal.assoc_curve
                         || current.creator != signal.creator
-                        || current.score != signal.score
+                        || current.audit_score != audit_at_snapshot
                         || current.creation_slot != signal.creation_slot
                 });
                 if stale {
@@ -904,17 +982,23 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     if let Some(sig) = newest {
                         signal.last_sig = Some(sig);
                         state.meta.insert(mint.clone(), signal.clone());
+                    } else if audit_changed {
+                        state.meta.insert(mint.clone(), signal.clone());
                     }
-                    match state.gate.observe(&mint, &swaps, now_secs()) {
-                        GateOutcome::Confirm { buyers } => {
-                            state.meta.remove(&mint);
-                            GateStep::Confirmed(buyers, signal.clone())
+                    if signal.audit_score.is_none() {
+                        GateStep::Waiting
+                    } else {
+                        match state.gate.observe(&mint, &swaps, now_secs()) {
+                            GateOutcome::Confirm { buyers } => {
+                                state.meta.remove(&mint);
+                                GateStep::Confirmed(buyers, signal.clone())
+                            }
+                            GateOutcome::Abort { reason } => {
+                                state.meta.remove(&mint);
+                                GateStep::Aborted(reason)
+                            }
+                            GateOutcome::Wait => GateStep::Waiting,
                         }
-                        GateOutcome::Abort { reason } => {
-                            state.meta.remove(&mint);
-                            GateStep::Aborted(reason)
-                        }
-                        GateOutcome::Wait => GateStep::Waiting,
                     }
                 }
             };
@@ -1015,11 +1099,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
         // Developer passed a real on-chain history screen (trust carried
         // on the signal from launch time).
+        let Some(score) = signal.audit_score else {
+            // Unreachable via poll_gates (quorum never confirms without
+            // a score) — fail closed rather than price risk on nothing.
+            warn!(%mint, "confirm reached without an audit score; dropping (fail-closed)");
+            return;
+        };
         let metrics = TokenMetrics {
             liquidity_usd,
             buy_velocity_5s: buyers,
             dev_reputation: signal.dev_trust,
-            rugcheck_score: signal.score,
+            rugcheck_score: score,
         };
         let profile = match &self.engine {
             Some(engine) => engine.evaluate(&metrics).await.profile,
@@ -1031,7 +1121,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             ),
         };
         if profile.action != Action::Buy {
-            info!(%mint, buyers, score = signal.score, "risk PASS at confirm");
+            info!(%mint, buyers, score, "risk PASS at confirm");
             return;
         }
         // Multi-strategy execution: rewrite the BUY profile per the
@@ -1397,6 +1487,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         .await
                         .insert(mint.clone(), recheck.position);
                     self.exec.live_diverged.lock().await.remove(&mint);
+                    // Same dispatch-cost accounting as the fast path: the
+                    // tip left the wallet even though the fill landed late.
+                    // Stale feed → skip (never invent a conversion rate).
+                    if let Some(sol_usd) = self.sol_feed.price() {
+                        let tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
+                        if tip_usd.is_finite() && tip_usd > 0.0 {
+                            self.daily.lock().await.record(-tip_usd, now_secs());
+                        }
+                    }
                     warn!(mint = %mint, "LIVE buy confirmed late; now tracked with exits");
                     self.emit(Alerter::format_live_buy(&mint, &recheck.bundle_id, amount));
                 }
@@ -1421,6 +1520,27 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.emit(format!("LIVE buy unconfirmed on {mint} (sig {}); MANUAL REVIEW REQUIRED (may hold)", recheck.signature));
                 }
             }
+        }
+    }
+
+    /// Flush paper PnL deferred while the live leg was holding, now that
+    /// it settled. Synthetic (override-priced) PnL is dropped, never
+    /// recorded — same exclusion as the fast path. Idempotent: the entry
+    /// is removed, so a second flush is a no-op.
+    async fn flush_deferred_pnl(&self, mint: &str) {
+        let pnls = self.exec.deferred_pnl.lock().await.remove(mint);
+        let Some(pnls) = pnls else { return };
+        if pnls.is_empty() {
+            return;
+        }
+        if self.exec.synthetic_mints.lock().await.contains(mint) {
+            warn!(mint = %mint, n = pnls.len(), "synthetic deferred PnL excluded from day-loss breaker (override price, no market)");
+            return;
+        }
+        let now = now_secs();
+        let mut daily = self.daily.lock().await;
+        for pnl in pnls {
+            daily.record(pnl, now);
         }
     }
 
@@ -1473,6 +1593,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let probe = {
             let guard = self.exec.live_positions.lock().await;
             let Some(tracked) = guard.get(mint) else {
+                drop(guard);
+                // Nothing held: any earlier deferral settles now (usually
+                // empty — the flush is a no-op then).
+                self.flush_deferred_pnl(mint).await;
                 return true;
             };
             // Integer sell math: (amount * numer)/10000, never f64 truncation
@@ -1533,6 +1657,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // 5-attempt budget and stamped the cooldown, throttling
                 // the runner exit after a TP scale-out).
                 self.exec.live_retry.lock().await.remove(mint);
+                // The corresponding paper PnL was deferred while holding;
+                // the fill settles it now.
+                self.flush_deferred_pnl(mint).await;
                 // Real dispatch cost: tip + priority fee left the wallet,
                 // so the day-loss gate sees live bleed, not paper-only
                 // profit.
@@ -1585,6 +1712,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.emit(format!("LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"));
                     // Auto-exit is over (human owns it): the paper PnL may
                     // settle — the bag is still reported via live_manual.
+                    self.flush_deferred_pnl(mint).await;
                     true
                 } else if deterministic {
                     warn!(%mint, error = %e, attempts, "LIVE sell rejected before dispatch; holding, will re-probe");
@@ -1595,6 +1723,132 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 }
             }
         }
+    }
+
+    /// Operator-requested full exit (`sell <MINT>`): close every paper
+    /// position for the mint at `Manual`, then sell the whole tracked
+    /// live bag. Returns true when settled (nothing held) so the caller
+    /// drops the request file; false keeps it for the next round.
+    /// The curve comes from tracked custody (live or manual-parked bags
+    /// carry it): a paper-only mint has no real bag to exit, so the file
+    /// settles with a loud log while paper automation continues. A mint
+    /// with neither settles immediately instead of retrying forever.
+    pub async fn manual_sell(&self, mint: &str) -> bool {
+        // Malformed request files (hand-crafted, not CLI-validated) die
+        // here instead of retrying every round forever.
+        if executor::parse_pubkey(mint).is_err() {
+            warn!(%mint, "manual sell request for a non-pubkey mint; dropping request");
+            return true;
+        }
+        // Per-mint serialization, same order as `on_tick` (serial first,
+        // then `live_sell`'s own lock inside) — never inverted.
+        let _serial = self.mint_serial(mint).await;
+        let curve = {
+            if let Some(tracked) = self.exec.live_positions.lock().await.get(mint) {
+                Some(tracked.curve.clone())
+            } else {
+                self.exec.live_manual.lock().await.get(mint).map(|held| held.curve.clone())
+            }
+        };
+        let Some(curve) = curve else {
+            let paper_open = !self.portfolio.lock().await.positions_for_mint(mint).is_empty();
+            if paper_open {
+                warn!(%mint, "manual sell on a paper-only mint: no live bag to exit; paper automation continues");
+            } else {
+                info!(%mint, "manual sell on an untracked mint; nothing to do");
+            }
+            return true;
+        };
+        let tick = match self.reserves.fetch_tick(mint, &curve).await {
+            Ok(tick) => tick,
+            Err(CurveError::BadMintKey(_)) | Err(CurveError::BadCurveKey(_)) => {
+                warn!(%mint, "manual sell request unroutable; dropping request");
+                return true;
+            }
+            Err(e) => {
+                warn!(%mint, error = %e, "manual sell price unreadable; keeping request for next round");
+                return false;
+            }
+        };
+        if now_secs().saturating_sub(tick.observed_at) >= CURVE_TICK_STALE_SECS {
+            warn!(mint = %tick.mint, "stale curve tick — manual sell deferred to next round");
+            return false;
+        }
+        let mut portfolio = self.portfolio.lock().await;
+        let ids: Vec<u64> = portfolio.positions_for_mint(&tick.mint);
+        let mut closed_pnls: Vec<f64> = Vec::new();
+        let mut closed_cards: Vec<(String, f64, f64, f64, bool)> = Vec::new();
+        let now = now_secs();
+        for id in ids {
+            match portfolio.close_position(id, tick.price_usd, tick.liquidity_usd, ExitReason::Manual, tick.observed_at) {
+                Ok(trade) => {
+                    closed_pnls.push(trade.net_pnl);
+                    let equity = portfolio.snapshot(&HashMap::new()).equity;
+                    info!(mint = %tick.mint, id, reason = ?trade.reason,
+                        net = format!("{:+.2}", trade.net_pnl), "paper position closed (manual sell)");
+                    closed_cards.push((
+                        format!("{:?}", trade.reason),
+                        trade.net_pnl,
+                        trade.net_pnl_percent,
+                        equity,
+                        false,
+                    ));
+                }
+                Err(e) => warn!(mint = %tick.mint, id, error = %e, "manual paper close failed"),
+            }
+        }
+        drop(portfolio);
+        for (reason, pnl, pct, equity, moonbag) in closed_cards {
+            self.emit(Alerter::format_exit(
+                &tick.mint, &reason, pnl, pct, equity, moonbag,
+            ));
+        }
+        // Live leg first, breaker second (same settle/defer rule as
+        // `on_tick`; synthetic paper never feeds the gate).
+        let live_settled = self.live_sell(&tick.mint, tick.price_usd, tick.liquidity_usd, 1.0).await;
+        if live_settled {
+            if self.exec.synthetic_mints.lock().await.contains(&tick.mint) {
+                warn!(mint = %tick.mint, "synthetic paper PnL excluded from day-loss breaker (override price, no market)");
+            } else {
+                for pnl in closed_pnls {
+                    self.daily.lock().await.record(pnl, now);
+                }
+            }
+        } else {
+            warn!(mint = %tick.mint, "manual sell: live still holds; breaker PnL deferred, request kept");
+            if !closed_pnls.is_empty() {
+                self.exec
+                    .deferred_pnl
+                    .lock()
+                    .await
+                    .entry(tick.mint.clone())
+                    .or_default()
+                    .extend(closed_pnls);
+            }
+            return false;
+        }
+        self.recheck_live_pending().await;
+        if self
+            .portfolio
+            .lock()
+            .await
+            .positions_for_mint(&tick.mint)
+            .is_empty()
+        {
+            self.exec.live_diverged.lock().await.remove(&tick.mint);
+            self.exec.synthetic_mints.lock().await.remove(&tick.mint);
+            // Deferred paper PnL settles here only when no live exposure
+            // remains to settle it later (flushed, not dropped — the
+            // economics already happened). A still-held bag keeps its
+            // stash for the `live_sell` flush paths.
+            let live_held = self.exec.live_positions.lock().await.contains_key(&tick.mint)
+                || self.exec.live_manual.lock().await.contains_key(&tick.mint);
+            if !live_held {
+                self.flush_deferred_pnl(&tick.mint).await;
+            }
+        }
+        self.maybe_unwatch(&tick).await;
+        true
     }
 
     /// Fire a card when alerting is enabled; silent otherwise.
@@ -1798,6 +2052,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         } else {
             warn!(mint = %tick.mint, "paper closed but live still holds; breaker PnL deferred until live settles");
+            // Stash (don't drop): flushed into the breaker when the live
+            // leg settles — otherwise the loss vanishes from the gate.
+            if !closed_pnls.is_empty() {
+                self.exec
+                    .deferred_pnl
+                    .lock()
+                    .await
+                    .entry(tick.mint.clone())
+                    .or_default()
+                    .extend(closed_pnls);
+            }
         }
         // Pending buys recheck before the unwatch decision so a late
         // confirmation keeps its feed (cheap when a round is already in
@@ -1815,6 +2080,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             self.exec.live_diverged.lock().await.remove(&tick.mint);
             self.exec.synthetic_mints.lock().await.remove(&tick.mint);
+            // Deferred paper PnL settles here only when no live exposure
+            // remains to settle it later (flushed, not dropped — the
+            // economics already happened). A still-held bag keeps its
+            // stash for the `live_sell` flush paths.
+            let live_held = self.exec.live_positions.lock().await.contains_key(&tick.mint)
+                || self.exec.live_manual.lock().await.contains_key(&tick.mint);
+            if !live_held {
+                self.flush_deferred_pnl(&tick.mint).await;
+            }
         }
         // Shared tail (see above): re-checks under fresh locks, so a
         // position opened by the gate task during the awaits above is
@@ -1969,6 +2243,12 @@ mod tests {
         Allow(u32),
         Reject,
         Broken,
+        /// Transient RugCheck failures (indexing latency) before an
+        /// allow: fails `fails_left` times, then allows with `score`.
+        Flaky {
+            fails_left: std::sync::Mutex<usize>,
+            score: u32,
+        },
     }
 
     struct StubAuditor {
@@ -1985,6 +2265,22 @@ mod tests {
                     token: None,
                 }),
                 AuditOutcome::Reject => Err(RugCheckError::SecurityRejection("rug".to_string())),
+                AuditOutcome::Flaky { fails_left, score } => {
+                    let mut fails = fails_left.lock().expect("lock");
+                    if *fails > 0 {
+                        *fails -= 1;
+                        Err(RugCheckError::Deserialization(
+                            serde_json::from_str::<u32>("bogus").expect_err("must fail"),
+                        ))
+                    } else {
+                        Ok(RugCheckReport {
+                            mint: mint.to_string(),
+                            score: *score,
+                            risks: vec![],
+                            token: None,
+                        })
+                    }
+                }
                 AuditOutcome::Broken => Err(RugCheckError::Deserialization(
                     serde_json::from_str::<u32>("bogus").expect_err("must fail"),
                 )),
@@ -2421,11 +2717,11 @@ mod tests {
         live: Option<StubLive>,
         alerts: Option<StubAlerts>,
     ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
-        let vaults = migration::VaultTicker::new(
+        let vaults = VaultTicker::new(
             "https://api.mainnet-beta.solana.com",
-            curve::CurveTicker::parse_commitment("confirmed").expect("known commitment"),
+            CurveTicker::parse_commitment("confirmed").expect("known commitment"),
             std::time::Duration::from_millis(500),
-            curve::SolUsdFeed::new_for_test(150.0),
+            SolUsdFeed::new_for_test(150.0),
         )
         .expect("vault ticker");
         Pipeline::shared(
@@ -2438,7 +2734,7 @@ mod tests {
             screener,
             alerts,
             vaults,
-            curve::SolUsdFeed::new_for_test(150.0),
+            SolUsdFeed::new_for_test(150.0),
         )
     }
 
@@ -2557,6 +2853,80 @@ mod tests {
         assert_eq!(pipe.pending_count().await, 1);
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_transient_watchlists_for_retry() {
+        // RugCheck 400 on a seconds-old mint (indexing latency) must NOT
+        // burn the launch at second 0: watchlist with no score and retry
+        // on the gate cadence instead.
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Flaky { fails_left: std::sync::Mutex::new(9999), score: 100 },
+            reserves,
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        assert_eq!(pipe.pending_count().await, 1);
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        let state = pipe.gate_state.lock().await;
+        assert_eq!(state.meta["MINT"].audit_score, None);
+    }
+
+    #[tokio::test]
+    async fn audit_retry_recovers_and_opens() {
+        // The retry lands (indexing caught up): quorum confirms with the
+        // resolved score and the position opens.
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Flaky { fails_left: std::sync::Mutex::new(1), score: 100 },
+            reserves,
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        assert_eq!(pipe.pending_count().await, 1);
+        // Age the attempt past the retry throttle so this round re-polls.
+        pipe.gate_state
+            .lock()
+            .await
+            .meta
+            .get_mut("MINT")
+            .expect("meta")
+            .last_audit_secs = 0;
+        pipe.poll_gates().await;
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+        assert_eq!(pipe.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn audit_unresolvable_aborts_at_deadline() {
+        // Persistent indexing failure still fails closed — at the gate
+        // deadline, never at second 0 (the mint gets its full window).
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12]));
+        let pipe = pipeline_screened(
+            settings(&[("GATE_WINDOW_SECS", "0")]),
+            AuditOutcome::Flaky { fails_left: std::sync::Mutex::new(9999), score: 100 },
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        assert_eq!(pipe.pending_count().await, 1);
+        pipe.poll_gates().await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 0);
     }
 
     #[tokio::test]
@@ -3085,22 +3455,41 @@ mod tests {
 
     #[tokio::test]
     async fn launch_skips_on_audit_reject_and_error() {
-        for outcome in [AuditOutcome::Reject, AuditOutcome::Broken] {
-            let reserves = StubReserves::with_tick(tick("MINT", 2.0));
-            let pipe = pipeline_screened(
-                Settings::from_map(&HashMap::new()),
-                outcome,
-                reserves,
-                funded(),
-                StubScreener::passing(),
-                None,
-            );
-            pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
-                .await;
-            assert!(pipe.portfolio.lock().await.position_ids().is_empty());
-            assert_eq!(pipe.pending_count().await, 0);
-            assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
-        }
+        // Policy rejection drops at once (never queued).
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Reject,
+            reserves,
+            funded(),
+            StubScreener::passing(),
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 0);
+        assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_watchlists_on_audit_transport_error() {
+        // Transport-level audit failure (Broken body) is retryable, not
+        // a reject: watchlist with no score, open nothing yet.
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Broken,
+            reserves,
+            funded(),
+            StubScreener::passing(),
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 1);
+        assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
     }
 
     #[tokio::test]
@@ -3432,6 +3821,75 @@ mod tests {
 
         assert_eq!(live.sells(), vec![("MINT".to_string(), 1_000)]);
         assert!(pipe.exec.live_positions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_sell_closes_both_legs() {
+        // `sell <MINT>`: paper closes at Manual and the whole tracked
+        // live bag sells, without waiting for any TP/SL trigger. (A real
+        // base58 mint: the daemon rejects malformed request files.)
+        let sys = "11111111111111111111111111111111";
+        let live = StubLive::working();
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick(sys, 2.0)),
+            funded(),
+            StubScreener::passing(),
+            Some(live.clone()),
+        );
+        let opened_now = now_secs();
+        pipe.portfolio
+            .lock()
+            .await
+            .open_position(
+                sys,
+                Side::Long,
+                2.0,
+                10.0,
+                1e9,
+                75.0,
+                -8.0,
+                false,
+                0.0,
+                0,
+                0.0,
+                opened_now,
+            )
+            .expect("manual open");
+        pipe.exec.live_positions.lock().await.insert(
+            sys.to_string(),
+            LivePosition {
+                mint: sys.to_string(),
+                curve: "CURVE".to_string(),
+                assoc_curve: "ASSOC".to_string(),
+                amount_tokens: 1_000,
+                creator: None,
+            },
+        );
+        assert!(pipe.manual_sell(sys).await);
+        let portfolio = pipe.portfolio.lock().await;
+        assert!(portfolio.position_ids().is_empty());
+        assert_eq!(portfolio.history()[0].reason, ExitReason::Manual);
+        drop(portfolio);
+        assert_eq!(live.sells(), vec![(sys.to_string(), 1_000)]);
+        assert!(pipe.exec.live_positions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_sell_unknown_mint_settles() {
+        // Nothing tracked anywhere: settle at once so the request file
+        // goes away instead of retrying forever.
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            StubScreener::passing(),
+            None,
+        );
+        assert!(pipe.manual_sell("NOPE").await);
+        assert!(pipe.manual_sell("11111111111111111111111111111111").await);
     }
 
     #[tokio::test]
@@ -3803,6 +4261,48 @@ mod tests {
         assert!(pipe.exec.live_manual.lock().await.contains_key("MINT"));
         assert!(pipe.live_tracked_mints().await.contains(&"MINT".to_string()));
         assert!(live.sells().is_empty());
+        // Give-up settles the leg: the paper profit stashed while
+        // holding flushes into the breaker (never vanishes).
+        assert!(!pipe.exec.deferred_pnl.lock().await.contains_key("MINT"));
+        assert!(pipe.daily.lock().await.day_net > 0.0);
+    }
+
+    #[tokio::test]
+    async fn deferred_pnl_flushes_when_live_settles_late() {
+        // Paper closes while live still holds: the breaker must NOT see
+        // the profit yet, and must see it once the late sell lands.
+        use std::sync::atomic::Ordering;
+        let live = StubLive::working();
+        live.inner.fail_sells_transient.store(true, Ordering::Relaxed);
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        // Tick 1: TP closes paper, live sell fails transiently.
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+        assert!(live.sells().is_empty());
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.daily.lock().await.day_net, 0.0);
+        assert!(pipe.exec.deferred_pnl.lock().await.contains_key("MINT"));
+        // Recover with a stale cooldown: the no-paper retry path sells
+        // and the stashed profit settles into the breaker.
+        live.inner.fail_sells_transient.store(false, Ordering::Relaxed);
+        {
+            let mut retry = pipe.exec.live_retry.lock().await;
+            retry.insert("MINT".to_string(), (1u32, 0u64));
+        }
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+        assert_eq!(live.sells(), vec![("MINT".to_string(), 1_000)]);
+        assert!(!pipe.exec.deferred_pnl.lock().await.contains_key("MINT"));
+        assert!(pipe.daily.lock().await.day_net > 0.0);
     }
 
     #[tokio::test]

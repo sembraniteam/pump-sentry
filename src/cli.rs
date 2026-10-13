@@ -1,4 +1,4 @@
-//! Supervisor CLI: `start` / `stop` / `restart` (+ `status`, `logs`, `run`).
+//! Supervisor CLI: `start` / `stop` / `restart` (+ `status`, `logs`, `run`, `sell`).
 //!
 //! The binary never runs the pipeline bare. Every invocation must name a
 //! subcommand; anything else prints [`USAGE`] to stderr and exits nonzero
@@ -11,6 +11,9 @@
 //! - `status` — report whether the daemon is alive.
 //! - `logs [-n N] [--follow]` — print the tail of the daemon log.
 //! - `run [--live]` — foreground pipeline (what the daemon child runs).
+//! - `sell <MINT>` — queue a manual full exit for one mint: the running
+//!   daemon closes its paper position (Manual) and sells the whole
+//!   tracked live bag on its next round, no daemon restart needed.
 //!
 //! `--live` (or `IS_LIVE=true`) keeps its old meaning — real Jito-routed
 //! swaps — but now attaches to a subcommand (`start --live`,
@@ -49,6 +52,7 @@ Commands:
   status                  Show whether the daemon is running (pid, mode, log)
   logs [-n N] [--follow]  Show the last N log lines (default 100)
   run [--live]            Run in the foreground (for debugging)
+  sell <MINT>             Queue a manual full exit for one mint now
   help                    Show this help
 
 Options:
@@ -67,6 +71,7 @@ Examples:
   solana-snipe-bot start --live
   solana-snipe-bot logs -n 50 --follow
   solana-snipe-bot restart --live
+  solana-snipe-bot sell <MINT>
   solana-snipe-bot stop
 ";
 
@@ -98,6 +103,11 @@ pub enum CliAction {
     Run {
         /// Live (real funds) when true.
         live: bool,
+    },
+    /// Queue a manual full exit for one mint (handled by the daemon).
+    Sell {
+        /// Token mint (base58) to exit fully.
+        mint: String,
     },
     /// Print usage; `Some` carries the human-readable cause.
     Help {
@@ -132,6 +142,12 @@ pub fn parse_cli(args: &[String]) -> CliAction {
         "logs" => CliAction::Logs {
             lines: log_lines(args),
             follow: args.iter().any(|a| a == "--follow" || a == "-f"),
+        },
+        "sell" => match args.get(2).map(String::as_str).unwrap_or("") {
+            "" => CliAction::Help {
+                error: Some("`sell` needs a mint: `solana-snipe-bot sell <MINT>`.".to_string()),
+            },
+            mint => CliAction::Sell { mint: mint.to_string() },
         },
         "help" | "--help" | "-h" => CliAction::Help { error: None },
         "" => CliAction::Help {
@@ -281,11 +297,14 @@ pub fn append_log_line(log: &Path, line: &str) {
         eprintln!("warning: cannot create log directory: {e}");
         return;
     }
-    let mut file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = match opts.open(log) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("warning: cannot write log: {e}");
@@ -407,6 +426,25 @@ pub fn cmd_start(live: bool, invocation: &str) -> ! {
     if pid_file.exists() {
         let _ = std::fs::remove_file(&pid_file);
     }
+    // Disk guard: an append-forever daemon log from a previous long run
+    // rotates here (mid-run rotation is impossible under shell
+    // redirection), before the new child inherits the fd.
+    rotate_log_if_huge(&log_file);
+    // Owner-only log from the first byte: the shell `>>` preserves the
+    // existing mode, so create (or chmod) here — custody lines (mints,
+    // amounts, bundles) must never land in a world-readable file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(&log_file).is_ok() {
+            let _ = std::fs::set_permissions(&log_file, std::fs::Permissions::from_mode(0o600));
+        } else {
+            if let Some(parent) = log_file.parent().filter(|d| !d.as_os_str().is_empty()) {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = write_private_file(&log_file, b"");
+        }
+    }
     let first_run = !log_file.metadata().is_ok_and(|m| m.len() > 0);
     match spawn_background(&log_file, live, invocation, first_run) {
         Ok(pid) => {
@@ -415,7 +453,7 @@ pub fn cmd_start(live: bool, invocation: &str) -> ! {
                 live,
                 started_at: unix_secs(),
             };
-            if let Err(e) = std::fs::write(&pid_file, info.to_json()) {
+            if let Err(e) = write_private_file(&pid_file, info.to_json().as_bytes()) {
                 eprintln!("warning: pid recorded but pid file write failed: {e}");
             }
             // Health gate: fatal misconfiguration (bad COMMITMENT, dead
@@ -621,6 +659,162 @@ fn read_from(mut file: std::fs::File, pos: u64) -> std::io::Result<String> {
     Ok(buf)
 }
 
+/// Single-file size cap for the daemon log: rotate at/above this.
+pub const LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+/// Archived generations kept (`log.1` newest … `log.3` oldest).
+pub const LOG_RETAIN_ARCHIVES: u32 = 3;
+
+/// Size-triggered rotation at (re)start: the daemon child inherits its
+/// stdout/stderr fd from shell redirection, so nothing in-process can
+/// rotate mid-run — the supervisor rotates instead, before every spawn.
+/// `log` at/above the cap shifts `.1`→`.2`→`.3` (oldest dropped) and the
+/// new run starts fresh. Best-effort: rotation failure warns on stderr,
+/// never blocks the start.
+fn rotate_log_if_huge(log: &Path) {
+    rotate_log_sized(log, LOG_ROTATE_BYTES, LOG_RETAIN_ARCHIVES);
+}
+
+/// Rotation core with explicit budget (unit-tested with byte budgets).
+fn rotate_log_sized(log: &Path, cap_bytes: u64, retain: u32) {
+    let huge = std::fs::metadata(log).is_ok_and(|m| m.len() >= cap_bytes);
+    if !huge {
+        return;
+    }
+    let archive = |i: u32| log.with_extension(format!("log.{i}"));
+    // `with_extension` on `bot.log` yields `bot.log.N` — sibling archives.
+    if retain == 0 {
+        if std::fs::remove_file(log).is_err() {
+            eprintln!("warning: oversized log {} unrotatable", log.display());
+        }
+        return;
+    }
+    if std::fs::remove_file(archive(retain)).is_err() {
+        // Missing oldest is fine (first rotations); other errors surface below.
+    }
+    for i in (1..retain).rev() {
+        let _ = std::fs::rename(archive(i), archive(i + 1));
+    }
+    if std::fs::rename(log, archive(1)).is_err() {
+        eprintln!("warning: oversized log {} unrotatable", log.display());
+    }
+}
+
+/// Write a file only its owner can read (0600 on unix): pid files,
+/// sell requests, snapshots, and WAL state all name live custody
+/// (mints, amounts, bundles) — world-readable defaults leak the book.
+/// Best-effort chmod covers pre-existing files; creation mode covers
+/// new ones. Returns the write outcome (chmod failure only warns).
+pub fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_err() {
+            eprintln!(
+                "warning: cannot restrict {} to owner-only",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Request-file path next to the log file (`sell-<MINT>.json`).
+/// Mints are base58 (no path separators by construction — validated in
+/// [`cmd_sell`]), so the filename round-trips safely.
+pub fn sell_request_path(log_file: &Path, mint: &str) -> PathBuf {
+    let name = format!("sell-{mint}.json");
+    log_file
+        .parent()
+        .map(|d| d.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Pending manual-sell requests: `(mint, path)` pairs sorted by mint
+/// (deterministic drain order). Best-effort: an unreadable directory
+/// yields nothing; non-request files are ignored.
+pub fn pending_sell_requests(log_file: &Path) -> Vec<(String, PathBuf)> {
+    let dir = log_file.parent().filter(|d| !d.as_os_str().is_empty());
+    let entries = dir
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name().is_some_and(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with("sell-") && n.ends_with(".json")
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut out: Vec<(String, PathBuf)> = entries
+        .into_iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_string_lossy().into_owned();
+            let mint = name.strip_prefix("sell-")?.strip_suffix(".json")?.to_string();
+            if mint.is_empty() { None } else { Some((mint, p)) }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `sell <MINT>`: queue a manual full exit for one mint. Validates the
+/// mint, refuses when no daemon runs (a queued request would sit until
+/// the next boot and fire stale — fail-closed at the CLI), else drops a
+/// request file the daemon drains on its gate cadence. Written
+/// temp-then-rename so a crash can never leave a torn body behind.
+pub fn cmd_sell(mint: &str) {
+    if executor::parse_pubkey(mint).is_err() {
+        eprintln!("bad MINT '{mint}': not a base58 pubkey");
+        std::process::exit(1);
+    }
+    let (pid_file, log_file) = resolve_paths();
+    if running_daemon(&pid_file).is_none() {
+        eprintln!(
+            "no daemon running (log {}); start the bot first",
+            log_file.display()
+        );
+        std::process::exit(1);
+    }
+    let path = sell_request_path(&log_file, mint);
+    let body = format!("{{\"mint\":\"{mint}\",\"ts\":{}}}", unix_secs());
+    let tmp = path.with_extension("json.part");
+    let staged = match write_private_file(&tmp, body.as_bytes()) {
+        Ok(()) => std::fs::rename(&tmp, &path),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("cannot queue sell request {}: {e}", path.display());
+        std::process::exit(1);
+    }
+    println!("manual sell queued for {mint} (daemon drains it on its next round)");
+}
+
+/// Mint claimed inside a sell-request body (`{"mint":"…","ts":…}`).
+/// `None` on any shape mismatch: the daemon drops such files loudly
+/// instead of acting on — or retrying — a forged/torn request. Base58
+/// carries no quotes, so no unescaping is needed.
+pub fn sell_request_body_mint(body: &str) -> Option<String> {
+    let rest = body.split_once("\"mint\":\"")?.1;
+    let (mint, _) = rest.split_once('"')?;
+    if mint.is_empty() {
+        return None;
+    }
+    Some(mint.to_string())
+}
+
 /// Spawn `<current-exe> run [--live]` detached with stdout/stderr
 /// appended to `log`, returning the daemon pid.
 ///
@@ -742,6 +936,14 @@ mod tests {
             parse_cli(&argv(&["bot", "help"])),
             CliAction::Help { error: None }
         );
+        assert_eq!(
+            parse_cli(&argv(&["bot", "sell", "MINT"])),
+            CliAction::Sell { mint: "MINT".to_string() }
+        );
+        assert!(matches!(
+            parse_cli(&argv(&["bot", "sell"])),
+            CliAction::Help { error: Some(_) }
+        ));
     }
 
     #[test]
@@ -846,11 +1048,77 @@ mod tests {
     }
 
     #[test]
+    fn sell_request_body_mint_parses() {
+        assert_eq!(
+            sell_request_body_mint(r#"{"mint":"ABC","ts":1}"#),
+            Some("ABC".to_string())
+        );
+        // Anything else is poison: the drain drops it, never acts on it.
+        assert_eq!(sell_request_body_mint(""), None);
+        assert_eq!(sell_request_body_mint("not json"), None);
+        assert_eq!(sell_request_body_mint(r#"{"mint":"","ts":1}"#), None);
+        assert_eq!(sell_request_body_mint(r#"{"ts":1}"#), None);
+    }
+
+    #[test]
+    fn sell_request_roundtrip() {
+        // Request files sort by mint and parse back (daemon drain order
+        // is deterministic; non-request files ignored).
+        let dir = std::env::temp_dir().join(format!(
+            "cli-sell-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let log = dir.join("bot.log");
+        std::fs::write(&log, "x").expect("write");
+        std::fs::write(dir.join("bot.pid"), "1").expect("write");
+        std::fs::write(dir.join("notes.txt"), "nope").expect("write");
+        let a = sell_request_path(&log, "MINTB");
+        let b = sell_request_path(&log, "MINTA");
+        std::fs::write(&a, "{}").expect("write");
+        std::fs::write(&b, "{}").expect("write");
+        let pending = pending_sell_requests(&log);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].0, "MINTA");
+        assert_eq!(pending[1].0, "MINTB");
+        assert_eq!(pending[0].1, b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn usage_lists_all_commands() {
         for cmd in [
-            "start", "stop", "restart", "status", "logs", "run", "help", "--live",
+            "start", "stop", "restart", "status", "logs", "run", "sell", "help", "--live",
         ] {
             assert!(USAGE.contains(cmd), "usage missing {cmd}");
         }
+    }
+
+    #[test]
+    fn log_rotation_shifts_and_bounces_small_logs() {
+        let dir = std::env::temp_dir().join(format!(
+            "cli-rotate-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let log = dir.join("bot.log");
+        // Under budget: untouched.
+        std::fs::write(&log, vec![0u8; 100]).expect("write");
+        rotate_log_sized(&log, 1_000, 3);
+        assert_eq!(std::fs::metadata(&log).expect("meta").len(), 100);
+        // At budget: shift .1→.2, current→.1, fresh start.
+        std::fs::write(log.with_extension("log.1"), vec![1u8; 10]).expect("write");
+        std::fs::write(&log, vec![0u8; 1_000]).expect("write");
+        rotate_log_sized(&log, 1_000, 2);
+        assert!(std::fs::metadata(&log).is_err(), "current must move away");
+        assert_eq!(std::fs::metadata(log.with_extension("log.1")).expect("m").len(), 1_000);
+        assert_eq!(std::fs::metadata(log.with_extension("log.2")).expect("m").len(), 10);
+        // Oldest generation dropped past retention.
+        std::fs::write(&log, vec![0u8; 1_000]).expect("write");
+        rotate_log_sized(&log, 1_000, 2);
+        assert!(std::fs::metadata(log.with_extension("log.3")).is_err(), "no third archive");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
