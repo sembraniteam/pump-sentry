@@ -61,7 +61,7 @@ cargo run -- start            # background daemon, logs to logs/bot.log
 cargo run -- status           # check the daemon (pid, mode, log)
 cargo run -- logs -n 50       # tail the log (add --follow to follow it)
 cargo run -- restart --live   # stop + restart in live mode
-cargo run -- sell <MINT>      # manual full exit now (no restart needed)
+cargo run -- sell <mint>      # manual full exit now (no restart needed)
 cargo run -- stop             # stop the daemon (SIGTERM, drain, snapshot)
 
 # Foreground (debugging):
@@ -83,7 +83,7 @@ restarted. `stop` sends SIGTERM (bounded 30s in-flight drain + a
 for manual review), then SIGKILL past 45s. `LOG_FILE` / `PID_FILE`
 override the default paths; run every command from the same directory.
 A heartbeat card (logs/candidates/cash/equity) fires at boot and every
-6h so quiet markets still prove liveness; `sell <MINT>` exits one mint
+6h so quiet markets still prove liveness; `sell <mint>` exits one mint
 now without stopping the daemon.
 
 With knobs:
@@ -158,8 +158,8 @@ the risk profile runs verbatim):
 ## Testing
 
 ```sh
-cargo test --workspace                    # 333 tests across all crates, live probes ignored by default
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                    # 334 tests across all crates, live probes ignored by default
+cargo clippy --all-targets                # must be zero warnings
 cargo fmt --all -- --check
 ```
 
@@ -167,7 +167,7 @@ cargo fmt --all -- --check
 
 ```
 src/main.rs            # supervisor CLI (start/stop/restart/status/logs/run) + run loop
-src/cli.rs             # subcommand parsing, daemon files, shutdown signals (tested)
+src/cli.rs             # subcommand parsing (incl. sell <mint>), daemon files, shutdown signals (tested)
 src/settings.rs        # env knobs (tested)
 src/pipeline.rs        # launch handling + tick exits (tested)
 src/live.rs            # live sizing + Jito dispatch sink (tested)
@@ -189,8 +189,11 @@ crates/migration/       # graduation detector + Raydium pool parser
   `NOTIONAL_USD`, and reviewed parameters.
 - `crates/executor` refuses to build anything when the wallet guard
   fails: missing key, or balance below trade + tip + 0.05 SOL reserve.
-- Auditing and insider screening are fail-closed (transport errors skip
-  the token). Both the launcher and, on `create_v2` launches, the distinct
+- Auditing and insider screening are fail-closed. RugCheck policy
+  rejections drop the token at once; transport trouble and fresh-mint
+  400s (indexing latency) watchlist the launch with no score and retry
+  every 3s until the gate deadline aborts. Both the launcher and, on
+  `create_v2` launches, the distinct
   creator are screened; either reject drops the signal and the gate
   watches both wallets for dumps. Velocity below 5 measured buyers
   resolves to `PASS` — no demand, no trade.

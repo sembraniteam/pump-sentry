@@ -35,6 +35,9 @@ the host under storm load.
   `format_migration` (destination + pool addresses) and
   `format_follow_spike` (post-migration 2x alert). Links point at
   `explorer.solana.com`. All interpolated fields are sanitized (no mentions/markdown breakouts) and length-capped.
+- `HeartbeatReport` + `format_heartbeat` — proof-of-life card (mode,
+  uptime, logs/candidates/parsed/dropped, watchlist, open positions,
+  cash, equity), fired by the daemon at boot and every 6h.
 
 ## Use
 

@@ -18,7 +18,16 @@ logsSubscribe (WebSocket, Mentions[pump_program])
   `try_send` on full drops the event and bumps `dropped_full` — the loop
   never awaits a full queue.
 - **Reconnects**: exponential backoff, 100ms base, 5s cap, plus 0–100ms
-  time-derived jitter.
+  time-derived jitter. Every reconnect (not the first boot) backfills
+  the socket gap: latest 100 program signatures replay oldest-first
+  through the same workers, deduplicated by a 4,000-entry seen-set.
+- **Fetch retries**: one 250ms retry for transient failures, plus a
+  ~1s jittered third attempt for `429` alone (the fast retry usually
+  lands inside the same limit window). Permits are re-acquired per
+  attempt, never held across backoff sleeps.
+- **RPC caches**: dev verdicts (`DEV_CACHE_TTL_SECS` = 1h) and funder
+  ancestry (`FUNDER_CACHE_TTL_SECS` = 24h) sit in bounded TTL maps, so
+  repeat wallets never re-burn `getSignaturesForAddress` pages.
 - **Zero panics**: no `.unwrap()` / `.expect()` / unchecked indexing on hot
   paths; all failures map to `PumpParseError` / `ListenerError` (`thiserror`).
 - **Zero-copy-ish parsing**: instruction args are Borsh-decoded from the byte

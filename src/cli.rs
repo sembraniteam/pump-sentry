@@ -11,7 +11,7 @@
 //! - `status` — report whether the daemon is alive.
 //! - `logs [-n N] [--follow]` — print the tail of the daemon log.
 //! - `run [--live]` — foreground pipeline (what the daemon child runs).
-//! - `sell <MINT>` — queue a manual full exit for one mint: the running
+//! - `sell <mint>` — queue a manual full exit for one mint: the running
 //!   daemon closes its paper position (Manual) and sells the whole
 //!   tracked live bag on its next round, no daemon restart needed.
 //!
@@ -52,7 +52,7 @@ Commands:
   status                  Show whether the daemon is running (pid, mode, log)
   logs [-n N] [--follow]  Show the last N log lines (default 100)
   run [--live]            Run in the foreground (for debugging)
-  sell <MINT>             Queue a manual full exit for one mint now
+  sell <mint>             Queue a manual full exit for one mint now
   help                    Show this help
 
 Options:
@@ -71,7 +71,7 @@ Examples:
   solana-snipe-bot start --live
   solana-snipe-bot logs -n 50 --follow
   solana-snipe-bot restart --live
-  solana-snipe-bot sell <MINT>
+  solana-snipe-bot sell <mint>
   solana-snipe-bot stop
 ";
 
@@ -145,7 +145,7 @@ pub fn parse_cli(args: &[String]) -> CliAction {
         },
         "sell" => match args.get(2).map(String::as_str).unwrap_or("") {
             "" => CliAction::Help {
-                error: Some("`sell` needs a mint: `solana-snipe-bot sell <MINT>`.".to_string()),
+                error: Some("`sell` needs a mint: `solana-snipe-bot sell <mint>`.".to_string()),
             },
             mint => CliAction::Sell { mint: mint.to_string() },
         },
@@ -727,7 +727,7 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Request-file path next to the log file (`sell-<MINT>.json`).
+/// Request-file path next to the log file (`sell-<mint>.json`).
 /// Mints are base58 (no path separators by construction — validated in
 /// [`cmd_sell`]), so the filename round-trips safely.
 pub fn sell_request_path(log_file: &Path, mint: &str) -> PathBuf {
@@ -769,7 +769,7 @@ pub fn pending_sell_requests(log_file: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// `sell <MINT>`: queue a manual full exit for one mint. Validates the
+/// `sell <mint>`: queue a manual full exit for one mint. Validates the
 /// mint, refuses when no daemon runs (a queued request would sit until
 /// the next boot and fire stale — fail-closed at the CLI), else drops a
 /// request file the daemon drains on its gate cadence. Written

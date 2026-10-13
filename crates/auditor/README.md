@@ -20,6 +20,9 @@ evaluate_token →  fetch_report + policy invariants → Report | SecurityReject
   `risk-engine/src/fallback.rs`).
 - `client` — pooled `reqwest` client, 1500ms timeout, retries on
   timeouts / connect errors / 5xx / 429 with exponential backoff (200ms × 2^attempt, max 2s).
+  Fresh-mint 400s ("not indexed yet") are NOT retried here — they
+  surface as `HttpStatus(400)` for the pipeline, which watchlists the
+  launch and retries every 3s until the gate deadline.
 
 ## Use
 

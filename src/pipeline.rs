@@ -391,7 +391,11 @@ pub struct LiveExecution<L = LiveTrader> {
     /// Mints that gave up the automated exit: the position is still held
     /// on-chain (never silently dropped) but needs a human exit — kept
     /// here (not in `live_positions`) so the tick loop stops probing
-    /// while the shutdown snapshot still reports them.
+    /// while the shutdown snapshot still reports them. Entries leave
+    /// only through an explicit `sell <mint>` (resurrected for the exit)
+    /// or not at all: time/count eviction would orphan a real bag the
+    /// next time the mint is bought, so growth here is bounded by
+    /// operator review in practice, not by code.
     pub live_manual: Mutex<HashMap<String, LivePosition>>,
     /// Paper-open but live-missing: the live buy definitively failed
     /// (bad order / dispatch error, no fill, no pending) while paper
@@ -1725,10 +1729,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
-    /// Operator-requested full exit (`sell <MINT>`): close every paper
+    /// Operator-requested full exit (`sell <mint>`): close every paper
     /// position for the mint at `Manual`, then sell the whole tracked
-    /// live bag. Returns true when settled (nothing held) so the caller
-    /// drops the request file; false keeps it for the next round.
+    /// live bag — including a manual-parked one, which is resurrected
+    /// into tracked for this explicit exit (the only way parked bags
+    /// leave; automatic legs never touch them). Returns true when
+    /// settled (nothing held) so the caller drops the request file;
+    /// false keeps it for the next round.
     /// The curve comes from tracked custody (live or manual-parked bags
     /// carry it): a paper-only mint has no real bag to exit, so the file
     /// settles with a loud log while paper automation continues. A mint
@@ -1759,6 +1766,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
             return true;
         };
+        // Explicit operator exit also covers manual-parked bags: move the
+        // bag back to tracked so `live_sell` below can probe it. This is
+        // the lifecycle that bounds `live_manual` growth — parked bags
+        // leave only through this command (or a restart replay), never
+        // through silent eviction (evicting custody tracking would orphan
+        // a real on-chain bag the next time the mint is bought).
+        if !self.exec.live_positions.lock().await.contains_key(mint)
+            && let Some(held) = self.exec.live_manual.lock().await.remove(mint)
+        {
+            warn!(%mint, amount = held.amount_tokens, "manual sell resurrects a parked bag for explicit exit");
+            self.exec.live_positions.lock().await.insert(mint.to_string(), held);
+        }
         let tick = match self.reserves.fetch_tick(mint, &curve).await {
             Ok(tick) => tick,
             Err(CurveError::BadMintKey(_)) | Err(CurveError::BadCurveKey(_)) => {
@@ -3825,7 +3844,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_sell_closes_both_legs() {
-        // `sell <MINT>`: paper closes at Manual and the whole tracked
+        // `sell <mint>`: paper closes at Manual and the whole tracked
         // live bag sells, without waiting for any TP/SL trigger. (A real
         // base58 mint: the daemon rejects malformed request files.)
         let sys = "11111111111111111111111111111111";
@@ -3890,6 +3909,38 @@ mod tests {
         );
         assert!(pipe.manual_sell("NOPE").await);
         assert!(pipe.manual_sell("11111111111111111111111111111111").await);
+    }
+
+    #[tokio::test]
+    async fn manual_sell_exits_parked_manual_bag() {
+        // A give-up-parked bag has no automatic exit left — but an
+        // explicit `sell` resurrects it into tracked and sells it. This
+        // is the lifecycle that bounds `live_manual`: parked bags leave
+        // through this command, never through silent eviction.
+        let sys = "11111111111111111111111111111111";
+        let live = StubLive::working();
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick(sys, 2.0)),
+            funded(),
+            StubScreener::passing(),
+            Some(live.clone()),
+        );
+        pipe.exec.live_manual.lock().await.insert(
+            sys.to_string(),
+            LivePosition {
+                mint: sys.to_string(),
+                curve: "CURVE".to_string(),
+                assoc_curve: "ASSOC".to_string(),
+                amount_tokens: 1_000,
+                creator: None,
+            },
+        );
+        assert!(pipe.manual_sell(sys).await);
+        assert_eq!(live.sells(), vec![(sys.to_string(), 1_000)]);
+        assert!(pipe.exec.live_manual.lock().await.is_empty());
+        assert!(pipe.exec.live_positions.lock().await.is_empty());
     }
 
     #[tokio::test]

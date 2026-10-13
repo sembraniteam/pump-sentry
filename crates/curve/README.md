@@ -12,7 +12,7 @@ live sizing).
 getAccount / getMultipleAccounts (HTTP RPC)
   → layout::BondingCurveReserves::parse (8-byte disc + 5×u64 + complete)
   → price_sol = virtual_sol / virtual_token × 10^decimals / 1e9
-  → price_usd = price_sol × SOL_USD
+  → price_usd = price_sol × sol_usd (live Jupiter feed, never the retired SOL_USD env)
   → liquidity_usd ≈ virtual-SOL side in USD (buy-side depth proxy)
 ```
 

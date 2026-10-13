@@ -471,6 +471,11 @@ async fn run_pipeline(live_arg: bool) {
     // memory while the RPCs stay throttled anyway.
     let mut in_flight = tokio::task::JoinSet::new();
     const MAX_IN_FLIGHT: usize = 32;
+    /// Manual-sell drain cadence in gate rounds (15 rounds ≈ 30s at the
+    /// default 2s cadence): the request scan is filesystem IO every
+    /// round otherwise, and operator exits tolerate the delay.
+    const MANUAL_SELL_DRAIN_EVERY: u64 = 15;
+    let mut gate_rounds: u64 = 0;
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let stats_task = Arc::clone(&stats);
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
@@ -567,11 +572,14 @@ async fn run_pipeline(live_arg: bool) {
                 }
             }
             _ = gate_timer.tick() => {
-                // Manual-sell drain (`sell <MINT>` request files): every
-                // round, unconditionally — exits must not wait on the
-                // gate slot. Settled requests are deleted; holding ones
-                // stay for the next round.
-                {
+                // Manual-sell drain (`sell <mint>` request files): every
+                // 15th round (~30s at the default cadence), not every
+                // round — the scan is a `read_dir` plus a file read per
+                // request, and a spam directory must not burn the gate
+                // cadence or RPC budget. Operator exits tolerate the
+                // delay; unsettled requests persist across rounds.
+                gate_rounds = gate_rounds.wrapping_add(1);
+                if gate_rounds.is_multiple_of(MANUAL_SELL_DRAIN_EVERY) {
                     let (_, log_file) = cli::resolve_paths();
                     for (mint, path) in cli::pending_sell_requests(&log_file) {
                         // Body must name the same mint as the filename:
