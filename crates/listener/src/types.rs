@@ -9,12 +9,10 @@ use thiserror::Error;
 /// Bounded event queue capacity.
 pub const EVENT_CHANNEL_CAPACITY: usize = 10_000;
 
-/// Default public HTTP RPC endpoint.
-/// Mirrors the main binary default (`settings::DEFAULT_HTTP_RPC_URL`;
-/// the listener cannot depend on the binary, so the pair is pinned by
-/// a test there). Change both together.
+/// Default public HTTP RPC endpoint. Canonical home: the binary
+/// reuses these (it depends on this crate), so change here only.
 pub const DEFAULT_HTTP_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-/// Default public WebSocket RPC endpoint. Same mirroring note as above.
+/// Default public WebSocket RPC endpoint. Same single-source note as above.
 pub const DEFAULT_WS_RPC_URL: &str = "wss://api.mainnet-beta.solana.com";
 
 /// Listener config.

@@ -227,7 +227,9 @@ pub fn plan_buy(
         return None;
     }
     let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
-    // Fee first at sizing tier, then slippage ceiling.
+    // Fee first at sizing tier, then slippage ceiling. The ceiling is
+    // deliberate (tiers are integers on-chain, so it is a no-op there):
+    // sizing must never underfund the fee-inclusive cost.
     let with_fee = u64::try_from(
         (u64_from_f64_floor(lamports)? as u128
             * (BPS_DENOMINATOR as u128 + fee_bps_per_side.ceil() as u128))
@@ -1288,7 +1290,7 @@ mod tests {
             WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
                 .expect("wallet");
         let exec = SwapExecutor::new(
-            crate::settings::DEFAULT_HTTP_RPC_URL,
+            listener::types::DEFAULT_HTTP_RPC_URL,
             CommitmentConfig::confirmed(),
             wallet,
         )

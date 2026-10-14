@@ -20,7 +20,7 @@ use crate::live_mirror::{LiveExecution, live_base_mint};
 use crate::follow::FollowState;
 pub use crate::gate::{DailyBreaker, GateState};
 #[cfg(test)]
-pub(crate) use crate::gate::{dev_reputation_score, resolve_entry_with_flag};
+pub(crate) use crate::gate::{dev_reputation_score, fee_aware_sl_floor, resolve_entry_with_flag};
 #[cfg(test)]
 pub(crate) use listener::BundleVerdict;
 use crate::settings::{Settings, now_secs};
@@ -68,10 +68,6 @@ impl ReserveFeed for CurveTicker {
 
     async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError> {
         self.token_decimals(mint).await
-    }
-
-    async fn venue_fee_bps(&self, mint: &str, curve: &str) -> Option<f64> {
-        self.venue_fee_bps(mint, curve).await
     }
 
     async fn fetch_tick_with_fee(
@@ -1277,7 +1273,7 @@ mod tests {
         alerts: Option<StubAlerts>,
     ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
         let vaults = VaultTicker::new(
-            crate::settings::DEFAULT_HTTP_RPC_URL,
+            listener::types::DEFAULT_HTTP_RPC_URL,
             CurveTicker::parse_commitment("confirmed").expect("known commitment"),
             std::time::Duration::from_millis(500),
             SolUsdFeed::new_for_test(150.0),
@@ -1302,27 +1298,23 @@ mod tests {
     }
 
     #[test]
-    fn entry_prefers_live_tick_over_override() {
+    fn entry_source_branches() {
+        // Live tick wins over the override; errors fall back to it;
+        // neither source means no entry.
         let live = tick("M", 2.0);
         assert_eq!(
             resolve_entry_with_flag(Ok(live), Some(9.0), 500.0),
             Some((2.0, 30_000.0, false))
         );
-    }
-
-    #[test]
-    fn entry_falls_back_to_override() {
-        let err: Result<PriceTick, CurveError> = Err(CurveError::AccountMissing("M".to_string()));
+        let missing = || {
+            Err(CurveError::AccountMissing("M".to_string()))
+                as Result<PriceTick, CurveError>
+        };
         assert_eq!(
-            resolve_entry_with_flag(err, Some(9.0), 500.0),
+            resolve_entry_with_flag(missing(), Some(9.0), 500.0),
             Some((9.0, 500.0, true))
         );
-    }
-
-    #[test]
-    fn entry_is_none_without_price_or_override() {
-        let err: Result<PriceTick, CurveError> = Err(CurveError::AccountMissing("M".to_string()));
-        assert_eq!(resolve_entry_with_flag(err, None, 0.0), None);
+        assert_eq!(resolve_entry_with_flag(missing(), None, 0.0), None);
     }
 
     #[test]
@@ -1712,7 +1704,7 @@ mod tests {
             // tier but widens past round-trip costs on 345 bps (−10.9).
             let id = pipe.portfolio.lock().await.position_ids()[0];
             let sl = pipe.portfolio.lock().await.position(id).expect("pos").sl_percent;
-            let want_sl = if want > 125.0 { -(2.0 * want / 100.0 + 4.0) } else { -8.0 };
+            let want_sl = fee_aware_sl_floor(-8.0, want);
             assert!((sl - want_sl).abs() < 1e-9, "fee={fee:?} sl={sl}");
         }
     }

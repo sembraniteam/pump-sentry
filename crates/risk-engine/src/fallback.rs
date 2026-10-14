@@ -5,6 +5,8 @@ use crate::schema::{Action, RiskProfile, TokenMetrics};
 /// Dev reputation floor.
 pub const DEV_REPUTATION_FLOOR: f64 = 0.40;
 /// Pre-LLM score cap. Keep `<= AuditPolicy::max_score` (400).
+/// Internal heuristic (see the policy cap note); the model-side PASS
+/// rule above 350 is advisory, enforced by `apply_score_gate`.
 pub const RUGCHECK_SCORE_CAP: u32 = 350;
 /// High-momentum buy velocity.
 pub const HIGH_MOMENTUM_VELOCITY: u32 = 25;

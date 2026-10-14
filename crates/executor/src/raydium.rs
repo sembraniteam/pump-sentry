@@ -16,6 +16,8 @@ pub const AMM_V4_FEE_BPS: u64 = 25;
 pub const AMM_V4_FEE_DEN: u64 = 10_000;
 
 /// Quote `amount_in` with fee. `None` on degenerate inputs.
+/// Over-limit fees refuse (fail-closed); the on-chain fee itself
+/// ceils, so the quote ceils the fee leg to stay conservative.
 pub fn quote_base_in(
     amount_in: u64,
     in_reserve: u64,
@@ -25,8 +27,12 @@ pub fn quote_base_in(
     if amount_in == 0 || in_reserve == 0 || out_reserve == 0 {
         return None;
     }
-    let fee_bps = fee_bps.min(AMM_V4_FEE_DEN);
-    let eff_in = amount_in as u128 * (AMM_V4_FEE_DEN - fee_bps) as u128 / AMM_V4_FEE_DEN as u128;
+    if fee_bps > AMM_V4_FEE_DEN {
+        return None;
+    }
+    let fee = amount_in as u128 * fee_bps as u128;
+    let fee = fee.div_ceil(AMM_V4_FEE_DEN as u128);
+    let eff_in = (amount_in as u128).checked_sub(fee)?;
     if eff_in == 0 {
         return None;
     }

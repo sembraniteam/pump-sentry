@@ -11,7 +11,9 @@ use crate::types::{RugCheckError, RugCheckReport};
 /// policy.
 #[derive(Debug, Clone)]
 pub struct AuditPolicy {
-    /// Reports with `score > max_score` are rejected.
+    /// Reports with `score > max_score` are rejected. The 400 cap is
+    /// an internal heuristic, not a vendor band (RugCheck publishes
+    /// no numeric safe threshold; raw scores are unbounded sums).
     pub max_score: u32,
     /// Reject when any risk has level `danger`.
     /// Only `warn` passes.

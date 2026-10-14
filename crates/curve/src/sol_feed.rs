@@ -215,14 +215,11 @@ mod tests {
     }
 
     #[test]
-    fn zero_means_unset() {
+    fn unset_and_stale_read_none() {
+        // Fresh-but-empty and aged feeds both price None + stale.
         let feed = SolUsdFeed::new(DEFAULT_JUP_URL, 120, Duration::from_secs(30));
         assert_eq!(feed.price(), None);
         assert!(feed.is_stale());
-    }
-
-    #[test]
-    fn stale_after_window() {
         let feed = SolUsdFeed::new_for_test(100.0);
         feed.inner
             .updated_at
@@ -236,5 +233,13 @@ mod tests {
         let feed = SolUsdFeed::new(DEFAULT_JUP_URL, 120, Duration::from_secs(30));
         feed.set_price(200.0);
         assert_eq!(feed.price(), Some(200.0));
+    }
+
+    #[test]
+    fn sol_mint_matches_ids_wsol() {
+        // String twin of `ids::WSOL_MINT` (JSON key + URL need strings):
+        // drift breaks loudly here, not in prod.
+        assert_eq!(SOL_MINT, ids::WSOL_MINT.to_string());
+        assert!(DEFAULT_JUP_URL.ends_with(&ids::WSOL_MINT.to_string()));
     }
 }

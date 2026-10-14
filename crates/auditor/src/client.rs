@@ -231,7 +231,7 @@ fn oversized_body() -> RugCheckError {
 /// Network errors worth retrying.
 /// Body stalls mid-stream retry like timeouts; decode failures return at once.
 fn is_transient_network_error(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode()
+    e.is_timeout() || e.is_connect() || e.is_body()
 }
 
 /// Retry server errors, rate limits, and timeouts.

@@ -1246,7 +1246,7 @@ mod tests {
     fn sell_request_body_mint_parses() {
         // A real 32-byte base58 pubkey (WSOL mint). Short strings like
         // "ABC" decode as bytes but are not pubkeys — must reject.
-        let mint = "So11111111111111111111111111111111111111112";
+        let mint = ids::WSOL_MINT.to_string();
         assert_eq!(
             sell_request_body_mint(&format!(r#"{{"mint":"{mint}","ts":1}}"#)),
             Some(mint.to_string())

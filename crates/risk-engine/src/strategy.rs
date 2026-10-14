@@ -3,7 +3,8 @@
 use crate::schema::{Action, RiskProfile};
 use std::str::FromStr;
 
-/// Scalp TP floor in percent.
+/// Scalp TP floor in percent. Warn-only (see the confirm gate):
+/// below-band TPs are honored as early exits, never widened.
 pub const SCALP_TP_MIN: f64 = 25.0;
 /// Scalp TP cap in percent.
 pub const SCALP_TP_MAX: f64 = 35.0;

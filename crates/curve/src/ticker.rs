@@ -124,13 +124,6 @@ impl CurveTicker {
         })
     }
 
-    /// Ticks dropped on a full queue. Test-only: production surfaces
-    /// drops via tracing, never by polling this counter.
-    #[cfg(test)]
-    pub fn dropped_count(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Watch a curve for a mint.
     pub async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
         Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
@@ -203,30 +196,14 @@ impl CurveTicker {
         Ok(decimals)
     }
 
-    /// Venue fee for one curve. `None` keeps 125 bps.
-    pub async fn venue_fee_bps(&self, mint: &str, curve: &str) -> Option<f64> {
-        let mint_key = Pubkey::from_str(mint)
-            .map_err(|_| CurveError::BadMintKey(mint.to_string()))
-            .ok()?;
-        let key = Pubkey::from_str(curve)
-            .map_err(|_| CurveError::BadCurveKey(curve.to_string()))
-            .ok()?;
-        let fee =
-            crate::fee::venue_fee_bps(&self.rpc, &self.fee_inputs, &self.supply, &mint_key, &key)
-                .await;
-        if fee.is_none() && warn_throttled(&FEE_WARN_AT) {
-            warn!(%curve, "venue fee unreadable; paper keeps the standard tier");
-        }
-        fee
-    }
-
     /// Reserve read plus venue fee from the same bytes.
     pub async fn fetch_tick_with_fee(
         &self,
         mint: &str,
         curve: &str,
     ) -> Result<(PriceTick, Option<f64>), CurveError> {
-        Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
+        let mint_key =
+            Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
         let key =
             Pubkey::from_str(curve).map_err(|_| CurveError::BadCurveKey(curve.to_string()))?;
         let sol_usd = self.sol_feed.price().ok_or(CurveError::StaleSolUsd)?;
@@ -234,7 +211,6 @@ impl CurveTicker {
         let decimals = self.token_decimals(mint).await?;
         let tick =
             tick_from_account(mint, curve, &account.data, &account.owner, sol_usd, decimals)?;
-        let mint_key = Pubkey::from_str(mint).expect("mint validated above");
         let fee = crate::fee::venue_fee_for_data(
             &self.rpc,
             &self.fee_inputs,

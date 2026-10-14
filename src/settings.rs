@@ -3,11 +3,9 @@
 use risk_engine::StrategyMode;
 use std::collections::HashMap;
 
-/// Default public HTTP RPC endpoint (override via `MAINNET_RPC_URL`).
-pub const DEFAULT_HTTP_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-/// Default public WebSocket RPC endpoint (override via `MAINNET_WSS_RPC_URL`).
-pub const DEFAULT_WS_RPC_URL: &str = "wss://api.mainnet-beta.solana.com";
 /// Default Jito block-engine base URL (override via `JITO_ENDPOINT`).
+/// Global endpoint stays the default (anycast reachability over shaving
+/// auction latency); point at the nearest region when it matters.
 pub const DEFAULT_JITO_ENDPOINT: &str = "https://mainnet.block-engine.jito.wtf";
 /// Default local chat-completions endpoint (override via `INFERENCE_ENDPOINT`).
 pub const DEFAULT_INFERENCE_ENDPOINT: &str = "http://127.0.0.1:11434/v1/chat/completions";
@@ -435,7 +433,7 @@ fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
                 );
                 legacy
             }
-            None => DEFAULT_WS_RPC_URL.to_string(),
+            None => listener::types::DEFAULT_WS_RPC_URL.to_string(),
         },
     }
 }
@@ -460,7 +458,7 @@ fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
                 );
                 legacy
             }
-            None => DEFAULT_HTTP_RPC_URL.to_string(),
+            None => listener::types::DEFAULT_HTTP_RPC_URL.to_string(),
         },
     }
 }
@@ -551,8 +549,8 @@ mod tests {
         assert!(s.warnings().iter().any(|w| w.contains("HTTP_URL is retired")), "{:?}", s.warnings());
         // Unset = public default.
         let s = Settings::from_map(&HashMap::new());
-        assert_eq!(s.http_url, DEFAULT_HTTP_RPC_URL);
-        assert_eq!(s.ws_url, DEFAULT_WS_RPC_URL);
+        assert_eq!(s.http_url, listener::types::DEFAULT_HTTP_RPC_URL);
+        assert_eq!(s.ws_url, listener::types::DEFAULT_WS_RPC_URL);
         // WSS mirrors the HTTP rule: canonical wins, legacy warns.
         let s = Settings::from_map(&vars(&[
             ("MAINNET_WSS_RPC_URL", "wss://helius/abc"),
@@ -660,15 +658,6 @@ mod tests {
         assert!(w.contains("COMMITMENT='bogus' unknown"), "{w}");
         let s = Settings::from_map(&HashMap::new());
         assert!(!s.warnings().iter().any(|x| x.contains("unknown; startup refuses")));
-    }
-
-    #[test]
-    fn rpc_defaults_match_listener_crate() {
-        // The listener crate cannot depend on the binary, so it keeps its
-        // own copies (`listener::types::DEFAULT_*_RPC_URL`). This pins
-        // them together; a drift breaks loudly here, not in prod.
-        assert_eq!(DEFAULT_HTTP_RPC_URL, listener::types::DEFAULT_HTTP_RPC_URL);
-        assert_eq!(DEFAULT_WS_RPC_URL, listener::types::DEFAULT_WS_RPC_URL);
     }
 
     #[test]

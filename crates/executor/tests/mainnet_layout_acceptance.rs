@@ -577,9 +577,8 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
     // which is exactly the production sniper shape (our wallet is
     // natively funded at setup): hunt recent buy-side flow for the
     // first canonical holder with SOL + base.
-    use executor::instructions::{
-        PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR,
-    };
+    use executor::instructions::PUMP_BUY_V3_DISCRIMINATOR;
+    use ids::{PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR};
     let buyer: Pubkey = {
         let mut before = None;
         let mut found = None;

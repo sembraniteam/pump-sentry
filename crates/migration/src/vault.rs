@@ -113,13 +113,6 @@ impl VaultTicker {
         })
     }
 
-    /// Ticks dropped on a full queue. Test-only: production surfaces
-    /// drops via tracing, never by polling this counter.
-    #[cfg(test)]
-    pub fn dropped_count(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Watch a pool (idempotent per mint).
     /// Base vault holds WSOL (9dp), quote the token (6dp).
     pub async fn watch(

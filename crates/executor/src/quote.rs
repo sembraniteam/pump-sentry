@@ -73,14 +73,13 @@ pub struct CurveView {
     pub vq: u64,
     /// Real (unbought) tokens: the hard cap.
     pub real_tokens: u64,
-    /// Stored supply (mayhem mcap input).
-    pub token_total_supply: u64,
     /// Coin creator rate (0 = unconfigured).
     pub coin_creator_fee_bps: u64,
+    /// Creator is the default key: the program charges no creator
+    /// fee regardless of schedule (per SDK `v3Rates`).
+    pub creator_is_default: bool,
     /// Schedule selector.
     pub quote: QuoteKind,
-    /// Mayhem coin.
-    pub is_mayhem: bool,
 }
 
 /// Quote-mint class selecting the schedule.
@@ -271,7 +270,7 @@ pub fn curve_fee_bps(
     view: &CurveView,
     mint_supply: u64,
 ) -> Result<(u64, u64), QuoteError> {
-    let mcap = market_cap(view.vq, view.vt, view.tier_supply(mint_supply))?;
+    let mcap = market_cap(view.vq, view.vt, mint_supply)?;
     let fees = match view.quote {
         QuoteKind::SolLike => tier_for(&schedule.tiers, mcap).ok_or(QuoteError::EmptyFeeTiers)?,
         QuoteKind::Usdc => tier_for(&schedule.stable, mcap).ok_or(QuoteError::EmptyFeeTiers)?,
@@ -286,14 +285,9 @@ pub fn curve_fee_bps(
     };
     let creator =
         if gate_on && view.coin_creator_fee_bps != 0 { view.coin_creator_fee_bps } else { fees.creator };
+    // Creatorless curves charge no creator fee (program rule).
+    let creator = if view.creator_is_default { 0 } else { creator };
     Ok((fees.protocol, creator))
-}
-
-impl CurveView {
-    /// Fee-tier supply: stored total on mayhem, live mint supply else.
-    fn tier_supply(&self, mint_supply: u64) -> u64 {
-        if self.is_mayhem { self.token_total_supply } else { mint_supply }
-    }
 }
 
 /// Fee-inclusive cost to buy `amount`. Over-remainder fails closed.
@@ -496,6 +490,7 @@ mod tests {
     const V_SOL: u64 = 30_000_000_000;
     const V_TOKENS: u64 = 1_073_000_000_000_000;
     const REAL: u64 = 793_100_000_000_000;
+    /// Tier-selection supply (live-mint stand-in).
     const SUPPLY: u64 = 1_000_000_000_000_000;
 
     fn sched(proto: u64, creator: u64) -> FeeSchedule {
@@ -513,10 +508,9 @@ mod tests {
             vt: V_TOKENS,
             vq: V_SOL,
             real_tokens: REAL,
-            token_total_supply: SUPPLY,
             coin_creator_fee_bps: 0,
+            creator_is_default: false,
             quote: QuoteKind::SolLike,
-            is_mayhem: true,
         }
     }
 
@@ -706,24 +700,27 @@ mod tests {
             (1_000u128, FeesBps { lp: 0, protocol: 80, creator: 20 }),
         ]);
         let v = sol_curve();
-        assert_eq!(curve_fee_bps(&s, false, &v, 0), Ok((80, 20)));
+        assert_eq!(curve_fee_bps(&s, false, &v, SUPPLY), Ok((80, 20)));
         // USDC routes to stable; other quotes to flat when exotic unset.
         let u = CurveView { quote: QuoteKind::Usdc, ..v };
-        assert_eq!(curve_fee_bps(&s, false, &u, 0), Ok((70, 10)));
+        assert_eq!(curve_fee_bps(&s, false, &u, SUPPLY), Ok((70, 10)));
         let o = CurveView { quote: QuoteKind::Other, ..v };
-        assert_eq!(curve_fee_bps(&s, false, &o, 0), Ok((5, 0)));
+        assert_eq!(curve_fee_bps(&s, false, &o, SUPPLY), Ok((5, 0)));
         // Empty SOL tiers fail closed (program: FeeTiersEmpty).
         let e = mk(vec![]);
         assert_eq!(
-            curve_fee_bps(&e, false, &v, 0),
+            curve_fee_bps(&e, false, &v, SUPPLY),
             Err(QuoteError::EmptyFeeTiers)
         );
         // Coin override wins only with gate on + nonzero stored rate.
         let w = CurveView { coin_creator_fee_bps: 250, ..v };
-        assert_eq!(curve_fee_bps(&s, true, &w, 0), Ok((80, 250)));
-        assert_eq!(curve_fee_bps(&s, false, &w, 0), Ok((80, 20)));
+        assert_eq!(curve_fee_bps(&s, true, &w, SUPPLY), Ok((80, 250)));
+        assert_eq!(curve_fee_bps(&s, false, &w, SUPPLY), Ok((80, 20)));
         let z = CurveView { coin_creator_fee_bps: 0, ..v };
-        assert_eq!(curve_fee_bps(&s, true, &z, 0), Ok((80, 20)));
+        assert_eq!(curve_fee_bps(&s, true, &z, SUPPLY), Ok((80, 20)));
+        // Creatorless curves charge no creator leg at all.
+        let d = CurveView { creator_is_default: true, ..w };
+        assert_eq!(curve_fee_bps(&s, true, &d, SUPPLY), Ok((80, 0)));
     }
 
     #[test]

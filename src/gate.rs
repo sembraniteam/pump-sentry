@@ -90,10 +90,13 @@ pub fn resolve_entry_with_flag(
 
 /// Stop-loss floor for a tier: 2x fee + 4pt margin, negated,
 /// clamped to [-100, 0) so absurd tiers can't print an invalid SL.
-fn fee_aware_sl_floor(sl_percent: f64, venue_fee_bps: f64) -> f64 {
-    sl_percent
-        .min(-(2.0 * venue_fee_bps / 100.0 + 4.0))
-        .clamp(-100.0, 0.0)
+pub(crate) fn fee_aware_sl_floor(sl_percent: f64, venue_fee_bps: f64) -> f64 {
+    let floored = sl_percent.min(-(2.0 * venue_fee_bps / 100.0 + 4.0));
+    let clamped = floored.clamp(-100.0, 0.0);
+    if clamped != floored {
+        warn!(sl = sl_percent, bps = venue_fee_bps, "absurd fee tier clamped the stop; check the schedule");
+    }
+    clamped
 }
 
 /// Re-gate a BUY against the audit score: the prompt advises PASS above
@@ -592,10 +595,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
         // Live ticks must carry positive liquidity: zero liquidity
         // prices fee-only (synthetic-grade). Fail closed.
-        // Note: `venue_fee=None` keeps the standard 125bps tier
-        // (see `CurveTicker::venue_fee_bps`); custom-tier mints whose
-        // fee read fails therefore book slightly cheap — accepted
-        // residual (widened only when the tier is known below).
+        // Note: `venue_fee=None` keeps the standard tier (see
+        // `fetch_tick_with_fee`); custom-tier mints whose fee read
+        // fails therefore book slightly cheap — accepted residual
+        // (widened only when the tier is known below).
         if !priced_via_override
             && (!liquidity_usd.is_finite() || liquidity_usd <= 0.0)
         {

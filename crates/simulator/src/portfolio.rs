@@ -4,6 +4,7 @@ use crate::market::FillModel;
 use crate::types::{ClosedTrade, ExitReason, Position, PositionId, Side};
 use std::collections::HashMap;
 use thiserror::Error;
+use tracing::warn;
 
 /// Runner backstop (24h).
 pub const RUNNER_BACKSTOP_SECS: u64 = 86_400;
@@ -191,6 +192,7 @@ impl PaperPortfolio {
     /// Set venue fee for one mint.
     pub fn set_venue_fee_for_mint(&mut self, mint: &str, fee_bps_per_side: f64) {
         if mint.is_empty() || !fee_bps_per_side.is_finite() || fee_bps_per_side < 0.0 {
+            warn!(mint, fee = fee_bps_per_side, "ignoring invalid venue fee tier");
             return;
         }
         self.venue_fees.insert(mint.to_string(), fee_bps_per_side);

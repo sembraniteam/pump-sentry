@@ -31,29 +31,6 @@ enum QuoteKind {
     Other,
 }
 
-/// Total venue fee (bps/side) for one curve.
-pub async fn venue_fee_bps(
-    rpc: &RpcClient,
-    cache: &FeeInputsCache,
-    supply_cache: &SupplyCache,
-    mint: &Pubkey,
-    curve: &Pubkey,
-) -> Option<f64> {
-    let curve_data = tokio::time::timeout(FEE_TIMEOUT, rpc.get_account(curve))
-        .await
-        .ok()?
-        .ok()?;
-    venue_fee_for_data(
-        rpc,
-        cache,
-        supply_cache,
-        mint,
-        &curve_data.owner,
-        &curve_data.data,
-    )
-    .await
-}
-
 /// Total venue fee from curve bytes (owner must be Pump).
 pub async fn venue_fee_for_data(
     rpc: &RpcClient,
@@ -68,6 +45,10 @@ pub async fn venue_fee_for_data(
     }
     let view = curve_fee_inputs(data)?;
     let supply = if view.is_mayhem {
+        // Stored total is fresh on every tick read (no extra RPC on
+        // the hot path). Dispatch tiers use live mint supply instead
+        // (see executor `quote_*_guard`); the two agree except across
+        // mayhem tier boundaries (bounded, documented residual).
         view.stored_supply
     } else {
         mint_supply(rpc, supply_cache, mint).await?

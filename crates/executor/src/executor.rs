@@ -140,8 +140,6 @@ pub struct CurveState {
     pub vq: u64,
     /// Real (unbought) tokens (quote cap).
     pub real_tokens: u64,
-    /// Stored supply (fee-tier mcap input on mayhem).
-    pub token_total_supply: u64,
     /// Coin creator rate in bps (0 = unconfigured).
     pub coin_creator_fee_bps: u64,
 }
@@ -174,7 +172,6 @@ pub fn parse_curve_state(owner: &Pubkey, data: &[u8]) -> Option<CurveState> {
         vt: u64at(8)?,
         vq: u64at(16)?,
         real_tokens: u64at(24)?,
-        token_total_supply: u64at(40)?,
         coin_creator_fee_bps: u64at(115)?,
     })
 }
@@ -456,13 +453,7 @@ impl SwapExecutor {
         };
         let (fees, supply) = tokio::join!(
             self.fee_inputs(),
-            async {
-                if state.is_mayhem {
-                    Some(state.token_total_supply)
-                } else {
-                    self.supply_cached(mint).await
-                }
-            }
+            self.supply_cached(mint),
         );
         let (Some((gate_on, schedule)), Some(supply)) = (fees, supply) else {
             return Err(refuse("fee inputs unreadable"));
@@ -471,8 +462,8 @@ impl SwapExecutor {
             vt: state.vt,
             vq: state.vq,
             real_tokens: state.real_tokens,
-            token_total_supply: state.token_total_supply,
             coin_creator_fee_bps: state.coin_creator_fee_bps,
+            creator_is_default: state.creator == Pubkey::default(),
             quote: if state.quote_mint == crate::instructions::WSOL_MINT {
                 crate::quote::QuoteKind::SolLike
             } else if state.quote_mint == crate::instructions::USDC_MINT {
@@ -480,7 +471,6 @@ impl SwapExecutor {
             } else {
                 crate::quote::QuoteKind::Other
             },
-            is_mayhem: state.is_mayhem,
         };
         match crate::quote::sell_out_after_fees(&schedule, gate_on, &view, supply, amount) {
             Ok(net) => {
@@ -538,13 +528,7 @@ impl SwapExecutor {
         }
         let (fees, supply) = tokio::join!(
             self.fee_inputs(),
-            async {
-                if state.is_mayhem {
-                    Some(state.token_total_supply)
-                } else {
-                    self.supply_cached(mint).await
-                }
-            }
+            self.supply_cached(mint),
         );
         let (Some((gate_on, schedule)), Some(supply)) = (fees, supply) else {
             warn!(mint = %mint, "fee inputs unreadable; keeping sized guard (sim decides)");
@@ -554,8 +538,8 @@ impl SwapExecutor {
             vt: state.vt,
             vq: state.vq,
             real_tokens: state.real_tokens,
-            token_total_supply: state.token_total_supply,
             coin_creator_fee_bps: state.coin_creator_fee_bps,
+            creator_is_default: state.creator == Pubkey::default(),
             quote: if state.quote_mint == crate::instructions::WSOL_MINT {
                 crate::quote::QuoteKind::SolLike
             } else if state.quote_mint == crate::instructions::USDC_MINT {
@@ -563,7 +547,6 @@ impl SwapExecutor {
             } else {
                 crate::quote::QuoteKind::Other
             },
-            is_mayhem: state.is_mayhem,
         };
         match crate::quote::buy_cost_incl_fees(&schedule, gate_on, &view, supply, amount) {
             Ok(cost) => match crate::quote::slippage_ceiling(cost, slippage_bps) {
@@ -777,6 +760,8 @@ impl SwapExecutor {
             Err(_) => return Err(ExecutorError::Timeout("raydium sell balance read")),
         }
         // Vaults must be classic Token accounts ([0] is spl_token); 2022 fails closed.
+        // Reserves read raw: accrued PnL (`need_take_pnl_*`) is not
+        // subtracted (accepted ~0.03% tolerance; the sim gate decides).
         let (base_vault, quote_vault) = tokio::join!(
             async {
                 tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.base_vault)).await
@@ -1269,6 +1254,16 @@ impl SwapExecutor {
             );
             ixs.extend(user_prefix);
             ixs.extend(buyback_prefix);
+            // Fail fast on a short quote balance (sim would catch it,
+            // but a sim outage in non-strict mode must not reach chain).
+            match self.quote_balance(&user_quote).await {
+                Some(held) if held >= max_sol_cost => {}
+                _ => {
+                    return Err(ExecutorError::BadOrder(
+                        "token-pair quote balance below max cost; refusing".to_string(),
+                    ));
+                }
+            }
         }
         ixs.push(PumpSwapBuilder::build_buy_v3_ix(
             order.amount_tokens,
@@ -1399,13 +1394,16 @@ impl SwapExecutor {
             .quote_sell_floor(&order.mint, state, order.amount_tokens, order.min_sol_output)
             .await?;
         let mut ixs = Vec::new();
-        // Quote ATA [10] must exist; prefix is idempotent.
-        let user_quote =
-            user_ata_with_program(payer, &quote_mint, &quote_program);
-        ixs.extend(
-            self.maybe_create_ata_ix(payer, payer, &quote_mint, &user_quote, &quote_program)
-                .await,
-        );
+        // Quote ATA [10] must exist; prefix is idempotent. SOL pairs
+        // skip it: the account is unused and needs neither read nor rent.
+        if quote_mint != crate::instructions::WSOL_MINT {
+            let user_quote =
+                user_ata_with_program(payer, &quote_mint, &quote_program);
+            ixs.extend(
+                self.maybe_create_ata_ix(payer, payer, &quote_mint, &user_quote, &quote_program)
+                    .await,
+            );
+        }
         if quote_mint != crate::instructions::WSOL_MINT {
             ixs.extend(
                 self.maybe_create_ata_ix(
@@ -1739,7 +1737,6 @@ mod tests {
         assert_eq!(state.vt, 1_073_000_000_000_000);
         assert_eq!(state.vq, 30_000_000_000);
         assert_eq!(state.real_tokens, 793_100_000_000_000);
-        assert_eq!(state.token_total_supply, 1_000_000_000_000_000);
         assert_eq!(state.coin_creator_fee_bps, 0);
         // Cashback + complete variants decode too.
         data[CURVE_CASHBACK_FLAG_OFFSET] = 1;

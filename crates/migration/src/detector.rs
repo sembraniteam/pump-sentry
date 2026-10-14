@@ -72,16 +72,6 @@ impl MigrationMonitor {
         account_data[COMPLETE_FLAG_OFFSET] != 0
     }
 
-    /// Graduation progress in percent, clamped. Non-finite maps to `0.0`.
-    pub fn calculate_progress(real_sol_lamports: u64) -> f64 {
-        let progress = real_sol_lamports as f64 / GRADUATION_REAL_SOL_LAMPORTS as f64 * 100.0;
-        if progress.is_finite() {
-            progress.clamp(0.0, 100.0)
-        } else {
-            0.0
-        }
-    }
-
     /// Classify a migration tx.
     ///
     /// Needs pump program or authority in keys plus the watched
@@ -132,11 +122,6 @@ impl MigrationMonitor {
 
         None
     }
-
-    /// Observed Pump.fun program ID.
-    pub fn pump_program(&self) -> Pubkey {
-        self.pump_program
-    }
 }
 
 #[cfg(test)]
@@ -177,20 +162,6 @@ mod tests {
         let mut foreign = vec![0xFFu8; 49];
         foreign[COMPLETE_FLAG_OFFSET] = 1;
         assert!(!MigrationMonitor::is_curve_graduated(&foreign));
-    }
-
-    #[test]
-    fn progress_clamps() {
-        assert_eq!(MigrationMonitor::calculate_progress(0), 0.0);
-        assert_eq!(
-            MigrationMonitor::calculate_progress(GRADUATION_REAL_SOL_LAMPORTS / 2),
-            50.0
-        );
-        assert_eq!(
-            MigrationMonitor::calculate_progress(GRADUATION_REAL_SOL_LAMPORTS),
-            100.0
-        );
-        assert_eq!(MigrationMonitor::calculate_progress(u64::MAX), 100.0);
     }
 
     #[test]

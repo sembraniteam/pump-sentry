@@ -417,7 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_v2_ok_with_idl_layout() {
+    fn parse_v2_ok_with_synth_encoding() {
+        // Synthetic encoding (bool directly after the triple), NOT the
+        // IDL layout (creator pubkey there): do not "fix" this toward
+        // the bool shape; mainnet parsing is pinned below.
         let data = encode_create_v2("Pepe", "PEPE", "https://x/y.json", false);
         assert!(is_pump_create_v2_ix(&data));
         assert!(!is_pump_create_ix(&data));
