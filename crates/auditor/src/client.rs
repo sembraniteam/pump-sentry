@@ -339,22 +339,25 @@ mod tests {
     const CLEAN_BODY: &str = r#"{
         "mint": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
         "score": 50,
+        "rugged": false,
         "risks": [],
-        "token": {"mint_authority": null, "freeze_authority": null, "supply": 1000, "decimals": 9}
+        "token": {"mintAuthority": null, "freezeAuthority": null, "supply": 1000, "decimals": 9}
     }"#;
 
     const RISKY_BODY: &str = r#"{
         "mint": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
         "score": 900,
+        "rugged": false,
         "risks": [{"name": "X", "value": "", "description": "bad", "score": 900, "level": "danger"}],
-        "token": {"mint_authority": "A", "freeze_authority": null, "supply": 1000, "decimals": 9}
+        "token": {"mintAuthority": "A", "freezeAuthority": null, "supply": 1000, "decimals": 9}
     }"#;
 
     const WRONG_MINT_BODY: &str = r#"{
         "mint": "DC4X9szDJk2wVm2NAGsshGFydKAahBg6sAAjmxvSJZGh",
         "score": 50,
+        "rugged": false,
         "risks": [],
-        "token": {"mint_authority": null, "freeze_authority": null, "supply": 1000, "decimals": 9}
+        "token": {"mintAuthority": null, "freezeAuthority": null, "supply": 1000, "decimals": 9}
     }"#;
 
     fn test_client(base_url: &str) -> RugCheckClient {

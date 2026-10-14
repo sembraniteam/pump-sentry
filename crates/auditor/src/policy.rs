@@ -70,6 +70,10 @@ impl Verdict {
 pub fn assess(report: &RugCheckReport, policy: &AuditPolicy) -> Verdict {
     let mut reasons = Vec::new();
 
+    if report.rugged {
+        reasons.push("RugCheck flags token as rugged".to_string());
+    }
+
     if report.score > policy.max_score {
         reasons.push(format!(
             "Risk score too high: {} (max {})",
@@ -132,6 +136,7 @@ mod tests {
         RugCheckReport {
             mint: "MINT".to_string(),
             score: 100,
+            rugged: false,
             risks: vec![RiskItem {
                 name: "Low Liquidity".to_string(),
                 value: "500".to_string(),
@@ -245,6 +250,35 @@ mod tests {
         match assess(&report, &AuditPolicy::default()) {
             Verdict::Reject { reasons } => {
                 assert!(reasons.iter().any(|r| r.contains("unverifiable")));
+            }
+            Verdict::Allow => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn rejects_rugged_flag() {
+        let mut report = clean_report();
+        report.rugged = true;
+        match assess(&report, &AuditPolicy::default()) {
+            Verdict::Reject { reasons } => {
+                assert!(reasons.iter().any(|r| r.contains("rugged")));
+            }
+            Verdict::Allow => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn rejects_live_shaped_report_with_authorities() {
+        // End-to-end: live camelCase keys must reach the policy.
+        let report: RugCheckReport = serde_json::from_str(
+            r#"{"mint": "M", "score": 100, "rugged": false, "risks": [],
+                "token": {"mintAuthority": "Auth111", "freezeAuthority": null,
+                          "supply": 0, "decimals": 6, "isInitialized": true}}"#,
+        )
+        .expect("valid JSON");
+        match assess(&report, &AuditPolicy::default()) {
+            Verdict::Reject { reasons } => {
+                assert!(reasons.iter().any(|r| r.contains("Mint authority")));
             }
             Verdict::Allow => panic!("expected rejection"),
         }

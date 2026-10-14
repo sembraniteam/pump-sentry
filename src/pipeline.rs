@@ -679,6 +679,7 @@ mod tests {
                 AuditOutcome::Allow(score) => Ok(RugCheckReport {
                     mint: mint.to_string(),
                     score: *score,
+                    rugged: false,
                     risks: vec![],
                     token: None,
                 }),
@@ -694,6 +695,7 @@ mod tests {
                         Ok(RugCheckReport {
                             mint: mint.to_string(),
                             score: *score,
+                            rugged: false,
                             risks: vec![],
                             token: None,
                         })

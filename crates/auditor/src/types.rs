@@ -61,6 +61,9 @@ pub struct RugCheckReport {
     /// Aggregate risk score. Higher is riskier.
     /// Required: missing score fails the fetch.
     pub score: u32,
+    /// RugCheck's own rugged flag. Reject on true.
+    #[serde(default)]
+    pub rugged: bool,
     /// Individual risk findings.
     #[serde(default)]
     pub risks: Vec<RiskItem>,
@@ -89,7 +92,9 @@ pub struct RiskItem {
 }
 
 /// On-chain token state relevant to rug risk.
+/// Live API keys are camelCase (`mintAuthority`, ...).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TokenInfo {
     /// Mint authority address, if still enabled.
     #[serde(default)]
@@ -113,21 +118,48 @@ mod tests {
     const SAMPLE: &str = r#"{
         "mint": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
         "score": 120,
+        "rugged": false,
         "risks": [
             {"name": "Low Liquidity", "value": "500", "description": "Low LP", "score": 120, "level": "warn"}
         ],
-        "token": {"mint_authority": null, "freeze_authority": null, "supply": 1000000000, "decimals": 6}
+        "token": {"mintAuthority": null, "freezeAuthority": null, "supply": 1000000000, "decimals": 6, "isInitialized": true}
     }"#;
 
     #[test]
-    fn deserializes_skill_shaped_report() {
+    fn deserializes_live_shaped_report() {
         let report: RugCheckReport = serde_json::from_str(SAMPLE).expect("valid JSON");
         assert_eq!(report.score, 120);
+        assert!(!report.rugged);
         assert_eq!(report.risks.len(), 1);
         assert_eq!(report.risks[0].level, "warn");
         let token = report.token.expect("token present");
         assert!(token.mint_authority.is_none());
         assert_eq!(token.decimals, 6);
+    }
+
+    #[test]
+    fn live_authority_keys_land_in_fields() {
+        // Regression: snake_case fixtures silently parsed live
+        // camelCase authorities as None (fail-open at policy).
+        let report: RugCheckReport = serde_json::from_str(
+            r#"{"mint": "M", "score": 0,
+                "token": {"mintAuthority": "Auth111", "freezeAuthority": null,
+                          "supply": 0, "decimals": 9, "isInitialized": true}}"#,
+        )
+        .expect("valid JSON");
+        let token = report.token.expect("token present");
+        assert_eq!(token.mint_authority.as_deref(), Some("Auth111"));
+        assert!(token.freeze_authority.is_none());
+    }
+
+    #[test]
+    fn rugged_flag_defaults_absent() {
+        let flagged: RugCheckReport = serde_json::from_str(r#"{"mint": "M", "score": 0, "rugged": true}"#)
+            .expect("valid JSON");
+        assert!(flagged.rugged);
+        let missing: RugCheckReport =
+            serde_json::from_str(r#"{"mint": "M", "score": 0}"#).expect("valid JSON");
+        assert!(!missing.rugged);
     }
 
     #[test]

@@ -615,10 +615,26 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         }
 
-        let Some(score) = signal.audit_score else {
-            // Fail closed (unreachable via poll_gates).
-            warn!(%mint, "confirm reached without an audit score; dropping (fail-closed)");
-            return;
+        // Confirm-time re-audit: LP pulls / authority flips between
+        // launch and quorum are invisible to the snapshot. Snapshots
+        // younger than one gate window skip the extra round-trip.
+        let score = if now_secs().saturating_sub(signal.last_audit_secs)
+            > self.settings.gate_window_secs
+        {
+            match self.auditor.evaluate_token(mint).await {
+                Ok(report) => report.score,
+                Err(e) => {
+                    warn!(%mint, error = %e, "confirm-time re-audit failed; dropping (fail-closed)");
+                    return;
+                }
+            }
+        } else {
+            let Some(score) = signal.audit_score else {
+                // Fail closed (unreachable via poll_gates).
+                warn!(%mint, "confirm reached without an audit score; dropping (fail-closed)");
+                return;
+            };
+            score
         };
         let metrics = TokenMetrics {
             liquidity_usd,
