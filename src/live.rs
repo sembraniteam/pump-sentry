@@ -111,7 +111,7 @@ pub struct LiveSellParams<'a> {
     pub liquidity_usd: f64,
     /// Fee tier. `None` is standard.
     pub venue_fee_bps: Option<f64>,
-    /// Jito tip (escalated on retry; caller computes via `escalated_tip`).
+    /// Jito tip (congestion-aware; caller computes via `effective_tip`).
     pub tip_lamports: u64,
 }
 
@@ -121,7 +121,7 @@ pub struct LiveSellParams<'a> {
 pub struct RaydiumSellParams<'a> {
     pub position: &'a LivePosition,
     pub pool: &'a RaydiumPoolLeg,
-    /// Jito tip (escalated on retry).
+    /// Jito tip (congestion-aware; caller computes via `effective_tip`).
     pub tip_lamports: u64,
 }
 
@@ -559,7 +559,7 @@ impl LiveTrader {
                     .map_err(|e| LiveError::BadOrder(format!("bad assoc_curve '{assoc_curve}': {e}")))?,
                 amount_tokens: plan.amount_tokens,
                 max_sol_cost: plan.max_sol_cost,
-                tip_lamports: self.tip_lamports,
+                tip_lamports: self.effective_tip(0).await,
                 creator,
                 slippage_bps: self.slippage_bps,
             }),
@@ -842,6 +842,20 @@ impl LiveTrader {
         self.tip_lamports
     }
 
+    /// Congestion-aware tip for an attempt: escalated base lifted to
+    /// the landed-tip floor, bounded at 4x base. Static tips underland
+    /// in congestion and overpay in calm; the floor adapts both legs.
+    /// Zero base stays zero (explicit tipless).
+    pub async fn effective_tip(&self, failed_attempts: u32) -> u64 {
+        let base = self.tip_lamports;
+        let esc = escalated_tip(base, failed_attempts);
+        if base == 0 {
+            return esc;
+        }
+        let floor = self.executor.tip_floor_lamports().await;
+        esc.max(floor.min(base.saturating_mul(TIP_ESCALATION_MAX_MULT)))
+    }
+
     /// Import boot-replayed pendings into recheck.
     pub fn import_pending(&self, items: Vec<wal::WalPending>) -> usize {
         self.with_pending("wal-import", 0, |guard| {
@@ -1061,6 +1075,17 @@ mod tests {
         // Zero base stays zero; saturates instead of wrapping.
         assert_eq!(escalated_tip(0, 9), 0);
         assert_eq!(escalated_tip(u64::MAX, 9), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn effective_tip_without_oracle_matches_escalation() {
+        // No bundle client: floor is 0, configured tip rules.
+        let trader = cost_trader(100_000, 0, 0);
+        assert_eq!(trader.effective_tip(0).await, 100_000);
+        assert_eq!(trader.effective_tip(2).await, 300_000);
+        // Explicit tipless stays tipless (floor must not lift it).
+        let bare = cost_trader(0, 0, 0);
+        assert_eq!(bare.effective_tip(9).await, 0);
     }
 
     #[test]

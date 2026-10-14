@@ -74,10 +74,30 @@ pub struct JitoClient {
     base: String,
     /// `getTipAccounts` cache: (accounts, unix seconds fetched).
     tips: std::sync::Arc<std::sync::Mutex<(Vec<String>, u64)>>,
+    /// Landed-tip floor cache: (lamports, unix seconds fetched).
+    floor: std::sync::Arc<std::sync::Mutex<(u64, u64)>>,
 }
 
 /// Tip-list TTL: 15 min; failures keep the old list.
 pub const TIP_ACCOUNTS_TTL_SECS: u64 = 900;
+
+/// Landed-tip floor oracle (median of recently landed tips, SOL).
+/// Lifts static tips in congestion; 0 when unknown.
+pub const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
+/// Floor TTL: 60s; failures keep the old value (stamped, so a dead
+/// oracle costs one attempt per window, not per dispatch).
+pub const TIP_FLOOR_TTL_SECS: u64 = 60;
+
+/// Lamports per SOL (floor conversion).
+const LAMPORTS_PER_SOL_F: f64 = 1_000_000_000.0;
+
+/// Seconds since epoch (0 on clock trouble).
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 impl JitoClient {
     /// Build against a block-engine base URL. Bad URLs fail fast.
@@ -102,6 +122,7 @@ impl JitoClient {
                 JITO_TIP_ACCOUNTS.iter().map(|s| s.to_string()).collect(),
                 0,
             ))),
+            floor: std::sync::Arc::new(std::sync::Mutex::new((0, 0))),
         })
     }
 
@@ -171,6 +192,57 @@ impl JitoClient {
         };
         parse_inflight_status(&body, bundle_id)
     }
+
+    /// Landed-tip floor in lamports. 0 when the oracle is unreachable:
+    /// callers fall back to the configured tip.
+    pub async fn tip_floor_lamports(&self) -> u64 {
+        let now = unix_secs();
+        let stale = self
+            .floor
+            .lock()
+            .map(|g| now.saturating_sub(g.1) >= TIP_FLOOR_TTL_SECS)
+            .unwrap_or(true);
+        if stale {
+            let fresh = self.fetch_tip_floor().await.unwrap_or(0);
+            if let Ok(mut guard) = self.floor.lock() {
+                if fresh > 0 {
+                    guard.0 = fresh;
+                }
+                guard.1 = now;
+            }
+        }
+        self.floor.lock().map(|g| g.0).unwrap_or(0)
+    }
+
+    /// GET the floor oracle. `None` on any trouble.
+    async fn fetch_tip_floor(&self) -> Option<u64> {
+        let res = match tokio::time::timeout(
+            Duration::from_millis(2000),
+            self.client.get(TIP_FLOOR_URL).send(),
+        )
+        .await
+        {
+            Ok(Ok(res)) if res.status().is_success() => res,
+            _ => return None,
+        };
+        let body: serde_json::Value = res.json().await.ok()?;
+        let floor = parse_tip_floor_lamports(&body);
+        if floor == 0 { None } else { Some(floor) }
+    }
+}
+
+/// Pure: median landed tip (SOL) → lamports. 0 on any schema trouble.
+fn parse_tip_floor_lamports(body: &serde_json::Value) -> u64 {
+    let sol = body
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("landed_tips_50th_percentile"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if !sol.is_finite() || sol <= 0.0 {
+        return 0;
+    }
+    (sol * LAMPORTS_PER_SOL_F) as u64
 }
 
 /// Build the `sendBundle` payload (pure). `params[1]` picks base64.
@@ -514,6 +586,26 @@ mod tests {
         assert_eq!(parse_inflight_status(&body, "B1"), BundleStatus::Unknown);
         let body: serde_json::Value = serde_json::from_str("{}").expect("json");
         assert_eq!(parse_inflight_status(&body, "B1"), BundleStatus::Unknown);
+    }
+
+    #[test]
+    fn tip_floor_parses_median_sol_to_lamports() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"[{"time":"2024-09-01T12:58:00Z","landed_tips_25th_percentile":6e-06,"landed_tips_50th_percentile":1e-05,"landed_tips_75th_percentile":3.6e-05}]"#,
+        )
+        .expect("json");
+        assert_eq!(parse_tip_floor_lamports(&body), 10_000);
+        for bad in [
+            "[]",
+            "[{}]",
+            "{}",
+            "null",
+            r#"[{"landed_tips_50th_percentile":-1.0}]"#,
+            r#"[{"landed_tips_50th_percentile":"much"}]"#,
+        ] {
+            let body: serde_json::Value = serde_json::from_str(bad).expect("json");
+            assert_eq!(parse_tip_floor_lamports(&body), 0, "{bad}");
+        }
     }
 
     #[tokio::test]

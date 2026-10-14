@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::live::{
     LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, RaydiumSellParams,
-    RecheckOutcome, SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN, escalated_tip,
+    RecheckOutcome, SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN,
 };
 use crate::pipeline::{
     AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener, CURVE_TICK_STALE_SECS,
@@ -518,12 +518,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Tip escalates with prior failures (bounded congestion
         // response; floors never widen instead). Read before the probe:
         // short lock, never held across awaits.
-        let tip = escalated_tip(trader.base_tip_lamports(), self.exec.retry_attempts(mint).await);
+        let attempts = self.exec.retry_attempts(mint).await;
+        let tip = trader.effective_tip(attempts).await;
         // Never compete with our own inflight bundle: a resend while
         // the prior sell is still engine-pending risks two live
         // bundles for one bag. Unknown status proceeds (exits must
         // not stall on a status outage).
-        if self.exec.retry_attempts(mint).await > 0 && trader.prior_sell_pending(mint).await {
+        if attempts > 0 && trader.prior_sell_pending(mint).await {
             warn!(%mint, "prior sell bundle still inflight-pending; holding resend");
             return false;
         }

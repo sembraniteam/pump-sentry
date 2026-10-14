@@ -15,7 +15,7 @@ use simulator::{ExitReason, Mark, PaperPortfolio, check_exit};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, RaydiumSellParams};
+use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, RaydiumSellParams, escalated_tip};
 use crate::live_mirror::{LiveExecution, live_base_mint};
 use crate::follow::FollowState;
 pub use crate::gate::{DailyBreaker, GateState};
@@ -105,6 +105,12 @@ pub trait LiveSink {
     /// Base Jito tip (live_sell escalates it by attempts).
     fn base_tip_lamports(&self) -> u64;
 
+    /// Congestion-aware tip for an attempt. Default is pure
+    /// escalation (stubs have no oracle); live lifts to the floor.
+    async fn effective_tip(&self, failed_attempts: u32) -> u64 {
+        escalated_tip(self.base_tip_lamports(), failed_attempts)
+    }
+
     /// True when a buy awaits confirmation.
     fn has_pending(&self) -> bool {
         false
@@ -167,6 +173,10 @@ impl LiveSink for LiveTrader {
 
     fn base_tip_lamports(&self) -> u64 {
         self.base_tip()
+    }
+
+    async fn effective_tip(&self, failed_attempts: u32) -> u64 {
+        self.effective_tip(failed_attempts).await
     }
 
     fn has_pending(&self) -> bool {

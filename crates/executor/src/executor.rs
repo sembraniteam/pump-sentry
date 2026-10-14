@@ -553,6 +553,15 @@ impl SwapExecutor {
         }
     }
 
+    /// Landed-tip floor in lamports. 0 without a bundle client or on
+    /// any oracle trouble: callers use the configured tip.
+    pub async fn tip_floor_lamports(&self) -> u64 {
+        match &self.jito {
+            Some(jito) => jito.tip_floor_lamports().await,
+            None => 0,
+        }
+    }
+
     /// Buy `amount_tokens` for at most `max_sol_cost` lamports.
     pub async fn buy(&self, order: &BuyOrder) -> Result<SwapReceipt, ExecutorError> {
         let ixs = self.preflight_buy(order, false).await?;
