@@ -145,6 +145,18 @@ pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> 
 /// `None` on non-positive inputs, zero quantity, or amounts that do not
 /// fit `u64` (`as`-casts saturate silently past the max — a garbage
 /// print must fail closed, never size a jumbo order).
+/// Truncate a float into `u64`, failing closed outside the range.
+/// `u64::MAX as f64` rounds UP to 2^64, so a `>` bound lets values in
+/// `(u64::MAX, 2^64]` through to a saturating cast (a garbage print
+/// sizing a max-quantity order); `>=` rejects them. Single home for
+/// every float→lamports/token conversion on the live path.
+fn u64_from_f64_floor(v: f64) -> Option<u64> {
+    if !v.is_finite() || v <= 0.0 || v >= u64::MAX as f64 {
+        return None;
+    }
+    Some(v as u64)
+}
+
 pub fn plan_buy(
     notional_usd: f64,
     price_usd: f64,
@@ -166,24 +178,18 @@ pub fn plan_buy(
     let slip = FillModel::default().slip_fraction(notional_usd, liquidity_usd);
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
     let amount_f = (notional_usd / price_usd / (1.0 + slip) * scale).floor();
-    if !amount_f.is_finite() || amount_f <= 0.0 || amount_f > u64::MAX as f64 {
-        return None;
-    }
-    let amount_tokens = amount_f as u64;
+    let amount_tokens = u64_from_f64_floor(amount_f)?;
     if amount_tokens == 0 {
         return None;
     }
     let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
-    if !lamports.is_finite() || lamports <= 0.0 || lamports > u64::MAX as f64 {
-        return None;
-    }
     // Venue fee first (exact integer ceil in u128; the narrowing
     // `try_from` fails closed if the fee tips a near-max guard over
     // u64::MAX), then the slippage ceiling. The fee engine downstream
-    // recomputes fee-inclusively and only ever RAISES this guard, so
+    // recomputes fee-inclusively but is clamped to this guard, so
     // pre-paying the fee here never double-counts.
     let with_fee = u64::try_from(
-        (lamports as u64 as u128 * (10_000 + VENUE_FEE_BPS) as u128).div_ceil(10_000),
+        (u64_from_f64_floor(lamports)? as u128 * (10_000 + VENUE_FEE_BPS) as u128).div_ceil(10_000),
     )
     .ok()?;
     // One guard constructor everywhere (ceiling math): the float quote
@@ -225,7 +231,9 @@ pub fn plan_sell_floor(
     let gross_notional = amount_tokens as f64 / scale * price_usd;
     let slip = FillModel::default().slip_fraction(gross_notional, liquidity_usd);
     let lamports = gross_notional * (1.0 - slip).max(0.0) / sol_usd * LAMPORTS_PER_SOL;
-    if !lamports.is_finite() || lamports <= 0.0 || lamports > u64::MAX as f64 {
+    // Same `>=` boundary as `plan_buy`: `u64::MAX as f64` is 2^64, and
+    // `as u64` below saturates past the max.
+    if !lamports.is_finite() || lamports <= 0.0 || lamports >= u64::MAX as f64 {
         return None;
     }
     // `as u64` saturates past the max — the check above fails closed
@@ -709,15 +717,24 @@ impl LiveTrader {
         for (entry, outcome) in results {
             match outcome {
                 RecheckOutcome::StillUnknown => {}
-                _ => match self.pending.lock() {
-                    Ok(mut guard) => {
-                        guard.remove(&entry.position.mint);
+                // Every terminal recheck verdict retires the WAL pending
+                // line: without the tombstone the next boot replays a
+                // dead bundle back into `pending` (wasteful re-polls), and
+                // a late-confirmed or given-up bag replays twice — once
+                // as pending, once as the parked manual bag (phantom
+                // `#late-…` duplicate demanding review for one fill).
+                _ => {
+                    self.write_wal_settled(&entry.bundle_id);
+                    match self.pending.lock() {
+                        Ok(mut guard) => {
+                            guard.remove(&entry.position.mint);
+                        }
+                        Err(_) => tracing::warn!(
+                            mint = %entry.position.mint,
+                            "pending-tracker lock poisoned; settled entry not removed"
+                        ),
                     }
-                    Err(_) => tracing::warn!(
-                        mint = %entry.position.mint,
-                        "pending-tracker lock poisoned; settled entry not removed"
-                    ),
-                },
+                }
             }
             out.push(PendingRecheck {
                 position: entry.position,
@@ -1220,6 +1237,19 @@ mod tests {
     }
 
     #[test]
+    fn u64_boundary_fails_closed() {
+        // `u64::MAX as f64` IS 2^64: exactly-2^64 must reject (old `>`
+        // bound passed it into a saturating cast → max-quantity order).
+        assert_eq!(u64_from_f64_floor(2f64.powi(64)), None);
+        assert_eq!(u64_from_f64_floor(f64::NAN), None);
+        assert_eq!(u64_from_f64_floor(f64::INFINITY), None);
+        assert_eq!(u64_from_f64_floor(0.0), None);
+        assert_eq!(u64_from_f64_floor(-1.0), None);
+        assert_eq!(u64_from_f64_floor(1e10), Some(10_000_000_000));
+        assert_eq!(u64_from_f64_floor(1.9), Some(1));
+    }
+
+    #[test]
     fn buy_plan_rejects_overflow() {
         // 1e36 base units does not fit u64: fail closed, never saturate.
         assert_eq!(plan_buy(1e20, 1e-10, 150.0, 200, 30_000.0), None);
@@ -1299,5 +1329,21 @@ mod tests {
         assert_eq!(replay.manual[0].position.mint, "STUCK");
         assert_eq!(replay.manual[0].note, "");
         assert_eq!(replay.skipped, 2);
+    }
+
+    #[test]
+    fn wal_replay_settled_retires_pending_beside_manual() {
+        // Give-up shape: the recheck loop parks the bag as manual AND
+        // writes the settled tombstone — without it the next boot
+        // replays one fill twice (pending re-poll + manual review).
+        let retired = [
+            r#"{"t":"pending","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}"#,
+            r#"{"t":"manual","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"note":"dispatch-unknown","ts":2}"#,
+            r#"{"t":"settled","bundle":"B1","ts":3}"#,
+        ];
+        let replay = wal::replay_lines(retired.into_iter());
+        assert!(replay.pending.is_empty(), "tombstone retires the poll");
+        assert_eq!(replay.manual.len(), 1);
+        assert_eq!(replay.manual[0].position.mint, "MINT");
     }
 }

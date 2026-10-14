@@ -55,7 +55,11 @@ pub fn quote_base_in_std(amount_in: u64, in_reserve: u64, out_reserve: u64) -> O
 /// Build a Raydium AMM v4 `SwapBaseInV2` instruction. All addresses are
 /// caller-resolved (pool vaults from [`crate::RAYDIUM_V4_PROGRAM_ID`]-owned
 /// parsing, authority derived off-chain); this function only lays out the
-/// verified wire order — it performs no RPC and never panics.
+/// verified wire order — it performs no RPC and never panics. `None` on a
+/// zero `amount_in` (a doomed ix: the chain would fail it after fees).
+/// Dormant path: post-migration tracking is paper-only, and Token-2022
+/// pools need a program parameter before this is routable — do not wire
+/// it without a funded run proving both.
 #[allow(clippy::too_many_arguments)]
 pub fn build_swap_base_in_v2_ix(
     amm: &Pubkey,
@@ -67,12 +71,15 @@ pub fn build_swap_base_in_v2_ix(
     user_owner: &Pubkey,
     amount_in: u64,
     minimum_amount_out: u64,
-) -> Instruction {
+) -> Option<Instruction> {
+    if amount_in == 0 {
+        return None;
+    }
     let mut data = Vec::with_capacity(17);
     data.push(SWAP_BASE_IN_V2_TAG);
     data.extend_from_slice(&amount_in.to_le_bytes());
     data.extend_from_slice(&minimum_amount_out.to_le_bytes());
-    Instruction {
+    Some(Instruction {
         program_id: ids::RAYDIUM_V4_PROGRAM_ID,
         accounts: vec![
             AccountMeta::new_readonly(ids::TOKEN_PROGRAM_ID, false),
@@ -85,7 +92,7 @@ pub fn build_swap_base_in_v2_ix(
             AccountMeta::new_readonly(*user_owner, true),
         ],
         data,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -108,7 +115,8 @@ mod tests {
             &key(7),
             1_000,
             900,
-        );
+        )
+        .expect("nonzero amount builds");
         assert_eq!(ix.program_id, ids::RAYDIUM_V4_PROGRAM_ID);
         assert_eq!(ix.accounts.len(), 8);
         assert_eq!(ix.accounts[0], AccountMeta::new_readonly(ids::TOKEN_PROGRAM_ID, false));
@@ -142,5 +150,20 @@ mod tests {
         ] {
             assert_eq!(quote_base_in(bad.0, bad.1, bad.2, 25), None);
         }
+        // Zero-amount swaps never build (doomed ix, fails on-chain).
+        assert!(
+            build_swap_base_in_v2_ix(
+                &key(1),
+                &key(2),
+                &key(3),
+                &key(4),
+                &key(5),
+                &key(6),
+                &key(7),
+                0,
+                0,
+            )
+            .is_none()
+        );
     }
 }

@@ -25,7 +25,7 @@ pump-sentry run              # foreground (debugging)
 
 State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry` (rename + SIGHUP, lossless).
 
-Live funding: v3 buys debit the wallet **WSOL** ATA, never native SOL — keep a WSOL float for inventory **and** native SOL for fees/tips/0.05 reserve. SOL-only wallets fail every buy (`spl-token wrap` first).
+Live funding: SOL-pair v3 buys pay **native SOL** (official BUY.md/TRADE_V3.md) — fund native for trade + fees + tips + 0.05 reserve. A **WSOL** float is only needed for token-paired quotes (USDC/pump coin), which debit the quote ATA via `TransferChecked`.
 
 ## Config
 
@@ -67,4 +67,4 @@ crates/executor/   # live swaps via Jito (only with --live)
 crates/curve|auditor|risk-engine|simulator|ids|alert|migration/
 ```
 
-Each crate has its own README. Tests: `cargo test --workspace` (339, live probes ignored) · `cargo clippy --all-targets` (zero warnings).
+Each crate has its own README. Tests: `cargo test --workspace` (346, live probes ignored) · `cargo clippy --all-targets` (zero warnings).

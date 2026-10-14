@@ -258,7 +258,6 @@ impl CurveTicker {
             // fallback).
             let Some(sol_usd) = self.sol_feed.price() else {
                 debug!("sol_usd stale; skipping round");
-                tokio::time::sleep(self.interval).await;
                 continue;
             };
             let keys: Vec<Pubkey> = watched.iter().map(|w| w.curve).collect();
@@ -269,12 +268,10 @@ impl CurveTicker {
                 Ok(Ok(accounts)) => accounts,
                 Ok(Err(e)) => {
                     warn!(error = %e, n = keys.len(), "round failed; backing off");
-                    tokio::time::sleep(self.interval).await;
                     continue;
                 }
                 Err(_) => {
                     warn!(n = keys.len(), "round timed out; backing off");
-                    tokio::time::sleep(self.interval).await;
                     continue;
                 }
             };

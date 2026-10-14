@@ -117,13 +117,14 @@ engine (`result` UUID, no `-32602`), proving base64 decode with the
 - v3 needs no fee recipient (fees stay on the curve); only the buyback
   pick travels. Tip accounts refresh every 15 minutes from
   `getTipAccounts` with static fallback.
-- Wallet funding is two-part: native SOL (fees + solvency guard) AND a
-  WSOL float in the wallet's WSOL ATA (every v3 buy debits WSOL via
-  `TransferChecked` — a SOL-only wallet sim-fails with token
-  `InsufficientFunds`, proven live). Wrap at setup
-  (`spl-token wrap <AMOUNT>`) and top up as buys draw it down;
-  preflight refuses with a "wrap SOL first" error when the float is
-  short, and always idempotently pre-creates the payer quote ATA.
+- Wallet funding is route-aware (official BUY.md/TRADE_V3.md): SOL-pair
+  buys transfer native SOL, so the trade guard is asserted natively
+  (trade + tip + 0.05 reserve) and no quote ATA is pre-created ([10] is
+  unused and need not exist). Only token-paired quotes (USDC/pump coin)
+  debit the payer quote ATA via `TransferChecked` — those need a funded
+  quote float; simulation still decides sufficiency. Wrap at setup
+  (`spl-token wrap <AMOUNT>`) only matters for token-paired inventory;
+  preflight refuses natively-short SOL-pair buys before simulation.
 - Unconfirmed buys are tracked as pending and re-polled, never assumed
   unfilled; sells retry with cooldown + attempt budget, then escalate.
   A crash-recovery WAL (`live-wal.jsonl`) replays pending/positions/

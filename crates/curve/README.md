@@ -25,7 +25,8 @@ getAccount / getMultipleAccounts (HTTP RPC)
   live buy/sell sizing) fails closed instead of printing stale USD.
 - `ticker` — `CurveTicker` with a dynamic watch set (`watch`/`unwatch` per mint), `fetch_tick` one-shot reads, and a
   `run` loop emitting `PriceTick`s via chunked `getMultipleAccounts` (≤100
-  accounts per call) per round. Every round is deadline-bound (`ROUND_TIMEOUT` 15s); missed rounds log and continue; the
+  accounts per call) per round. Every chunk is deadline-bound (15s) under
+  a 60s overall round budget; missed rounds log and continue; the
   loop ends
   when the receiver drops. Unknown commitments are rejected (`None`),
   never coerced — callers fail closed.

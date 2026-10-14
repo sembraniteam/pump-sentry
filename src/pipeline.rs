@@ -263,6 +263,23 @@ const GATE_FANOUT_MIN: usize = 1;
 /// gate fanout for the next round (rate-limit/backoff signal).
 const SLOW_GATE_ROUND_SECS: u64 = 10;
 
+/// Base mint behind a live-tracking key. Parked duplicate bags carry a
+/// `#`-suffixed key (`MINT#2-<bundle>`, `MINT#late-<bundle>`, WAL replays)
+/// so they never clobber the first bag; Base58 never contains `#`, so the
+/// prefix is always the mint. Heat and duplicate guards must compare on
+/// this, never on raw keys — otherwise a mint whose only bag is parked
+/// reads as "not exposed" and a second fill dispatches over real custody.
+pub fn live_base_mint(key: &str) -> &str {
+    key.split('#').next().unwrap_or(key)
+}
+
+/// Short tag for suffixed live-tracking keys (`MINT#2-<tag>`). Byte
+/// slicing would panic on a non-ASCII boundary; bundle UUIDs and
+/// signatures are ASCII today, but keys must never depend on that.
+fn short_tag(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
 /// Map screened dev history to a 0.4–1.0 trust score for the risk
 /// input. Screening already rejected young/prolific wallets; survivors
 /// ramp from 0.7 at exactly `min_age` to 1.0 at 4× `min_age`, minus 0.05
@@ -1000,10 +1017,27 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 if stale {
                     GateStep::Stale
                 } else {
+                    // Snapshot watermark for the compare-and-swap below.
+                    let snap_sig = signal.last_sig.clone();
+                    let has_new = newest.is_some();
                     if let Some(sig) = newest {
                         signal.last_sig = Some(sig);
-                        state.meta.insert(mint.clone(), signal.clone());
-                    } else if audit_changed {
+                    }
+                    if audit_changed || has_new {
+                        // Never regress a concurrently-advanced watermark:
+                        // overlapping rounds snapshot the same entry, and
+                        // the older round must not overwrite the newer
+                        // round's `last_sig` (it would re-read the window
+                        // and stall quorum; buyer counts stay safe via set
+                        // semantics either way). Audit progress merges
+                        // onto whichever watermark is current.
+                        if has_new
+                            && let Some(current) = state.meta.get(&mint)
+                            && current.last_sig != snap_sig
+                            && let Some(fresh) = current.last_sig.clone()
+                        {
+                            signal.last_sig = Some(fresh);
+                        }
                         state.meta.insert(mint.clone(), signal.clone());
                     }
                     if signal.audit_score.is_none() {
@@ -1311,6 +1345,27 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
+    /// True when any live bag exists for `mint`: tracked, parked manual
+    /// (exact or `#`-suffixed duplicate keys — compared by base mint),
+    /// or pending confirm. Single home for the duplicate/heat guard so a
+    /// parked bag can never read as "not exposed".
+    async fn is_live_tracked(&self, trader: &L, mint: &str) -> bool {
+        if self.exec.live_positions.lock().await.contains_key(mint) {
+            return true;
+        }
+        if self
+            .exec
+            .live_manual
+            .lock()
+            .await
+            .keys()
+            .any(|k| live_base_mint(k) == mint)
+        {
+            return true;
+        }
+        trader.pending_mints().iter().any(|m| m == mint)
+    }
+
     /// Mirror a paper open with a real Jito-routed buy (live mode only).
     /// Paper opens first; live failures park explicitly (diverged for
     /// definitive no-fill, manual for unknown fills) so paper never
@@ -1373,7 +1428,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .keys()
                 .cloned()
                 .collect();
-            exposure.extend(self.exec.live_manual.lock().await.keys().cloned());
+            exposure.extend(
+                self.exec
+                    .live_manual
+                    .lock()
+                    .await
+                    .keys()
+                    .map(|k| live_base_mint(k).to_string()),
+            );
             exposure.extend(trader.pending_mints());
             exposure.sort();
             exposure.dedup();
@@ -1393,10 +1455,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // already tracked / manual / pending. The post-dispatch check
         // below stays as defense-in-depth (a concurrent buy may have
         // landed first while this one was in flight).
-        if self.exec.live_positions.lock().await.contains_key(mint)
-            || self.exec.live_manual.lock().await.contains_key(mint)
-            || trader.pending_mints().iter().any(|m| m == mint)
-        {
+        if self.is_live_tracked(trader, mint).await {
             warn!(%mint, "LIVE buy skipped: mint already tracked/manual/pending; no dispatch (paper stays open, no new funds)");
             self.emit(format!("LIVE buy skipped on already-tracked {mint}; no dispatch"));
             return;
@@ -1420,17 +1479,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // dispatch was in flight. The second fill is REAL on-chain
                 // custody — park it in `live_manual` (human exit), never
                 // drop it silently.
-                if self.exec.live_positions.lock().await.contains_key(mint)
-                    || self.exec.live_manual.lock().await.contains_key(mint)
-                    || trader.pending_mints().iter().any(|m| m == mint)
-                {
+                if self.is_live_tracked(trader, mint).await {
                     warn!(%mint, %bundle, amount = position.amount_tokens, "LIVE buy landed for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
                     trader.record_manual(&position, &bundle);
                     self.exec
                         .live_manual
                         .lock()
                         .await
-                        .insert(format!("{mint}#2-{}", &bundle[..bundle.len().min(8)]), position);
+                        .insert(format!("{mint}#2-{}", short_tag(&bundle)), position);
                     self.emit(format!("second LIVE bag on {mint} ({bundle}); MANUAL EXIT REQUIRED"));
                     return;
                 }
@@ -1522,13 +1578,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     // Same no-overwrite rule as the fast buy path: a
                     // late confirmation never clobbers a newer bag. The
                     // late fill is still real custody — park it manual.
-                    if self.exec.live_positions.lock().await.contains_key(&mint)
-                        || self.exec.live_manual.lock().await.contains_key(&mint)
-                    {
+                    if self.is_live_tracked(trader, &mint).await {
                         warn!(mint = %mint, bundle = %recheck.bundle_id, amount = recheck.position.amount_tokens, "late LIVE buy confirm for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
                         trader.record_manual(&recheck.position, &recheck.bundle_id);
                         self.exec.live_manual.lock().await.insert(
-                            format!("{mint}#late-{}", &recheck.bundle_id[..recheck.bundle_id.len().min(8)]),
+                            format!("{mint}#late-{}", short_tag(&recheck.bundle_id)),
                             recheck.position,
                         );
                         self.emit(format!("late LIVE buy confirm on already-tracked {mint}; MANUAL REVIEW REQUIRED"));
@@ -1667,8 +1721,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Floor (never ceiling): the live leg must never oversell
             // custody — any dust shortfall self-heals via the no-paper
             // retry path, which re-sells the remainder at full fraction.
-            // Settled for the breaker (dust value is ~0) but stamp the
-            // cooldown so re-probes don't spam every tick. Guard drops
+            // NOT settled for the breaker: the live leg still holds (even
+            // dust), so recording paper PnL now would mask real exposure.
+            // Stamp the cooldown so re-probes don't spam every tick, and
+            // leave attempts uncounted: dust can never sell, so parking
+            // it to manual would page a human over ~$0. Guard drops
             // before the retry lock (never nested, never across await).
             if sell_amount == 0 {
                 drop(guard);
@@ -1680,7 +1737,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     .entry(mint.to_string())
                     .or_insert((0u32, 0u64))
                     .1 = now;
-                return true;
+                return false;
             }
             LivePosition {
                 mint: tracked.mint.clone(),
@@ -3353,16 +3410,19 @@ mod tests {
             base_vault: Some(fixture_wallet(21)),
             quote_vault: Some(fixture_wallet(22)),
         });
+        // Real pubkey mint: the pool follow validates it at the vault
+        // boundary (garbage mints fail fast instead of tracking nothing).
+        let mint = fixture_wallet(30);
         let pipe = pipeline_alerted(
             Settings::from_map(&HashMap::new()),
             AuditOutcome::Allow(100),
-            StubReserves::with_tick(tick("MINT", 2.0)),
+            StubReserves::with_tick(tick(&mint, 2.0)),
             funded(),
             screener,
             None,
             Some(alerts.clone()),
         );
-        let mut graduated = tick("MINT", 2.0);
+        let mut graduated = tick(&mint, 2.0);
         graduated.complete = true;
         pipe.on_tick(&graduated).await;
         pipe.on_tick(&graduated).await;

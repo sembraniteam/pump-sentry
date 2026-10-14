@@ -8,7 +8,7 @@
 
 use crate::fallback::evaluate_metrics_fallback;
 use crate::schema::{RiskProfile, TokenMetrics, build_prompt};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -24,6 +24,11 @@ pub const DEFAULT_MAX_TOKENS: u32 = 128;
 /// would stall the hot path, so [`RiskEngineBuilder::timeout`] values
 /// clamp here at build time.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(2);
+/// Floor for the inference budget: a zero budget would time out every
+/// `evaluate` into the fallback, silently disabling the model path.
+/// Misconfiguration clamps here instead of failing the build (the bot
+/// must boot on bad knobs; the fallback is always available).
+pub const MIN_TIMEOUT: Duration = Duration::from_millis(50);
 /// Token budget bounds: 0 starves the model into permanent fallback,
 /// unbounded budgets burn latency and cost.
 pub const MIN_MAX_TOKENS: u32 = 16;
@@ -182,7 +187,7 @@ impl RiskEngine {
         // Clamp caller-controlled budgets: an hour-long timeout or a
         // zero/unbounded token budget would break the 300ms hot-path
         // contract (falling back always, or never).
-        let timeout = b.timeout.min(MAX_TIMEOUT);
+        let timeout = b.timeout.clamp(MIN_TIMEOUT, MAX_TIMEOUT);
         let max_tokens = b.max_tokens.clamp(MIN_MAX_TOKENS, MAX_MAX_TOKENS);
         let client = Client::builder()
             .timeout(timeout.saturating_add(Duration::from_millis(100)))
@@ -273,8 +278,8 @@ impl RiskEngine {
                 return None;
             }
         };
-        if response.status() != StatusCode::OK {
-            debug!(status = ?response.status(), "inference non-200 status");
+        if !response.status().is_success() {
+            debug!(status = ?response.status(), "inference non-2xx status");
             return None;
         }
         let body: ChatResponse = match response.json().await {
@@ -456,7 +461,7 @@ mod tests {
             .timeout(Duration::ZERO)
             .build()
             .expect("engine");
-        assert_eq!(tiny.timeout, Duration::ZERO);
+        assert_eq!(tiny.timeout, MIN_TIMEOUT);
         let tokens = RiskEngineBuilder {
             max_tokens: u32::MAX,
             ..RiskEngineBuilder::default()

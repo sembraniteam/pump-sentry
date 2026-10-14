@@ -182,8 +182,17 @@ pub fn parse_cli(args: &[String]) -> CliAction {
 
 /// `-n N` / `--lines N` value for `logs`; falls back to
 /// [`DEFAULT_LOG_LINES`] on missing/unparsable input (never panics, never
-/// fails the command for a typo).
+/// fails the command for a typo). Accepts `-nN`, `--lines=N`, and the
+/// two-word forms alike.
 fn log_lines(args: &[String]) -> usize {
+    let glued = args.iter().find_map(|a| {
+        a.strip_prefix("--lines=")
+            .or_else(|| a.strip_prefix("-n").filter(|rest| !rest.is_empty()))
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    if let Some(n) = glued {
+        return n;
+    }
     args.windows(2)
         .find_map(|w| {
             (w[0] == "-n" || w[0] == "--lines")
@@ -275,8 +284,11 @@ pub fn read_pid_file(path: &Path) -> Option<PidInfo> {
     PidInfo::from_json(&raw)
 }
 
-/// True when `pid` names a live process (`kill -0` on unix; pid-file
-/// existence elsewhere — documented limitation for non-unix hosts).
+/// True when `pid` names a live process (`kill(pid, 0)` on unix;
+/// pid-file existence elsewhere — documented limitation for non-unix
+/// hosts). No subprocess: shelling out to the `kill` binary breaks when
+/// it is missing from PATH (minimal containers), misreading a live
+/// daemon as dead and spawning a twin.
 ///
 /// The range guard comes first: pid 0 means "our process group" and any
 /// value above `i32::MAX` overflows `pid_t` (on Linux `u32::MAX` wraps
@@ -288,13 +300,14 @@ pub fn process_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        // SAFETY: `kill` with sig 0 sends nothing; it only error-checks.
+        // ESRCH = no such process; EPERM = exists but unpermitted;
+        // anything else (EINVAL is impossible here) reads as dead.
+        let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if r == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     {
@@ -307,6 +320,75 @@ pub fn process_alive(pid: u32) -> bool {
 pub fn running_daemon(pid_file: &Path) -> Option<PidInfo> {
     let info = read_pid_file(pid_file)?;
     process_alive(info.pid).then_some(info)
+}
+
+/// Start-lock path next to the pid file (`bot.lock` beside `bot.pid`):
+/// serializes concurrent `start` invocations that would otherwise both
+/// pass the `running_daemon` check and spawn twin daemons.
+pub fn start_lock_path(pid_file: &Path) -> PathBuf {
+    let mut lock = pid_file.to_path_buf();
+    lock.set_extension("lock");
+    lock
+}
+
+/// Maximum age of a start-lock claim: an owner that neither finished
+/// (lock removed on every `cmd_start` exit) nor stayed alive past this
+/// is a crashed starter — stealable.
+pub const START_LOCK_STALE_SECS: u64 = 120;
+
+/// Claim the start lock (`<pid>:<unix_ts>`, atomic `create_new`).
+/// Fails when a live starter claimed within [`START_LOCK_STALE_SECS`].
+/// A stale claim (holder dead or too old, e.g. a crashed starter) is
+/// stolen with best-effort overwrite — two racing stealers serialize on
+/// the second `create_new` after removing the stale file.
+pub fn try_acquire_start_lock(lock_path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let claim = format!("{}:{}", std::process::id(), unix_secs());
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(claim.as_bytes())?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Garbage content can never be a live claim (claims are always
+            // well-formed `pid:ts`), so unparsable locks are stealable too.
+            let stale = std::fs::read_to_string(lock_path)
+                .ok()
+                .and_then(|raw| {
+                    let (pid, ts) = raw.trim().split_once(':')?;
+                    Some((pid.parse::<u32>().ok()?, ts.parse::<u64>().ok()?))
+                })
+                .is_none_or(|(pid, ts)| {
+                    !process_alive(pid) || unix_secs().saturating_sub(ts) >= START_LOCK_STALE_SECS
+                });
+            if !stale {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "start already in progress",
+                ));
+            }
+            // Steal: remove-then-create races a twin stealer, but the
+            // loser then fails `create_new` and refuses — exactly one wins.
+            let _ = std::fs::remove_file(lock_path);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(lock_path)?;
+            use std::io::Write;
+            f.write_all(claim.as_bytes())?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Quote one shell word for `sh -c` (single-quote with embedded-quote
@@ -356,9 +438,11 @@ pub fn append_log_line(log: &Path, line: &str) {
 /// Last `n` lines of the log file (`n == 0` yields none; missing file is
 /// an error so `logs` can say so loudly).
 ///
-/// Bounded memory: seeks from the end and reads only the trailing chunk
-/// (64 KiB windows, back to start at most until `n` lines are covered),
-/// so `logs 20` on a 50 MB file never loads the whole file into RAM.
+/// Bounded memory: seeks from the end in 64 KiB windows, and the buffer
+/// never holds more than the trailing `n` lines plus one window — so
+/// `logs 20` on a 50 MB file never loads it into RAM, no matter how
+/// large `n` gets. Non-UTF8 bytes degrade to U+FFFD instead of failing
+/// the whole read (one stray byte must not hide the log).
 pub fn tail_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
@@ -366,8 +450,6 @@ pub fn tail_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let len = file.metadata()?.len();
-    // 64 KiB per window: a few windows cover any sane `n`; huge `n`
-    // degrades to a full read, never worse than the old behavior.
     const WINDOW: u64 = 65536;
     let mut pos = len;
     let mut buf: Vec<u8> = Vec::new();
@@ -377,21 +459,32 @@ pub fn tail_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
         file.seek(SeekFrom::Start(pos))?;
         let mut chunk = vec![0u8; take as usize];
         file.read_exact(&mut chunk)?;
-        // Prepend: chunk precedes everything read so far.
-        let mut next = Vec::with_capacity(chunk.len() + buf.len() + 1);
+        // Prepend: the chunk precedes everything read so far.
+        let mut next = Vec::with_capacity(chunk.len() + buf.len());
         next.extend_from_slice(&chunk);
-        // Keep a single newline boundary between windows (the split
-        // below counts `\n`; without it a line spanning two windows
-        // would merge and undercount).
         next.extend_from_slice(&buf);
         buf = next;
         let newlines = buf.iter().filter(|b| **b == b'\n').count();
-        if newlines > n || pos == 0 {
+        if newlines > n {
+            // We hold more than the trailing `n` lines: drain through
+            // the cut-th newline, keeping exactly the trailing `n`.
+            let cut = newlines - n;
+            let mut seen = 0usize;
+            if let Some(at) = buf.iter().position(|b| {
+                if *b == b'\n' {
+                    seen += 1;
+                }
+                seen >= cut
+            }) {
+                buf.drain(..=at);
+            }
+            break;
+        }
+        if pos == 0 {
             break;
         }
     }
-    let text = String::from_utf8(buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     // A trailing newline yields no extra empty line via `.lines()` —
     // matches the old `read_to_string` semantics exactly.
@@ -538,6 +631,9 @@ impl ShutdownSummary {
 
 /// `start`: refuse when already running, else spawn the detached `run`
 /// child, record the pid file, and report. Diverges via `process::exit`.
+/// A start-lock serializes concurrent `start` invocations (check-then-
+/// spawn races spawn twin daemons); stale locks are stolen, see
+/// [`try_acquire_start_lock`].
 pub fn cmd_start(live: bool, invocation: &str) -> ! {
     let (pid_file, log_file) = resolve_paths();
     if let Some(info) = running_daemon(&pid_file) {
@@ -552,6 +648,11 @@ pub fn cmd_start(live: bool, invocation: &str) -> ! {
     // `status` reads clean.
     if pid_file.exists() {
         let _ = std::fs::remove_file(&pid_file);
+    }
+    let lock_path = start_lock_path(&pid_file);
+    if let Err(e) = try_acquire_start_lock(&lock_path) {
+        eprintln!("another start is already in progress ({e}); refusing to spawn a second daemon");
+        std::process::exit(1);
     }
     // Disk guard: an append-forever daemon log from a previous long run
     // rotates here (mid-run rotation is impossible under shell
@@ -592,6 +693,7 @@ pub fn cmd_start(live: bool, invocation: &str) -> ! {
             std::thread::sleep(std::time::Duration::from_secs(grace_secs));
             if !process_alive(pid) {
                 let _ = std::fs::remove_file(&pid_file);
+                let _ = std::fs::remove_file(&lock_path);
                 eprintln!(
                     "bot died within {grace_secs}s (likely misconfiguration). Last log lines:"
                 );
@@ -621,10 +723,12 @@ pub fn cmd_start(live: bool, invocation: &str) -> ! {
                     "re-run — recorded in the log"
                 }
             );
+            let _ = std::fs::remove_file(&lock_path);
             std::process::exit(0);
         }
         Err(e) => {
             eprintln!("failed to start daemon: {e}");
+            let _ = std::fs::remove_file(&lock_path);
             std::process::exit(1);
         }
     }
@@ -654,11 +758,14 @@ pub fn stop_daemon() -> i32 {
     println!("stopping bot (pid {})...", info.pid);
     #[cfg(unix)]
     {
-        let _ = std::process::Command::new("kill")
-            .arg(info.pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Direct `kill(2)` (SIGTERM, then SIGKILL): no subprocess, so a
+        // `kill`-less PATH cannot wedge the stop loop. See
+        // [`process_alive`] for why the binary is not used.
+        // SAFETY: plain signal send to a validated pid; return ignored
+        // (absence is handled by the poll loop below).
+        unsafe {
+            libc::kill(info.pid as libc::pid_t, libc::SIGTERM);
+        }
         let rounds = STOP_GRACE_SECS * 1000 / STOP_POLL_MS;
         for _ in 0..rounds {
             if !process_alive(info.pid) {
@@ -668,12 +775,10 @@ pub fn stop_daemon() -> i32 {
         }
         if process_alive(info.pid) {
             eprintln!("daemon did not stop within {STOP_GRACE_SECS}s; SIGKILL...");
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(info.pid.to_string())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            unsafe {
+                libc::kill(info.pid as libc::pid_t, libc::SIGKILL);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
@@ -682,7 +787,12 @@ pub fn stop_daemon() -> i32 {
         eprintln!("stop is only fully supported on unix; remove the pid file manually.");
     }
     let stopped = !process_alive(info.pid);
-    let _ = std::fs::remove_file(&pid_file);
+    // Keep the pid file when the daemon survived: deleting it would
+    // untrack a live process and let the next `start` spawn a second
+    // instance over the same wallet/WAL.
+    if stopped {
+        let _ = std::fs::remove_file(&pid_file);
+    }
     append_log_line(
         &log_file,
         &format!("=== bot stopped at unix_ts={} (pid {}) ===", unix_secs(), info.pid),
@@ -1110,6 +1220,21 @@ mod tests {
                 follow: false
             }
         );
+        // Glued forms parse too (previously silently fell to default).
+        assert_eq!(
+            parse_cli(&argv(&["bot", "logs", "--lines=7"])),
+            CliAction::Logs {
+                lines: 7,
+                follow: false
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["bot", "logs", "-n42"])),
+            CliAction::Logs {
+                lines: 42,
+                follow: false
+            }
+        );
     }
 
     #[test]
@@ -1201,6 +1326,32 @@ mod tests {
     }
 
     #[test]
+    fn start_lock_blocks_live_steals_stale() {
+        let dir = std::env::temp_dir().join(format!(
+            "cli-lock-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let lock = dir.join("bot.lock");
+        // Fresh claim succeeds.
+        try_acquire_start_lock(&lock).expect("acquire");
+        // A live holder (our own pid, fresh ts) blocks a second claim.
+        assert!(try_acquire_start_lock(&lock).is_err());
+        // Dead holder pid is stealable.
+        std::fs::write(&lock, format!("{}:{}", u32::MAX, unix_secs())).expect("write");
+        try_acquire_start_lock(&lock).expect("steal dead");
+        // Garbage content is stealable (never a live claim).
+        std::fs::write(&lock, "garbage").expect("write");
+        try_acquire_start_lock(&lock).expect("steal garbage");
+        // Ancient ts with a live pid is stealable (crashed starter).
+        std::fs::write(&lock, format!("{}:1", std::process::id())).expect("write");
+        try_acquire_start_lock(&lock).expect("steal ancient");
+        assert_eq!(start_lock_path(&dir.join("bot.pid")), dir.join("bot.lock"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tail_lines_returns_last_n() {
         let path = std::env::temp_dir().join(format!(
             "cli-tail-test-{}-{:?}.log",
@@ -1212,6 +1363,23 @@ mod tests {
         assert_eq!(tail_lines(&path, 99).expect("tail").len(), 4);
         assert!(tail_lines(&path, 0).expect("tail").is_empty());
         assert!(tail_lines(&path.join("missing"), 10).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tail_lines_tolerates_non_utf8() {
+        // One stray byte degrades to U+FFFD; the log stays readable.
+        let path = std::env::temp_dir().join(format!(
+            "cli-tail-bin-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, [b'a', b'\n', 0xff, b'\n', b'z', b'\n']).expect("write");
+        let tail = tail_lines(&path, 3).expect("tail");
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0], "a");
+        assert!(tail[1].contains('\u{FFFD}'), "lossy: {tail:?}");
+        assert_eq!(tail[2], "z");
         let _ = std::fs::remove_file(&path);
     }
 

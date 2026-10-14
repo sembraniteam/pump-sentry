@@ -121,15 +121,16 @@ impl VaultTicker {
     ) -> Result<(), VaultError> {
         let parse =
             |s: &str| Pubkey::from_str(s).map_err(|_| VaultError::BadAddress(s.to_string()));
+        let mint = parse(mint)?.to_string();
         let entry = WatchedPool {
-            mint: mint.to_string(),
+            mint: mint.clone(),
             amm_id: parse(amm_id)?,
             base_vault: parse(base_vault)?,
             quote_vault: parse(quote_vault)?,
             base_decimals,
             quote_decimals,
         };
-        self.subs.write().await.insert(mint.to_string(), entry);
+        self.subs.write().await.insert(mint, entry);
         Ok(())
     }
 
@@ -540,7 +541,7 @@ mod tests {
         assert_eq!(ticker.watched_count().await, 0);
         ticker
             .watch_defaults(
-                "MINT",
+                "11111111111111111111111111111111",
                 "11111111111111111111111111111111",
                 "11111111111111111111111111111111",
                 "11111111111111111111111111111111",
@@ -548,8 +549,20 @@ mod tests {
             .await
             .expect("watch");
         assert_eq!(ticker.watched_count().await, 1);
-        assert!(ticker.unwatch("MINT").await);
-        assert!(!ticker.unwatch("MINT").await);
+        assert!(ticker.unwatch("11111111111111111111111111111111").await);
+        assert!(!ticker.unwatch("11111111111111111111111111111111").await);
+        // Garbage mints fail fast instead of yielding zero ticks forever.
+        assert!(
+            ticker
+                .watch_defaults(
+                    "MINT",
+                    "11111111111111111111111111111111",
+                    "11111111111111111111111111111111",
+                    "11111111111111111111111111111111",
+                )
+                .await
+                .is_err()
+        );
         assert!(
             ticker
                 .watch(

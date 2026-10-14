@@ -347,11 +347,13 @@ fn get_float(
 ) -> f64 {
     match vars.get(key) {
         None => default,
-        Some(v) => match v.parse() {
-            Ok(x) => x,
-            Err(_) => {
+        Some(v) => match v.parse::<f64>() {
+            // `nan`/`inf` parse as Ok — a NaN cash ledger or infinite
+            // notional must never boot silently; fall back loudly.
+            Ok(x) if x.is_finite() => x,
+            _ => {
                 notes.push(format!(
-                    "{key}='{v}' is not a number; using default {default}"
+                    "{key}='{v}' is not a finite number; using default {default}"
                 ));
                 default
             }
@@ -427,6 +429,13 @@ fn parse_retired_sol_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>
 fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
     const DEFAULT: &str = "wss://api.mainnet-beta.solana.com";
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
+    if vars.contains_key("MAINNET_WSS_RPC_URL")
+        && vars.get("MAINNET_WSS_RPC_URL").is_some_and(|v| clean(v).is_empty())
+    {
+        notes.push(
+            "MAINNET_WSS_RPC_URL is blank; using the public endpoint (check for typos)".to_string(),
+        );
+    }
     match vars.get("MAINNET_WSS_RPC_URL").map(clean).filter(|v| !v.is_empty()) {
         Some(url) => url,
         None => match vars.get("WS_URL").map(clean).filter(|v| !v.is_empty()) {
@@ -450,6 +459,15 @@ fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
 fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
     const DEFAULT: &str = "https://api.mainnet-beta.solana.com";
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
+    // A present-but-blank value is a typo, not an unset var: say so
+    // instead of silently dropping to the rate-limited public endpoint.
+    if vars.contains_key("MAINNET_RPC_URL")
+        && vars.get("MAINNET_RPC_URL").is_some_and(|v| clean(v).is_empty())
+    {
+        notes.push(
+            "MAINNET_RPC_URL is blank; using the public endpoint (check for typos)".to_string(),
+        );
+    }
     match vars.get("MAINNET_RPC_URL").map(clean).filter(|v| !v.is_empty()) {
         Some(url) => url,
         None => match vars.get("HTTP_URL").map(clean).filter(|v| !v.is_empty()) {

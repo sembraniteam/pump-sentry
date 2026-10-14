@@ -35,6 +35,12 @@ pub const TOKEN_SUPPLY_LEN: usize = 8;
 /// truth; same rule as above).
 pub const COMPLETE_FLAG_OFFSET: usize = 48;
 
+// Pinned to the canonical curve-state offset in `ids`: one program
+// upgrade edits one value — drift between the reserve view here and the
+// full state view breaks the build instead of silently forking
+// graduation reads across `curve`, `migration`, and `listener`.
+const _: () = assert!(COMPLETE_FLAG_OFFSET == ids::CURVE_COMPLETE_OFFSET);
+
 /// Pump.fun mint decimals.
 pub const PUMP_TOKEN_DECIMALS: u8 = 6;
 

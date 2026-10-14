@@ -611,8 +611,9 @@ mod tests {
 
     #[test]
     fn moonbag_scale_out_lifts_timeout_and_disarms() {
-        // Runner freedom: after a partial TP exit the survivor has no
-        // time-stop (rides to trailing/SL/TP) and cannot scale out twice.
+        // Runner freedom: after a partial TP exit the survivor's timeout
+        // lifts to the 24h backstop (rides to trailing/SL/TP) and cannot
+        // scale out twice.
         let mut pf = funded();
         let id = pf
             .open_position_params(&OpenPositionParams {

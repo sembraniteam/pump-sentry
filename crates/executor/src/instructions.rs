@@ -161,9 +161,10 @@ impl PumpSwapBuilder {
     /// v3 buy instruction: the 17-account shape for entries on any
     /// non-cashback curve. Fees stay on the curve, so neither a fee
     /// recipient nor a same-curve reference is needed — only the
-    /// buyback pick plus derived addresses. Writability byte-proven
-    /// against frozen mainnet samples; preflight simulation gates
-    /// every build (the 17-shape sim probe is the gate).
+    /// buyback pick plus derived addresses. Pubkeys and payload are
+    /// byte-proven against frozen mainnet samples; writability flags
+    /// are self-consistent by construction (the chain gate is the sim
+    /// probe, not the flags). Preflight simulation gates every build.
     pub fn build_buy_v3_ix(
         amount: u64,
         max_sol_cost: u64,

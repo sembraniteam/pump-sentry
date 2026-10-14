@@ -216,15 +216,16 @@ impl JitoClient {
         if accounts.is_empty() {
             return None;
         }
-        // Trust-but-verify: a rotated-but-legitimate list still overlaps
-        // the compiled set; a disjoint list smells hijacked/stale and is
-        // rejected loudly rather than poisoning tips for a quarter hour.
+        // Rotation accepted with a loud log: a fully-rotated-but-valid
+        // list (clean pubkeys over authenticated HTTPS) heals instead of
+        // pinning stale tips forever. A compromised endpoint is out of
+        // scope for this check (TLS is the trust root); the 15-minute
+        // TTL re-verifies anyway.
         let overlaps = accounts
             .iter()
             .any(|a| JITO_TIP_ACCOUNTS.contains(&a.as_str()));
         if !overlaps {
-            warn!("getTipAccounts returned a disjoint set; keeping previous list");
-            return None;
+            warn!("getTipAccounts rotated fully; adopting fresh list");
         }
         debug!(count = accounts.len(), "refreshed Jito tip accounts");
         Some(accounts)

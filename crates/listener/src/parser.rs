@@ -58,15 +58,13 @@ pub enum PumpParseError {
     /// First 8 bytes do not match the `create` discriminator.
     #[error("Discriminator mismatch")]
     InvalidDiscriminator,
-    /// Borsh decoding of `name/symbol/uri` failed.
+    /// Borsh decoding of `name/symbol/uri` failed (borsh validates
+    /// `String` as UTF-8, so bad encodings surface here, not elsewhere).
     #[error("Failed to decode Borsh data: {0}")]
     Borsh(#[from] std::io::Error),
     /// Args section exceeds [`MAX_CREATE_ARGS_LEN`] bytes (hostile prefix).
     #[error("Create args too long: {0} bytes")]
     ArgsTooLong(usize),
-    /// Name/symbol/uri is not valid UTF-8.
-    #[error("Create string field is not valid UTF-8")]
-    BadString,
     /// Fewer than 8 accounts were supplied.
     #[error("Insufficient accounts: required at least {required}, found {found}")]
     InsufficientAccounts { required: usize, found: usize },

@@ -9,7 +9,7 @@ Consumes the prompt schema from skill `adaptive-risk-prompting`.
 evaluate(metrics)
   ├─ POST {endpoint} (OpenAI-compatible chat, temperature 0.1, JSON mode)
   │    └─ valid in-schema profile within 300ms → DecisionSource::Model
-  └─ timeout / error / non-200 / bad JSON / invalid profile
+  └─ timeout / error / non-2xx / bad JSON / invalid profile
        └─ evaluate_heuristic_fallback → DecisionSource::Fallback
 ```
 

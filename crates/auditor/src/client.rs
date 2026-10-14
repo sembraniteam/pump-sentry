@@ -162,7 +162,21 @@ impl RugCheckClient {
                 {
                     return Err(oversized_body());
                 }
-                let bytes = response.bytes().await?;
+                // Body-stream stalls are transport trouble like send
+                // failures: retry within budget instead of failing a
+                // launch on a stall that arrived after the headers.
+                let bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e)
+                        if is_transient_network_error(&e) && attempt < self.max_retries =>
+                    {
+                        warn!(mint, attempt, error = %e, "rugcheck body stalled; retrying");
+                        sleep_backoff(attempt).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(RugCheckError::Network(e)),
+                };
                 if bytes.len() as u64 > MAX_BODY_BYTES {
                     return Err(oversized_body());
                 }
@@ -211,9 +225,7 @@ fn valid_mint(mint: &str) -> bool {
 
 /// Capped-body rejection (see [`MAX_BODY_BYTES`]).
 fn oversized_body() -> RugCheckError {
-    RugCheckError::Deserialization(serde::de::Error::custom(format!(
-        "response body exceeds {MAX_BODY_BYTES} bytes"
-    )))
+    RugCheckError::ResponseTooLarge
 }
 
 /// Network errors worth retrying: timeouts and connection failures.
@@ -470,6 +482,7 @@ mod tests {
             .fetch_report(TEST_MINT)
             .await
             .expect_err("must fail");
-        assert!(matches!(err, RugCheckError::Deserialization(_)));
+        assert!(matches!(err, RugCheckError::ResponseTooLarge));
+        assert!(!err.is_retryable());
     }
 }

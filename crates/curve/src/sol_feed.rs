@@ -199,15 +199,25 @@ impl SolUsdFeed {
     }
 
     /// Background loop: immediate refresh, then every `refresh` interval.
-    /// Ends when the feed is dropped (no self-keepalive).
+    /// Ends when the feed is dropped (weak reference: the task holds no
+    /// strong count, so the last `Arc` drop stops the loop).
     pub async fn run(self: Arc<Self>) {
         // Immediate attempt; log but don't crash if it fails (retry next tick).
         let _ = self.refresh_once().await;
-        let mut interval = tokio::time::interval(self.refresh);
+        let refresh = self.refresh;
+        let weak = Arc::downgrade(&self);
+        drop(self);
+        let mut interval = tokio::time::interval(refresh);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Discard the immediate first tick: without this the loop would
+        // refresh twice back-to-back (once above, once here).
+        interval.tick().await;
         loop {
+            let Some(feed) = weak.upgrade() else {
+                break;
+            };
             interval.tick().await;
-            let _ = self.refresh_once().await;
+            let _ = feed.refresh_once().await;
         }
     }
 

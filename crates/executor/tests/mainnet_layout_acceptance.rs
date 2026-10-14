@@ -569,12 +569,14 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
     );
     // Buyer = a FUNDED stranger (recent real buyer on any curve).
     // The create fee payer was the obvious candidate (funded seconds
-    // ago) but 3/3 sampled held ZERO WSOL, and v3 debits WSOL via
-    // TransferChecked — a SOL-only buyer fails with token
-    // InsufficientFunds (proven 2026-10-14). Any funded account can
-    // buy a fresh curve, which is exactly the production sniper shape
-    // (our wallet is WSOL-funded at setup): hunt recent buy-side flow
-    // for the first canonical holder with SOL + WSOL.
+    // ago) but carries no position history; official BUY.md/TRADE_V3.md
+    // settle the funding question: SOL-pair buys transfer native SOL
+    // ([10] unused), so the hunt filters on native SOL and base hold —
+    // WSOL is advisory only (matters for token-paired quotes). The sim
+    // remains the real gate. Any funded account can buy a fresh curve,
+    // which is exactly the production sniper shape (our wallet is
+    // natively funded at setup): hunt recent buy-side flow for the
+    // first canonical holder with SOL + base.
     use executor::instructions::{
         PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR,
     };
@@ -718,13 +720,13 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
                         &executor::instructions::WSOL_MINT,
                         &executor::instructions::TOKEN_PROGRAM_ID,
                     );
+                    // Advisory only: SOL-pair buys pay native SOL, so a
+                    // missing WSOL float must not filter candidates — the
+                    // sim decides. (Token-paired quotes would need it.)
                     let wsol: u64 = match rpc.get_token_account_balance(&wsol_ata).await {
                         Ok(b) => b.amount.parse().unwrap_or(0),
-                        Err(_) => continue,
+                        Err(_) => 0,
                     };
-                    if wsol < 100_000 {
-                        continue;
-                    }
                     println!("buyer hunt: {cand} (holder, {sol} SOL, {wsol} WSOL) via {sig}");
                     found = Some(cand);
                     break;

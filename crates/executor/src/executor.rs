@@ -73,7 +73,11 @@ pub struct BuyOrder {
     pub associated_bonding_curve: Pubkey,
     /// Token base units to buy.
     pub amount_tokens: u64,
-    /// Slippage guard: max lamports to spend.
+    /// Slippage guard: max lamports to spend. The on-chain `max_sol_cost`
+    /// (TRADE_V3.md: "most quote the buyer will pay") is buyer protection:
+    /// the fee-inclusive recompute below can only LOWER it, never raise
+    /// it — a stale guard fails closed at simulation (free), while an
+    /// exceeded one would overpay for real.
     pub max_sol_cost: u64,
     /// Jito tip budget in lamports, paid as an in-bundle system transfer
     /// on `buy_jito`/`sell_jito` (plain-RPC `buy`/`sell` ignore it).
@@ -383,23 +387,29 @@ impl SwapExecutor {
 
     /// Tip budget that actually leaves the wallet on this path: the
     /// order's tip for Jito bundles, zero for plain-RPC sends (which
-    /// never attach it). Keeps plain-path solvency from demanding funds
-    /// the transaction will never spend.
-    fn effective_tip(&self, tip_lamports: u64) -> u64 {
-        if self.jito.is_some() { tip_lamports } else { 0 }
+    /// never attach it). Callers pass whether the dispatch is bundled —
+    /// demanding tip+reserve natively for a tipless send blocks valid
+    /// trades when the balance covers the reserve but not a phantom tip.
+    fn effective_tip(&self, tip_lamports: u64, bundled: bool) -> u64 {
+        if bundled && self.jito.is_some() {
+            tip_lamports
+        } else {
+            0
+        }
     }
 
-    /// Read-only live funding snapshot: native SOL for fees/tips plus the
-    /// wallet WSOL balance that funds v3 buys. v3 buys debit the payer
-    /// quote ATA ([10], the WSOL ATA on SOL pairs) via TransferChecked —
-    /// never native SOL — so a SOL-only wallet fails every buy at
-    /// preflight. No funds move here; callers gate on the result before
-    /// the first signal (native shortfall fails closed, zero WSOL warns
-    /// loudly since per-trade preflight enforces the exact guard).
+    /// Read-only live funding snapshot: native SOL (fees, tips, and the
+    /// trade guard on SOL-paired quotes) plus the wallet WSOL balance
+    /// (funds token-paired quotes only). SOL-paired v3 buys transfer
+    /// native SOL (BUY.md; TRADE_V3.md [10] unused) — a WSOL float is
+    /// NOT required for them. No funds move here; callers gate on the
+    /// result before the first signal (native shortfall fails closed;
+    /// zero WSOL merely informs, since per-trade preflight enforces the
+    /// exact guard anyway).
     pub async fn live_funding_report(&self, tip_lamports: u64) -> LiveFundingReport {
         use crate::instructions::{WSOL_MINT, user_ata_with_program};
         let required = self
-            .effective_tip(tip_lamports)
+            .effective_tip(tip_lamports, true)
             .saturating_add(crate::wallet::MIN_SOL_RESERVE_LAMPORTS);
         let native_balance = match tokio::time::timeout(
             Duration::from_secs(15),
@@ -446,6 +456,13 @@ impl SwapExecutor {
             Ok(Ok(account)) => account,
             _ => return None,
         };
+        // Allowlist like `mint_supply` below: a garbage/closed mint owner
+        // must fail closed here, not surface as a confusing sim failure
+        // after extra RPCs.
+        use crate::instructions::{TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID};
+        if account.owner != TOKEN_PROGRAM_ID && account.owner != TOKEN_2022_PROGRAM_ID {
+            return None;
+        }
         Some(account.owner)
     }
 
@@ -500,6 +517,12 @@ impl SwapExecutor {
         match crate::quote::buy_cost_incl_fees(&schedule, gate_on, &view, supply, amount) {
             Ok(cost) => match crate::quote::slippage_ceiling(cost, slippage_bps) {
                 Some(guard) => {
+                    // Clamp to the order ceiling: the recompute exists to
+                    // price out 6002s with fresh fees, but it must never
+                    // authorize MORE than the caller stated — a price move
+                    // since sizing fails closed at simulation (free) instead
+                    // of buying the spike (real loss).
+                    let guard = guard.min(fallback_max);
                     if guard != fallback_max {
                         info!(mint = %mint, quoted = cost, guard, fallback = fallback_max,
                             "fee-inclusive guard recomputed");
@@ -615,35 +638,38 @@ impl SwapExecutor {
 
     /// Buy `amount_tokens` for at most `max_sol_cost` lamports.
     pub async fn buy(&self, order: &BuyOrder) -> Result<SwapReceipt, ExecutorError> {
-        let ixs = self.preflight_buy(order).await?;
+        let ixs = self.preflight_buy(order, false).await?;
         self.send(&ixs, "buy").await
     }
 
     /// Sell `amount_tokens` for at least `min_sol_output` lamports.
     pub async fn sell(&self, order: &SellOrder) -> Result<SwapReceipt, ExecutorError> {
-        let ixs = self.preflight_sell(order).await?;
+        let ixs = self.preflight_sell(order, false).await?;
         self.send(&ixs, "sell").await
     }
 
     /// Buy via Jito bundle: swap ix plus the order's tip in one atomic
     /// transaction. Requires [`SwapExecutor::with_jito`].
     pub async fn buy_jito(&self, order: &BuyOrder) -> Result<JitoReceipt, ExecutorError> {
-        let mut ixs = self.preflight_buy(order).await?;
+        let mut ixs = self.preflight_buy(order, true).await?;
         self.push_tip(&mut ixs, order.tip_lamports).await;
         self.send_bundle(&ixs, "buy-jito").await
     }
 
     /// Sell via Jito bundle (see [`SwapExecutor::buy_jito`]).
     pub async fn sell_jito(&self, order: &SellOrder) -> Result<JitoReceipt, ExecutorError> {
-        let mut ixs = self.preflight_sell(order).await?;
+        let mut ixs = self.preflight_sell(order, true).await?;
         self.push_tip(&mut ixs, order.tip_lamports).await;
         self.send_bundle(&ixs, "sell-jito").await
     }
 
     /// Shared buy path: solvency preflight plus swap instruction.
+    /// `bundled` selects the solvency tip (Jito sends attach it, plain
+    /// sends never do).
     async fn preflight_buy(
         &self,
         order: &BuyOrder,
+        bundled: bool,
     ) -> Result<Vec<solana_instruction::Instruction>, ExecutorError> {
         // Degenerate orders can never fill: reject before spending fees.
         // (`LiveTrader::plan_buy` already filters these; this guards
@@ -655,10 +681,12 @@ impl SwapExecutor {
             return Err(ExecutorError::BadOrder("buy max_sol_cost is 0".to_string()));
         }
         // Route-aware solvency is decided below (after the guard
-        // recompute): every v3 buy funds the trade from the payer quote
-        // ATA (WSOL ATA on SOL pairs — asserted in `preflight_buy_v3`),
-        // so natively only tip + reserve must sit. Asserting the guard
-        // natively too would demand every lamport twice.
+        // recompute): SOL-paired buys transfer NATIVE SOL (BUY.md;
+        // TRADE_V3.md [10] is unused and need not exist), so the trade
+        // guard must sit natively. Token-paired quotes debit the payer
+        // quote ATA via TransferChecked, so natively only tip + reserve
+        // must sit (quote-side cover is enforced in `preflight_buy_v3`
+        // only where the quote engine prices it).
         // Nothing is spent before those checks.
         let payer = self.wallet.pubkey();
         // Curve state (creator cross-check, cashback/complete routing)
@@ -671,53 +699,19 @@ impl SwapExecutor {
         let Some(token_program) = base_program else {
             return Err(ExecutorError::BadOrder("mint account unreadable; token program unknown".to_string()));
         };
-        // Program-bound ATA: Token-2022 mints derive a DIFFERENT address
-        // than the classic helper (verified live).
-        let ata = user_ata_with_program(&payer, &order.mint, &token_program);
-        let ixs = self
-            .maybe_create_ata_ix(&payer, &payer, &order.mint, &ata, &token_program)
-            .await;
-        // Fee-inclusive guard recompute (6002 class): fresh
-        // fee-inclusive quote + slippage ceiling replaces the
-        // notional-derived guard. Falls back with a loud log when
-        // unreadable; simulation refuses a truly short guard either
-        // way. Native solvency below is asserted against this raised
-        // guard (not the sized value), so no second re-check is needed.
-        let (final_max, _) = self
-            .quote_buy_guard(
-                &order.mint,
-                curve_state.as_ref(),
-                order.amount_tokens,
-                order.max_sol_cost,
-                order.slippage_bps,
-            )
-            .await;
-        // Route-aware funding: classic (no creator) pays native, so the
-        // Route-aware funding (v3-only): every v3 buy funds the trade
-        // from the payer quote ATA (WSOL ATA on SOL pairs — asserted in
-        // `preflight_buy_v3`), so natively only tip + reserve must sit.
-        // No native-trade arm remains: legacy/mayhem-18/v2 dispatch was
-        // retired (new launches are v3 curves; anything else fails
-        // closed below).
-        let balance = self
-            .wallet
-            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports))
-            .await?;
-        info!(mint = %order.mint, balance, max_cost = final_max, "buy pre-flight ok");
-        // v3-only routing. Legacy v1 creates (no creator), cashback-era
-        // curves, and unreadable curve state all fail closed: new
-        // launches are `create_v2` v3 curves, so anything else is either
-        // ancient (complete) or unprovable — loud diverged/manual
-        // upstream, never an unproven dispatch.
+        // v3-only routing FIRST (no RPC beyond the two above): legacy v1
+        // creates, creator mismatches, complete and cashback-era curves
+        // all fail closed before the quote/solvency round-trips burn
+        // budget and widen the quote-to-land slot gap. New launches are
+        // `create_v2` v3 curves; anything else is either ancient
+        // (complete) or unprovable — loud diverged/manual upstream,
+        // never an unproven dispatch.
         let Some(creator) = order.creator.as_ref() else {
             warn!(mint = %order.mint, "creatorless order: legacy v1 creates are unsupported (v3-only dispatch)");
             return Err(ExecutorError::BadOrder(
                 "no creator: legacy v1 creates unsupported; refusing (fail-closed)".to_string(),
             ));
         };
-        // Creator cross-check against chain bytes when available:
-        // the launch-time parse is single-sample provenance — never
-        // trust it over curve state (a mismatch fails closed).
         let Some(state) = curve_state.as_ref() else {
             warn!(mint = %order.mint, "curve state unreadable; refusing unroutable dispatch (fail-closed)");
             return Err(ExecutorError::BadOrder(
@@ -750,6 +744,49 @@ impl SwapExecutor {
                 "cashback-era curve: v3 refused on-chain (6094) and v2 dispatch retired; refusing (fail-closed)".to_string(),
             ));
         }
+        // Program-bound ATA: Token-2022 mints derive a DIFFERENT address
+        // than the classic helper (verified live).
+        let ata = user_ata_with_program(&payer, &order.mint, &token_program);
+        let ixs = self
+            .maybe_create_ata_ix(&payer, &payer, &order.mint, &ata, &token_program)
+            .await;
+        // Fee-inclusive guard recompute (6002 class): fresh
+        // fee-inclusive quote + slippage ceiling replaces the
+        // notional-derived guard. Falls back with a loud log when
+        // unreadable; simulation refuses a truly short guard either
+        // way. Native solvency below is asserted against this raised
+        // guard (not the sized value), so no second re-check is needed.
+        let (final_max, _) = self
+            .quote_buy_guard(
+                &order.mint,
+                curve_state.as_ref(),
+                order.amount_tokens,
+                order.max_sol_cost,
+                order.slippage_bps,
+            )
+            .await;
+        // Route-aware funding (v3-only): SOL-paired trades pay native
+        // SOL, so the guard is asserted natively (trade + tip + reserve);
+        // token-paired trades pay from the quote ATA, so natively only
+        // tip + reserve must sit. No native-trade arm remains beyond
+        // this: legacy/mayhem-18/v2 dispatch was retired (new launches
+        // are v3 curves; anything else fails closed below).
+        let is_sol_quote = curve_state
+            .as_ref()
+            .is_some_and(|s| s.quote_mint == crate::instructions::WSOL_MINT);
+        let trade_lamports = if is_sol_quote { final_max } else { 0 };
+        let balance = self
+            .wallet
+            .assert_solvency(&self.rpc, trade_lamports, self.effective_tip(order.tip_lamports, bundled))
+            .await?;
+        info!(mint = %order.mint, balance, max_cost = final_max, "buy pre-flight ok");
+        // Routing already decided above; re-bind for the call (the state
+        // cannot have vanished, but guessing is worse than re-checking).
+        let Some(state) = curve_state.as_ref() else {
+            return Err(ExecutorError::BadOrder(
+                "curve state unreadable; refusing unroutable dispatch (fail-closed)".to_string(),
+            ));
+        };
         info!(mint = %order.mint, mayhem = state.is_mayhem,
             "v3 buy via derived addresses + listed buyback (no reference scan)");
         return self
@@ -761,12 +798,13 @@ impl SwapExecutor {
     /// plus the listed buyback pick — no same-curve reference needed
     /// (fees stay on the curve). The spend guard is the order's own
     /// `max_sol_cost`, never a copied value. Pre-creates: the payer
-    /// quote ATA ([10]) ALWAYS — the trade debits it via
-    /// TransferChecked on every quote, including WSOL on SOL pairs
-    /// (a SOL-only buyer fails the sim with token InsufficientFunds);
-    /// the buyback ATA additionally on token-paired quotes (on SOL
-    /// quotes the buyback is the wallet itself). The base-ATA prefix
-    /// (if needed) is already in `ixs`.
+    /// quote ATA ([10]) and the buyback ATA on token-paired quotes
+    /// only (the trade debits them via TransferChecked and the program
+    /// never creates accounts). On SOL-paired quotes NO quote ATA is
+    /// created: the trade transfers native SOL (BUY.md; TRADE_V3.md
+    /// [10] is unused and need not exist) — the derived address is
+    /// still passed for the seed constraint. The base-ATA prefix (if
+    /// needed) is already in `ixs`.
     /// (Arity documented, not shrunk: the seven inputs are the full
     /// v3-buy context — order, chain accounts, guard, and routing state —
     /// and the sole caller passes all of them. Splitting the struct would
@@ -789,41 +827,25 @@ impl SwapExecutor {
         };
         let buyback_wallet = crate::instructions::DEFAULT_BUYBACK_FEE_RECIPIENT;
         let buyback = buyback_account(&buyback_wallet, &quote_mint, &quote_program);
-        // Payer quote ATA ([10]) must exist on EVERY quote: the trade
-        // debits it via TransferChecked, and the program never creates
-        // accounts (proven live 2026-10-14: a funded-SOL but WSOL-empty
-        // buyer failed the sim with token InsufficientFunds). The
-        // idempotent prefix makes this safe on all paths.
+        // Quote-side funding (TRADE_V3.md + BUY.md): on SOL-paired quotes
+        // the trade transfers native SOL — [10] is unused and need not
+        // exist, so no quote ATA is pre-created and no WSOL balance is
+        // demanded (native cover was asserted in `preflight_buy`). An
+        // earlier revision demanded a WSOL float here from a misread
+        // live probe; the official docs refute it (a nonexistent account
+        // cannot be debited). Token-paired quotes debit the payer quote
+        // ATA via TransferChecked: pre-create it (idempotent) and let
+        // simulation decide sufficiency.
         let user_quote =
             user_ata_with_program(payer, &quote_mint, &quote_program);
-        ixs.extend(
-            self.maybe_create_ata_ix(payer, payer, &quote_mint, &user_quote, &quote_program)
-                .await,
-        );
-        // SOL quotes pay in WSOL: the wallet must hold the quoted guard
-        // in its WSOL ATA (native SOL alone cannot fill). Compare against
-        // the ceiling (max_sol_cost), not the bare quote — a guard above
-        // cost still fails without matching WSOL. Refuse with a
-        // wrap hint instead of burning fees on a doomed sim; transport
-        // trouble proceeds (sim decides), token quotes skip (sim
-        // decides — their economics are outside the quote engine).
         if quote_mint == crate::instructions::WSOL_MINT {
-            match self.quote_balance(&user_quote).await {
-                Some(held) if held < max_sol_cost => {
-                    return Err(ExecutorError::BadOrder(format!(
-                        "wsol {held} below guard {max_sol_cost}; wrap SOL into the wallet WSOL ATA first"
-                    )));
-                }
-                Some(held) => {
-                    info!(mint = %order.mint, held, cost = max_sol_cost, "wsol covers guard");
-                }
-                None => {
-                    warn!(mint = %order.mint, "wsol balance unreadable; simulation decides");
-                }
-            }
+            info!(mint = %order.mint, cost = max_sol_cost, "sol-pair buy pays native SOL; no quote ATA needed");
         } else {
-            // Anyone may fund the rent (official docs); the recipient owns it.
-            ixs.extend(
+            // The two existence reads are independent: batch them instead
+            // of serializing on the sniper hot path.
+            let (user_prefix, buyback_prefix) = tokio::join!(
+                self.maybe_create_ata_ix(payer, payer, &quote_mint, &user_quote, &quote_program),
+                // Anyone may fund the rent (official docs); the recipient owns it.
                 self.maybe_create_ata_ix(
                     payer,
                     &buyback_wallet,
@@ -831,8 +853,9 @@ impl SwapExecutor {
                     &buyback,
                     &quote_program,
                 )
-                .await,
             );
+            ixs.extend(user_prefix);
+            ixs.extend(buyback_prefix);
         }
         ixs.push(PumpSwapBuilder::build_buy_v3_ix(
             order.amount_tokens,
@@ -856,13 +879,14 @@ impl SwapExecutor {
     async fn preflight_sell(
         &self,
         order: &SellOrder,
+        bundled: bool,
     ) -> Result<Vec<solana_instruction::Instruction>, ExecutorError> {
         if order.amount_tokens == 0 {
             return Err(ExecutorError::BadOrder("sell amount_tokens is 0".to_string()));
         }
         let balance = self
             .wallet
-            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports))
+            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled))
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "sell pre-flight ok");
         let payer = self.wallet.pubkey();
@@ -881,7 +905,12 @@ impl SwapExecutor {
         .await
         {
             Ok(Ok(balance)) => {
-                let held: u64 = balance.amount.parse().unwrap_or(0);
+                let held: u64 = balance.amount.parse().map_err(|_| {
+                    ExecutorError::BadOrder(format!(
+                        "sell balance unreadable for {} (RPC shape change?); refusing",
+                        order.mint
+                    ))
+                })?;
                 if held < order.amount_tokens {
                     return Err(ExecutorError::BadOrder(format!(
                         "sell amount {} exceeds ATA balance {held}",

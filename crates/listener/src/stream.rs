@@ -107,8 +107,10 @@ pub enum ListenerError {
 
 /// Exponential backoff with jitter.
 ///
-/// Base 100ms, doubles per attempt, capped at 5s. Jitter adds 0–100ms derived
-/// from the current time (no extra RNG dependency, no blocking).
+/// Base 100ms, doubles per attempt, capped at 5s. The jitter mixes a
+/// per-process counter into the time-derived nanos: pure `subsec_nanos`
+/// correlates across rapid successive calls (same nanosecond bucket),
+/// stacking retries from one burst back onto the same instant.
 pub fn backoff_duration(attempt: u32) -> Duration {
     let exp_ms = 100u64.saturating_mul(1u64 << attempt.min(6)).min(5_000);
     let total = exp_ms.saturating_add(jitter_ms(100)).min(5_000);
@@ -116,14 +118,22 @@ pub fn backoff_duration(attempt: u32) -> Duration {
 }
 
 fn jitter_ms(max: u64) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     if max == 0 {
         return 0;
     }
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => u64::from(d.subsec_nanos() % (max as u32)),
-        Err(_) => 0,
-    }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let seq = CALLS.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    // Golden-ratio stride spreads consecutive calls across the window
+    // even when the clock hasn't advanced between them.
+    nanos
+        .wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        % max
 }
 
 /// Pump.fun log listener.
@@ -131,7 +141,7 @@ pub struct PumpFunListener {
     config: ListenerConfig,
     stats: Arc<ListenerStats>,
     /// Recently seen signatures (dedup for gap backfill; bounded).
-    seen: std::sync::Mutex<std::collections::HashSet<String>>,
+    seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl PumpFunListener {
@@ -143,7 +153,7 @@ impl PumpFunListener {
         Ok(Self {
             config,
             stats: Arc::new(ListenerStats::new()),
-            seen: std::sync::Mutex::new(std::collections::HashSet::new()),
+            seen: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -228,6 +238,7 @@ impl PumpFunListener {
             let rpc_clone = Arc::clone(rpc);
             let stats_clone = Arc::clone(&self.stats);
             let sem_clone = Arc::clone(semaphore);
+            let seen_clone = Arc::clone(&self.seen);
             let sig = info.signature.clone();
             let slot = info.slot;
             let Some(commitment) = self.config.commitment_config() else {
@@ -236,6 +247,7 @@ impl PumpFunListener {
             tokio::spawn(async move {
                 fetch_and_emit(
                     &sig, slot, &rpc_clone, &tx_clone, &stats_clone, &sem_clone, commitment,
+                    seen_clone,
                 )
                 .await;
             });
@@ -381,6 +393,7 @@ impl PumpFunListener {
             let rpc_clone = Arc::clone(rpc);
             let stats_clone = Arc::clone(&self.stats);
             let sem_clone = Arc::clone(semaphore);
+            let seen_clone = Arc::clone(&self.seen);
             let Some(commitment) = self.config.commitment_config() else {
                 // Validated at subscribe(); unreachable in practice, but
                 // never coerce silently.
@@ -396,6 +409,7 @@ impl PumpFunListener {
                     &stats_clone,
                     &sem_clone,
                     commitment,
+                    seen_clone,
                 )
                 .await;
             });
@@ -573,6 +587,12 @@ fn is_transient_fetch_error(e: &ClientError) -> bool {
 /// all failures are counted and logged. Fetch permits are acquired per
 /// attempt and released across the backoff sleep: a sleeping worker must
 /// not pin one of the 32 fetch slots.
+///
+/// `seen` is the dedup set: fetch failures (transient RPC trouble, and
+/// drop-on-full downstream) UNMARK the signature so a later gap-backfill
+/// can retry it. Deterministic failures (bad signature, undecodable
+/// transaction) stay marked — retrying identical bytes is pointless.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_and_emit(
     sig_str: &str,
     slot_hint: u64,
@@ -581,7 +601,16 @@ async fn fetch_and_emit(
     stats: &Arc<ListenerStats>,
     sem: &Arc<Semaphore>,
     commitment: CommitmentConfig,
+    seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
+    let unmark = |why: &str| {
+        match seen.lock() {
+            Ok(mut guard) => {
+                guard.remove(sig_str);
+            }
+            Err(_) => debug!(signature = %sig_str, why, "seen-set lock poisoned; unmark skipped"),
+        }
+    };
     let signature = match Signature::from_str(sig_str) {
         Ok(s) => s,
         Err(e) => {
@@ -614,10 +643,14 @@ async fn fetch_and_emit(
     )
     .await    {
         Ok(Some(v)) => v,
-        Ok(None) => return,
+        Ok(None) => {
+            unmark("fetch failed; backfill may retry");
+            return;
+        }
         Err(_) => {
             stats.inc_fetch_err();
             debug!(signature = %sig_str, "getTransaction timed out");
+            unmark("fetch timed out; backfill may retry");
             return;
         }
     };
@@ -633,6 +666,7 @@ async fn fetch_and_emit(
             Err(mpsc::error::TrySendError::Full(_)) => {
                 stats.inc_dropped_full();
                 warn!("event channel full; dropping launch event");
+                unmark("channel full; backfill may retry");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 debug!("downstream closed; dropping launch event");

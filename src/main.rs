@@ -246,7 +246,16 @@ async fn run_pipeline(live_arg: bool) {
         warn!("Starting in 5s — Ctrl-C now to abort (no confirmation prompt,");
         warn!("so automation never hangs; the delay is the abort window).");
         warn!("================================================================");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Race the delay against the shutdown signal: a Ctrl-C/SIGTERM
+        // inside the window exits cleanly before anything boots (nothing
+        // is running yet, so there is nothing to drain).
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+            _ = crate::cli::shutdown_signal() => {
+                warn!("aborted during live startup window; exiting before boot");
+                std::process::exit(0);
+            }
+        }
     }
 
     // Surface suspicious config (typos fall back to defaults silently).
@@ -370,12 +379,13 @@ async fn run_pipeline(live_arg: bool) {
                 std::process::exit(1);
             }
         };
-        // Live funding gate (read-only, no funds move): v3 buys debit the
-        // wallet WSOL ATA via TransferChecked, never native SOL — a
-        // SOL-only wallet fails every buy at preflight. Native shortfall
-        // (tip + 0.05 reserve) fails closed here; zero/missing WSOL warns
-        // loudly instead of exiting (the operator may fund after boot,
-        // and per-trade preflight enforces the exact guard anyway).
+        // Live funding gate (read-only, no funds move): SOL-paired v3
+        // buys transfer native SOL (BUY.md), so the trade guard must sit
+        // natively — enforced per trade in preflight. Native shortfall
+        // (tip + 0.05 reserve) fails closed here; zero/missing WSOL only
+        // informs (a WSOL float funds token-paired quotes alone; the
+        // operator may fund after boot, and per-trade preflight enforces
+        // the exact guard anyway).
         {
             let report: LiveFundingReport =
                 executor.live_funding_report(settings.tip_lamports).await;
@@ -393,12 +403,9 @@ async fn run_pipeline(live_arg: bool) {
                 None => warn!("live native balance unreadable; per-trade solvency decides"),
             }
             match report.wsol_funded() {
-                Some(true) => info!(ata = %report.wsol_ata, held = report.wsol_balance, "live WSOL funds v3 buys"),
+                Some(true) => info!(ata = %report.wsol_ata, held = report.wsol_balance, "live WSOL float covers token-paired quotes"),
                 _ => {
-                    warn!("================================================================");
-                    warn!("live wallet WSOL empty/missing at {} — every v3 buy will refuse at preflight (TransferChecked debits WSOL, not native SOL).", report.wsol_ata);
-                    warn!("wrap SOL into that ATA first (e.g. spl-token wrap), keep native SOL for fees/tips.");
-                    warn!("================================================================");
+                    warn!("no WSOL float at {} — token-paired quotes need one (SOL-pair buys pay native SOL and are unaffected).", report.wsol_ata);
                 }
             }
         }

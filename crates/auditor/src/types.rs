@@ -18,6 +18,12 @@ pub enum RugCheckError {
     /// Failed to parse JSON response: {0}
     #[error("Failed to parse JSON response: {0}")]
     Deserialization(#[from] serde_json::Error),
+    /// Response body exceeded [`MAX_BODY_BYTES`]: a rogue server must not
+    /// turn the audit path into a retry loop. Never retryable (unlike
+    /// [`RugCheckError::Deserialization`], which covers genuinely
+    /// unparseable-but-small bodies during indexing latency).
+    #[error("RugCheck response body exceeds size cap")]
+    ResponseTooLarge,
     /// Token rejected: {0}
     #[error("Token rejected: {0}")]
     SecurityRejection(String),
@@ -35,7 +41,7 @@ impl RugCheckError {
     /// Only policy rejections and client misconfiguration drop at once.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::SecurityRejection(_) | Self::BadUrl(_) => false,
+            Self::SecurityRejection(_) | Self::BadUrl(_) | Self::ResponseTooLarge => false,
             Self::Network(_) | Self::Deserialization(_) => true,
             Self::HttpStatus(s) => {
                 s.is_server_error()
@@ -157,9 +163,10 @@ mod tests {
             serde_json::from_str::<u32>("bogus").expect_err("must fail")
         )
         .is_retryable());
-        // Policy and config: drop at once, never queue.
+        // Policy, config, and oversize bodies: drop at once, never queue.
         assert!(!RugCheckError::SecurityRejection("rug".to_string()).is_retryable());
         assert!(!RugCheckError::BadUrl(":::".to_string()).is_retryable());
+        assert!(!RugCheckError::ResponseTooLarge.is_retryable());
         assert!(!RugCheckError::HttpStatus(StatusCode::FORBIDDEN).is_retryable());
     }
 }

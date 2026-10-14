@@ -28,8 +28,9 @@ fresh pool account  ──→ RaydiumV4Pool::parse (AMM ID + base/quote
   `is_wsol_based` flags them; `validate` gates trust (Raydium owner,
   WSOL base, expected token quote). `parse` alone is untrusted by
   contract — use `parse_validated` (parse + gate in one step).
-- `vault` — post-migration price ticker: chunked batched vault-balance
-  reads (≤50 pools per round, 15s deadline) converted to USD spot
+- `vault` — post-migration price ticker: sequential chunked
+  vault-balance reads (≤50 pools per chunk, 15s per chunk under a 60s
+  overall round budget) converted to USD spot
   (SOL-per-token from the WSOL base vault over the token quote vault;
   WSOL 9dp / Pump 6dp).
 

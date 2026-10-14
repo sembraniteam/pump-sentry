@@ -533,6 +533,14 @@ impl EntryGate {
 }
 
 /// Developer history policy.
+///
+/// Coverage limitation (by design, RPC-bounded): wallet age is measured
+/// over the full `sig_limit` signature window, but the prior-launch
+/// count is sampled from only the newest `sample_txs` transactions.
+/// A serial launcher whose launches sit deeper than `sample_txs` in an
+/// otherwise old wallet passes the count — the age gate, audit score,
+/// quorum, and bundle forensics downstream still apply. Raising
+/// `sample_txs` widens coverage at direct RPC cost.
 #[derive(Debug, Clone)]
 pub struct DevScreenConfig {
     /// Minimum wallet age in seconds (default 3600: reject fresh wallets).
@@ -725,27 +733,35 @@ pub async fn screen_developer(
 }
 
 /// True when a dev-history sample is trustworthy enough to count:
-/// unreadable fetches must stay strictly below half the sample.
+/// unreadable fetches must stay strictly below half the sample, and an
+/// empty sample proves nothing (every signature unparsable or flagged —
+/// counting zero launches would launder a decode failure into a pass).
 /// Pure and unit-tested (the fail-closed boundary for serial launchers).
 fn sample_trustworthy(failed: usize, total: usize) -> bool {
-    failed == 0 || failed * 2 < total
+    total > 0 && (failed == 0 || failed * 2 < total)
 }
 
 /// RPC-backed swap reader for one curve: signatures since `since_sig`
 /// (newest-first walk, stop at the watermark), classified records.
 /// Returns `(records, newest_signature, truncated)`.
 ///
-/// Paginated (up to [`CURVE_SWAP_MAX_PAGES`] × [`CURVE_SWAP_PAGE_LIMIT`]):
-/// when `since_sig` is not found and the last page is full, the watermark
-/// is stale — `truncated` reports it so callers must NOT advance quorum
-/// on the partial view (confirming on it would bless a high-velocity
-/// gap). Failed transactions are skipped; undecodable ones simply
+/// When `exhaustive` is false (quorum path), `since_sig=None` is the
+/// baseline first read and never truncated; a watermarked read that
+/// never finds its watermark saw a partial view (high-velocity gap or
+/// pruned history) and reports truncated so callers hold instead of
+/// advancing quorum or the watermark over the gap. When `exhaustive`
+/// is true (bundle forensics, which needs the whole creation-slot
+/// history), hitting the page cap on full pages reports truncated even
+/// without a watermark — the fail-closed branch it feeds would
+/// otherwise be dead code on curves with 75+ transactions.
+/// Failed transactions are skipped; undecodable ones simply
 /// contribute no records (gate stays `Wait`: fail-closed for entries).
 pub async fn read_curve_swaps(
     rpc: &RpcClient,
     commitment: CommitmentConfig,
     curve: &Pubkey,
     since_sig: Option<&str>,
+    exhaustive: bool,
 ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ClientError> {
     let tx_config = json_tx_config(commitment);
     let mut records = Vec::new();
@@ -814,7 +830,15 @@ pub async fn read_curve_swaps(
         before = Some(cursor);
     }
 
-    let truncated = since_sig.is_some() && !watermark_found && pages >= CURVE_SWAP_MAX_PAGES;
+    let truncated = match (since_sig, exhaustive) {
+        // Watermarked read that never found its watermark: partial view.
+        (Some(_), _) => !watermark_found,
+        // Exhaustive read that hit the page cap on full pages: more
+        // history exists than was read.
+        (None, true) => pages >= CURVE_SWAP_MAX_PAGES,
+        // Baseline first read: complete by definition.
+        (None, false) => false,
+    };
     if truncated {
         // High-velocity gap: newest 75 returned, intermediates missed.
         // Callers must not advance quorum on this partial view.
@@ -928,7 +952,8 @@ pub struct DetectedMigration {
     pub signature: String,
     /// Where liquidity landed.
     pub destination: MigrationDestination,
-    /// New AMM account for Raydium migrations (initialize2 account 1).
+    /// New AMM account for Raydium migrations (initialize2 account 4,
+    /// [`INITIALIZE2_AMM_INDEX`]).
     pub amm_id: Option<Pubkey>,
     /// Parsed pool for Raydium migrations (swap-ready addresses).
     pub pool: Option<RaydiumV4Pool>,
@@ -1182,7 +1207,12 @@ impl RpcScreener {
     }
 
     /// Developer history verdict (fail-closed on transport errors).
-    /// Repeat wallets are served from a TTL cache (history barely moves).
+    /// Repeat wallets are served from a TTL cache (history barely moves)
+    /// — except early age-rejects (no-history or below-minimum-age with
+    /// an unsampled prior count): age is time-sensitive, and rechecking
+    /// costs one cheap signature page (the fan-out stays skipped), so a
+    /// wallet that ages past the gate is trusted on its next launch,
+    /// not an hour later.
     pub async fn dev_verdict(
         &self,
         dev: &Pubkey,
@@ -1203,10 +1233,16 @@ impl RpcScreener {
             None => return Err(ScreenError::Timeout("dev_verdict")),
             Some(result) => result?,
         };
-        self.dev_cache
-            .lock()
-            .await
-            .put(dev.to_string(), verdict.clone(), now_secs);
+        // Only full-sample verdicts are cacheable: early age-rejects
+        // (`!pass` with no sampled priors) would freeze a young wallet
+        // as rejected past its aging-out, with a fabricated `priors: 0`.
+        // (Unreachable otherwise: the full path only rejects on priors.)
+        if verdict.pass || verdict.prior_launches > 0 {
+            self.dev_cache
+                .lock()
+                .await
+                .put(dev.to_string(), verdict.clone(), now_secs);
+        }
         Ok(verdict)
     }
 
@@ -1223,6 +1259,7 @@ impl RpcScreener {
             self.commitment,
             curve,
             since_sig,
+            false,
         ))
         .await
         {
@@ -1233,7 +1270,8 @@ impl RpcScreener {
 
     /// Hunt the migration transaction for a graduated curve: scan recent
     /// signatures, classify each candidate, and on a Raydium hit resolve
-    /// the new AMM id (initialize2 account 1) plus its parsed pool.
+    /// the new AMM id (initialize2 account 4, [`INITIALIZE2_AMM_INDEX`])
+    /// plus its parsed pool.
     /// The pool is trusted only after the full gate: Raydium-owned
     /// account, WSOL base, and quote matching `expected_token_mint` —
     /// anything else keeps scanning. Returns `None` when no migration is
@@ -1437,7 +1475,7 @@ impl RpcScreener {
         creation_slot: u64,
     ) -> Result<(BundleAnalysis, bool), ClientError> {
         let (records, _, truncated) =
-            read_curve_swaps(&self.rpc, self.commitment, curve, None).await?;
+            read_curve_swaps(&self.rpc, self.commitment, curve, None, true).await?;
         if truncated {
             // Partial newest-75 view: early creation-slot buys may be
             // missing, so the monopoly share undercounts toward a false
@@ -1553,14 +1591,21 @@ impl RpcScreener {
             return pairs;
         }
         use futures_util::stream::{self, StreamExt};
-        let fresh: Vec<(Pubkey, Option<String>)> =
+        // Outer `Err` (deadline or transport) is transient: never
+        // cached, retried next round. `Ok` (found or conclusively
+        // untraceable) is stable for 24h.
+        let fresh: Vec<(Pubkey, Result<Option<String>, ()>)> =
             stream::iter(missing)
                 .map(|buyer| async move {
-                    let found = tokio::time::timeout(FUNDER_TRACE_TIMEOUT, self.genesis_funder(&buyer))
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|funder| funder.to_string());
+                    let found = match tokio::time::timeout(
+                        FUNDER_TRACE_TIMEOUT,
+                        self.genesis_funder(&buyer),
+                    )
+                    .await
+                    {
+                        Err(_) | Ok(Err(())) => Err(()),
+                        Ok(Ok(found)) => Ok(found.map(|funder| funder.to_string())),
+                    };
                     (buyer, found)
                 })
                 .buffered(FUNDER_TRACE_FANOUT)
@@ -1568,7 +1613,8 @@ impl RpcScreener {
                 .await;
         {
             let mut cache = self.funder_cache.lock().await;
-            for (buyer, funder) in &fresh {
+            for (buyer, found) in &fresh {
+                let Ok(funder) = found else { continue };
                 cache.put(buyer.to_string(), funder.clone(), now);
                 if let Some(funder) = funder
                     && let Ok(funder) = Pubkey::from_str(funder)
@@ -1615,10 +1661,13 @@ impl RpcScreener {
     /// Genesis funder: walk the wallet's signature history newest-first
     /// (pages of 1000, capped at [`MAX_FUNDER_PAGES`]) down to its first
     /// transaction, then return the source of the first SOL funding
-    /// found there (oldest few tried in order). `None` when the wallet
-    /// has no history, exceeds the page cap, or nothing parses.
-    /// The caller deadline-bounds each trace via [`FUNDER_TRACE_TIMEOUT`].
-    async fn genesis_funder(&self, buyer: &Pubkey) -> Option<Pubkey> {
+    /// found there (oldest few tried in order). `Ok(None)` when the walk
+    /// conclusively ends (no history, page cap, nothing parses) —
+    /// stable enough to cache. `Err(())` on transport/timeout trouble —
+    /// the caller must NOT cache it (a blip would freeze as
+    /// "untraceable" for 24h). The caller deadline-bounds each trace
+    /// via [`FUNDER_TRACE_TIMEOUT`].
+    async fn genesis_funder(&self, buyer: &Pubkey) -> Result<Option<Pubkey>, ()> {
         let mut before: Option<Signature> = None;
         let mut oldest_page: Vec<(String, bool)> = Vec::new();
         let mut pages = 0u32;
@@ -1642,7 +1691,7 @@ impl RpcScreener {
             .await
             {
                 Ok(Ok(page)) => page,
-                _ => return None,
+                _ => return Err(()),
             };
             if page.is_empty() {
                 break;
@@ -1661,12 +1710,15 @@ impl RpcScreener {
             }
         }
         if oldest_page.is_empty() {
-            return None;
+            return Ok(None);
         }
         let tx_config = json_tx_config(self.commitment);
         // Oldest first; a few fallbacks in case the very first
         // transaction carries no parseable funding. Failed
-        // transactions never fund anyone.
+        // transactions never fund anyone. A fetch that fails here only
+        // skips that candidate (the next trail slot may still resolve);
+        // total unreadability falls through to `Ok(None)` — the trail
+        // was walked, just unresolvable.
         for (sig, failed) in oldest_page.iter().rev().take(FUNDER_TRAIL) {
             if *failed {
                 continue;
@@ -1684,10 +1736,10 @@ impl RpcScreener {
                 _ => continue,
             };
             if let Some(funder) = find_funding_source(&fetched, buyer) {
-                return Some(funder);
+                return Ok(Some(funder));
             }
         }
-        None
+        Ok(None)
     }
 }
 
@@ -2320,7 +2372,8 @@ mod tests {
 
     #[test]
     fn unreadable_sample_majority_is_untrustworthy() {
-        assert!(sample_trustworthy(0, 0));
+        // Empty sample proves nothing: fail closed, never count zero.
+        assert!(!sample_trustworthy(0, 0));
         assert!(sample_trustworthy(0, 20));
         assert!(sample_trustworthy(1, 20));
         assert!(sample_trustworthy(9, 20));
@@ -3028,5 +3081,69 @@ mod tests {
             find_funding_source(&tx, &Pubkey::new_from_array([2; 32])),
             Some(Pubkey::new_from_array([1; 32]))
         );
+    }
+
+    /// Frozen-mainnet v3 replay: pins the v3 layout the whole sniper
+    /// runs on (trader at index 8, amount = first u64 — second u64
+    /// `min_tokens_out` for exact-quote) against real chain fills, so a
+    /// one-byte drift in the TRADE_V3.md table breaks the build instead
+    /// of silently mis-scoring quorum, dev dumps, and monopoly math.
+    fn v3_records(raw: &str) -> Vec<SwapRecord> {
+        use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
+        let fetched: EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_str(raw).expect("fixture");
+        extract_pump_swaps(&fetched, "frozen-v3")
+    }
+
+    #[test]
+    fn replay_buy_v3_mainnet() {
+        let records = v3_records(include_str!("../tests/fixtures/buy_v3_mainnet.json"));
+        // Exactly one real swap; the rest are non-swap pump ixs
+        // (Unknown — never quorum-counted, dev-dump attribution only).
+        let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
+        assert_eq!(buys.len(), 1, "exactly one v3 buy");
+        assert!(records.iter().all(|r| r.side == SwapSide::Buy
+            || r.side == SwapSide::Unknown));
+        let r = buys[0];
+        assert_eq!(
+            r.wallet,
+            Pubkey::from_str("4zUGAASz4nciz9hKZBiiZVUwRZD1RjtBUKhJ86mJDFkW").expect("wallet")
+        );
+        assert!(r.amount_base_units > 0, "buy amount must decode");
+    }
+
+    #[test]
+    fn replay_sell_v3_mainnet() {
+        let records = v3_records(include_str!("../tests/fixtures/sell_v3_mainnet.json"));
+        let sells: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Sell).collect();
+        assert_eq!(sells.len(), 1, "exactly one v3 sell");
+        assert!(records.iter().all(|r| r.side == SwapSide::Sell
+            || r.side == SwapSide::Unknown));
+        let r = sells[0];
+        assert_eq!(
+            r.wallet,
+            Pubkey::from_str("4s4vL1TLZSNMxhG6FZgc2GevwLSLP5XyHEhPdAaKqNLR").expect("wallet")
+        );
+        // Full exit on-chain (pre 30952762059 → post 0): the decoded
+        // amount must equal the balance delta to the unit.
+        assert_eq!(r.amount_base_units, 30_952_762_059);
+    }
+
+    #[test]
+    fn replay_buy_exact_quote_in_v3_mainnet() {
+        let records =
+            v3_records(include_str!("../tests/fixtures/buy_exact_quote_in_v3_mainnet.json"));
+        let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
+        assert_eq!(buys.len(), 1, "exactly one exact-quote v3 buy");
+        assert!(records.iter().all(|r| r.side == SwapSide::Buy
+            || r.side == SwapSide::Unknown));
+        let r = buys[0];
+        assert_eq!(
+            r.wallet,
+            Pubkey::from_str("AMDEmVocLtN5ji2gBY7BrmSHEyM5vt6TGszBbg4crMXg").expect("wallet")
+        );
+        // Exact-quote carries (spend, min_out): we attribute the
+        // conservative `min_tokens_out` (second u64), never the spend.
+        assert!(r.amount_base_units > 0, "min_tokens_out must decode");
     }
 }
