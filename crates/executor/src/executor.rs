@@ -745,26 +745,22 @@ impl SwapExecutor {
             ));
         }
         // Program-bound ATA: Token-2022 mints derive a DIFFERENT address
-        // than the classic helper (verified live).
+        // than the classic helper (verified live). The base-ATA existence
+        // read and the fee-inclusive guard recompute are independent —
+        // batch them instead of serializing on the sniper hot path. The
+        // guard falls back to the order value with a loud log when the
+        // quote is unreadable; simulation refuses a truly short guard.
         let ata = user_ata_with_program(&payer, &order.mint, &token_program);
-        let ixs = self
-            .maybe_create_ata_ix(&payer, &payer, &order.mint, &ata, &token_program)
-            .await;
-        // Fee-inclusive guard recompute (6002 class): fresh
-        // fee-inclusive quote + slippage ceiling replaces the
-        // notional-derived guard. Falls back with a loud log when
-        // unreadable; simulation refuses a truly short guard either
-        // way. Native solvency below is asserted against this raised
-        // guard (not the sized value), so no second re-check is needed.
-        let (final_max, _) = self
-            .quote_buy_guard(
+        let (ixs, (final_max, _)) = tokio::join!(
+            self.maybe_create_ata_ix(&payer, &payer, &order.mint, &ata, &token_program),
+            self.quote_buy_guard(
                 &order.mint,
                 curve_state.as_ref(),
                 order.amount_tokens,
                 order.max_sol_cost,
                 order.slippage_bps,
             )
-            .await;
+        );
         // Route-aware funding (v3-only): SOL-paired trades pay native
         // SOL, so the guard is asserted natively (trade + tip + reserve);
         // token-paired trades pay from the quote ATA, so natively only

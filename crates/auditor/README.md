@@ -1,56 +1,13 @@
-# auditor
+# auditor — RugCheck token-risk client
 
-Async [RugCheck.xyz](https://rugcheck.xyz) token-risk client used by the
-snipe pipeline to reject rugs / honeypots before buying.
+Rejects rugs/honeypots before buying: `fetch_report` (raw) + `evaluate_token` (policy-enforced).
 
-## Architecture
-
-```
-fetch_report  →  GET {base}/tokens/{mint}/report (timeout + retries)
-evaluate_token →  fetch_report + policy invariants → Report | SecurityRejection
-```
-
-- `types` — `RugCheckReport`, `RiskItem`, `TokenInfo`, `RugCheckError`
-  (skill `solana-rugcheck-api` contract).
-- `policy` — pure `assess(report, policy) -> Verdict::{Allow, Reject}`:
-  score cap (default 400), no `danger` risks, no mint/freeze authority.
-  Fail-closed on missing data: absent `token` info rejects (authorities
-  unverifiable). Note the layers differ by design: the auditor hard-gate
-  is 400 while the risk-engine heuristic triages at 350 (see
-  `risk-engine/src/fallback.rs`).
-- `client` — pooled `reqwest` client, 1500ms timeout, retries on
-  timeouts / connect errors / 5xx / 429 with exponential backoff (200ms × 2^attempt, max 2s).
-  Fresh-mint 400s ("not indexed yet") are NOT retried here — they
-  surface as `HttpStatus(400)` for the pipeline, which watchlists the
-  launch and retries every 3s until the gate deadline.
-
-## Use
+- Policy: score cap 400, no `danger`, no mint/freeze authority; missing data rejects (fail-closed).
+- Retries (1500ms timeout, backoff 200ms×2^n ≤2s): timeouts, connects, 5xx, 429. Fresh-mint 400s are NOT retried here — the pipeline watchlists and retries every 3s. Oversize bodies are terminal, never retried.
 
 ```rust
-use auditor::RugCheckClient;
-
-let auditor = RugCheckClient::new()?;
-match auditor.evaluate_token("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU").await {
-    Ok(report) => println!("allow, score={}", report.score),
-    Err(auditor::RugCheckError::SecurityRejection(reason)) => println!("reject: {reason}"),
-    Err(e) => eprintln!("audit failed: {e}"),
-}
+let report = RugCheckClient::new()?.evaluate_token(mint).await?;
 ```
-
-Custom policy / mirror endpoint:
-
-```rust
-use auditor::{AuditPolicy, RugCheckClient};
-use std::time::Duration;
-
-let auditor = RugCheckClient::builder()
-    .policy(AuditPolicy { max_score: 200, ..Default::default() })
-    .timeout(Duration::from_millis(800))
-    .max_retries(1)
-    .build();
-```
-
-## Test
 
 ```sh
 cargo test -p auditor

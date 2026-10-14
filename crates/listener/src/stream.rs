@@ -45,9 +45,9 @@ const MAX_CONCURRENT_FETCHES: usize = 32;
 /// gap (newest-first from RPC, replayed oldest-first).
 const BACKFILL_SIG_LIMIT: usize = 100;
 
-/// Seen-signature memory cap. Cleared wholesale past it (a duplicate
-/// across the clear is possible but harmless: the gate re-submits and
-/// confirm guards — holding, cooldown — absorb it).
+/// Seen-signature memory cap. Past it an arbitrary half is evicted (a
+/// duplicate across the eviction re-emits: the gate re-submits, capped
+/// at `created + 3×window`, and confirm guards absorb it).
 const SEEN_SIG_CAP: usize = 4_000;
 
 /// Deadline for the WebSocket handshake (`connect` + `logs_subscribe`):
@@ -162,12 +162,20 @@ impl PumpFunListener {
         Arc::clone(&self.stats)
     }
 
-    /// Record a signature as seen (bounded dedup memory).
+    /// Record a signature as seen (bounded dedup memory). Past the cap,
+    /// evict an arbitrary half instead of clearing wholesale: a full
+    /// clear re-emits every in-flight signature at once (refreshing gate
+    /// deadlines), while a half keeps most of the dedup working.
     fn mark_seen(&self, sig: &str) {
         match self.seen.lock() {
             Ok(mut guard) => {
                 if guard.len() >= SEEN_SIG_CAP {
-                    guard.clear();
+                    let drop_n = guard.len() / 2;
+                    let victims: Vec<String> =
+                        guard.iter().take(drop_n).cloned().collect();
+                    for v in victims {
+                        guard.remove(&v);
+                    }
                 }
                 guard.insert(sig.to_string());
             }

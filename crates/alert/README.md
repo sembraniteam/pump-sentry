@@ -1,63 +1,13 @@
-# alert
+# alert — Discord trade cards via Hermes CLI
 
-Non-blocking Discord trade alerts via Hermes CLI (skill
-`discord-hermes-alerting`).
+Fire-and-forget, never blocks pricing or swaps, never fails the caller (5s timeout, warn-only).
 
-## Architecture
-
-```
-Alerter::send(card)
-  └─ tokio::spawn detached: `hermes send --to discord[:<channel-id>] "<card>"`
-     ├─ 5s timeout → child killed, warn only
-     ├─ spawn failure → warn only
-     ├─ non-zero exit → warn with stderr
-     └─ success → silent
-```
-
-Never blocks pricing or swap paths; never fails the caller. Alerts are
-observability, not consensus: at most 4 children run at once, excess
-messages drop with a counter (`dropped_count`) instead of fork-bombing
-the host under storm load.
-
-- `discord::Alerter` — `{binary, enabled, timeout, channel}`;
-  `disabled()` is a no-op for tests and silent runs; `with_binary()`
-  redirects dispatch (tests use `/bin/echo` and `/bin/false`);
-  `with_channel("<numeric-id>")` targets `--to discord:<id>` (blank,
-  non-numeric, or overlong input keeps the default target; the skill
-  defines no channel flag — routing otherwise lives in the host Hermes
-  config). `HERMES_BIN` env overrides the binary path (prefer absolute:
-  a bare `hermes` resolves via `PATH`, which a writable directory can
-  hijack). Timed-out children are killed (`kill_on_drop`) so late
-  deliveries cannot duplicate after the timeout.
-- Cards — skill formats verbatim: `format_entry` (🟢 open with TP/SL),
-  `format_exit` (🎯/🛑 with reason, signed PnL, equity, moonbag tag),
-  `format_live_buy` / `format_live_sell` carrying the Jito bundle UUID,
-  `format_migration` (destination + pool addresses) and
-  `format_follow_spike` (post-migration 2x alert). Links point at
-  `explorer.solana.com`. All interpolated fields are sanitized (no mentions/markdown breakouts) and length-capped.
-- `HeartbeatReport` + `format_heartbeat` — proof-of-life card (mode,
-  uptime, logs/candidates/parsed/dropped, watchlist, open positions,
-  cash, equity), fired by the daemon at boot and every 6h.
-
-## Use
+- At most 4 in flight; storms drop with a counter. `HERMES_BIN` overrides the binary (absolute preferred).
+- Cards: entry/exit (signed PnL, moonbag tag), live buy/sell (bundle UUID), migration, 2x follow-spike, 6h heartbeat. Fields sanitized and length-capped.
 
 ```rust
-use alert::Alerter;
-
-let alerts = Alerter::new(); // enabled, shells out to `hermes`
-alerts.send(Alerter::format_entry("MINT", 0.0000042, 40.0, -10.0, 10.0));
+Alerter::new().send(Alerter::format_entry("MINT", 0.0000042, 40.0, -10.0, 10.0));
 ```
-
-silence:
-
-```rust
-use alert::Alerter;
-
-let silent = Alerter::disabled(); // or DISCORD_ALERTS=false in the bot
-silent.send("dropped silently".to_string());
-```
-
-## Test
 
 ```sh
 cargo test -p alert

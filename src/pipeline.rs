@@ -2025,6 +2025,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// stay bounded, and hunt migrations on graduated curves. Called by
     /// both `on_tick` branches so the rule cannot diverge again; every
     /// step is idempotent, so concurrent empties are harmless.
+    ///
+    /// Manual-parked bags do NOT pin the feed: they are never auto-probed
+    /// (only an explicit `sell <mint>` touches them, and it fetches its
+    /// own tick plus recreates the serial entries on demand), so keeping
+    /// their curves watched would grow the watch set without bound on
+    /// every give-up. Custody stays listed in `live_manual` and the
+    /// shutdown snapshot either way.
     async fn maybe_unwatch(&self, tick: &PriceTick) {
         if !self
             .portfolio
@@ -2038,9 +2045,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.exec.live_positions.lock().await.contains_key(&tick.mint) {
             return;
         }
-        if self.exec.live_manual.lock().await.contains_key(&tick.mint) {
-            return;
-        }
+        // Manual-parked bags never block eviction (see doc above): no
+        // auto-probing reads them, and `manual_sell` recreates locks.
         if self.gate_state.lock().await.gate.contains(&tick.mint) {
             return;
         }
