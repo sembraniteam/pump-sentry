@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::live::{
-    LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, RaydiumSellParams,
-    RecheckOutcome, SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN,
+    LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PumpSwapSellParams,
+    RaydiumSellParams, RecheckOutcome, SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN,
 };
 use crate::pipeline::{
     AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener, CURVE_TICK_STALE_SECS,
@@ -529,14 +529,24 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return false;
         }
         let sell_result = match &pool {
-            Some(leg) => {
-                warn!(%mint, amm = %leg.amm, leg_mint = %leg.mint, "routing post-migration exit via Raydium");
-                trader.sell_raydium(&RaydiumSellParams {
-                    position: &probe,
-                    pool: leg,
-                    tip_lamports: tip,
-                }).await
-            }
+            Some(leg) => match leg.venue {
+                crate::live::PoolVenue::PumpSwap => {
+                    warn!(%mint, amm = %leg.amm, leg_mint = %leg.mint, "routing post-migration exit via PumpSwap");
+                    trader.sell_pumpswap(&PumpSwapSellParams {
+                        position: &probe,
+                        pool: leg,
+                        tip_lamports: tip,
+                    }).await
+                }
+                crate::live::PoolVenue::RaydiumV4 => {
+                    warn!(%mint, amm = %leg.amm, leg_mint = %leg.mint, "routing post-migration exit via Raydium");
+                    trader.sell_raydium(&RaydiumSellParams {
+                        position: &probe,
+                        pool: leg,
+                        tip_lamports: tip,
+                    }).await
+                }
+            },
             None => {
                 trader
                     .sell(&LiveSellParams {

@@ -52,15 +52,27 @@ pub const SELL_MAX_ATTEMPTS: u32 = 5;
 /// Recheck rounds before manual review.
 pub const PENDING_MAX_ATTEMPTS: u32 = 5;
 
-/// Raydium pool leg for one mint.
+/// Post-migration pool venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolVenue {
+    /// Raydium AMM V4 (legacy venue).
+    RaydiumV4,
+    /// PumpSwap AMM (live venue).
+    PumpSwap,
+}
+
+/// Pool leg for one mint. Vault orientation is WSOL-side-first on
+/// both venues (BASE holds WSOL, QUOTE the token).
 #[derive(Debug, Clone)]
-pub struct RaydiumPoolLeg {
+pub struct PoolLeg {
     pub mint: String,
     pub amm: String,
     /// Coin vault (WSOL).
     pub base_vault: String,
     /// Pc vault (token).
     pub quote_vault: String,
+    /// Routing venue.
+    pub venue: PoolVenue,
 }
 
 /// Tracked fill (base units).
@@ -120,7 +132,17 @@ pub struct LiveSellParams<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct RaydiumSellParams<'a> {
     pub position: &'a LivePosition,
-    pub pool: &'a RaydiumPoolLeg,
+    pub pool: &'a PoolLeg,
+    /// Jito tip (congestion-aware; caller computes via `effective_tip`).
+    pub tip_lamports: u64,
+}
+
+/// PumpSwap-leg sell request. Floor quotes from live reserves plus
+/// the fee schedule, so no USD inputs cross here either.
+#[derive(Debug, Clone, Copy)]
+pub struct PumpSwapSellParams<'a> {
+    pub position: &'a LivePosition,
+    pub pool: &'a PoolLeg,
     /// Jito tip (congestion-aware; caller computes via `effective_tip`).
     pub tip_lamports: u64,
 }
@@ -921,38 +943,46 @@ impl LiveTrader {
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE sell dispatched");
         self.note_sell_bundle(&position.mint, &receipt.bundle_id);
+        self.confirm_pool_sell(&position.mint, &receipt, "sell").await
+    }
+
+    /// Confirm a pool-leg sell bundle. Shared by every venue (`label`
+    /// names the leg in logs and errors). No WAL write here: the
+    /// caller records the sell write-ahead of its custody subtract.
+    async fn confirm_pool_sell(
+        &self,
+        mint: &str,
+        receipt: &JitoReceipt,
+        label: &str,
+    ) -> Result<String, LiveError> {
         match self
             .executor
             .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
             .await
         {
             Ok(ConfirmOutcome::Confirmed) => {
-                // No WAL write here: the caller records the sell
-                // write-ahead of its custody subtract (single write
-                // point — a duplicate line would double-subtract a
-                // partial exit on boot replay).
-                self.clear_sell_bundle(&position.mint);
-                Ok(receipt.bundle_id)
+                self.clear_sell_bundle(mint);
+                Ok(receipt.bundle_id.clone())
             }
             Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
-                "sell bundle {} errored on-chain; still holding",
+                "{label} bundle {} errored on-chain; still holding",
                 receipt.bundle_id
             ))),
             Ok(ConfirmOutcome::Timeout) => {
                 match self.executor.bundle_status(&receipt.bundle_id).await {
                     BundleStatus::Failed | BundleStatus::Invalid => {
                         Err(LiveError::Unconfirmed(format!(
-                            "sell bundle {} engine reports bundle failed/invalid; still holding",
+                            "{label} bundle {} engine reports bundle failed/invalid; still holding",
                             receipt.bundle_id
                         )))
                     }
                     BundleStatus::Landed => {
-                        self.clear_sell_bundle(&position.mint);
-                        Ok(receipt.bundle_id)
+                        self.clear_sell_bundle(mint);
+                        Ok(receipt.bundle_id.clone())
                     }
                     BundleStatus::Pending | BundleStatus::Unknown => {
                         Err(LiveError::Unconfirmed(format!(
-                            "sell bundle {} unconfirmed after {:?}; still holding",
+                            "{label} bundle {} unconfirmed after {:?}; still holding",
                             receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
                         )))
                     }
@@ -960,7 +990,7 @@ impl LiveTrader {
             }
             // Transport failure: same as timeout.
             Err(e) => Err(LiveError::Unconfirmed(format!(
-                "sell bundle {} confirm RPC failed ({e}); still holding",
+                "{label} bundle {} confirm RPC failed ({e}); still holding",
                 receipt.bundle_id
             ))),
         }
@@ -998,46 +1028,43 @@ impl LiveTrader {
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE raydium sell dispatched");
         self.note_sell_bundle(&position.mint, &receipt.bundle_id);
-        match self
-            .executor
-            .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
-            .await
+        self.confirm_pool_sell(&position.mint, &receipt, "raydium sell").await
+    }
+
+    /// PumpSwap sell at `pool` via Jito. Floor quotes from live
+    /// reserves plus the fee schedule.
+    pub async fn sell_pumpswap(&self, req: &PumpSwapSellParams<'_>) -> Result<String, LiveError> {
+        let position = req.position;
+        let pool = req.pool;
+        let receipt = match tokio::time::timeout(
+            LIVE_DISPATCH_TIMEOUT,
+            self.executor.sell_pumpswap_jito(&executor::SellPumpSwapOrder {
+                mint: parse_pubkey(&position.mint)
+                    .map_err(|e| LiveError::BadOrder(format!("bad mint '{}': {e}", position.mint)))?,
+                pool: parse_pubkey(&pool.amm)
+                    .map_err(|e| LiveError::BadOrder(format!("bad pool '{}': {e}", pool.amm)))?,
+                base_vault: parse_pubkey(&pool.base_vault)
+                    .map_err(|e| LiveError::BadOrder(format!("bad base_vault '{e}")))?,
+                quote_vault: parse_pubkey(&pool.quote_vault)
+                    .map_err(|e| LiveError::BadOrder(format!("bad quote_vault '{e}")))?,
+                amount_tokens: position.amount_tokens,
+                slippage_bps: self.slippage_bps,
+                tip_lamports: req.tip_lamports,
+            }),
+        )
+        .await
         {
-            Ok(ConfirmOutcome::Confirmed) => {
-                // No WAL write here (see curve-leg sell above).
-                self.clear_sell_bundle(&position.mint);
-                Ok(receipt.bundle_id)
+            Ok(dispatch) => dispatch?,
+            Err(_) => {
+                return Err(LiveError::Unconfirmed(format!(
+                    "pumpswap sell dispatch of {} timed out after {:?}; still holding",
+                    position.mint, LIVE_DISPATCH_TIMEOUT
+                )));
             }
-            Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
-                "raydium sell bundle {} errored on-chain; still holding",
-                receipt.bundle_id
-            ))),
-            Ok(ConfirmOutcome::Timeout) => {
-                match self.executor.bundle_status(&receipt.bundle_id).await {
-                    BundleStatus::Failed | BundleStatus::Invalid => {
-                        Err(LiveError::Unconfirmed(format!(
-                            "raydium sell bundle {} engine reports bundle failed/invalid; still holding",
-                            receipt.bundle_id
-                        )))
-                    }
-                    BundleStatus::Landed => {
-                        self.clear_sell_bundle(&position.mint);
-                        Ok(receipt.bundle_id)
-                    }
-                    BundleStatus::Pending | BundleStatus::Unknown => {
-                        Err(LiveError::Unconfirmed(format!(
-                            "raydium sell bundle {} unconfirmed after {:?}; still holding",
-                            receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
-                        )))
-                    }
-                }
-            }
-            // Transport failure: same as timeout.
-            Err(e) => Err(LiveError::Unconfirmed(format!(
-                "raydium sell bundle {} confirm RPC failed ({e}); still holding",
-                receipt.bundle_id
-            ))),
-        }
+        };
+        tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE pumpswap sell dispatched");
+        self.note_sell_bundle(&position.mint, &receipt.bundle_id);
+        self.confirm_pool_sell(&position.mint, &receipt, "pumpswap sell").await
     }
 }
 

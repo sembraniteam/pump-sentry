@@ -23,8 +23,8 @@ pub struct FollowState {
     pub alerted_spike: bool,
     /// Last tick time (unix secs).
     pub last_seen_secs: u64,
-    /// Raydium leg (`None` when unresolvable).
-    pub pool: Option<crate::live::RaydiumPoolLeg>,
+    /// Pool leg (`None` when unresolvable).
+    pub pool: Option<crate::live::PoolLeg>,
 }
 
 /// Idle-follow TTL (a day).
@@ -111,11 +111,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Seed now: pools that never tick still expire. Keeps raced baseline.
         // A tick-first entry carries pool None: overwrite the leg when
         // the hunt resolves it, or routing stays blind until eviction.
-        let pool = Some(crate::live::RaydiumPoolLeg {
+        let venue = match report.destination {
+            MigrationDestination::PumpSwap => crate::live::PoolVenue::PumpSwap,
+            MigrationDestination::RaydiumV4 => crate::live::PoolVenue::RaydiumV4,
+        };
+        let pool = Some(crate::live::PoolLeg {
             mint: mint.to_string(),
             amm: amm.clone(),
             base_vault: base_vault.clone(),
             quote_vault: quote_vault.clone(),
+            venue,
         });
         self.followed
             .lock()

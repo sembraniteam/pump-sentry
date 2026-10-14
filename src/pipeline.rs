@@ -15,7 +15,7 @@ use simulator::{ExitReason, Mark, PaperPortfolio, check_exit};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, RaydiumSellParams, escalated_tip};
+use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams, escalated_tip};
 use crate::live_mirror::{LiveExecution, live_base_mint};
 use crate::follow::FollowState;
 pub use crate::gate::{DailyBreaker, GateState};
@@ -102,6 +102,9 @@ pub trait LiveSink {
     /// Raydium sell at a pool leg. Same contract as `sell`.
     async fn sell_raydium(&self, req: &RaydiumSellParams<'_>) -> Result<String, LiveError>;
 
+    /// PumpSwap sell at a pool leg. Same contract as `sell`.
+    async fn sell_pumpswap(&self, req: &PumpSwapSellParams<'_>) -> Result<String, LiveError>;
+
     /// Base Jito tip (live_sell escalates it by attempts).
     fn base_tip_lamports(&self) -> u64;
 
@@ -169,6 +172,10 @@ impl LiveSink for LiveTrader {
 
     async fn sell_raydium(&self, req: &RaydiumSellParams<'_>) -> Result<String, LiveError> {
         self.sell_raydium(req).await
+    }
+
+    async fn sell_pumpswap(&self, req: &PumpSwapSellParams<'_>) -> Result<String, LiveError> {
+        self.sell_pumpswap(req).await
     }
 
     fn base_tip_lamports(&self) -> u64 {
@@ -672,7 +679,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live::RaydiumPoolLeg;
+    use crate::live::{PoolLeg, PoolVenue};
     use migration::PoolTick;
     use simulator::Side;
     use simulator::FillModel;
@@ -740,6 +747,8 @@ mod tests {
         sells: StdMutex<Vec<(String, u64)>>,
         /// Raydium-leg sells `(mint, amm, amount)`.
         raydium_sells: StdMutex<Vec<(String, String, u64)>>,
+        /// PumpSwap-leg sells `(mint, pool, amount)`.
+        pumpswap_sells: StdMutex<Vec<(String, String, u64)>>,
         /// Tips passed per sell (escalation wiring proof).
         sell_tips: StdMutex<Vec<u64>>,
         /// Base tip the stub reports (mirrors prod default).
@@ -761,6 +770,7 @@ mod tests {
                     buys: StdMutex::new(vec![]),
                     sells: StdMutex::new(vec![]),
                     raydium_sells: StdMutex::new(vec![]),
+                    pumpswap_sells: StdMutex::new(vec![]),
                     sell_tips: StdMutex::new(vec![]),
                     tip_lamports: 100_000,
                     fail_buys: std::sync::atomic::AtomicBool::new(false),
@@ -783,6 +793,10 @@ mod tests {
 
         fn raydium_sells(&self) -> Vec<(String, String, u64)> {
             self.inner.raydium_sells.lock().expect("lock").clone()
+        }
+
+        fn pumpswap_sells(&self) -> Vec<(String, String, u64)> {
+            self.inner.pumpswap_sells.lock().expect("lock").clone()
         }
 
         fn sell_tips(&self) -> Vec<u64> {
@@ -891,6 +905,39 @@ mod tests {
                 .expect("lock")
                 .push(req.tip_lamports);
             Ok("bundle-stub-raydium".to_string())
+        }
+
+        async fn sell_pumpswap(&self, req: &PumpSwapSellParams<'_>) -> Result<String, LiveError> {
+            let position = req.position;
+            let pool = req.pool;
+            // Same failure hooks as the curve leg.
+            if self
+                .inner
+                .fail_sells
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(LiveError::BadOrder("stubbed pumpswap sell failure".to_string()));
+            }
+            if self
+                .inner
+                .fail_sells_transient
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(LiveError::Unconfirmed(
+                    "stubbed transient pumpswap sell failure".to_string(),
+                ));
+            }
+            self.inner
+                .pumpswap_sells
+                .lock()
+                .expect("lock")
+                .push((position.mint.clone(), pool.amm.clone(), position.amount_tokens));
+            self.inner
+                .sell_tips
+                .lock()
+                .expect("lock")
+                .push(req.tip_lamports);
+            Ok("bundle-stub-pumpswap".to_string())
         }
 
         fn base_tip_lamports(&self) -> u64 {
@@ -2534,11 +2581,12 @@ mod tests {
                 entry_price: 2.0,
                 alerted_spike: false,
                 last_seen_secs: now_secs(),
-                pool: Some(RaydiumPoolLeg {
+                pool: Some(PoolLeg {
                     mint: "MINT".to_string(),
                     amm: "AMM".to_string(),
                     base_vault: "BASE".to_string(),
                     quote_vault: "QUOTE".to_string(),
+                    venue: PoolVenue::RaydiumV4,
                 }),
             },
         );
@@ -2548,6 +2596,51 @@ mod tests {
         assert_eq!(
             live.raydium_sells(),
             vec![("MINT".to_string(), "AMM".to_string(), 1_000)]
+        );
+        assert!(pipe.exec.live_positions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_sell_routes_pumpswap_when_pool_known() {
+        // Same close, but the leg is a PumpSwap pool: the exit must
+        // take the PumpSwap leg (curve and Raydium legs untouched).
+        use crate::follow::FollowState;
+        let live = StubLive::working();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        pipe.followed.lock().await.insert(
+            "MINT".to_string(),
+            FollowState {
+                entry_price: 2.0,
+                alerted_spike: false,
+                last_seen_secs: now_secs(),
+                pool: Some(PoolLeg {
+                    mint: "MINT".to_string(),
+                    amm: "POOL".to_string(),
+                    base_vault: "WSOLVAULT".to_string(),
+                    quote_vault: "TOKENVAULT".to_string(),
+                    venue: PoolVenue::PumpSwap,
+                }),
+            },
+        );
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+
+        assert!(live.sells().is_empty());
+        assert!(live.raydium_sells().is_empty());
+        assert_eq!(
+            live.pumpswap_sells(),
+            vec![("MINT".to_string(), "POOL".to_string(), 1_000)]
         );
         assert!(pipe.exec.live_positions.lock().await.is_empty());
     }
