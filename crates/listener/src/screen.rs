@@ -640,6 +640,15 @@ pub async fn screen_developer(
         .last()
         .and_then(|s| s.block_time)
         .map(|t| now_secs.saturating_sub(t.max(0) as u64));
+    // Early reject before the expensive fan-out: a wallet that already
+    // fails the age gate (or has no timestamp at all) can never pass
+    // `judge_developer` regardless of its prior-launch count, so
+    // sampling 5-20 full transactions for it only burns RPC quota
+    // (fresh throwaway wallets are 85-90% of Pump.fun devs and 429
+    // directly). Prior count is reported as 0 — irrelevant on a reject.
+    if age_secs.is_none_or(|age| age < cfg.min_age_secs) {
+        return Ok(judge_developer(age_secs, 0, cfg));
+    }
 
     let tx_config = json_tx_config(commitment);
     // Bounded fan-out (5-wide): 20 sequential fetches could consume the

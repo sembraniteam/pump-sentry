@@ -523,14 +523,20 @@ async fn fetch_tx_permit_bound(
 /// True for rate-limit rejections specifically (`429`): worth a longer
 /// second backoff tier, since the first 250ms retry usually lands inside
 /// the same limit window.
+///
+/// Covers both surfaces: JSON-RPC `429` (`RpcError::RpcResponseError`)
+/// and HTTP-level `429` from provider proxies (Helius/QuickNode), which
+/// `HttpSender` surfaces as `ClientErrorKind::Reqwest` with
+/// `status() == 429` after its own 5 internal retries are exhausted.
 fn is_rate_limited(e: &ClientError) -> bool {    use solana_client::client_error::ClientErrorKind;
-    matches!(
-        e.kind(),
+    match e.kind() {
         ClientErrorKind::RpcError(solana_client::rpc_request::RpcError::RpcResponseError {
             code: 429,
             ..
-        })
-    )
+        }) => true,
+        ClientErrorKind::Reqwest(e) => e.status().is_some_and(|s| s.as_u16() == 429),
+        _ => false,
+    }
 }
 
 /// True for failures worth one retry: transport-level trouble plus
@@ -545,7 +551,9 @@ fn is_transient_fetch_error(e: &ClientError) -> bool {
     use solana_client::client_error::ClientErrorKind;
     match e.kind() {
         ClientErrorKind::Io(_) => true,
-        ClientErrorKind::Reqwest(e) => e.is_timeout() || e.is_connect(),
+        ClientErrorKind::Reqwest(e) => {
+            e.is_timeout() || e.is_connect() || e.status().is_some_and(|s| s.as_u16() == 429)
+        }
         ClientErrorKind::RpcError(solana_client::rpc_request::RpcError::RpcResponseError {
             code: -32005 | -32007 | -32009 | 429,
             ..
@@ -971,5 +979,44 @@ mod tests {
         assert!(ev.mint.to_string().ends_with("pump"));
         assert_ne!(ev.mint, ev.user);
         assert_ne!(ev.bonding_curve, ev.mint);
+    }
+
+    #[tokio::test]
+    async fn http_429_maps_to_rate_limited_transient() {
+        // Provider-proxy 429 (Helius/QuickNode) surfaces as
+        // `ClientErrorKind::Reqwest` with HTTP status 429 after
+        // `HttpSender`'s own 5 internal retries — both classifiers must
+        // still see it as rate-limited/transient, or the fetch worker
+        // drops the launch without its tier-2 backoff.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            // Initial + 5 internal `HttpSender` retries = 6 hits.
+            for _ in 0..8 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                // `Retry-After: 0` keeps the sender's internal 429
+                // retries instant so the test stays fast.
+                let head = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 0\r\nRetry-After: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let rpc = RpcClient::new(format!("http://{addr}"));
+        let err = rpc.get_slot().await.expect_err("must 429");
+        assert!(
+            is_rate_limited(&err),
+            "HTTP 429 must classify as rate-limited: {err:?}"
+        );
+        assert!(
+            is_transient_fetch_error(&err),
+            "HTTP 429 must classify as transient: {err:?}"
+        );
     }
 }

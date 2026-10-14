@@ -429,8 +429,9 @@ pub struct LiveExecution<L = LiveTrader> {
     /// not interleave across concurrent ticks for one mint, but a slow
     /// confirm on mint A must never block exits on mint B (a global
     /// lock did exactly that in volatile markets). One small mutex per
-    /// ever live-traded mint; removal is never needed for correctness
-    /// (clones keep working after eviction, so entries are kept).
+    /// live-traded mint, evicted by `maybe_unwatch` on a confirmed-empty
+    /// book (clones held by in-flight tasks keep working after eviction,
+    /// so eviction is safe and the map stays bounded on long runs).
     pub live_sell_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -1816,6 +1817,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             } else {
                 info!(%mint, "manual sell on an untracked mint; nothing to do");
             }
+            // Terminal empty: no tick will ever arrive to trigger
+            // `maybe_unwatch`, so evict the serial entry created above —
+            // otherwise every stray `sell <unknown>` leaks one map entry.
+            self.evict_mint_locks(mint).await;
             return true;
         };
         // Explicit operator exit also covers manual-parked bags: move the
@@ -1834,6 +1839,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Ok(tick) => tick,
             Err(CurveError::BadMintKey(_)) | Err(CurveError::BadCurveKey(_)) => {
                 warn!(%mint, "manual sell request unroutable; dropping request");
+                // Terminal: request dropped, no tick follows — evict the
+                // serial entry (same leak as the untracked path above).
+                self.evict_mint_locks(mint).await;
                 return true;
             }
             Err(e) => {
@@ -1945,6 +1953,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         serial.lock_owned().await
     }
 
+    /// Drop a mint's serialization entries without a tick. Used by
+    /// `manual_sell` terminal paths (untracked / unroutable) where no
+    /// tick will ever reach `maybe_unwatch`. Safe while a serial guard
+    /// is held: in-flight clones keep working after map eviction.
+    async fn evict_mint_locks(&self, mint: &str) {
+        self.tick_locks.lock().await.remove(mint);
+        self.exec.live_sell_locks.lock().await.remove(mint);
+    }
+
     /// Shared close-path tail: unwatch the feed on a confirmed-empty
     /// state (no paper positions, no tracked live fills, no watchlisted
     /// signal), evict this mint's serialization locks so the lock maps
@@ -1970,11 +1987,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.gate_state.lock().await.gate.contains(&tick.mint) {
             return;
         }
+        // Lock-map eviction is unconditional on a confirmed-empty book:
+        // gating it on `unwatch() == true` leaks entries for mints that
+        // were never watched (restart replays, watch-failed diverges) or
+        // were already unwatched by a concurrent empty. Clones held by
+        // in-flight tasks keep working after eviction, so this is safe.
         if self.reserves.unwatch(&tick.mint).await {
             info!(mint = %tick.mint, "unwatched (nothing left)");
-            self.tick_locks.lock().await.remove(&tick.mint);
-            self.exec.live_sell_locks.lock().await.remove(&tick.mint);
         }
+        self.tick_locks.lock().await.remove(&tick.mint);
+        self.exec.live_sell_locks.lock().await.remove(&tick.mint);
         if tick.complete {
             self.report_migration_once(&tick.mint, &tick.curve).await;
         }

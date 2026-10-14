@@ -134,6 +134,39 @@ async fn mainnet_v3_17_simulates() {
     let rpc = rpc_client();
 
     // --- helpers: parse frozen fixture into (mint, quote_mint, curve, assoc, buyback)
+    // plus the fixture's own trader ([8] payer) and base ATA ([9]).
+    // The trader/ATA pair is the offline fallback when
+    // `get_token_largest_accounts` is throttled (public RPC 429s on the
+    // heavy indexing call): the fixture already names a real seller and
+    // its ATA, so the sim gate can run without the largest-holders RPC.
+    fn fixture_v3_trader(raw: &str, path: &str) -> (Pubkey, Pubkey) {
+        let raw: serde_json::Value =
+            serde_json::from_str(raw).expect("fixture json");
+        let msg = &raw["transaction"]["message"];
+        let mut keys: Vec<String> = serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        if let Some(loaded) = raw["meta"]["loadedAddresses"].as_object() {
+            for table in ["writable", "readonly"] {
+                for addr in loaded.get(table).and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+                    keys.push(addr.as_str().expect("addr").to_string());
+                }
+            }
+        }
+        let pump = ids::PUMP_PROGRAM_ID.to_string();
+        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            if ix["programIdIndex"].as_u64() != Some(pi as u64) { continue; }
+            let data = bs58::decode(ix["data"].as_str().expect("data")).into_vec().expect("b58");
+            let is_v3 = (data.starts_with(&ids::PUMP_BUY_V3_DISCRIMINATOR) || data.starts_with(&ids::PUMP_SELL_V3_DISCRIMINATOR)) && data.len() == 24;
+            if !is_v3 { continue; }
+            let idx: Vec<usize> = serde_json::from_value(ix["accounts"].clone()).expect("accts");
+            assert_eq!(idx.len(), 17, "fixture {path} must be 17 accounts");
+            let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
+            // Positions per 17-shape: [8] payer/trader, [9] base ATA.
+            return (key(8), key(9));
+        }
+        panic!("no v3 ix in fixture {path}");
+    }
+
     fn fixture_v3_accounts(raw: &str, path: &str) -> (Pubkey, Pubkey, Pubkey, Pubkey, Pubkey) {
         let raw: serde_json::Value =
             serde_json::from_str(raw).expect("fixture json");
@@ -185,26 +218,65 @@ async fn mainnet_v3_17_simulates() {
 
         // Live largest holders for this mint (holder-based replay: fill buyers flip fast,
         // zero ATAs stay open with rent — owner still resolves and often still holds SOL/WSOL).
-        let holders = match tokio::time::timeout(std::time::Duration::from_secs(15), rpc.get_token_largest_accounts(&mint)).await {
-            Ok(Ok(h)) => h, _ => { eprintln!("largest-accounts unreadable for {mint}"); continue; }
-        };
+        // Public RPC 429s on this heavy indexing call: retry with backoff
+        // first (transient throttle), then fall back to the fixture's own
+        // trader/ATA (a real historical seller) so the sim gate does not
+        // hard-fail on throttling alone. An empty fallback (flipped/rent-
+        // collected ATA) yields no candidate and `continue`s below — never
+        // a false GREEN.
+        let mut largest = None;
+        for attempt in 0..3u32 {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), rpc.get_token_largest_accounts(&mint)).await {
+                Ok(Ok(h)) => { largest = Some(h); break; }
+                _ if attempt < 2 => {
+                    eprintln!("largest-accounts unreadable for {mint} (attempt {}/3; backing off)", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * (attempt as u64 + 1))).await;
+                }
+                _ => {
+                    eprintln!("largest-accounts unreadable for {mint} (throttled after 3 attempts); using fixture-trader fallback");
+                }
+            }
+        }
         let mut holder_owners: Vec<(Pubkey, Pubkey, u64)> = Vec::new();
         let mut zero_base_owners: Vec<Pubkey> = Vec::new();
-        for h in holders.iter().take(10) {
-            let Ok(hata) = Pubkey::from_str(&h.address) else { continue };
-            let Ok(hdata) = rpc.get_account(&hata).await else { continue };
-            if hdata.data.len() < 72 { continue; }
-            let howner = Pubkey::new_from_array(hdata.data[32..64].try_into().expect("32B"));
-            if howner == curve { continue; }
-            if user_ata_with_program(&howner, &mint, &token_program) != hata { aux_drops += 1; continue; }
-            let hbase: u64 = match rpc.get_token_account_balance(&hata).await { Ok(b) => b.amount.parse().unwrap_or(0), Err(_) => continue };
-            if hbase < 1_000 {
-                if !zero_base_owners.contains(&howner) { zero_base_owners.push(howner); }
-                continue;
+        let mut holders_len = 0usize;
+        if let Some(holders) = largest.as_ref() {
+            holders_len = holders.len();
+            for h in holders.iter().take(10) {
+                let Ok(hata) = Pubkey::from_str(&h.address) else { continue };
+                let Ok(hdata) = rpc.get_account(&hata).await else { continue };
+                if hdata.data.len() < 72 { continue; }
+                let howner = Pubkey::new_from_array(hdata.data[32..64].try_into().expect("32B"));
+                if howner == curve { continue; }
+                if user_ata_with_program(&howner, &mint, &token_program) != hata { aux_drops += 1; continue; }
+                let hbase: u64 = match rpc.get_token_account_balance(&hata).await { Ok(b) => b.amount.parse().unwrap_or(0), Err(_) => continue };
+                if hbase < 1_000 {
+                    if !zero_base_owners.contains(&howner) { zero_base_owners.push(howner); }
+                    continue;
+                }
+                holder_owners.push((howner, hata, hbase));
             }
-            holder_owners.push((howner, hata, hbase));
+        } else {
+            // Offline fallback: the fixture's trader + base ATA. Verified
+            // canonical (aux-filtered) and balance-checked live below, so a
+            // stale zero-balance fallback simply yields no candidate rather
+            // than a false GREEN.
+            let (ftrader, fata) = fixture_v3_trader(raw, path);
+            if user_ata_with_program(&ftrader, &mint, &token_program) == fata && ftrader != curve {
+                let hbase: u64 = match rpc.get_token_account_balance(&fata).await { Ok(b) => b.amount.parse().unwrap_or(0), Err(_) => 0 };
+                if hbase >= 1_000 {
+                    holder_owners.push((ftrader, fata, hbase));
+                } else if rpc.get_account(&fata).await.is_ok() {
+                    zero_base_owners.push(ftrader);
+                } else {
+                    eprintln!("fixture fallback ATA missing on-chain for {mint}");
+                }
+            } else {
+                aux_drops += 1;
+                eprintln!("fixture fallback trader is aux/non-canonical for {mint}");
+            }
         }
-        eprintln!("fixture {path}: holders={} funded_base={} zero_base={}", holders.len(), holder_owners.len(), zero_base_owners.len());
+        eprintln!("fixture {path}: holders={holders_len} funded_base={} zero_base={}", holder_owners.len(), zero_base_owners.len());
         if holder_owners.is_empty() && zero_base_owners.is_empty() { eprintln!("no holder for {mint}"); continue; }
 
         // BUY side: needs SOL + WSOL, never base — zero-base flip owners qualify.

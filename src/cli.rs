@@ -318,14 +318,50 @@ pub fn append_log_line(log: &Path, line: &str) {
 
 /// Last `n` lines of the log file (`n == 0` yields none; missing file is
 /// an error so `logs` can say so loudly).
+///
+/// Bounded memory: seeks from the end and reads only the trailing chunk
+/// (64 KiB windows, back to start at most until `n` lines are covered),
+/// so `logs 20` on a 50 MB file never loads the whole file into RAM.
 pub fn tail_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
-    let raw = std::fs::read_to_string(path)?;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
     if n == 0 {
         return Ok(Vec::new());
     }
-    let lines: Vec<String> = raw.lines().map(str::to_string).collect();
-    let skip = lines.len().saturating_sub(n);
-    Ok(lines.into_iter().skip(skip).collect())
+    let len = file.metadata()?.len();
+    // 64 KiB per window: a few windows cover any sane `n`; huge `n`
+    // degrades to a full read, never worse than the old behavior.
+    const WINDOW: u64 = 65536;
+    let mut pos = len;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let take = WINDOW.min(pos);
+        pos -= take;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; take as usize];
+        file.read_exact(&mut chunk)?;
+        // Prepend: chunk precedes everything read so far.
+        let mut next = Vec::with_capacity(chunk.len() + buf.len() + 1);
+        next.extend_from_slice(&chunk);
+        // Keep a single newline boundary between windows (the split
+        // below counts `\n`; without it a line spanning two windows
+        // would merge and undercount).
+        next.extend_from_slice(&buf);
+        buf = next;
+        let newlines = buf.iter().filter(|b| **b == b'\n').count();
+        if newlines > n || pos == 0 {
+            break;
+        }
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    // A trailing newline yields no extra empty line via `.lines()` —
+    // matches the old `read_to_string` semantics exactly.
+    if lines.len() > n {
+        lines.drain(..lines.len() - n);
+    }
+    Ok(lines)
 }
 
 /// Future that resolves on the first shutdown request: SIGINT (Ctrl-C)
@@ -804,11 +840,13 @@ pub fn cmd_sell(mint: &str) {
 
 /// Mint claimed inside a sell-request body (`{"mint":"…","ts":…}`).
 /// `None` on any shape mismatch: the daemon drops such files loudly
-/// instead of acting on — or retrying — a forged/torn request. Base58
-/// carries no quotes, so no unescaping is needed.
+/// instead of acting on — or retrying — a forged/torn request. Parsed
+/// with `serde_json` so standard formatting (spaces, multi-line, field
+/// order) is accepted; Base58 carries no quotes, so no unescaping edge
+/// cases arise. Empty mints still return `None`.
 pub fn sell_request_body_mint(body: &str) -> Option<String> {
-    let rest = body.split_once("\"mint\":\"")?.1;
-    let (mint, _) = rest.split_once('"')?;
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mint = value.get("mint")?.as_str()?;
     if mint.is_empty() {
         return None;
     }
@@ -1053,11 +1091,27 @@ mod tests {
             sell_request_body_mint(r#"{"mint":"ABC","ts":1}"#),
             Some("ABC".to_string())
         );
+        // Standard JSON formatting (spaces, newlines, field order) must
+        // also parse — the old hand-rolled `split_once("\"mint\":\"")`
+        // dropped these as poison.
+        assert_eq!(
+            sell_request_body_mint(r#"{"mint": "ABC", "ts": 1}"#),
+            Some("ABC".to_string())
+        );
+        assert_eq!(
+            sell_request_body_mint("{\n  \"mint\" : \"ABC\",\n  \"ts\" : 1\n}"),
+            Some("ABC".to_string())
+        );
+        assert_eq!(
+            sell_request_body_mint(r#"{"ts":1,"mint":"ABC"}"#),
+            Some("ABC".to_string())
+        );
         // Anything else is poison: the drain drops it, never acts on it.
         assert_eq!(sell_request_body_mint(""), None);
         assert_eq!(sell_request_body_mint("not json"), None);
         assert_eq!(sell_request_body_mint(r#"{"mint":"","ts":1}"#), None);
         assert_eq!(sell_request_body_mint(r#"{"ts":1}"#), None);
+        assert_eq!(sell_request_body_mint(r#"{"mint":123,"ts":1}"#), None);
     }
 
     #[test]

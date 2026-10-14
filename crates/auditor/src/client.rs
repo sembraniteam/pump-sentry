@@ -226,7 +226,11 @@ fn is_transient_network_error(e: &reqwest::Error) -> bool {
 }
 
 /// Retry server-side failures, rate limits, and request timeouts;
-/// other client errors (4xx) are terminal.
+/// other client errors (4xx) are terminal HERE by design. HTTP 400
+/// ("not indexed yet" on seconds-old mints) is retryable one layer up
+/// at the pipeline watchlist (`RugCheckError::is_retryable`, seconds
+/// cadence) — retrying it here would burn the millisecond backoff budget
+/// on indexing latency that resolves in seconds, not milliseconds.
 fn is_retryable_status(status: StatusCode) -> bool {
     status.is_server_error()
         || status == StatusCode::TOO_MANY_REQUESTS
