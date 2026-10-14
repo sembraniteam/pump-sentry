@@ -75,6 +75,13 @@ cargo run -p listener --example watch
 IS_LIVE=true SOLANA_PRIVATE_KEY=<base58> cargo run -- start --live
 ```
 
+Funding for live (v3): buys debit the wallet **WSOL** ATA via
+`TransferChecked`, never native SOL — fund the wallet with **both**:
+wrapped SOL for inventory (one trade guard ≈ `NOTIONAL_USD` + slippage,
+kept in the WSOL ATA) **and** native SOL for fees, Jito tips, and the
+0.05 SOL reserve. A SOL-only wallet fails every buy at preflight (boot
+logs say so loudly; wrap with e.g. `spl-token wrap <amount>` first).
+
 Daemon details: `start`/`restart` spawn `<binary> run` detached
 (`nohup`, stdout/stderr appended to `logs/bot.log`), record the pid in
 `logs/bot.pid`, and log a banner with when the bot was first started vs

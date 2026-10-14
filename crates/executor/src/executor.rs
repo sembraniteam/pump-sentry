@@ -312,6 +312,36 @@ pub struct SwapExecutor {
     strict_sim: bool,
 }
 
+/// Read-only live funding snapshot (see
+/// [`SwapExecutor::live_funding_report`]). `None` balances mean the read
+/// failed (transport/shape) — callers warn and let per-trade checks
+/// decide, never treat unknown as funded or as broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveFundingReport {
+    /// Trading wallet address.
+    pub payer: Pubkey,
+    /// Native SOL balance in lamports (`None` = unreadable).
+    pub native_balance: Option<u64>,
+    /// Native lamports required (effective tip + 0.05 SOL reserve).
+    pub native_required: u64,
+    /// Wallet WSOL associated token account (funds every v3 buy).
+    pub wsol_ata: Pubkey,
+    /// WSOL balance in base units (`None` = missing/unreadable ATA).
+    pub wsol_balance: Option<u64>,
+}
+
+impl LiveFundingReport {
+    /// Known-funded natively (`None` when the balance is unreadable).
+    pub fn native_ok(&self) -> Option<bool> {
+        self.native_balance.map(|b| b >= self.native_required)
+    }
+
+    /// Known to hold spendable WSOL (`None` when unreadable).
+    pub fn wsol_funded(&self) -> Option<bool> {
+        self.wsol_balance.map(|b| b > 0)
+    }
+}
+
 impl SwapExecutor {
     /// Build against an HTTP RPC URL with explicit commitment.
     pub fn new(
@@ -357,6 +387,49 @@ impl SwapExecutor {
     /// the transaction will never spend.
     fn effective_tip(&self, tip_lamports: u64) -> u64 {
         if self.jito.is_some() { tip_lamports } else { 0 }
+    }
+
+    /// Read-only live funding snapshot: native SOL for fees/tips plus the
+    /// wallet WSOL balance that funds v3 buys. v3 buys debit the payer
+    /// quote ATA ([10], the WSOL ATA on SOL pairs) via TransferChecked —
+    /// never native SOL — so a SOL-only wallet fails every buy at
+    /// preflight. No funds move here; callers gate on the result before
+    /// the first signal (native shortfall fails closed, zero WSOL warns
+    /// loudly since per-trade preflight enforces the exact guard).
+    pub async fn live_funding_report(&self, tip_lamports: u64) -> LiveFundingReport {
+        use crate::instructions::{WSOL_MINT, user_ata_with_program};
+        let required = self
+            .effective_tip(tip_lamports)
+            .saturating_add(crate::wallet::MIN_SOL_RESERVE_LAMPORTS);
+        let native_balance = match tokio::time::timeout(
+            Duration::from_secs(15),
+            self.rpc.get_balance(&self.wallet.pubkey()),
+        )
+        .await
+        {
+            Ok(Ok(balance)) => Some(balance),
+            _ => None,
+        };
+        // WSOL is always classic SPL, but resolve the program off-chain
+        // like every dispatch path instead of assuming it.
+        let wsol_ata = match self.token_program(&WSOL_MINT).await {
+            Some(program) => {
+                user_ata_with_program(&self.wallet.pubkey(), &WSOL_MINT, &program)
+            }
+            None => user_ata_with_program(
+                &self.wallet.pubkey(),
+                &WSOL_MINT,
+                &crate::instructions::TOKEN_PROGRAM_ID,
+            ),
+        };
+        let wsol_balance = self.quote_balance(&wsol_ata).await;
+        LiveFundingReport {
+            payer: self.wallet.pubkey(),
+            native_balance,
+            native_required: required,
+            wsol_ata,
+            wsol_balance,
+        }
     }
 
     /// Resolve the token program owning `mint` (classic SPL vs
@@ -1179,6 +1252,29 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(matches!(err, ExecutorError::BadSignature { .. }));
+    }
+
+    #[test]
+    fn funding_report_predicates() {
+        // Pure gate semantics: known balances decide, unknown reads
+        // abstain (callers warn, never treat unknown as funded/broke).
+        // Pubkeys are placeholders — only the balance logic is pinned.
+        use solana_pubkey::Pubkey;
+        let funded = LiveFundingReport {
+            payer: Pubkey::default(),
+            native_balance: Some(100_000),
+            native_required: 60_000,
+            wsol_ata: Pubkey::default(),
+            wsol_balance: Some(1_000),
+        };
+        assert_eq!(funded.native_ok(), Some(true));
+        assert_eq!(funded.wsol_funded(), Some(true));
+        let broke = LiveFundingReport { native_balance: Some(10_000), wsol_balance: Some(0), ..funded };
+        assert_eq!(broke.native_ok(), Some(false));
+        assert_eq!(broke.wsol_funded(), Some(false));
+        let unknown = LiveFundingReport { native_balance: None, wsol_balance: None, ..funded };
+        assert_eq!(unknown.native_ok(), None);
+        assert_eq!(unknown.wsol_funded(), None);
     }
 
     #[test]

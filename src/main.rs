@@ -24,7 +24,7 @@ use std::time::Duration;
 use alert::Alerter;
 use auditor::RugCheckClient;
 use curve::{CurveTicker, PriceTick};
-use executor::{JitoClient, SwapExecutor, WalletGuard};
+use executor::{JitoClient, LiveFundingReport, SwapExecutor, WalletGuard};
 use listener::{DevScreenConfig, ListenerConfig, PumpFunListener, RpcScreener};
 use migration::{PoolTick, VaultTicker};
 use risk_engine::RiskEngine;
@@ -342,6 +342,38 @@ async fn run_pipeline(live_arg: bool) {
                 std::process::exit(1);
             }
         };
+        // Live funding gate (read-only, no funds move): v3 buys debit the
+        // wallet WSOL ATA via TransferChecked, never native SOL — a
+        // SOL-only wallet fails every buy at preflight. Native shortfall
+        // (tip + 0.05 reserve) fails closed here; zero/missing WSOL warns
+        // loudly instead of exiting (the operator may fund after boot,
+        // and per-trade preflight enforces the exact guard anyway).
+        {
+            let report: LiveFundingReport =
+                executor.live_funding_report(settings.tip_lamports).await;
+            match report.native_ok() {
+                Some(true) => info!(payer = %report.payer, balance = report.native_balance, required = report.native_required, "live native SOL covers tip + reserve"),
+                Some(false) => {
+                    eprintln!(
+                        "live wallet {} short native SOL: have {} lamports, need {} (tip + 0.05 reserve); fund before live",
+                        report.payer,
+                        report.native_balance.unwrap_or(0),
+                        report.native_required
+                    );
+                    std::process::exit(1);
+                }
+                None => warn!("live native balance unreadable; per-trade solvency decides"),
+            }
+            match report.wsol_funded() {
+                Some(true) => info!(ata = %report.wsol_ata, held = report.wsol_balance, "live WSOL funds v3 buys"),
+                _ => {
+                    warn!("================================================================");
+                    warn!("live wallet WSOL empty/missing at {} — every v3 buy will refuse at preflight (TransferChecked debits WSOL, not native SOL).", report.wsol_ata);
+                    warn!("wrap SOL into that ATA first (e.g. spl-token wrap), keep native SOL for fees/tips.");
+                    warn!("================================================================");
+                }
+            }
+        }
         Some(LiveTrader::new(
             executor,
             settings.slippage_bps,
