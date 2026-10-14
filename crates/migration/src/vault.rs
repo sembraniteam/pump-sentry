@@ -35,6 +35,11 @@ pub enum VaultError {
     /// Address is not a valid pubkey: {0}
     #[error("invalid address: {0}")]
     BadAddress(String),
+    /// Vault decimals are not plausible (base={0} quote={1}): SPL mints
+    /// cap at 18 decimals, so anything above is a misconfiguration that
+    /// would misprice the pool silently.
+    #[error("invalid vault decimals: base={0} quote={1}")]
+    BadConfig(u8, u8),
     /// SOL→USD feed has no fresh price (stale or never fetched).
     #[error("SOL/USD feed stale: no fresh price")]
     StaleSolUsd,
@@ -119,6 +124,15 @@ impl VaultTicker {
         base_decimals: u8,
         quote_decimals: u8,
     ) -> Result<(), VaultError> {
+        if base_decimals > 18 || quote_decimals > 18 {
+            return Err(VaultError::BadConfig(base_decimals, quote_decimals));
+        }
+        if base_decimals != WSOL_DECIMALS_DEFAULT || quote_decimals != PUMP_TOKEN_DECIMALS_DEFAULT {
+            warn!(
+                mint = %mint, base_decimals, quote_decimals,
+                "non-standard vault decimals (expected 9/6): a 1000x misprice hides here when base/quote are swapped"
+            );
+        }
         let parse =
             |s: &str| Pubkey::from_str(s).map_err(|_| VaultError::BadAddress(s.to_string()));
         let mint = parse(mint)?.to_string();
@@ -526,6 +540,35 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn watch_rejects_implausible_decimals() {
+        use curve::SolUsdFeed;
+        let ticker = VaultTicker::new(
+            "https://api.mainnet-beta.solana.com",
+            solana_commitment_config::CommitmentConfig::confirmed(),
+            Duration::from_millis(500),
+            SolUsdFeed::new_for_test(150.0),
+        )
+        .expect("ticker");
+        let mint = "11111111111111111111111111111111";
+        // SPL mints cap at 18 decimals: fail closed, never misprice.
+        for (base, quote) in [(19, 6), (9, 19), (u8::MAX, u8::MAX)] {
+            let err = ticker
+                .watch(mint, mint, mint, mint, base, quote)
+                .await
+                .expect_err("must fail");
+            assert!(matches!(err, VaultError::BadConfig(b, q) if b == base && q == quote));
+        }
+        assert_eq!(ticker.watched_count().await, 0);
+        // Non-standard but plausible decimals (e.g. swapped 6/9) are
+        // accepted with a warn, not silently: the caller owns the pair.
+        ticker
+            .watch(mint, mint, mint, mint, 6, 9)
+            .await
+            .expect("plausible custom decimals accepted");
+        assert_eq!(ticker.watched_count().await, 1);
     }
 
     #[tokio::test]

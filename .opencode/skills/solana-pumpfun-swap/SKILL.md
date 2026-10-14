@@ -39,6 +39,11 @@ form leaves volume untracked.
 
 ## Rust Instruction Builder Implementation
 
+> **DELETED Oct-2026, do not re-add — dispatch is v3-only (17-account
+> `buy_v3`/`sell_v3`).** The builder below is the retired legacy shape,
+> kept as a parsing/screening reference only. Production dispatch code
+> was deleted; see `AGENTS.md` ("Dispatch is v3-only").
+
 ```rust
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_sdk::{
@@ -142,7 +147,8 @@ impl PumpSwapBuilder {
 }
 ```
 
-> **This skill's builder above is the LEGACY shape and is now deprecated in the repo** (`build_buy_ix` /
+> **This skill's builder above is the LEGACY shape and was DELETED Oct-2026 — do not re-add; dispatch is
+> v3-only (17-account `buy_v3`/`sell_v3`)** (`build_buy_ix` /
 > `build_sell_ix` bake in the canonical fee recipient, classic token program, no creator, and untracked volume).
 > Production code MUST use `PumpSwapBuilder::build_swap_ix` with explicit `SwapAccounts`
 > (`crates/executor/src/instructions.rs`):

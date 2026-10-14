@@ -54,8 +54,8 @@ live SOL using Pump.fun instructions, Jito MEV bundles, and non-blocking Discord
       mint through the classic program fails with `IncorrectProgramId`).
     - Build swaps ONLY via `PumpSwapBuilder::build_swap_ix` with explicit `SwapAccounts` (live fee recipient from the
       Global account, per-mint token program, creator for the mayhem shape). The legacy `build_buy_ix` /
-      `build_sell_ix` wrappers are deprecated: they bake in the canonical recipient, classic program, no creator, and
-      untracked volume, and cannot express mayhem routing.
+      `build_sell_ix` wrappers are DELETED Oct-2026 (do not re-add; dispatch is v3-only, 17-account): they baked in
+      the canonical recipient, classic program, no creator, and untracked volume, and cannot express mayhem routing.
     - Run `simulateTransaction` preflight first: definitive failures refuse before fees burn.
 3. **MEV Defense (Jito Bundles):**
     - For all live buys/sells, package the transaction with a Jito tip instruction (`jito-mev-execution`).

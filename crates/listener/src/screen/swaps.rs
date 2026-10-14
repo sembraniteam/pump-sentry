@@ -42,7 +42,8 @@ pub struct SwapRecord {
     pub signature: String,
     /// Slot the transaction landed in (creation-slot rule input).
     pub slot: u64,
-    /// Trader (`user` account, index 6).
+    /// Trader (`user` account; versioned index: v1=6, v2=13, v3=8 —
+    /// see `IDX_SWAP_USER` / `IDX_SWAP_V2_USER` / `IDX_SWAP_V3_USER`).
     pub wallet: Pubkey,
     /// Direction by discriminator.
     pub side: SwapSide,

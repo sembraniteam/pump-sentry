@@ -28,6 +28,7 @@ risk_engine = { package = "risk-engine", path = "crates/risk-engine" }
 simulator = { path = "crates/simulator" }
 curve = { path = "crates/curve" }
 executor = { path = "crates/executor" }
+ids = { path = "crates/ids" }
 migration = { path = "crates/migration" }
 alert = { path = "crates/alert" }
 serde_json = "1"
@@ -41,3 +42,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # (via quinn/Solana) and `aws-lc-rs` (via reqwest), so rustls cannot
 # auto-select a process default and panics on first TLS use.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+solana-keypair = "3.1"
+solana-commitment-config = "3.1"
+bs58 = "0.5"

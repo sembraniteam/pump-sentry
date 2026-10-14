@@ -31,7 +31,7 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - `crates/ids` is the single source of truth for on-chain constants (program IDs, discriminators, fee/volume addresses).
   A program upgrade
   edits exactly one file there — never duplicate a constant elsewhere.
-- `src/pipeline.rs` (~2500 lines) is the orchestrator: gate → risk →
+- `src/pipeline.rs` (~2900 lines) is the orchestrator: gate → risk →
   paper ledger → live mirror. `LiveExecution` and `DailyBreaker` are
   split out; method bodies still live on `Pipeline`.
 - `src/live.rs` sizes/orders live trades; `crates/executor` builds and

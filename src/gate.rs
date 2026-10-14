@@ -16,7 +16,7 @@ use risk_engine::{
     Action, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics, evaluate_heuristic_fallback,
     resolve_strategy,
 };
-use simulator::Side;
+use simulator::{FillModel, Side};
 use tracing::{debug, info, warn};
 
 use crate::pipeline::{AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener};
@@ -798,6 +798,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             info!(%mint, "mint in cooldown; skipping");
             return;
+        }
+        // Per-mint venue fee (custom creator tiers): one joined
+        // FeeConfig/Global/curve read, best-effort. `None` keeps the
+        // standard 125 bps tier; a custom tier re-prices this mint's
+        // paper fills to match the live dispatch exactly.
+        if let Some(bps) = self.reserves.venue_fee_bps(mint, curve).await {
+            portfolio.set_venue_fee_for_mint(mint, bps);
+            if (bps - FillModel::default().venue_fee_bps()).abs() > f64::EPSILON {
+                info!(%mint, bps, "custom venue fee tier registered for paper ledger");
+            }
         }
         match portfolio.open_position_params(&simulator::OpenPositionParams {
             mint,

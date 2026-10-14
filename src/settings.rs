@@ -22,7 +22,10 @@ pub struct Settings {
     pub commitment: String,
     /// Virtual starting balance in USD.
     pub start_balance: f64,
-    /// Commission per side in basis points.
+    /// Extra commission per side in basis points (default 0: keep 0
+    /// unless charging on top — the 125bps Pump.fun venue fee already
+    /// lives in the [`FillModel::BondingCurve`] fill price, so any
+    /// `fee_bps > 0` here is commission-only and stacks on the venue fee).
     pub fee_bps: f64,
     /// Paper notional per trade in USD.
     pub notional_usd: f64,
@@ -95,7 +98,7 @@ pub struct Settings {
     pub compute_unit_limit: u32,
     /// Jito tip budget per bundle in lamports.
     pub tip_lamports: u64,
-    /// Jito block-engine base URL (region).
+    /// Jito block-engine base URL (global; override per region).
     pub jito_endpoint: String,
     /// Discord trade alerts via Hermes CLI (needs `hermes` on PATH).
     pub discord_alerts: bool,
@@ -169,13 +172,14 @@ impl Settings {
     }
 
     /// Build knobs from an explicit map (test-friendly, no global state).
-    pub fn from_map(vars: &HashMap<String, String>) -> Self {        let mut notes = Vec::new();
+    pub fn from_map(vars: &HashMap<String, String>) -> Self {
+        let mut notes = Vec::new();
         Self {
             ws_url: parse_wss_url(vars, &mut notes),
             http_url: parse_rpc_url(vars, &mut notes),
             commitment: get_string(vars, "COMMITMENT", "confirmed"),
             start_balance: get_float(vars, "START_BALANCE", 100.0, &mut notes),
-            fee_bps: get_float(vars, "FEE_BPS", 30.0, &mut notes),
+            fee_bps: get_float(vars, "FEE_BPS", 0.0, &mut notes),
             notional_usd: get_float(vars, "NOTIONAL_USD", 10.0, &mut notes),
             trail_percent: get_float(vars, "TRAIL_PERCENT", 5.0, &mut notes),
             runner_trail_percent: get_float(vars, "RUNNER_TRAIL_PERCENT", 20.0, &mut notes),
@@ -210,7 +214,7 @@ impl Settings {
             jito_endpoint: get_string(
                 vars,
                 "JITO_ENDPOINT",
-                "https://frankfurt.mainnet.block-engine.jito.wtf",
+                "https://mainnet.block-engine.jito.wtf",
             ),
             discord_alerts: get_bool(vars, "DISCORD_ALERTS", true, &mut notes),
             discord_channel: vars
@@ -264,6 +268,11 @@ impl Settings {
         }
         if self.fee_bps < 0.0 || !self.fee_bps.is_finite() {
             out.push(format!("FEE_BPS={} is invalid", self.fee_bps));
+        } else if self.fee_bps > 0.0 {
+            out.push(format!(
+                "FEE_BPS={} is commission-only on top of the 125bps venue fee already in FillModel fills (keep 0 unless charging extra)",
+                self.fee_bps
+            ));
         }
         if self.max_open_positions == 0 {
             out.push("MAX_OPEN_POSITIONS=0; the pipeline can never open".to_string());
@@ -541,6 +550,7 @@ mod tests {
         let s = Settings::from_map(&HashMap::new());
         assert_eq!(s.commitment, "confirmed");
         assert_eq!(s.start_balance, 100.0);
+        assert_eq!(s.fee_bps, 0.0);
         assert_eq!(s.gate_window_secs, 10);
         assert_eq!(s.gate_min_buyers, 5);
         assert_eq!(s.max_open_positions, 3);

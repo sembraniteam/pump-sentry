@@ -137,7 +137,9 @@ impl Mark {
 pub struct OpenPositionParams<'a> {
     /// Token mint (base58).
     pub mint: &'a str,
-    /// Direction (`Long` for spot snipes; `Short` exists for PnL-math generality).
+    /// Direction (`Long` for spot snipes; `Short` is PnL-math generality
+    /// only — the pipeline opens `Long` exclusively, shorts are never
+    /// dispatched live).
     pub side: Side,
     /// Current quote in USD per token.
     pub quote: f64,
@@ -166,7 +168,8 @@ pub struct OpenPositionParams<'a> {
 pub struct PortfolioSnapshot {
     /// Free cash in USD.
     pub cash: f64,
-    /// Cash locked in open positions (entry notionals).
+    /// Cash locked in open positions (signed entry notionals: +long,
+    /// −short — short proceeds sit in cash, the shares are owed).
     pub locked: f64,
     /// Mark-to-market equity = cash + Σ position values.
     pub equity: f64,
@@ -187,6 +190,13 @@ pub struct PaperPortfolio {
     cash: f64,
     fee_bps: f64,
     fill: FillModel,
+    /// Per-mint venue-fee overrides (protocol + coin creator, bps/side)
+    /// for custom-fee coins. Absent mints use [`FillModel`]'s fee, so
+    /// standard 125 bps coins need no registration. Bounded in practice
+    /// by the heat cap (≤3 live mints); entries for closed books are
+    /// evicted by [`PaperPortfolio::clear_venue_fee_for_mint`] and never
+    /// grow without bound on long runs.
+    venue_fees: HashMap<String, f64>,
     next_id: PositionId,
     positions: HashMap<PositionId, Position>,
     history: Vec<ClosedTrade>,
@@ -221,6 +231,7 @@ impl PaperPortfolio {
             cash: starting_balance_usd.max(0.0),
             fee_bps: fee_bps.max(0.0),
             fill: FillModel::default(),
+            venue_fees: HashMap::new(),
             next_id: 1,
             positions: HashMap::new(),
             history: Vec::new(),
@@ -231,9 +242,42 @@ impl PaperPortfolio {
     }
 
     /// Override the fill model (default: bonding-curve cost model).
+    /// Per-mint venue overrides survive: they re-tier whatever model is
+    /// installed here.
     pub fn with_fill_model(mut self, fill: FillModel) -> Self {
         self.fill = fill;
         self
+    }
+
+    /// Register a custom venue fee (bps/side) for one mint: protocol +
+    /// coin creator total (e.g. `345.0` for a 95 + 250 coin). Non-finite
+    /// or negative inputs are ignored (fail-closed to the default tier,
+    /// never a zeroed cost). Call when the on-chain fee schedule is
+    /// known; standard coins need no registration.
+    pub fn set_venue_fee_for_mint(&mut self, mint: &str, fee_bps_per_side: f64) {
+        if mint.is_empty() || !fee_bps_per_side.is_finite() || fee_bps_per_side < 0.0 {
+            return;
+        }
+        self.venue_fees.insert(mint.to_string(), fee_bps_per_side);
+    }
+
+    /// Drop a mint's venue override (position lifecycle ended).
+    pub fn clear_venue_fee_for_mint(&mut self, mint: &str) {
+        self.venue_fees.remove(mint);
+    }
+
+    /// Effective venue fee (bps/side) for one mint: override or default.
+    pub fn venue_fee_for(&self, mint: &str) -> f64 {
+        self.venue_fees.get(mint).copied().unwrap_or_else(|| self.fill.venue_fee_bps())
+    }
+
+    /// Effective fill model for one mint: base model re-tiered to the
+    /// mint's venue fee. Single home so open/book/snapshot cannot drift.
+    fn fill_for_mint(&self, mint: &str) -> FillModel {
+        match self.venue_fees.get(mint) {
+            Some(fee) => self.fill.with_venue_fee_bps(*fee),
+            None => self.fill,
+        }
     }
 
     /// Free cash in USD.
@@ -292,7 +336,9 @@ impl PaperPortfolio {
     /// Open a long/short at `quote` with `notional_usd` exposure.
     ///
     /// Execution uses the fill model against `liquidity_usd`; entry fee is
-    /// charged on the executed notional. Cash is debited `notional + fee`.
+    /// charged on the executed notional. Longs debit `notional + fee`,
+    /// shorts credit `notional − fee` (shorts are PnL-math generality —
+    /// the pipeline opens `Long` only).
     /// `trail_percent` is the giveback that fires the trailing stop when
     /// `trailing` is set (ignored otherwise). `moonbag_percent` (0–100,
     /// clamped) is the share kept riding after a TakeProfit scale-out.
@@ -333,6 +379,12 @@ impl PaperPortfolio {
     }
 
     /// Open a position from [`OpenPositionParams`] (preferred entry point).
+    ///
+    /// Cash flow is side-aware: longs debit `notional + entry fee`
+    /// (custody), shorts credit `notional − entry fee` (sale proceeds —
+    /// no margin model, so only the entry fee needs covering cash).
+    /// `Short` exists for PnL-math generality; the pipeline opens `Long`
+    /// exclusively and never dispatches a short live.
     pub fn open_position_params(
         &mut self,
         p: &OpenPositionParams<'_>,
@@ -358,16 +410,9 @@ impl PaperPortfolio {
         }
 
         let entry_price = self
-            .fill
+            .fill_for_mint(p.mint)
             .fill_price(p.side, quote, notional_usd, p.liquidity_usd);
         let entry_fee = self.fee_for(notional_usd);
-        let need = notional_usd + entry_fee;
-        if need > self.cash {
-            return Err(PortfolioError::InsufficientFunds {
-                need,
-                have: self.cash,
-            });
-        }
 
         // Quantity follows executed notional so slippage is accounted in size.
         let quantity = match p.side {
@@ -375,7 +420,30 @@ impl PaperPortfolio {
             Side::Short => -(notional_usd / entry_price),
         };
 
-        self.cash -= need;
+        match p.side {
+            Side::Long => {
+                let need = notional_usd + entry_fee;
+                if need > self.cash {
+                    return Err(PortfolioError::InsufficientFunds {
+                        need,
+                        have: self.cash,
+                    });
+                }
+                self.cash -= need;
+            }
+            Side::Short => {
+                // Short sale: receive proceeds minus fee. Only the fee
+                // needs covering cash (no margin model — shorts are
+                // paper-generality, never dispatched live).
+                if entry_fee > self.cash {
+                    return Err(PortfolioError::InsufficientFunds {
+                        need: entry_fee,
+                        have: self.cash,
+                    });
+                }
+                self.cash += notional_usd - entry_fee;
+            }
+        }
         let id = self.next_id;
         // 2^64 positions is unreachable; a silent saturating reuse would
         // overwrite a live position, so fail loudly instead (precedent:
@@ -527,7 +595,12 @@ impl PaperPortfolio {
         }
     }
 
-    /// Price one slice and credit its proceeds to cash.
+    /// Price one slice and settle its cash leg.
+    ///
+    /// Longs credit `exit_notional − exit fee` (sale); shorts debit
+    /// `exit_notional + exit fee` (buy-back). Either way
+    /// `net_pnl = (exit − entry) * qty − fees`, so a flat-price round
+    /// trip nets exactly `−fees`.
     fn book(
         &mut self,
         slice: &CloseSlice,
@@ -536,7 +609,7 @@ impl PaperPortfolio {
         reason: ExitReason,
         now_secs: u64,
     ) -> ClosedTrade {
-        let exit_price = self.fill.fill_price(
+        let exit_price = self.fill_for_mint(&slice.mint).fill_price(
             flip_side(slice.side),
             quote,
             slice.quantity.abs() * quote,
@@ -554,8 +627,12 @@ impl PaperPortfolio {
             0.0
         };
 
-        // Cash locked at entry was notional + entry fee; return value minus exit fee.
-        self.cash += slice.entry_notional + gross_pnl - exit_fee;
+        // Settle the exit leg: longs receive sale proceeds, shorts pay
+        // the buy-back (both net of their own commission).
+        match slice.side {
+            Side::Long => self.cash += exit_notional - exit_fee,
+            Side::Short => self.cash -= exit_notional + exit_fee,
+        }
 
         ClosedTrade {
             id: slice.id,
@@ -590,29 +667,45 @@ impl PaperPortfolio {
     /// Mark-to-market snapshot. `quotes` maps mint → current price; missing
     /// mints are marked at entry (zero unrealized).
     /// Mark-to-market snapshot. Each open position is valued at its
-    /// estimated exit proceeds (mark price through the fill model minus
-    /// exit commission), so `equity` already reflects the cost of
+    /// estimated exit leg through the fill model (longs: exit proceeds
+    /// minus exit commission; shorts: negative buy-back cost inclusive
+    /// of exit commission), so `equity` already reflects the cost of
     /// liquidating. Mints without marks contribute zero unrealized.
+    /// `locked` sums signed entry notionals (+long, −short); `equity`
+    /// is always `cash + Σ position values`.
     pub fn snapshot(&self, marks: &HashMap<String, Mark>) -> PortfolioSnapshot {
         let mut locked = 0.0;
         let mut unrealized = 0.0;
         for position in self.positions.values() {
-            locked += position.entry_notional;
+            // Signed basis: longs lock cash, shorts posted negative
+            // notional (proceeds sit in cash, the shares are owed).
+            let basis = match position.side {
+                Side::Long => position.entry_notional,
+                Side::Short => -position.entry_notional,
+            };
+            locked += basis;
             let value = match marks.get(&position.mint) {
-                Some(mark) if mark.price.is_finite() && mark.price > 0.0 => {                    let exit_size = position.quantity.abs() * mark.price;
-                    let slip = self.fill.slip_fraction(exit_size, mark.liquidity_usd);
+                Some(mark) if mark.price.is_finite() && mark.price > 0.0 => {
+                    let exit_size = position.quantity.abs() * mark.price;
+                    let slip = self.fill_for_mint(&position.mint).slip_fraction_for_side(
+                        flip_side(position.side),
+                        exit_size,
+                        mark.liquidity_usd,
+                    );
                     let exit_price = match position.side {
-                        Side::Long => mark.price * (1.0 - slip),
+                        Side::Long => mark.price * (1.0 - slip).max(0.0),
                         Side::Short => mark.price * (1.0 + slip),
                     };
-                    let gross = (exit_price - position.entry_price) * position.quantity;
-                    let exit_fee =
-                        self.fee_for(position.quantity.abs() * exit_price);
-                    position.entry_notional + gross - exit_fee
+                    let exit_notional = position.quantity.abs() * exit_price;
+                    let exit_fee = self.fee_for(exit_notional);
+                    match position.side {
+                        Side::Long => exit_notional - exit_fee,
+                        Side::Short => -(exit_notional + exit_fee),
+                    }
                 }
-                _ => position.entry_notional,
+                _ => basis,
             };
-            unrealized += value - position.entry_notional;
+            unrealized += value - basis;
         }
         PortfolioSnapshot {
             cash: self.cash,
@@ -804,6 +897,66 @@ mod tests {
         assert!((trade.fees - 1.0).abs() < 1e-9);
         assert!((trade.net_pnl + 1.0).abs() < 1e-9);
         assert!((pf.cash() - 99.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn short_roundtrip_flat_price_nets_minus_fees() {
+        // Short economics: open credits proceeds, close debits the
+        // buy-back — a flat round trip loses exactly both commissions.
+        let mut pf = PaperPortfolio::new(100.0, 100.0).with_fill_model(FillModel::Exact);
+        let id = pf
+            .open_position(
+                "MINT",
+                Side::Short,
+                1.0,
+                50.0,
+                1e9,
+                75.0,
+                -8.0,
+                false,
+                0.0,
+                0,
+                0.0,
+                0,
+            )
+            .expect("open");
+        // Proceeds credited: 100 + 50 − 0.50 entry fee.
+        assert!((pf.cash() - 149.50).abs() < 1e-9, "cash={}", pf.cash());
+        assert_eq!(pf.position(id).expect("p").quantity, -50.0);
+        let trade = pf
+            .close_position(id, 1.0, 1e9, ExitReason::Manual, 1)
+            .expect("close");
+        assert!((trade.gross_pnl).abs() < 1e-9, "gross={}", trade.gross_pnl);
+        assert!((trade.fees - 1.0).abs() < 1e-9, "fees={}", trade.fees);
+        assert!((trade.net_pnl + 1.0).abs() < 1e-9, "net={}", trade.net_pnl);
+        assert!((pf.cash() - 99.0).abs() < 1e-9, "cash={}", pf.cash());
+        // Equity is whole: snapshot before close already priced the
+        // buy-back liability (cash + value == close cash).
+        let mut pf2 = PaperPortfolio::new(100.0, 100.0).with_fill_model(FillModel::Exact);
+        let id2 = pf2
+            .open_position(
+                "MINT",
+                Side::Short,
+                1.0,
+                50.0,
+                1e9,
+                75.0,
+                -8.0,
+                false,
+                0.0,
+                0,
+                0.0,
+                0,
+            )
+            .expect("open");
+        let mut marks = HashMap::new();
+        marks.insert("MINT".to_string(), Mark::price_only(1.0));
+        let snap = pf2.snapshot(&marks);
+        let trade2 = pf2
+            .close_position(id2, 1.0, 1e9, ExitReason::Manual, 1)
+            .expect("close");
+        assert!((pf2.cash() - snap.equity).abs() < 1e-9);
+        assert!((trade2.net_pnl + 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1154,6 +1307,36 @@ mod tests {
         let p = pf.position(id).expect("p");
         assert_eq!(p.trail_percent, 0.0);
         assert_eq!(p.moonbag_percent, 0.0);
+    }
+
+    #[test]
+    fn custom_venue_fee_prices_worse_fills_per_mint() {
+        // A 95 + 250 = 345 bps custom-fee coin must fill worse than the
+        // standard 125 bps tier, without touching other mints.
+        let mut pf = PaperPortfolio::new(1_000.0, 0.0);
+        pf.set_venue_fee_for_mint("CUSTOM", 345.0);
+        assert!((pf.venue_fee_for("CUSTOM") - 345.0).abs() < 1e-9);
+        assert!((pf.venue_fee_for("STD") - 125.0).abs() < 1e-9);
+        let std_id = pf
+            .open_position("STD", Side::Long, 1.0, 100.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
+            .expect("std open");
+        let cus_id = pf
+            .open_position("CUSTOM", Side::Long, 1.0, 100.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
+            .expect("custom open");
+        let std_px = pf.position(std_id).expect("std").entry_price;
+        let cus_px = pf.position(cus_id).expect("cus").entry_price;
+        assert!(cus_px > std_px, "custom {cus_px} vs std {std_px}");
+        // ~2.2pp wider per side on fee alone (345 - 125 = 220 bps).
+        assert!((cus_px - std_px - 0.022).abs() < 1e-9, "cus={cus_px} std={std_px}");
+        // Clearing reverts to the default tier; garbage inputs never
+        // zero costs silently.
+        pf.clear_venue_fee_for_mint("CUSTOM");
+        assert!((pf.venue_fee_for("CUSTOM") - 125.0).abs() < 1e-9);
+        pf.set_venue_fee_for_mint("", 999.0);
+        pf.set_venue_fee_for_mint("BAD", f64::NAN);
+        pf.set_venue_fee_for_mint("NEG", -5.0);
+        assert!((pf.venue_fee_for("BAD") - 125.0).abs() < 1e-9);
+        assert!((pf.venue_fee_for("NEG") - 125.0).abs() < 1e-9);
     }
 
     #[test]

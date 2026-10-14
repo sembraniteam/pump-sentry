@@ -63,7 +63,8 @@ pub struct JitoClient {
 pub const TIP_ACCOUNTS_TTL_SECS: u64 = 900;
 
 impl JitoClient {
-    /// Build against a regional base URL, e.g.
+    /// Build against a block-engine base URL, e.g.
+    /// `https://mainnet.block-engine.jito.wtf` (global) or a regional
     /// `https://frankfurt.mainnet.block-engine.jito.wtf`.
     /// Returns the reason instead of `None` so startup logs say more
     /// than "bad URL" (fail fast at startup, never half-enable live).
@@ -335,7 +336,7 @@ mod tests {
             Err(JitoError::BadUrl(_))
         ));
         let client =
-            JitoClient::new("https://frankfurt.mainnet.block-engine.jito.wtf").expect("ok");
+            JitoClient::new("https://mainnet.block-engine.jito.wtf").expect("ok");
         assert!(client.endpoint().ends_with("/api/v1/bundles"));
     }
 }

@@ -149,8 +149,8 @@ impl EntryGate {
     /// Fold one observation round into the entry. Removes the entry on
     /// terminal outcomes. Unknown mints report [`GateOutcome::Wait`].
     ///
-    /// Best-effort dev-dump detection: a `Sell` (legacy or `sell_v2`,
-    /// whose layout is frozen-sample verified) authored by any watched
+    /// Best-effort dev-dump detection: a `Sell` (any `SwapSide::Sell` —
+    /// legacy/v2/v3, all layout-verified) authored by any watched
     /// insider wallet (launcher cohort) aborts here. Dumps routed through
     /// transfers or funded sybils do not abort on their own — cluster
     /// forensics in [`BundleDetector`] covers coordinated funding instead.

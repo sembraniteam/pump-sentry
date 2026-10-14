@@ -15,7 +15,7 @@ use listener::{
 };
 use migration::VaultTicker;
 use risk_engine::{RiskEngine, StrategyMode};
-use simulator::{ExitReason, PaperPortfolio, check_exit};
+use simulator::{ExitReason, Mark, PaperPortfolio, check_exit};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -47,6 +47,13 @@ pub trait ReserveFeed {
     async fn fetch_tick(&self, mint: &str, curve: &str) -> Result<PriceTick, CurveError>;
     /// Mint decimals for base-unit math (cached upstream).
     async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError>;
+    /// Venue fee (bps/side) for one curve's fee tier, read live
+    /// (FeeConfig + Global gate + the coin's own rate). `None` on any
+    /// failure — callers keep the standard 125 bps tier. Default: none
+    /// (stubs stay silent; the real ticker reads chain).
+    async fn venue_fee_bps(&self, _mint: &str, _curve: &str) -> Option<f64> {
+        None
+    }
     /// Watch a curve for exit polling.
     async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError>;
     /// Stop watching; true when an entry was removed.
@@ -60,6 +67,10 @@ impl ReserveFeed for CurveTicker {
 
     async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError> {
         self.token_decimals(mint).await
+    }
+
+    async fn venue_fee_bps(&self, _mint: &str, curve: &str) -> Option<f64> {
+        self.venue_fee_bps(curve).await
     }
 
     async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
@@ -99,10 +110,16 @@ pub trait LiveSink {
         Vec::new()
     }
 
-    /// Per-dispatch on-chain overhead in lamports (tip + priority fee;
-    /// default: none). Used for day-loss cost accounting.
+    /// Per-dispatch on-chain overhead in lamports (tip + priority fee +
+    /// base tx fee; default: none). Used for day-loss cost accounting.
     fn dispatch_cost_lamports(&self) -> u64 {
         0
+    }
+
+    /// First-buy-per-mint all-in cost (dispatch + one ATA rent reserve;
+    /// default: dispatch cost). Debit on buy paths, never on sells.
+    fn first_touch_cost_lamports(&self) -> u64 {
+        self.dispatch_cost_lamports()
     }
 
     /// Record a tracked fill in the crash-recovery WAL (default: none).
@@ -150,6 +167,10 @@ impl LiveSink for LiveTrader {
 
     fn dispatch_cost_lamports(&self) -> u64 {
         self.dispatch_cost_lamports()
+    }
+
+    fn first_touch_cost_lamports(&self) -> u64 {
+        self.first_touch_cost_lamports()
     }
 
     fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
@@ -276,6 +297,13 @@ pub struct Pipeline<
     pub reserves: R,
     /// Virtual positions and cash.
     pub portfolio: Mutex<PaperPortfolio>,
+    /// Last realizable mark per mint (price + liquidity from the latest
+    /// accepted tick, plus observation time). Feeds heartbeat/exit-card
+    /// equity so snapshots deduct exit costs instead of carrying books
+    /// at entry notional. Best-effort cache: ticks older than
+    /// [`CURVE_TICK_STALE_SECS`] are dropped at use, never drive exits
+    /// here (exits use the live tick).
+    pub last_marks: Mutex<HashMap<String, (Mark, u64)>>,
     /// Per-mint tick serialization (see [`Pipeline::on_tick`]).
     pub tick_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Real-funds execution state (dispatcher, fills, retries).
@@ -351,15 +379,37 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             alerts,
             vaults,
             sol_feed,
+            last_marks: Mutex::new(HashMap::new()),
         })
     }
 
 
-    /// Paper cash + mark-to-market equity (heartbeat cards).
+    /// Paper cash + realizable equity (heartbeat cards).
+    ///
+    /// Realizable, not book value: the snapshot runs over the latest
+    /// accepted tick per mint, so open positions are valued at estimated
+    /// exit proceeds (fill model + exit commission). Mints with no tick
+    /// yet (or a tick older than [`CURVE_TICK_STALE_SECS`]) contribute
+    /// zero unrealized rather than a stale print.
     pub async fn paper_cash_equity(&self) -> (f64, f64) {
+        let marks = self.fresh_marks(now_secs()).await;
         let portfolio = self.portfolio.lock().await;
-        let snap = portfolio.snapshot(&HashMap::new());
+        let snap = portfolio.snapshot(&marks);
         (snap.cash, snap.equity)
+    }
+
+    /// Clone the last-marks cache minus stale entries (single home so
+    /// heartbeat and exit cards share the freshness rule).
+    async fn fresh_marks(&self, now: u64) -> HashMap<String, Mark> {
+        // Only `on_tick` writes; every reader filters through here so a
+        // hung ticker cannot pin equity to a dead print.
+        self.last_marks
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, (_, ts))| now.saturating_sub(*ts) < CURVE_TICK_STALE_SECS)
+            .map(|(m, (mark, _))| (m.clone(), *mark))
+            .collect()
     }
 
     /// Mints with open paper positions (shutdown snapshot: nothing open
@@ -498,6 +548,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.reserves.unwatch(&tick.mint).await {
             info!(mint = %tick.mint, "unwatched (nothing left)");
         }
+        // Venue-fee overrides die with the book: a later relaunch
+        // re-reads the tier at confirm instead of pricing off a dead
+        // coin's custom rate. Bounds the override map on long runs.
+        self.portfolio.lock().await.clear_venue_fee_for_mint(&tick.mint);
         self.tick_locks.lock().await.remove(&tick.mint);
         self.exec.live_sell_locks.lock().await.remove(&tick.mint);
         if tick.complete {
@@ -516,10 +570,27 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(mint = %tick.mint, age, observed_at = tick.observed_at, "stale curve tick — dropped");
             return;
         }
+        // Record the realizable mark first (heartbeat/exit equity): short
+        // critical section, never held across the portfolio lock below.
+        // Migrated curves carry a stale spot — never cache them, or the
+        // next heartbeat would price a dead pool.
+        if !tick.complete {
+            self.last_marks.lock().await.insert(
+                tick.mint.clone(),
+                (
+                    Mark { price: tick.price_usd, liquidity_usd: tick.liquidity_usd },
+                    tick.observed_at,
+                ),
+            );
+        }
         // Per-mint serialization: two ticks for one mint must not
         // interleave close math and live probes (fractions computed from
         // divergent views would double-sell or strand dust).
         let _serial = self.mint_serial(&tick.mint).await;
+        // Clone fresh marks BEFORE the portfolio guard: exit cards value
+        // survivors realizably (same rule as the heartbeat), and the
+        // cache lock is never held across the portfolio lock.
+        let card_marks = self.fresh_marks(now_secs()).await;
         let mut portfolio = self.portfolio.lock().await;
         let ids: Vec<u64> = portfolio.positions_for_mint(&tick.mint);
         let mut closed_fraction = 0.0f64;
@@ -596,7 +667,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         let is_moonbag_exit = trade.fraction_closed < 1.0;
                         // Runner bookkeeping (stop ratchet, timeout lift,
                         // moonbag disarm) lives in settle(); nothing to do.
-                        let equity = portfolio.snapshot(&HashMap::new()).equity;
+                        // Realizable equity over fresh marks (this tick is
+                        // already cached above): exit costs deducted, so
+                        // the card never poses pre-cost book value as
+                        // take-home.
+                        let equity = portfolio.snapshot(&card_marks).equity;
                         info!(mint = %tick.mint, id, reason = ?trade.reason,
                         net = format!("{:+.2}", trade.net_pnl),
                         pct = format!("{:+.2}%", trade.net_pnl_percent),
@@ -874,6 +949,9 @@ mod tests {
         fail_watch: bool,
         /// Mint decimals reported by `token_decimals` (6 = standard).
         decimals: u8,
+        /// Venue fee reported by `venue_fee_bps` (`None` = unreadable,
+        /// so the paper leg keeps the standard tier).
+        fee_bps: Option<f64>,
     }
 
     impl StubReserves {
@@ -884,6 +962,7 @@ mod tests {
                 unwatched: StdMutex::new(vec![]),
                 fail_watch: false,
                 decimals: 6,
+                fee_bps: None,
             }
         }
 
@@ -894,6 +973,7 @@ mod tests {
                 unwatched: StdMutex::new(vec![]),
                 fail_watch: false,
                 decimals: 6,
+                fee_bps: None,
             }
         }
 
@@ -913,6 +993,10 @@ mod tests {
 
         async fn token_decimals(&self, _mint: &str) -> Result<u8, CurveError> {
             Ok(self.decimals)
+        }
+
+        async fn venue_fee_bps(&self, _mint: &str, _curve: &str) -> Option<f64> {
+            self.fee_bps
         }
 
         async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
@@ -1464,6 +1548,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
+        // Default bonding-curve model (venue fee applies): no tick yet
+        // means book value, a fresh tick means exit costs deducted.
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::failing(),
+            PaperPortfolio::new(100.0, 0.0),
+            StubScreener::passing(),
+            None,
+        );
+        let (cash_empty, equity_empty) = pipe.paper_cash_equity().await;
+        assert_eq!((cash_empty, equity_empty), (100.0, 100.0));
+        pipe.portfolio
+            .lock()
+            .await
+            .open_position(
+                "MINT",
+                Side::Long,
+                2.0,
+                10.0,
+                1e9,
+                75.0,
+                -8.0,
+                false,
+                0.0,
+                0,
+                0.0,
+                now_secs(),
+            )
+            .expect("manual open");
+        // Before any tick: book value (zero unrealized).
+        let (cash_book, equity_book) = pipe.paper_cash_equity().await;
+        assert!((equity_book - 100.0).abs() < 1e-9, "book {equity_book}");
+        assert_eq!(cash_book, 90.0);
+        // A fresh flat tick marks equity realizable: the 125 bps venue
+        // fee on the exit leg deducts, so equity drops below book.
+        pipe.on_tick(&tick("MINT", 2.0)).await;
+        assert_eq!(pipe.portfolio.lock().await.positions_for_mint("MINT").len(), 1);
+        let snap = pipe
+            .portfolio
+            .lock()
+            .await
+            .snapshot(&HashMap::from([(
+                "MINT".to_string(),
+                simulator::Mark { price: 2.0, liquidity_usd: 30_000.0 },
+            )]));
+        let (cash, equity) = pipe.paper_cash_equity().await;
+        assert_eq!(cash, snap.cash);
+        assert!((equity - snap.equity).abs() < 1e-9);
+        assert!(equity < 100.0, "exit costs must deduct: {equity}");
+        assert!(snap.unrealized_pnl < 0.0);
+    }
+
+    #[tokio::test]
     async fn daily_breaker_blocks_opens_but_not_exits() {
         let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
         let reserves = StubReserves::with_tick(tick("MINT", 2.0));
@@ -1525,6 +1664,34 @@ mod tests {
         drop(portfolio);
         assert_eq!(pipe.pending_count().await, 0);
         assert_eq!(pipe.reserves.watched.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn confirm_registers_custom_venue_fee() {
+        // FeeConfig read at confirm wires the paper ledger: a 345 bps
+        // custom tier lands per mint, while an unreadable tier (None)
+        // keeps the standard 125 bps default.
+        for (fee, want) in [(Some(345.0), 345.0), (None, 125.0)] {
+            let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+            let mut reserves = StubReserves::with_tick(tick("MINT", 2.0));
+            reserves.fee_bps = fee;
+            let pipe = pipeline_screened(
+                Settings::from_map(&HashMap::new()),
+                AuditOutcome::Allow(100),
+                reserves,
+                PaperPortfolio::new(100.0, 0.0),
+                screener,
+                None,
+            );
+            pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+                .await;
+            pipe.poll_gates().await;
+            assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+            assert!(
+                (pipe.portfolio.lock().await.venue_fee_for("MINT") - want).abs() < 1e-9,
+                "fee={fee:?}"
+            );
+        }
     }
 
     #[tokio::test]

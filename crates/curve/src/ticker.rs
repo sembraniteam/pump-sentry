@@ -91,6 +91,10 @@ pub struct CurveTicker {
     /// is bounded by distinct mints ever confirmed (arbitrary eviction
     /// past the cap — order-free, since no entry is hotter than another).
     decimals: Arc<Mutex<HashMap<String, u8>>>,
+    /// FeeConfig/Global cache for [`CurveTicker::venue_fee_bps`]:
+    /// program-owned globals change only on upgrades (hour TTL), while
+    /// the per-curve account stays fresh per call.
+    fee_inputs: crate::fee::FeeInputsCache,
 }
 
 /// Cap for the decimals cache (distinct confirmed mints; arbitrary
@@ -134,6 +138,7 @@ impl CurveTicker {
             sol_feed,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decimals: Arc::new(Mutex::new(HashMap::new())),
+            fee_inputs: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -224,6 +229,22 @@ impl CurveTicker {
         }
         cache.insert(mint.to_string(), decimals);
         Ok(decimals)
+    }
+
+    /// Venue fee (protocol + coin creator, bps/side) for one curve's fee
+    /// tier, read live: curve account (quote kind + coin override) plus
+    /// the cached FeeConfig/Global inputs. `None` on any failure or on a
+    /// multi-tier schedule — callers keep the standard 125 bps tier.
+    /// Confirm-path only (bounded deadline, no retry): a missing tier
+    /// must not stall the gate.
+    pub async fn venue_fee_bps(&self, curve: &str) -> Option<f64> {
+        let key =
+            Pubkey::from_str(curve).map_err(|_| CurveError::BadCurveKey(curve.to_string())).ok()?;
+        let fee = crate::fee::venue_fee_bps(&self.rpc, &self.fee_inputs, &key).await;
+        if fee.is_none() {
+            debug!(%curve, "venue fee unreadable; paper keeps the standard tier");
+        }
+        fee
     }
 
     /// Poll loop: `getMultipleAccounts` per round, one tick per curve.

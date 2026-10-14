@@ -10,9 +10,13 @@ use crate::fallback::evaluate_metrics_fallback;
 use crate::schema::{RiskProfile, TokenMetrics, build_prompt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Skill-mandated inference deadline: fall back after 300ms.
 pub const FALLBACK_TIMEOUT: Duration = Duration::from_millis(300);
@@ -152,6 +156,9 @@ pub struct RiskEngine {
     timeout: Duration,
     temperature: f32,
     max_tokens: u32,
+    /// Heuristic-fallback count (observability: silent model trouble
+    /// hides outages; `fallback_count` exposes the fallback rate).
+    fallback_count: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for RiskEngine {
@@ -202,7 +209,13 @@ impl RiskEngine {
             timeout,
             temperature: b.temperature.clamp(0.0, 1.0),
             max_tokens,
+            fallback_count: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Heuristic-fallback count since construction (all fallback causes).
+    pub fn fallback_count(&self) -> u64 {
+        self.fallback_count.load(Ordering::Relaxed)
     }
 
     /// Evaluate metrics: model inference within budget, else heuristic.
@@ -237,13 +250,19 @@ impl RiskEngine {
                 source: DecisionSource::Model,
             },
             Ok(None) => {
-                debug!("inference unusable; using heuristic fallback");
+                self.fallback_count.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    endpoint = %self.endpoint, model = %self.model,
+                    fallbacks = self.fallback_count(),
+                    "inference unusable; using heuristic fallback"
+                );
                 RiskDecision {
                     profile: evaluate_metrics_fallback(metrics),
                     source: DecisionSource::Fallback,
                 }
             }
             Err(_) => {
+                self.fallback_count.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "inference exceeded {:?}; using heuristic fallback",
                     self.timeout
@@ -274,18 +293,18 @@ impl RiskEngine {
         let response = match req.send().await {
             Ok(response) => response,
             Err(e) => {
-                debug!(error = %e, "inference request failed");
+                warn!(endpoint = %self.endpoint, model = %self.model, error = %e, "inference request failed; using heuristic fallback");
                 return None;
             }
         };
         if !response.status().is_success() {
-            debug!(status = ?response.status(), "inference non-2xx status");
+            warn!(endpoint = %self.endpoint, model = %self.model, status = ?response.status(), "inference non-2xx status; using heuristic fallback");
             return None;
         }
         let body: ChatResponse = match response.json().await {
             Ok(body) => body,
             Err(e) => {
-                debug!(error = %e, "inference body decode failed");
+                warn!(endpoint = %self.endpoint, model = %self.model, error = %e, "inference body decode failed; using heuristic fallback");
                 return None;
             }
         };
@@ -295,12 +314,12 @@ impl RiskEngine {
         let profile: RiskProfile = match serde_json::from_str(json) {
             Ok(profile) => profile,
             Err(e) => {
-                debug!(error = %e, content, "inference output not in schema");
+                warn!(endpoint = %self.endpoint, model = %self.model, error = %e, content = %truncate200(json), "inference output not in schema; using heuristic fallback");
                 return None;
             }
         };
         if !profile.is_valid() {
-            debug!(?profile, "inference profile failed validation");
+            warn!(endpoint = %self.endpoint, model = %self.model, ?profile, "inference profile failed validation; using heuristic fallback");
             return None;
         }
         Some(profile)
@@ -348,6 +367,20 @@ struct ChatChoice {
 struct ChatContent {
     #[serde(default)]
     content: String,
+}
+
+/// Cut model output to 200 chars for log lines (full bodies belong in
+/// debug traces, not warn spam on the hot path).
+fn truncate200(s: &str) -> String {
+    const MAX: usize = 200;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut end = MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Remove one layer of markdown fencing, if present.
@@ -549,5 +582,22 @@ mod tests {
         let decision = fast_engine(&base).evaluate(&metrics()).await;
         assert_eq!(decision.source, DecisionSource::Model);
         assert_eq!(decision.profile.action, Action::Pass);
+    }
+
+    #[tokio::test]
+    async fn fallback_count_tracks_model_trouble() {
+        let base = serve_scripted(vec![(0, 500, "{}")]).await;
+        let engine = fast_engine(&base);
+        assert_eq!(engine.fallback_count(), 0);
+        let decision = engine.evaluate(&metrics()).await;
+        assert_eq!(decision.source, DecisionSource::Fallback);
+        assert_eq!(engine.fallback_count(), 1);
+    }
+
+    #[test]
+    fn truncate200_caps_long_output() {
+        let long = "x".repeat(500);
+        assert_eq!(super::truncate200(&long).chars().count(), 201);
+        assert_eq!(super::truncate200("short"), "short");
     }
 }

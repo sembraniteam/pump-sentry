@@ -8,7 +8,8 @@
 use crate::settings::now_secs;
 use crate::wal;
 use executor::{BuyOrder, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, parse_pubkey};
-use simulator::FillModel;
+use ids::{ATA_RENT_LAMPORTS, BASE_TX_FEE_LAMPORTS};
+use simulator::{FillModel, Side};
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
@@ -27,6 +28,15 @@ pub const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 /// trade + fees, so a fee-blind guard spends the slippage budget on
 /// baseline cost (a 1.15%-short guard failed live with 6002).
 pub const VENUE_FEE_BPS: u64 = 125;
+/// Spend-guard fee ceiling: covers custom `coin_creator_fee_bps` overrides
+/// (observed 250 bps creator + 95 bps protocol = 345 total) with margin.
+/// Sizing still uses [`VENUE_FEE_BPS`] (live standard tier); the guard uses
+/// this max so custom-fee coins fail on price, never on 6002 underfunding.
+pub const VENUE_FEE_GUARD_BPS: u64 = 400;
+const _: () = {
+    assert!(VENUE_FEE_GUARD_BPS >= VENUE_FEE_BPS);
+    assert!(VENUE_FEE_GUARD_BPS >= 345);
+};
 
 /// Live-trade failures: bad inputs or dispatch errors.
 #[derive(Error, Debug)]
@@ -176,7 +186,7 @@ pub fn plan_buy(
     }
     // Paper parity: the ledger fills at quote*(1+slip), so size from the
     // filled price (floored — never oversize custody past 2^53 either).
-    let slip = FillModel::default().slip_fraction(notional_usd, liquidity_usd);
+    let slip = FillModel::default().slip_fraction(Side::Long, notional_usd, liquidity_usd);
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
     let amount_f = (notional_usd / price_usd / (1.0 + slip) * scale).floor();
     let amount_tokens = u64_from_f64_floor(amount_f)?;
@@ -186,11 +196,15 @@ pub fn plan_buy(
     let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
     // Venue fee first (exact integer ceil in u128; the narrowing
     // `try_from` fails closed if the fee tips a near-max guard over
-    // u64::MAX), then the slippage ceiling. The fee engine downstream
-    // recomputes fee-inclusively but is clamped to this guard, so
-    // pre-paying the fee here never double-counts.
+    // u64::MAX), then the slippage ceiling. Sizing reserves the standard
+    // 125 bps tier; the GUARD uses the max tier so custom creator-fee
+    // coins (up to 345 observed) never 6002 on underfunding — the fee
+    // engine downstream recomputes fee-inclusively but is clamped to this
+    // guard, so pre-paying here never double-counts standard coins and
+    // only over-reserves custom ones (fail on price, not on funding).
     let with_fee = u64::try_from(
-        (u64_from_f64_floor(lamports)? as u128 * (10_000 + VENUE_FEE_BPS) as u128).div_ceil(10_000),
+        (u64_from_f64_floor(lamports)? as u128 * (10_000 + VENUE_FEE_GUARD_BPS) as u128)
+            .div_ceil(10_000),
     )
     .ok()?;
     // One guard constructor everywhere (ceiling math): the float quote
@@ -230,18 +244,23 @@ pub fn plan_sell_floor(
     // floor starts from modeled proceeds (a bare-quote floor would price
     // above reality and fail the fill on-chain).
     let gross_notional = amount_tokens as f64 / scale * price_usd;
-    let slip = FillModel::default().slip_fraction(gross_notional, liquidity_usd);
+    let slip = FillModel::default().slip_fraction(Side::Short, gross_notional, liquidity_usd);
     let lamports = gross_notional * (1.0 - slip).max(0.0) / sol_usd * LAMPORTS_PER_SOL;
     // Same `>=` boundary as `plan_buy`: `u64::MAX as f64` is 2^64, and
     // `as u64` below saturates past the max.
     if !lamports.is_finite() || lamports <= 0.0 || lamports >= u64::MAX as f64 {
         return None;
     }
-    // `as u64` saturates past the max — the check above fails closed
-    // first, like `plan_buy` (a saturating floor would authorize a jumbo
-    // `min_sol_output`... which fails closed downstream anyway, but an
-    // unguardable quote must never dispatch).
-    let floor = (lamports * (10_000.0 - slippage_bps as f64) / 10_000.0).floor() as u64;
+    // Integer mul-div floor in u128: the old float
+    // `(lamports * (10000-bps)/10000).floor() as u64` loses integer
+    // precision past 2^53, while lamports are exact integers — floor the
+    // quote to whole lamports first, then apply the margin with integer
+    // math (floor by construction via `/`).
+    let base = lamports.floor() as u64;
+    if base == 0 {
+        return None;
+    }
+    let floor = (base as u128 * (10_000 - slippage_bps as u128) / 10_000) as u64;
     if floor == 0 {
         return None;
     }
@@ -351,16 +370,32 @@ impl LiveTrader {
     }
 
     /// Per-dispatch on-chain overhead in lamports: Jito tip plus the
-    /// priority fee (`ceil(limit * price / 1e6)`), saturating instead of
-    /// wrapping on absurd configs. The breaker prices this into USD so
+    /// priority fee (`ceil(limit * price / 1e6)`) plus the base
+    /// transaction fee ([`BASE_TX_FEE_LAMPORTS`], single-sourced in
+    /// `ids`), saturating instead of wrapping on absurd configs. Covers
+    /// every dispatch (buy or sell). The breaker prices this into USD so
     /// the day-loss gate sees live bleed, not paper-only profit.
+    /// First-buy-per-mint ATA rent is NOT included here — see
+    /// [`first_touch_cost_lamports`](Self::first_touch_cost_lamports).
     pub fn dispatch_cost_lamports(&self) -> u64 {
         let prio = (self.compute_unit_limit as u128)
             .saturating_mul(self.priority_fee_micro_lamports as u128)
             .saturating_add(999_999)
             / 1_000_000;
         let prio = u64::try_from(prio).unwrap_or(u64::MAX);
-        self.tip_lamports.saturating_add(prio)
+        self.tip_lamports
+            .saturating_add(prio)
+            .saturating_add(BASE_TX_FEE_LAMPORTS)
+    }
+
+    /// First-buy-per-mint all-in cost: dispatch overhead plus one
+    /// [`ATA_RENT_LAMPORTS`] reserve for creating the user's ATA (rent is
+    /// recoverable on close but a real same-day outflow for the gate).
+    /// Use on the buy fast-path and the recheck-confirm path; sells and
+    /// repeat buys use [`dispatch_cost_lamports`](Self::dispatch_cost_lamports).
+    pub fn first_touch_cost_lamports(&self) -> u64 {
+        self.dispatch_cost_lamports()
+            .saturating_add(ATA_RENT_LAMPORTS)
     }
 
     /// Run `f` under the pending-tracker lock. Single home for the
@@ -922,8 +957,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slippage_ceiling_covers_fee_inclusive_quotes() {
-        // The frozen 6002 log: quote required 1_668_970, guard sent
+    fn slippage_ceiling_covers_fee_inclusive_quotes() {        // The frozen 6002 log: quote required 1_668_970, guard sent
         // 1_650_001 (1.15% short). At 100bps the guard must be
         // ceil(1_668_970 * 1.01) = 1_685_660 — above `Right`, never
         // equal-or-below it.
@@ -943,13 +977,14 @@ mod tests {
     #[test]
     fn buy_plan_math() {
         // $10 at $0.0000042 into $30k liquidity: the paper fill model
-        // takes fee + impact first, so live sizes ~2.3508M tokens
-        // (2_350_783_986_459 base units) — identical inputs size
-        // identically on both legs.
+        // takes fee + exact constant-product impact first, so live sizes
+        // ~2.3508M tokens (2_350_783_728_484 base units) — identical
+        // inputs size identically on both legs.
         let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0).expect("plan");
-        assert_eq!(plan.amount_tokens, 2_350_783_986_459);
-        // $10 ≈ 66.67M lamports + 1.25% venue fee, then + 2% slippage guard.
-        assert_eq!(plan.max_sol_cost, 68_850_000);
+        assert_eq!(plan.amount_tokens, 2_350_783_728_484);
+        // $10 ≈ 66.67M lamports + 4% guard fee (covers custom creator
+        // tiers), then + 2% slippage guard → 70_720_000.
+        assert_eq!(plan.max_sol_cost, 70_720_000);
     }
 
     #[test]
@@ -965,9 +1000,10 @@ mod tests {
     #[test]
     fn sell_floor_math() {
         // 1e6 units (1 token) at $2, SOL $150: model proceeds land
-        // below quote (fee + impact), then − 2% margin → 12_902_462.
+        // below quote (fee + impact), then − 2% margin via integer
+        // mul-div floor → 12_902_461.
         let floor = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0).expect("floor");
-        assert_eq!(floor, 12_902_462);
+        assert_eq!(floor, 12_902_461);
     }
 
     #[test]
@@ -998,6 +1034,19 @@ mod tests {
         assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_001, 30_000.0), None);
         // Sub-lamport dust floors to 0: no unprotected dispatch.
         assert_eq!(plan_sell_floor(1, 1e-9, 1e9, 200, 30_000.0), None);
+    }
+
+    #[test]
+    fn sell_floor_uses_integer_math_at_1_lamport_boundary() {
+        // Integer mul-div floor: ~1.31 lamports of modeled proceeds floor
+        // to base 1; 0bps keeps 1, any margin floors to 0 → rejected
+        // (never an unprotected dispatch).
+        assert_eq!(plan_sell_floor(1, 0.2, 150.0, 0, f64::NAN), Some(1));
+        assert_eq!(plan_sell_floor(1, 0.2, 150.0, 1, f64::NAN), None);
+        // Exactness of the integer path: 10_001 at 1bps floors to 9_999,
+        // never rounded up by f64.
+        let floored = (10_001u64 as u128 * (10_000 - 1) as u128 / 10_000) as u64;
+        assert_eq!(floored, 9_999);
     }
 
     #[test]
@@ -1079,5 +1128,53 @@ mod tests {
         assert!(replay.pending.is_empty(), "tombstone retires the poll");
         assert_eq!(replay.manual.len(), 1);
         assert_eq!(replay.manual[0].position.mint, "MINT");
+    }
+
+    fn cost_trader(tip_lamports: u64, unit_limit: u32, unit_price: u64) -> LiveTrader {
+        // Throwaway wallet: cost math never touches the network, the
+        // executor is just ballast for the constructor.
+        use executor::WalletGuard;
+        use solana_commitment_config::CommitmentConfig;
+        use solana_keypair::Keypair;
+        let keypair = Keypair::new();
+        let wallet =
+            WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
+                .expect("wallet");
+        let exec = SwapExecutor::new(
+            "https://api.mainnet-beta.solana.com",
+            CommitmentConfig::confirmed(),
+            wallet,
+        )
+        .expect("executor");
+        LiveTrader::new(exec, 200, tip_lamports).with_dispatch_fees(unit_limit, unit_price)
+    }
+
+    #[test]
+    fn dispatch_cost_includes_base_fee() {
+        // tip 10_000 + prio ceil(200_000 * 1_000 / 1e6) = 200, plus the
+        // 5_000 base fee single-sourced in `ids`.
+        let trader = cost_trader(10_000, 200_000, 1_000);
+        assert_eq!(
+            trader.dispatch_cost_lamports(),
+            10_000 + 200 + BASE_TX_FEE_LAMPORTS
+        );
+        // Zero-fee config still pays the base fee: no free dispatch.
+        let bare = cost_trader(0, 0, 0);
+        assert_eq!(bare.dispatch_cost_lamports(), BASE_TX_FEE_LAMPORTS);
+    }
+
+    #[test]
+    fn first_touch_adds_ata_rent() {
+        // First buy per mint = dispatch overhead + one ATA rent reserve.
+        let trader = cost_trader(10_000, 200_000, 1_000);
+        assert_eq!(
+            trader.first_touch_cost_lamports(),
+            trader.dispatch_cost_lamports() + ATA_RENT_LAMPORTS
+        );
+        let bare = cost_trader(0, 0, 0);
+        assert_eq!(
+            bare.first_touch_cost_lamports(),
+            BASE_TX_FEE_LAMPORTS + ATA_RENT_LAMPORTS
+        );
     }
 }

@@ -5,9 +5,12 @@
 //! liquidity. [`CurveTicker`] polls watched curves over HTTP RPC and
 //! emits [`PriceTick`]s for the exit engine.
 
+pub mod fee;
 pub mod layout;
 pub mod sol_feed;
 pub mod ticker;
+
+pub use fee::{FEE_CACHE_TTL, FEE_TIMEOUT, FeeInputsCache};
 
 pub use layout::{
     BONDING_CURVE_DISCRIMINATOR, BONDING_CURVE_MIN_LEN, BondingCurveReserves, COMPLETE_FLAG_OFFSET,

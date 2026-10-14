@@ -92,6 +92,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
     /// Register a migrated Raydium pool for post-migration price tracking.
     /// PumpSwap migrations carry no pool: nothing to follow.
+    /// Raydium follows are price-only (spike cards, never swaps — no
+    /// Raydium swap builder yet).
     async fn follow_pool(&self, mint: &str, report: &MigrationReport) {
         let (Some(amm), Some(base_vault), Some(quote_vault)) = (
             report.amm_id.clone(),
@@ -129,8 +131,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     }
 
     /// One post-migration pool tick: seed the entry on first sight, then
-    /// alert once the price doubles off it. Paper tracking only — entries
-    /// need a Raydium swap builder (future work).
+    /// alert once the price doubles off it. Paper tracking only (price
+    /// cards, never swaps — PumpSwap carries no pool, and Raydium has no
+    /// swap builder yet); entries need a Raydium swap builder (future work).
     pub async fn on_pool_tick(&self, tick: &PoolTick) {
         // Validate at the boundary: non-finite/non-positive prices must not
         // seed baselines or trigger alerts; stale ticks are dropped.

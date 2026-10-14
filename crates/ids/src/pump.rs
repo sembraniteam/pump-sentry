@@ -138,6 +138,18 @@ pub const CURVE_MIN_LEN: usize = 115;
 /// Offset of the complete flag byte in curve data (verified live:
 /// 1 on two migrated curves with zeroed reserves).
 pub const CURVE_COMPLETE_OFFSET: usize = 48;
+/// Offset of the coin's own creator-fee rate (u64le bps, 0 = unconfigured
+/// → schedule rate) in curve data. Proven by the executor's dispatch
+/// path (`CurveState::coin_creator_fee_bps` reads here); needs
+/// `115..123`, so shorter blobs fail closed to the default tier.
+pub const CURVE_COIN_CREATOR_FEE_OFFSET: usize = 115;
+/// End offset (exclusive) of the coin-creator-fee slot in curve data.
+pub const CURVE_COIN_CREATOR_FEE_END: usize = 123;
+/// Offset of the `creator_fee_configurable` gate byte in the Global
+/// account (1088 bytes; 1 = the coin's own rate wins when nonzero).
+/// Proven transitively by the buyback array at 741..997 matching the
+/// published 8-list in order (see the executor's fee engine).
+pub const GLOBAL_FEE_GATE_OFFSET: usize = 1045;
 /// Seed for user volume-accumulator PDAs: `["user_volume_accumulator",
 /// user]`. Verified byte-exact against a live mayhem buy.
 pub const USER_VOLUME_ACCUMULATOR_SEED: &[u8] = b"user_volume_accumulator";

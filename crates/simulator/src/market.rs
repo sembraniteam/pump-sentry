@@ -14,15 +14,19 @@ use crate::types::{ExitReason, Position, Side};
 pub enum FillModel {
     /// Fill exactly at the quote (for benchmarks / tests).
     Exact,
-    /// Bonding-curve cost: `slip_frac = size_frac + fee_frac`, where
-    /// `size_frac = notional_usd / liquidity_usd` is the exact
-    /// first-order constant-product impact (dx/x per side) and
-    /// `fee_frac = fee_bps_per_side / 10_000` is the venue fee —
-    /// 125 bps on Pump.fun (0.95% protocol + 0.30% creator), identical on
-    /// buys and sells, so a flat round trip costs ~2.53% before impact.
-    /// Clamped to `max_slip_frac`. Calibrated 2026-10-11 against
-    /// pump.fun/docs/fees after the old 50bps/1% linear model understated
-    /// a $10-into-$4500 fill by ~13x (live round trips measured 2–4%).
+    /// Bonding-curve cost: exact asymmetric constant-product impact plus
+    /// the venue fee, clamped to `max_slip_frac`, where
+    /// `s = notional_usd / liquidity_usd` and
+    /// `fee_frac = fee_bps_per_side / 10_000`:
+    ///
+    /// - buys (liquidity removal): `slip = s/(1-s) + fee_frac`;
+    /// - sells (liquidity addition): `slip = s/(1+s) + fee_frac`.
+    ///
+    /// The 125bps venue fee on Pump.fun (0.95% protocol + 0.30% creator)
+    /// is identical on buys and sells, so a flat round trip costs ~2.53%
+    /// before impact. Calibrated 2026-10-11 against pump.fun/docs/fees
+    /// after the old 50bps/1% linear model understated a $10-into-$4500
+    /// fill by ~13x (live round trips measured 2–4%).
     BondingCurve {
         /// Venue fee per side in basis points (125.0 on Pump.fun).
         fee_bps_per_side: f64,
@@ -41,14 +45,46 @@ impl Default for FillModel {
 }
 
 impl FillModel {
-    /// Total cost fraction for one side: constant-product impact plus
-    /// venue fee, clamped to the cap. Fee-only when liquidity is unknown
-    /// (non-finite or non-positive).
+    /// Venue fee in bps for the bonding-curve leg (`0.0` for [`FillModel::Exact`]).
+    pub fn venue_fee_bps(&self) -> f64 {
+        match *self {
+            FillModel::Exact => 0.0,
+            FillModel::BondingCurve {
+                fee_bps_per_side, ..
+            } => fee_bps_per_side.max(0.0),
+        }
+    }
+
+    /// Same model with the venue fee replaced (custom `coin_creator_fee_bps`
+    /// coins price 250+ bps creator instead of the standard 30). Negative
+    /// inputs clamp to zero like [`FillModel::slip_fraction`]; `Exact`
+    /// is returned unchanged (no venue leg to retier).
+    pub fn with_venue_fee_bps(&self, fee_bps_per_side: f64) -> Self {
+        match *self {
+            FillModel::Exact => FillModel::Exact,
+            FillModel::BondingCurve { max_slip_frac, .. } => FillModel::BondingCurve {
+                fee_bps_per_side: fee_bps_per_side.max(0.0),
+                max_slip_frac,
+            },
+        }
+    }
+
+    /// Total cost fraction for one side: exact constant-product impact
+    /// plus venue fee, clamped to the cap. Fee-only when liquidity is
+    /// unknown (non-finite or non-positive). `side` selects the impact
+    /// leg: buys (`Long`) pay `s/(1-s)`, sells (`Short`) pay `s/(1+s)`,
+    /// where `s = notional_usd / liquidity_usd`.
     ///
     /// Negative `fee_bps_per_side`/`max_slip_frac` are trusted-config
     /// mistakes: they clamp to zero (debug-asserted) rather than
     /// understating costs. Validate user-supplied configs upstream.
-    pub fn slip_fraction(&self, notional_usd: f64, liquidity_usd: f64) -> f64 {
+    pub fn slip_fraction(&self, side: Side, notional_usd: f64, liquidity_usd: f64) -> f64 {
+        self.slip_fraction_for_side(side, notional_usd, liquidity_usd)
+    }
+
+    /// Side-aware slip fraction (single home for the impact math;
+    /// [`FillModel::slip_fraction`] delegates here).
+    pub fn slip_fraction_for_side(&self, side: Side, notional_usd: f64, liquidity_usd: f64) -> f64 {
         if let FillModel::BondingCurve {
             fee_bps_per_side,
             max_slip_frac,
@@ -76,7 +112,23 @@ impl FillModel {
         } else {
             0.0
         };
-        (size + fee).clamp(0.0, cap)
+        let impact = match *self {
+            FillModel::Exact => 0.0,
+            FillModel::BondingCurve { .. } => match side {
+                // Buy removes base liquidity: dx/x = s/(1-s); s >= 1
+                // drains the pool (infinite impact → clamped to cap).
+                Side::Long => {
+                    if size >= 1.0 {
+                        f64::INFINITY
+                    } else {
+                        size / (1.0 - size)
+                    }
+                }
+                // Sell adds base liquidity back: dx/x = s/(1+s).
+                Side::Short => size / (1.0 + size),
+            },
+        };
+        (impact + fee).clamp(0.0, cap)
     }
     /// Convert a quote into an execution price.
     ///
@@ -91,7 +143,7 @@ impl FillModel {
         if !quote.is_finite() || quote <= 0.0 || !notional_usd.is_finite() || notional_usd <= 0.0 {
             return quote;
         }
-        let slip = self.slip_fraction(notional_usd, liquidity_usd);
+        let slip = self.slip_fraction_for_side(side, notional_usd, liquidity_usd);
         match side {
             Side::Long => quote * (1.0 + slip),
             Side::Short => quote * (1.0 - slip).max(0.0),
@@ -197,14 +249,32 @@ mod tests {
             fee_bps_per_side: 125.0,
             max_slip_frac: 0.25,
         };
-        // 1% of liquidity: 1% impact + 1.25% fee = 2.25% against.
+        // 1% of liquidity: exact constant-product impact is asymmetric —
+        // buy s/(1-s) = 1.0101% + 1.25% fee = 2.2601% against,
+        // sell s/(1+s) = 0.9901% + 1.25% fee = 2.2401% against.
         let buy = model.fill_price(Side::Long, 1.0, 100.0, 10_000.0);
-        assert!((buy - 1.0225).abs() < 1e-12, "buy={buy}");
+        assert!((buy - 1.022_601_010_101_01).abs() < 1e-12, "buy={buy}");
         let sell = model.fill_price(Side::Short, 1.0, 100.0, 10_000.0);
-        assert!((sell - 0.9775).abs() < 1e-12, "sell={sell}");
-        // Cap binds on huge size.
+        assert!((sell - 0.977_599_009_900_99).abs() < 1e-12, "sell={sell}");
+        // 10% of liquidity: buy 11.111% + fee, sell 9.0909% + fee.
+        let buy10 = model.slip_fraction_for_side(Side::Long, 1_000.0, 10_000.0);
+        assert!(
+            (buy10 - (0.1 / 0.9 + 0.0125)).abs() < 1e-12,
+            "buy10={buy10}"
+        );
+        let sell10 = model.slip_fraction_for_side(Side::Short, 1_000.0, 10_000.0);
+        assert!(
+            (sell10 - (0.1 / 1.1 + 0.0125)).abs() < 1e-12,
+            "sell10={sell10}"
+        );
+        // Cap binds on huge size (both sides).
         let capped = model.fill_price(Side::Long, 1.0, 10_000_000.0, 10_000.0);
         assert!((capped - 1.25).abs() < 1e-12, "capped={capped}");
+        let capped_sell = model.fill_price(Side::Short, 1.0, 10_000_000.0, 10_000.0);
+        assert!(
+            (capped_sell - 0.75).abs() < 1e-12,
+            "capped_sell={capped_sell}"
+        );
     }
 
     #[test]

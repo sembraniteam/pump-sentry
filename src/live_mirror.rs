@@ -435,9 +435,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // same mint (paper is live-backed again).
                 self.exec.clear_diverged(mint).await;
                 // Real dispatch cost hits the day-loss gate now (tip +
-                // priority fee left the wallet whether or not the trade
-                // wins).
-                let buy_tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
+                // priority fee + base fee left the wallet whether or not
+                // the trade wins, plus one ATA rent reserve: this is the
+                // first touch of a new mint).
+                let buy_tip_usd =
+                    trader.first_touch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
                 if buy_tip_usd.is_finite() && buy_tip_usd > 0.0 {
                     self.daily.lock().await.record(-buy_tip_usd, now_secs());
                     self.portfolio.lock().await.debit_dispatch_cost(buy_tip_usd);
@@ -515,11 +517,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     trader.acknowledge_buy(&recheck.position, &recheck.bundle_id);
                     self.exec.insert_tracked(recheck.position).await;
                     self.exec.clear_diverged(&mint).await;
-                    // Same dispatch-cost accounting as the fast path: the
-                    // tip left the wallet even though the fill landed late.
+                    // Same first-touch accounting as the fast path: the
+                    // dispatch overhead plus one ATA rent reserve left
+                    // the wallet even though the fill landed late.
                     // Stale feed → skip (never invent a conversion rate).
                     if let Some(sol_usd) = self.sol_feed.price() {
-                        let tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
+                        let tip_usd =
+                            trader.first_touch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
                         if tip_usd.is_finite() && tip_usd > 0.0 {
                             self.daily.lock().await.record(-tip_usd, now_secs());
                             self.portfolio.lock().await.debit_dispatch_cost(tip_usd);
@@ -660,9 +664,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // The corresponding paper PnL was deferred while holding;
                 // the fill settles it now.
                 self.flush_deferred_pnl(mint).await;
-                // Real dispatch cost: tip + priority fee left the wallet,
-                // so the day-loss gate sees live bleed, not paper-only
-                // profit.
+                // Real dispatch cost: tip + priority fee + base fee left
+                // the wallet, so the day-loss gate sees live bleed, not
+                // paper-only profit. Sells never touch ATA rent (the
+                // account already exists), so plain dispatch cost here.
                 let tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
                 if tip_usd.is_finite() && tip_usd > 0.0 {
                     self.daily.lock().await.record(-tip_usd, now_secs());
@@ -799,7 +804,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             match portfolio.close_position(id, tick.price_usd, tick.liquidity_usd, ExitReason::Manual, tick.observed_at) {
                 Ok(trade) => {
                     closed_pnls.push(trade.net_pnl);
-                    let equity = portfolio.snapshot(&HashMap::new()).equity;
+                    // Realizable equity at this tick (same rule as the
+                    // auto-exit path): the manual card deducts exit
+                    // costs for survivors instead of book value.
+                    let mut marks: HashMap<String, simulator::Mark> = HashMap::new();
+                    marks.insert(
+                        tick.mint.clone(),
+                        simulator::Mark {
+                            price: tick.price_usd,
+                            liquidity_usd: tick.liquidity_usd,
+                        },
+                    );
+                    let equity = portfolio.snapshot(&marks).equity;
                     info!(mint = %tick.mint, id, reason = ?trade.reason,
                         net = format!("{:+.2}", trade.net_pnl), "paper position closed (manual sell)");
                     closed_cards.push((

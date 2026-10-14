@@ -833,10 +833,20 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
         "SIM logs:\n{}",
         res.value.logs.as_ref().map(|l| l.join("\n")).unwrap_or_default()
     );
-    assert!(
-        res.value.err.is_none(),
-        "mayhem extended buy simulation failed: {:?}",
-        res.value.err
-    );
+    // Attribute the failure: a funding move between hunt and sim (buyer
+    // drained, curve graduated mid-flight) surfaces as `insufficient
+    // funds` inside a TransferChecked — a stale sample, not a layout
+    // bug. Fail loudly either way, but label flaky samples as reruns so
+    // a red run is never misread as a mapping regression (observed once:
+    // same code GREEN on rerun with a fresh sample).
+    if let Some(err) = &res.value.err {
+        let logs = res.value.logs.as_ref().map(|l| l.join("\n")).unwrap_or_default();
+        if logs.contains("insufficient funds") {
+            panic!(
+                "FLAKY SAMPLE (funds moved between hunt and sim); rerun for a fresh launch: {err:?}"
+            );
+        }
+        panic!("mayhem extended buy simulation failed: {err:?}");
+    }
     println!("MAYHEM BUY GREEN mint={}", ev.mint);
 }

@@ -39,7 +39,7 @@ use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
 pub use ids::{
-    ASSOCIATED_TOKEN_PROGRAM_ID, BUYBACK_FEE_RECIPIENTS,
+    ASSOCIATED_TOKEN_PROGRAM_ID, BUYBACK_FEE_RECIPIENTS, COMPUTE_BUDGET_PROGRAM_ID,
     CURVE_CASHBACK_FLAG_OFFSET, CURVE_COMPLETE_OFFSET, CURVE_CREATOR_END, CURVE_CREATOR_OFFSET,
     CURVE_MAYHEM_FLAG_OFFSET, CURVE_MIN_LEN, CURVE_QUOTE_MINT_END, CURVE_QUOTE_MINT_OFFSET,
     DEFAULT_BUYBACK_FEE_RECIPIENT, EVENT_AUTHORITY, FEE_CONFIG_ACCOUNT, FEE_CONFIG_PROGRAM,
@@ -290,10 +290,6 @@ pub fn user_ata_with_program(owner: &Pubkey, mint: &Pubkey, token_program: &Pubk
 fn pubkey_into_theirs(key: &Pubkey) -> Pubkey {
     Pubkey::new_from_array(key.to_bytes())
 }
-
-/// Compute Budget program (canonical, stable across SDK versions).
-pub const COMPUTE_BUDGET_PROGRAM_ID: Pubkey =
-    Pubkey::from_str_const("ComputeBudget111111111111111111111111111111");
 
 /// Build the compute-budget prefix: `SetComputeUnitLimit` then
 /// `SetComputeUnitPrice` (runtime convention: limit before price).
