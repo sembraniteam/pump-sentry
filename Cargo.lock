@@ -1444,6 +1444,7 @@ dependencies = [
  "bs58",
  "ids",
  "listener",
+ "migration",
  "reqwest 0.13.5",
  "serde_json",
  "solana-client",

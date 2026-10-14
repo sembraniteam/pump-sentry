@@ -50,6 +50,11 @@ pub enum PortfolioError {
     /// Mint must be a non-empty address string.
     #[error("invalid mint: {0:?}")]
     InvalidMint(String),
+    /// Position-id space exhausted (2^64 opens without restart).
+    /// Unreachable in practice; fail-closed instead of reusing an id
+    /// (a silent reuse would overwrite a live position).
+    #[error("position id space exhausted")]
+    IdExhausted,
 }
 
 /// Pro-rata slice of a position being settled. Owns its data so the
@@ -243,7 +248,10 @@ impl PaperPortfolio {
 
     /// Override the fill model (default: bonding-curve cost model).
     /// Per-mint venue overrides survive: they re-tier whatever model is
-    /// installed here.
+    /// installed here — except [`FillModel::Exact`], which has no venue
+    /// leg, so overrides are silently inert under it. Production always
+    /// runs the bonding-curve model; use `Exact` only for fee-free
+    /// benchmarks, never to price custom-fee coins.
     pub fn with_fill_model(mut self, fill: FillModel) -> Self {
         self.fill = fill;
         self
@@ -268,7 +276,10 @@ impl PaperPortfolio {
 
     /// Effective venue fee (bps/side) for one mint: override or default.
     pub fn venue_fee_for(&self, mint: &str) -> f64 {
-        self.venue_fees.get(mint).copied().unwrap_or_else(|| self.fill.venue_fee_bps())
+        self.venue_fees
+            .get(mint)
+            .copied()
+            .unwrap_or_else(|| self.fill.venue_fee_bps())
     }
 
     /// Effective fill model for one mint: base model re-tiered to the
@@ -409,9 +420,9 @@ impl PaperPortfolio {
             return Err(PortfolioError::InvalidMint(p.mint.to_string()));
         }
 
-        let entry_price = self
-            .fill_for_mint(p.mint)
-            .fill_price(p.side, quote, notional_usd, p.liquidity_usd);
+        let entry_price =
+            self.fill_for_mint(p.mint)
+                .fill_price(p.side, quote, notional_usd, p.liquidity_usd);
         let entry_fee = self.fee_for(notional_usd);
 
         // Quantity follows executed notional so slippage is accounted in size.
@@ -448,7 +459,10 @@ impl PaperPortfolio {
         // 2^64 positions is unreachable; a silent saturating reuse would
         // overwrite a live position, so fail loudly instead (precedent:
         // Borsh-encode expects elsewhere in the tree).
-        self.next_id = self.next_id.checked_add(1).expect("position id space exhausted");
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(PortfolioError::IdExhausted)?;
         self.positions.insert(
             id,
             Position {

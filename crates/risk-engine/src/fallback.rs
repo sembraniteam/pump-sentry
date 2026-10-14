@@ -11,9 +11,11 @@ pub const DEV_REPUTATION_FLOOR: f64 = 0.40;
 ///
 /// `RUGCHECK_SCORE_CAP` (350) vs the auditor's hard gate (400 in
 /// `auditor/src/policy.rs::AuditPolicy::default`): this is the softer
-/// pre-LLM triage — scores 351–400 are still *observed* but resolve to
-/// PASS here, so only the model path (or a threshold change) can buy
-/// them. Keep `RUGCHECK_SCORE_CAP <= AuditPolicy::max_score`.
+/// pre-LLM triage — and since the model prompt also passes above 350,
+/// scores 351–400 are a deliberate dead zone (observed, never bought on
+/// any path). Fail-closed by construction; narrowing the dead zone
+/// means changing the prompt AND this cap together.
+/// Keep `RUGCHECK_SCORE_CAP <= AuditPolicy::max_score`.
 pub const RUGCHECK_SCORE_CAP: u32 = 350;
 /// Skill thresholds, named for readability and testability.
 pub const HIGH_MOMENTUM_VELOCITY: u32 = 25;
@@ -73,7 +75,9 @@ pub fn evaluate_heuristic_fallback(
             timeout_seconds: 180,
             moonbag_percent: 20.0,
         }
-    } else if liq_usd >= MODERATE_MOMENTUM_LIQUIDITY_USD {
+    } else if buy_velocity_5s >= MODERATE_MOMENTUM_VELOCITY
+        && liq_usd >= MODERATE_MOMENTUM_LIQUIDITY_USD
+    {
         RiskProfile {
             action: Action::Buy,
             tp_percent: 35.0,

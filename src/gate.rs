@@ -16,7 +16,7 @@ use risk_engine::{
     Action, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics, evaluate_heuristic_fallback,
     resolve_strategy,
 };
-use simulator::{FillModel, Side};
+use simulator::Side;
 use tracing::{debug, info, warn};
 
 use crate::pipeline::{AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener};
@@ -111,6 +111,15 @@ pub fn resolve_entry_with_flag(
     }
 }
 
+/// Stop-loss floor for a venue tier: twice the per-side fee (round
+/// trip) plus a 4-point impact margin, negated. A tighter stop on a
+/// custom tier loses to venue costs before price action matters:
+/// 125 bps → −6.5% (never binds: profiles stop at −8 or wider),
+/// 345 bps → −10.9% (widens a −8 stop). Pure and unit-tested.
+fn fee_aware_sl_floor(sl_percent: f64, venue_fee_bps: f64) -> f64 {
+    sl_percent.min(-(2.0 * venue_fee_bps / 100.0 + 4.0))
+}
+
 /// Confirm-open request: one gate-confirmed signal plus its quorum.
 /// Bundles the four `confirm_open` inputs so new context cannot grow the
 /// arity again.
@@ -134,6 +143,11 @@ struct TrackedOpen<'a> {
     profile: &'a risk_engine::RiskProfile,
     allow_live: bool,
     creator: Option<&'a str>,
+    /// Venue tier read with the pricing tick (same chain state, one
+    /// fewer RPC than a separate fee call). `None` keeps the standard
+    /// tier — and is forced `None` for synthetic (override-priced)
+    /// opens, whose paper never feeds the breaker anyway.
+    venue_fee_bps: Option<f64>,
     /// SOL/USD stamped at confirm time (shared by paper + live sizing).
     /// Captured here — not re-read at dispatch — so the amount and the
     /// guard price one market, not two reads seconds apart. Freshness
@@ -653,7 +667,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let mint = req.mint;
         let signal = req.signal;
         let buyers = req.buyers;
-        let tick_result = self.reserves.fetch_tick(mint, &signal.curve).await;
+        // Pricing + venue tier from one chain state (single account read
+        // for both — a tick and a tier from two different slots could
+        // price one market and fee another).
+        let (tick_result, venue_fee) = match self
+            .reserves
+            .fetch_tick_with_fee(mint, &signal.curve)
+            .await
+        {
+            Ok((tick, fee)) => (Ok(tick), fee),
+            Err(e) => (Err(e), None),
+        };
         // A manual QUOTE_USD fallback is for paper/tests only: never let
         // real funds ride on an operator-set price when the feed is down.
         // The flag comes from the resolver itself (single source), so a
@@ -671,6 +695,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // (Pump.fun standard). A non-6 mint would misprice entries and
         // live orders by 10^Δ — drop it loudly instead of guessing.
         // Unreadable decimals fail closed for the same reason.
+        // Locked to the live sizing scale at compile time: changing one
+        // without the other diverges paper from dispatch silently.
+        const _: () = assert!(crate::live::TOKEN_DECIMALS == 6);
         match self.reserves.token_decimals(mint).await {
             Ok(6) => {}
             Ok(other) => {
@@ -749,6 +776,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             profile: &profile,
             allow_live: req.allow_live && !priced_via_override,
             creator: signal.creator.as_deref(),
+            // Synthetic paper has no market behind its quote: no tier
+            // to register (its PnL never feeds the breaker anyway).
+            venue_fee_bps: if priced_via_override { None } else { venue_fee },
             sol,
             trail_percent,
         })
@@ -799,14 +829,28 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             info!(%mint, "mint in cooldown; skipping");
             return;
         }
-        // Per-mint venue fee (custom creator tiers): one joined
-        // FeeConfig/Global/curve read, best-effort. `None` keeps the
-        // standard 125 bps tier; a custom tier re-prices this mint's
-        // paper fills to match the live dispatch exactly.
-        if let Some(bps) = self.reserves.venue_fee_bps(mint, curve).await {
+        // Per-mint venue fee (custom creator tiers), read with the pricing
+        // tick upstream — no second fetch here. `None` keeps the standard
+        // 125 bps tier; a custom tier re-prices this mint's paper fills
+        // to match the live dispatch exactly.
+        if let Some(bps) = req.venue_fee_bps {
             portfolio.set_venue_fee_for_mint(mint, bps);
-            if (bps - FillModel::default().venue_fee_bps()).abs() > f64::EPSILON {
+            if (bps - crate::live::VENUE_FEE_BPS as f64).abs() > f64::EPSILON {
                 info!(%mint, bps, "custom venue fee tier registered for paper ledger");
+            }
+        }
+        // Fee-aware stop: a stop tighter than round-trip venue costs plus
+        // margin gets eaten by fees, not alpha. Standard tiers never bind
+        // (floor −6.5% sits inside −8/−10); custom tiers widen the stop
+        // instead of booking structural losers. TP is untouched (far
+        // above costs on every tier).
+        let mut profile = *profile;
+        if let Some(bps) = req.venue_fee_bps {
+            let widened = fee_aware_sl_floor(profile.sl_percent, bps);
+            if widened < profile.sl_percent {
+                info!(%mint, sl = profile.sl_percent, widened, bps,
+                    "custom-tier stop widened past round-trip costs");
+                profile.sl_percent = widened;
             }
         }
         match portfolio.open_position_params(&simulator::OpenPositionParams {
@@ -865,5 +909,25 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
             Err(e) => warn!(%mint, error = %e, "paper open failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fee_aware_sl_floor_leaves_standard_stops() {
+        // 125 bps → floor −6.5%: profiles stop at −8 or wider already.
+        assert_eq!(fee_aware_sl_floor(-8.0, 125.0), -8.0);
+        assert_eq!(fee_aware_sl_floor(-10.0, 125.0), -10.0);
+    }
+
+    #[test]
+    fn fee_aware_sl_floor_widens_custom_tiers() {
+        // 345 bps → floor −10.9%: a −8 stop would lose to venue costs.
+        assert_eq!(fee_aware_sl_floor(-8.0, 345.0), -10.9);
+        // Already-wide stops are untouched (never tightened).
+        assert_eq!(fee_aware_sl_floor(-15.0, 345.0), -15.0);
     }
 }

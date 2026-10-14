@@ -38,6 +38,7 @@ zeroize = "1"
 
 [dev-dependencies]
 listener = { path = "../listener" }
+migration = { path = "../migration" }
 solana-message = "4"
 solana-rpc-client-api = "4.3.0"
 solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }

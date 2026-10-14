@@ -16,7 +16,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Skill-mandated inference deadline: fall back after 300ms.
 pub const FALLBACK_TIMEOUT: Duration = Duration::from_millis(300);
@@ -170,6 +170,7 @@ impl std::fmt::Debug for RiskEngine {
             .field("timeout", &self.timeout)
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
+            .field("fallback_count", &self.fallback_count())
             .finish()
     }
 }
@@ -213,7 +214,11 @@ impl RiskEngine {
         })
     }
 
-    /// Heuristic-fallback count since construction (all fallback causes).
+    /// Heuristic-fallback count since construction (model-trouble
+    /// fallbacks via [`RiskEngine::evaluate`] plus explicit
+    /// [`RiskEngine::evaluate_fallback`] calls — both resolve to the
+    /// heuristic, so both count. The engine-`None` path in the pipeline
+    /// bypasses the engine entirely and is NOT counted here.)
     pub fn fallback_count(&self) -> u64 {
         self.fallback_count.load(Ordering::Relaxed)
     }
@@ -251,7 +256,9 @@ impl RiskEngine {
             },
             Ok(None) => {
                 self.fallback_count.fetch_add(1, Ordering::Relaxed);
-                warn!(
+                // Debug, not warn: `infer` already warned the specific
+                // cause above — one warn per fallback, not two.
+                debug!(
                     endpoint = %self.endpoint, model = %self.model,
                     fallbacks = self.fallback_count(),
                     "inference unusable; using heuristic fallback"
@@ -264,8 +271,10 @@ impl RiskEngine {
             Err(_) => {
                 self.fallback_count.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    "inference exceeded {:?}; using heuristic fallback",
-                    self.timeout
+                    endpoint = %self.endpoint, model = %self.model,
+                    timeout = ?self.timeout,
+                    fallbacks = self.fallback_count(),
+                    "inference timed out; using heuristic fallback"
                 );
                 RiskDecision {
                     profile: evaluate_metrics_fallback(metrics),
@@ -276,7 +285,9 @@ impl RiskEngine {
     }
 
     /// Synchronous heuristic-only evaluation (no I/O; for tests/tools).
+    /// Counts as a fallback (it resolves to the heuristic by request).
     pub fn evaluate_fallback(&self, metrics: &TokenMetrics) -> RiskDecision {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
         RiskDecision {
             profile: evaluate_metrics_fallback(metrics),
             source: DecisionSource::Fallback,

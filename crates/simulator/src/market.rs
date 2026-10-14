@@ -22,11 +22,14 @@ pub enum FillModel {
     /// - buys (liquidity removal): `slip = s/(1-s) + fee_frac`;
     /// - sells (liquidity addition): `slip = s/(1+s) + fee_frac`.
     ///
-    /// The 125bps venue fee on Pump.fun (0.95% protocol + 0.30% creator)
-    /// is identical on buys and sells, so a flat round trip costs ~2.53%
-    /// before impact. Calibrated 2026-10-11 against pump.fun/docs/fees
-    /// after the old 50bps/1% linear model understated a $10-into-$4500
-    /// fill by ~13x (live round trips measured 2–4%).
+    /// The default 125 bps venue fee on Pump.fun (0.95% protocol + 0.30%
+    /// creator) is identical on buys and sells, so a flat round trip
+    /// costs ~2.53% before impact. Coins with a custom creator rate
+    /// re-tier per mint via [`FillModel::with_venue_fee_bps`] (kept in
+    /// the portfolio's override map, not here). Calibrated 2026-10-11
+    /// against pump.fun/docs/fees after the old 50bps/1% linear model
+    /// understated a $10-into-$4500 fill by ~13x (live round trips
+    /// measured 2–4%).
     BondingCurve {
         /// Venue fee per side in basis points (125.0 on Pump.fun).
         fee_bps_per_side: f64,
@@ -139,6 +142,17 @@ impl FillModel {
     /// Unknown liquidity pays the venue fee (no size basis): `slip_fraction`
     /// already does fee-only there, so no early return here — returning
     /// the bare quote would understate costs ~1.25% vs the snapshot path.
+    /// Note the deliberate asymmetry: a degenerate *notional* also passes
+    /// the bare quote through (fee-free), while `slip_fraction` for the
+    /// same input reports fee-only. The bare-quote branch means "no trade
+    /// priced", never "a free trade" — all production pricers
+    /// (`open`/`book`/`snapshot`/live sizing) reject non-positive
+    /// notionals before reaching the model, so the two paths agree
+    /// everywhere a fill can book.
+    /// The cap bounds the *total* per-side adverse excursion
+    /// (impact + fee): a pathological fee tier above the cap prices at
+    /// the cap, never above it. Real tiers (≤345 bps observed) sit far
+    /// below, so the clamp only binds on size.
     pub fn fill_price(&self, side: Side, quote: f64, notional_usd: f64, liquidity_usd: f64) -> f64 {
         if !quote.is_finite() || quote <= 0.0 || !notional_usd.is_finite() || notional_usd <= 0.0 {
             return quote;

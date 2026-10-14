@@ -14,8 +14,9 @@ use crate::types::{RugCheckError, RugCheckReport};
 /// (`risk-engine/src/fallback.rs::RUGCHECK_SCORE_CAP`): the two layers
 /// answer different questions. This policy is the hard on-chain gate —
 /// anything over 400 never reaches the watchlist. The 350 heuristic is
-/// the softer pre-LLM triage inside the risk engine (scores 351–400 can
-/// still be *observed* but never *bought* without a model override).
+/// the softer pre-LLM triage — and the model prompt passes above 350
+/// too, so scores 351–400 form a deliberate dead zone (observed, never
+/// bought on any path). Fail-closed by construction.
 /// Keep the strict ordering `heuristic cap <= policy cap` when tuning.
 #[derive(Debug, Clone)]
 pub struct AuditPolicy {

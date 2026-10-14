@@ -58,6 +58,10 @@ pub struct HeartbeatReport<'a> {
     pub watchlist_pending: usize,
     /// Open paper positions.
     pub open_positions: usize,
+    /// Live bags parked for manual exit (post-migration graduates,
+    /// exhausted sell retries). Real custody invisible to paper equity —
+    /// surfaced here so a quiet market never hides a stuck bag.
+    pub manual_bags: usize,
     /// Free paper cash (USD).
     pub cash_usd: f64,
     /// Mark-to-market paper equity (USD).
@@ -325,6 +329,7 @@ impl Alerter {
              • **Dropped:** `{}`\n\
              • **Watchlist:** `{}` pending\n\
              • **Open:** `{}` position(s)\n\
+             • **Manual bags:** `{}` held\n\
              • **Cash:** `${:.2}`\n\
              • **Equity:** `${:.2}`",
             r.logs_seen,
@@ -333,6 +338,7 @@ impl Alerter {
             r.dropped,
             r.watchlist_pending,
             r.open_positions,
+            r.manual_bags,
             r.cash_usd,
             r.equity_usd,
         )
@@ -408,6 +414,7 @@ mod tests {
             dropped: 2,
             watchlist_pending: 3,
             open_positions: 1,
+            manual_bags: 2,
             cash_usd: 90.5,
             equity_usd: 102.25,
         });
@@ -415,6 +422,7 @@ mod tests {
         assert!(card.contains("`live`"));
         assert!(card.contains("2h 5m"));
         assert!(card.contains("`1000`"));
+        assert!(card.contains("`2` held"));
         assert!(card.contains("$90.50"));
         assert!(card.contains("$102.25"));
     }

@@ -22,21 +22,17 @@ use thiserror::Error;
 pub const TOKEN_DECIMALS: u32 = 6;
 /// Lamports per SOL.
 pub const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
-/// Pump.fun venue fee priced into every spend guard (protocol + creator,
-/// 125 bps total — matches the simulator's per-side fee and the on-chain
-/// fee schedule). Applied BEFORE the slippage ceiling: the chain debits
-/// trade + fees, so a fee-blind guard spends the slippage budget on
-/// baseline cost (a 1.15%-short guard failed live with 6002).
+/// Pump.fun standard venue fee priced into sizing when no per-mint tier
+/// is known (protocol + creator, 125 bps total — matches the simulator's
+/// default per-side fee and the live single-tier schedule). Canonical
+/// home for the standard tier in the binary: sizing callers pass the
+/// paper ledger's per-mint tier when one is registered, else this.
+/// Locked to the simulator default by
+/// `standard_tier_matches_simulator_default` — change both together.
+/// Applied BEFORE the slippage ceiling: the chain debits trade + fees,
+/// so a fee-blind guard spends the slippage budget on baseline cost
+/// (a 1.15%-short guard failed live with 6002).
 pub const VENUE_FEE_BPS: u64 = 125;
-/// Spend-guard fee ceiling: covers custom `coin_creator_fee_bps` overrides
-/// (observed 250 bps creator + 95 bps protocol = 345 total) with margin.
-/// Sizing still uses [`VENUE_FEE_BPS`] (live standard tier); the guard uses
-/// this max so custom-fee coins fail on price, never on 6002 underfunding.
-pub const VENUE_FEE_GUARD_BPS: u64 = 400;
-const _: () = {
-    assert!(VENUE_FEE_GUARD_BPS >= VENUE_FEE_BPS);
-    assert!(VENUE_FEE_GUARD_BPS >= 345);
-};
 
 /// Live-trade failures: bad inputs or dispatch errors.
 #[derive(Error, Debug)]
@@ -116,6 +112,11 @@ pub struct LiveBuyParams<'a> {
     /// Curve liquidity in USD for impact sizing (mirrors the paper
     /// [`FillModel`](FillModel): unknown/zero pays fee-only).
     pub liquidity_usd: f64,
+    /// Venue fee tier (bps/side) for this mint, when the confirm path
+    /// registered one. `None` means the standard tier
+    /// ([`VENUE_FEE_BPS`]) — the same default the paper ledger falls
+    /// back to, so both legs price identically with or without a tier.
+    pub venue_fee_bps: Option<f64>,
     /// Token creator (base58), when the launch carried one.
     pub creator: Option<&'a str>,
 }
@@ -148,11 +149,18 @@ pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> 
 }
 
 /// Size a buy from USD notional at spot: tokens from `notional/price`
-/// through the paper [`FillModel`](FillModel) (fee + impact,
-/// fee-only when liquidity is unknown — identical inputs give identical
-/// sizes on both legs), spend cap from `notional/sol` plus
-/// `slippage_bps` (clamped to 10_000 = 100% like the sell floor, so a
-/// misconfigured `SLIPPAGE_BPS` cannot authorize unbounded overspend).
+/// through the paper [`FillModel`](FillModel) at `fee_bps_per_side`
+/// (fee + impact, fee-only when liquidity is unknown — identical inputs
+/// give identical sizes on both legs), spend cap from `notional/sol`
+/// plus `slippage_bps` (clamped to 10_000 = 100% like the sell floor, so a
+/// misconfigured `SLIPPAGE_BPS` cannot authorize unbounded overspend —
+/// and live boot refuses `>= 10000` outright, so the clamp is
+/// defense-in-depth, not the policy).
+/// `fee_bps_per_side` is REQUIRED (no silent tier): callers pass the
+/// paper ledger's per-mint tier, or [`VENUE_FEE_BPS`] for the standard
+/// tier. Sizing and guard share the tier, so custom-fee coins size AND
+/// fund exactly — the fee engine downstream still recomputes
+/// fee-inclusively but is clamped to this guard (never double-counts).
 /// `None` on non-positive inputs, zero quantity, or amounts that do not
 /// fit `u64` (`as`-casts saturate silently past the max — a garbage
 /// print must fail closed, never size a jumbo order).
@@ -161,6 +169,9 @@ pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> 
 /// `(u64::MAX, 2^64]` through to a saturating cast (a garbage print
 /// sizing a max-quantity order); `>=` rejects them. Single home for
 /// every float→lamports/token conversion on the live path.
+/// `amount_f` below stays in f64 past 2^53 (1-ulp dust on absurd
+/// notional/price ratios): economically negligible next to the 25% slip
+/// cap, and `u64_from_f64_floor` still fail-closes true overflow.
 fn u64_from_f64_floor(v: f64) -> Option<u64> {
     if !v.is_finite() || v <= 0.0 || v >= u64::MAX as f64 {
         return None;
@@ -174,6 +185,7 @@ pub fn plan_buy(
     sol_usd: f64,
     slippage_bps: u64,
     liquidity_usd: f64,
+    fee_bps_per_side: f64,
 ) -> Option<LiveBuyPlan> {
     if !notional_usd.is_finite() || notional_usd <= 0.0 {
         return None;
@@ -184,9 +196,13 @@ pub fn plan_buy(
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
         return None;
     }
+    if !fee_bps_per_side.is_finite() || fee_bps_per_side < 0.0 {
+        return None;
+    }
     // Paper parity: the ledger fills at quote*(1+slip), so size from the
     // filled price (floored — never oversize custody past 2^53 either).
-    let slip = FillModel::default().slip_fraction(Side::Long, notional_usd, liquidity_usd);
+    let fill = FillModel::default().with_venue_fee_bps(fee_bps_per_side);
+    let slip = fill.slip_fraction(Side::Long, notional_usd, liquidity_usd);
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
     let amount_f = (notional_usd / price_usd / (1.0 + slip) * scale).floor();
     let amount_tokens = u64_from_f64_floor(amount_f)?;
@@ -194,16 +210,14 @@ pub fn plan_buy(
         return None;
     }
     let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
-    // Venue fee first (exact integer ceil in u128; the narrowing
-    // `try_from` fails closed if the fee tips a near-max guard over
-    // u64::MAX), then the slippage ceiling. Sizing reserves the standard
-    // 125 bps tier; the GUARD uses the max tier so custom creator-fee
-    // coins (up to 345 observed) never 6002 on underfunding — the fee
+    // Venue fee first, at the SAME tier as sizing (exact integer ceil in
+    // u128; the narrowing `try_from` fails closed if the fee tips a
+    // near-max guard over u64::MAX), then the slippage ceiling. The fee
     // engine downstream recomputes fee-inclusively but is clamped to this
-    // guard, so pre-paying here never double-counts standard coins and
-    // only over-reserves custom ones (fail on price, not on funding).
+    // guard, so pre-paying here never double-counts.
     let with_fee = u64::try_from(
-        (u64_from_f64_floor(lamports)? as u128 * (10_000 + VENUE_FEE_GUARD_BPS) as u128)
+        (u64_from_f64_floor(lamports)? as u128
+            * (10_000 + fee_bps_per_side.ceil() as u128))
             .div_ceil(10_000),
     )
     .ok()?;
@@ -218,17 +232,24 @@ pub fn plan_buy(
 }
 
 /// Floor for a sell: model proceeds (paper [`FillModel`](FillModel)
-/// at the same inputs, so the floor tracks what the ledger books) minus
-/// `slippage_bps`. `None` on degenerate inputs — and on a zero floor:
+/// at the same inputs AND the same `fee_bps_per_side` tier, so the floor
+/// tracks what the ledger books) minus `slippage_bps`.
+/// `fee_bps_per_side` is REQUIRED like [`plan_buy`]: a floor priced at
+/// the wrong tier authorizes either an unfillable minimum (overstated
+/// proceeds → on-chain failure → manual exit) or a giveaway.
+/// `None` on degenerate inputs — and on a zero floor:
 /// `min_sol_output = 0` authorizes the slot leader to fill at any price
 /// (sandwich drain), so full-slippage configs and sub-lamport dust fail
-/// closed instead of dispatching unprotected.
+/// closed instead of dispatching unprotected. (`slippage_bps >= 10000`
+/// refuses here while [`plan_buy`] clamps: buys are additionally gated
+/// at live boot, so the clamp is defense-in-depth, not policy.)
 pub fn plan_sell_floor(
     amount_tokens: u64,
     price_usd: f64,
     sol_usd: f64,
     slippage_bps: u64,
     liquidity_usd: f64,
+    fee_bps_per_side: f64,
 ) -> Option<u64> {
     if amount_tokens == 0 || !price_usd.is_finite() || price_usd <= 0.0 {
         return None;
@@ -239,12 +260,17 @@ pub fn plan_sell_floor(
     if slippage_bps >= 10_000 {
         return None;
     }
+    if !fee_bps_per_side.is_finite() || fee_bps_per_side < 0.0 {
+        return None;
+    }
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
     // Paper parity: fills land BELOW the quote by the model slip, so the
     // floor starts from modeled proceeds (a bare-quote floor would price
     // above reality and fail the fill on-chain).
     let gross_notional = amount_tokens as f64 / scale * price_usd;
-    let slip = FillModel::default().slip_fraction(Side::Short, gross_notional, liquidity_usd);
+    let slip = FillModel::default()
+        .with_venue_fee_bps(fee_bps_per_side)
+        .slip_fraction(Side::Short, gross_notional, liquidity_usd);
     let lamports = gross_notional * (1.0 - slip).max(0.0) / sol_usd * LAMPORTS_PER_SOL;
     // Same `>=` boundary as `plan_buy`: `u64::MAX as f64` is 2^64, and
     // `as u64` below saturates past the max.
@@ -554,6 +580,7 @@ impl LiveTrader {
             sol_usd,
             self.slippage_bps,
             req.liquidity_usd,
+            req.venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
         )
         .ok_or_else(|| {
             LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
@@ -873,6 +900,8 @@ impl LiveTrader {
     }
 
     /// Sell the full tracked amount at `price_usd` via Jito bundle.
+    /// `venue_fee_bps` prices the floor at the mint's tier (`None` =
+    /// standard [`VENUE_FEE_BPS`], same default as the buy leg).
     /// Returns the bundle UUID.
     pub async fn sell(
         &self,
@@ -880,6 +909,7 @@ impl LiveTrader {
         price_usd: f64,
         sol_usd: f64,
         liquidity_usd: f64,
+        venue_fee_bps: Option<f64>,
     ) -> Result<String, LiveError> {
         let floor = plan_sell_floor(
             position.amount_tokens,
@@ -887,6 +917,7 @@ impl LiveTrader {
             sol_usd,
             self.slippage_bps,
             liquidity_usd,
+            venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
         )
         .ok_or_else(|| LiveError::BadOrder(format!("cannot floor sell of {}", position.mint)))?;
         let receipt = match tokio::time::timeout(
@@ -975,26 +1006,59 @@ mod tests {
     }
 
     #[test]
+    fn standard_tier_matches_simulator_default() {
+        // Cross-crate lock: the binary's standard tier and the paper
+        // model's default fee must stay one number, or sizing and the
+        // ledger diverge silently on every trade.
+        assert_eq!(VENUE_FEE_BPS as f64, FillModel::default().venue_fee_bps());
+    }
+
+    #[test]
     fn buy_plan_math() {
         // $10 at $0.0000042 into $30k liquidity: the paper fill model
         // takes fee + exact constant-product impact first, so live sizes
         // ~2.3508M tokens (2_350_783_728_484 base units) — identical
         // inputs size identically on both legs.
-        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0).expect("plan");
+        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0).expect("plan");
         assert_eq!(plan.amount_tokens, 2_350_783_728_484);
-        // $10 ≈ 66.67M lamports + 4% guard fee (covers custom creator
-        // tiers), then + 2% slippage guard → 70_720_000.
-        assert_eq!(plan.max_sol_cost, 70_720_000);
+        // $10 ≈ 66.67M lamports + 1.25% venue fee, then + 2% slippage guard.
+        assert_eq!(plan.max_sol_cost, 68_850_000);
+    }
+
+    #[test]
+    fn buy_plan_custom_fee_sizes_and_funds_at_tier() {
+        // A 345 bps coin sizes SMALLER (worse fill) and funds HIGHER
+        // than the standard tier at identical inputs — sizing and guard
+        // share the tier, so custody matches the paper ledger exactly.
+        let std = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0).expect("std");
+        let cus = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 345.0).expect("custom");
+        assert!(cus.amount_tokens < std.amount_tokens);
+        assert!(cus.max_sol_cost > std.max_sol_cost);
+        // Parity with the ledger at the same tier.
+        use simulator::{PaperPortfolio, Side};
+        let mut paper = PaperPortfolio::new(1_000.0, 0.0);
+        paper.set_venue_fee_for_mint("MINT", 345.0);
+        let id = paper
+            .open_position(
+                "MINT", Side::Long, 0.000_004_2, 10.0, 30_000.0, 75.0, -8.0, false, 0.0,
+                0, 0.0, 1_000,
+            )
+            .expect("open");
+        let qty = paper.position(id).expect("pos").quantity;
+        assert_eq!(cus.amount_tokens, (qty * 1e6).floor() as u64);
     }
 
     #[test]
     fn buy_plan_rejects_degenerate() {
-        assert_eq!(plan_buy(0.0, 1.0, 150.0, 200, 30_000.0), None);
-        assert_eq!(plan_buy(10.0, 0.0, 150.0, 200, 30_000.0), None);
-        assert_eq!(plan_buy(10.0, 1.0, 0.0, 200, 30_000.0), None);
-        assert_eq!(plan_buy(f64::NAN, 1.0, 150.0, 200, 30_000.0), None);
+        assert_eq!(plan_buy(0.0, 1.0, 150.0, 200, 30_000.0, 125.0), None);
+        assert_eq!(plan_buy(10.0, 0.0, 150.0, 200, 30_000.0, 125.0), None);
+        assert_eq!(plan_buy(10.0, 1.0, 0.0, 200, 30_000.0, 125.0), None);
+        assert_eq!(plan_buy(f64::NAN, 1.0, 150.0, 200, 30_000.0, 125.0), None);
         // Dust that rounds to zero units.
-        assert_eq!(plan_buy(1e-12, 1.0, 150.0, 200, 30_000.0), None);
+        assert_eq!(plan_buy(1e-12, 1.0, 150.0, 200, 30_000.0, 125.0), None);
+        // Non-finite/negative tiers never price (no silent tier).
+        assert_eq!(plan_buy(10.0, 1.0, 150.0, 200, 30_000.0, f64::NAN), None);
+        assert_eq!(plan_buy(10.0, 1.0, 150.0, 200, 30_000.0, -1.0), None);
     }
 
     #[test]
@@ -1002,8 +1066,18 @@ mod tests {
         // 1e6 units (1 token) at $2, SOL $150: model proceeds land
         // below quote (fee + impact), then − 2% margin via integer
         // mul-div floor → 12_902_461.
-        let floor = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0).expect("floor");
+        let floor = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 125.0).expect("floor");
         assert_eq!(floor, 12_902_461);
+    }
+
+    #[test]
+    fn sell_floor_custom_fee_floors_lower() {
+        // Same proceeds, worse tier → lower floor. A 125-priced floor on
+        // a 345 coin would authorize an unfillable minimum; the tiered
+        // floor tracks on-chain reality instead.
+        let std = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 125.0).expect("std");
+        let cus = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 345.0).expect("custom");
+        assert!(cus < std, "custom {cus} vs std {std}");
     }
 
     #[test]
@@ -1022,18 +1096,18 @@ mod tests {
     #[test]
     fn buy_plan_rejects_overflow() {
         // 1e36 base units does not fit u64: fail closed, never saturate.
-        assert_eq!(plan_buy(1e20, 1e-10, 150.0, 200, 30_000.0), None);
+        assert_eq!(plan_buy(1e20, 1e-10, 150.0, 200, 30_000.0, 125.0), None);
         // Oversized spend cap (amount fits, cap does not): same treatment.
-        assert_eq!(plan_buy(1e13, 1e6, 150.0, 200, 30_000.0), None);
+        assert_eq!(plan_buy(1e13, 1e6, 150.0, 200, 30_000.0, 125.0), None);
     }
 
     #[test]
     fn sell_floor_rejects_zero_floor() {
         // 100% slippage authorizes any fill price: rejected outright.
-        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_000, 30_000.0), None);
-        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_001, 30_000.0), None);
+        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_000, 30_000.0, 125.0), None);
+        assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_001, 30_000.0, 125.0), None);
         // Sub-lamport dust floors to 0: no unprotected dispatch.
-        assert_eq!(plan_sell_floor(1, 1e-9, 1e9, 200, 30_000.0), None);
+        assert_eq!(plan_sell_floor(1, 1e-9, 1e9, 200, 30_000.0, 125.0), None);
     }
 
     #[test]
@@ -1041,8 +1115,8 @@ mod tests {
         // Integer mul-div floor: ~1.31 lamports of modeled proceeds floor
         // to base 1; 0bps keeps 1, any margin floors to 0 → rejected
         // (never an unprotected dispatch).
-        assert_eq!(plan_sell_floor(1, 0.2, 150.0, 0, f64::NAN), Some(1));
-        assert_eq!(plan_sell_floor(1, 0.2, 150.0, 1, f64::NAN), None);
+        assert_eq!(plan_sell_floor(1, 0.2, 150.0, 0, f64::NAN, 125.0), Some(1));
+        assert_eq!(plan_sell_floor(1, 0.2, 150.0, 1, f64::NAN, 125.0), None);
         // Exactness of the integer path: 10_001 at 1bps floors to 9_999,
         // never rounded up by f64.
         let floored = (10_001u64 as u128 * (10_000 - 1) as u128 / 10_000) as u64;
@@ -1051,10 +1125,13 @@ mod tests {
 
     #[test]
     fn sell_floor_rejects_degenerate() {
-        assert_eq!(plan_sell_floor(0, 2.0, 150.0, 200, 30_000.0), None);
-        assert_eq!(plan_sell_floor(100, 0.0, 150.0, 200, 30_000.0), None);
+        assert_eq!(plan_sell_floor(0, 2.0, 150.0, 200, 30_000.0, 125.0), None);
+        assert_eq!(plan_sell_floor(100, 0.0, 150.0, 200, 30_000.0, 125.0), None);
         // Absurd proceeds that don't fit u64: fail closed, never saturate.
-        assert_eq!(plan_sell_floor(u64::MAX, 1e12, 1e-6, 0, 30_000.0), None);
+        assert_eq!(plan_sell_floor(u64::MAX, 1e12, 1e-6, 0, 30_000.0, 125.0), None);
+        // Bad tiers never price.
+        assert_eq!(plan_sell_floor(100, 2.0, 150.0, 200, 30_000.0, f64::NAN), None);
+        assert_eq!(plan_sell_floor(100, 2.0, 150.0, 200, 30_000.0, -1.0), None);
     }
 
     #[test]
@@ -1073,7 +1150,7 @@ mod tests {
             )
             .expect("open");
         let qty = paper.position(id).expect("pos").quantity;
-        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0).expect("plan");
+        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0).expect("plan");
         // Paper quantity is whole tokens; live tracks base units (1e6).
         assert_eq!(plan.amount_tokens, (qty * 1e6).floor() as u64);
         // Sell floor sits below modeled gross proceeds (conservative by
@@ -1081,7 +1158,7 @@ mod tests {
         // One token at $3 into $30k liquidity: slip ≈ fee-only, so the
         // floor lands just under gross (the full-size plan above would
         // pin the 25% impact cap instead — same model, both legs).
-        let floor = plan_sell_floor(1_000_000, 3.0, 150.0, 200, 30_000.0).expect("floor");
+        let floor = plan_sell_floor(1_000_000, 3.0, 150.0, 200, 30_000.0, 125.0).expect("floor");
         let gross = 1_000_000_f64 / 1e6 * 3.0 / 150.0 * LAMPORTS_PER_SOL;
         assert!((floor as f64) < gross, "floor {floor} vs gross {gross}");
         assert!((floor as f64) > gross * 0.9, "floor {floor} vs gross {gross}");

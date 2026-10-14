@@ -659,6 +659,7 @@ async fn run_pipeline(live_arg: bool) {
                 let snap = stats_task.snapshot();
                 let pending = pipeline.pending_count().await;
                 let open = pipeline.open_position_mints().await.len();
+                let manual = pipeline.exec.manual_keys().await.len();
                 let (cash, equity) = pipeline.paper_cash_equity().await;
                 let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
                     mode: if live_mode { "live" } else { "paper" },
@@ -669,11 +670,12 @@ async fn run_pipeline(live_arg: bool) {
                     dropped: snap.dropped_full.saturating_add(snap.dropped_throttled),
                     watchlist_pending: pending,
                     open_positions: open,
+                    manual_bags: manual,
                     cash_usd: cash,
                     equity_usd: equity,
                 });
-                info!("heartbeat: logs={} candidates={} watchlist={} open={} equity={:.2}",
-                    snap.logs_seen, snap.candidates, pending, open, equity);
+                info!("heartbeat: logs={} candidates={} watchlist={} open={} manual={} equity={:.2}",
+                    snap.logs_seen, snap.candidates, pending, open, manual, equity);
                 if let Some(alerts) = pipeline.alerts.as_ref() {
                     alerts.alert(card);
                 }

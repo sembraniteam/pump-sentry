@@ -233,18 +233,59 @@ impl CurveTicker {
 
     /// Venue fee (protocol + coin creator, bps/side) for one curve's fee
     /// tier, read live: curve account (quote kind + coin override) plus
-    /// the cached FeeConfig/Global inputs. `None` on any failure or on a
-    /// multi-tier schedule — callers keep the standard 125 bps tier.
+    /// Venue fee (protocol + coin creator, bps/side) for one curve's fee
+    /// tier, read live: curve account (quote kind, reserves, supply,
+    /// mayhem flag, coin override) plus the mint supply plus the cached
+    /// FeeConfig/Global inputs. `None` on any failure — callers keep the
+    /// standard 125 bps tier.
     /// Confirm-path only (bounded deadline, no retry): a missing tier
     /// must not stall the gate.
-    pub async fn venue_fee_bps(&self, curve: &str) -> Option<f64> {
-        let key =
-            Pubkey::from_str(curve).map_err(|_| CurveError::BadCurveKey(curve.to_string())).ok()?;
-        let fee = crate::fee::venue_fee_bps(&self.rpc, &self.fee_inputs, &key).await;
+    pub async fn venue_fee_bps(&self, mint: &str, curve: &str) -> Option<f64> {
+        let mint_key = Pubkey::from_str(mint)
+            .map_err(|_| CurveError::BadMintKey(mint.to_string()))
+            .ok()?;
+        let key = Pubkey::from_str(curve)
+            .map_err(|_| CurveError::BadCurveKey(curve.to_string()))
+            .ok()?;
+        let fee = crate::fee::venue_fee_bps(&self.rpc, &self.fee_inputs, &mint_key, &key).await;
         if fee.is_none() {
             debug!(%curve, "venue fee unreadable; paper keeps the standard tier");
         }
         fee
+    }
+
+    /// One-shot reserve read plus the curve's venue-fee tier from the
+    /// SAME account bytes (single home for the confirm path, so pricing
+    /// and tiering can never read two different chain states — and one
+    /// fewer RPC per confirm than separate `fetch_tick` + `venue_fee_bps`
+    /// calls). Fee is best-effort `Option` (standard tier on `None`);
+    /// the tick itself still fails closed on bad reserves.
+    pub async fn fetch_tick_with_fee(
+        &self,
+        mint: &str,
+        curve: &str,
+    ) -> Result<(PriceTick, Option<f64>), CurveError> {
+        Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
+        let key =
+            Pubkey::from_str(curve).map_err(|_| CurveError::BadCurveKey(curve.to_string()))?;
+        let sol_usd = self.sol_feed.price().ok_or(CurveError::StaleSolUsd)?;
+        let account = read_with_retry(&self.rpc, &key).await?;
+        let decimals = self.token_decimals(mint).await?;
+        let tick =
+            tick_from_account(mint, curve, &account.data, &account.owner, sol_usd, decimals)?;
+        let mint_key = Pubkey::from_str(mint).expect("mint validated above");
+        let fee = crate::fee::venue_fee_for_data(
+            &self.rpc,
+            &self.fee_inputs,
+            &mint_key,
+            &account.owner,
+            &account.data,
+        )
+        .await;
+        if fee.is_none() {
+            debug!(%curve, "venue fee unreadable; paper keeps the standard tier");
+        }
+        Ok((tick, fee))
     }
 
     /// Poll loop: `getMultipleAccounts` per round, one tick per curve.

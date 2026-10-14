@@ -426,6 +426,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bad_request_is_terminal_at_client_layer() {
+        // HTTP 400 (mint not yet indexed) must NOT burn the ms-retry
+        // budget here: the scripted 200 behind it must stay unconsumed
+        // (the pipeline's watchlist retry owns 400s on a seconds
+        // cadence). A retry would drink the 200 and succeed.
+        let base = serve_canned(vec![(400, "not indexed"), (200, CLEAN_BODY)]).await;
+        let err = test_client(&base)
+            .fetch_report(TEST_MINT)
+            .await
+            .expect_err("must fail");
+        match err {
+            RugCheckError::HttpStatus(s) => assert_eq!(s, StatusCode::BAD_REQUEST),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn evaluate_accepts_clean_token() {
         let base = serve_canned(vec![(200, CLEAN_BODY)]).await;
         let report = test_client(&base)

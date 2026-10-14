@@ -407,6 +407,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 price_usd: entry_quote,
                 sol_usd,
                 liquidity_usd,
+                // Same tier the paper ledger registered at open: sizing
+                // and guard match the booked fills exactly.
+                venue_fee_bps: Some(self.portfolio.lock().await.venue_fee_for(mint)),
                 creator,
             })
             .await
@@ -609,6 +612,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if cooling {
             return false;
         }
+        // Floor at the mint's registered tier (paper parity): the ledger
+        // booked this tier at open, so the live floor must match it — a
+        // 125-priced floor on a 345 coin authorizes an unfillable
+        // minimum. Short lock, never held across awaits.
+        let venue_fee_bps = self.portfolio.lock().await.venue_fee_for(mint);
         let probe = {
             let Some(tracked) = self.exec.tracked(mint).await else {
                 // Nothing held: any earlier deferral settles now (usually
@@ -647,7 +655,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 creator: tracked.creator.clone(),
             }
         };
-        match trader.sell(&probe, price_usd, sol_usd, liquidity_usd).await {
+        match trader.sell(&probe, price_usd, sol_usd, liquidity_usd, Some(venue_fee_bps)).await {
             Ok(bundle) => {
                 // WAL first (write-ahead): a crash between here and the
                 // subtract below replays to a subtracted position, never
@@ -762,7 +770,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Terminal empty: no tick will ever arrive to trigger
             // `maybe_unwatch`, so evict the serial entry created above —
             // otherwise every stray `sell <unknown>` leaks one map entry.
+            // Same for the venue-tier override (no book, no tier).
             self.evict_mint_locks(mint).await;
+            self.portfolio.lock().await.clear_venue_fee_for_mint(mint);
             return true;
         };
         // Explicit operator exit also covers manual-parked bags: move the
@@ -782,8 +792,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Err(CurveError::BadMintKey(_)) | Err(CurveError::BadCurveKey(_)) => {
                 warn!(%mint, "manual sell request unroutable; dropping request");
                 // Terminal: request dropped, no tick follows — evict the
-                // serial entry (same leak as the untracked path above).
+                // serial entry (same leak as the untracked path above),
+                // plus the venue-tier override (no book, no tier).
                 self.evict_mint_locks(mint).await;
+                self.portfolio.lock().await.clear_venue_fee_for_mint(mint);
                 return true;
             }
             Err(e) => {

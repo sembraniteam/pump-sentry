@@ -54,6 +54,19 @@ pub trait ReserveFeed {
     async fn venue_fee_bps(&self, _mint: &str, _curve: &str) -> Option<f64> {
         None
     }
+    /// Reserve read plus venue tier from the same account bytes (single
+    /// chain state for pricing + tiering, one fewer RPC than separate
+    /// calls). Default composes the two one-shot methods (stubs inherit
+    /// it); the real ticker overrides with one shared read.
+    async fn fetch_tick_with_fee(
+        &self,
+        mint: &str,
+        curve: &str,
+    ) -> Result<(PriceTick, Option<f64>), CurveError> {
+        let tick = self.fetch_tick(mint, curve).await?;
+        let fee = self.venue_fee_bps(mint, curve).await;
+        Ok((tick, fee))
+    }
     /// Watch a curve for exit polling.
     async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError>;
     /// Stop watching; true when an entry was removed.
@@ -69,8 +82,16 @@ impl ReserveFeed for CurveTicker {
         self.token_decimals(mint).await
     }
 
-    async fn venue_fee_bps(&self, _mint: &str, curve: &str) -> Option<f64> {
-        self.venue_fee_bps(curve).await
+    async fn venue_fee_bps(&self, mint: &str, curve: &str) -> Option<f64> {
+        self.venue_fee_bps(mint, curve).await
+    }
+
+    async fn fetch_tick_with_fee(
+        &self,
+        mint: &str,
+        curve: &str,
+    ) -> Result<(PriceTick, Option<f64>), CurveError> {
+        self.fetch_tick_with_fee(mint, curve).await
     }
 
     async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
@@ -90,12 +111,15 @@ pub trait LiveSink {
     async fn buy(&self, req: &LiveBuyParams<'_>) -> Result<(LivePosition, String), LiveError>;
 
     /// Sell a tracked position at `price_usd`; returns the bundle UUID.
+    /// `venue_fee_bps` prices the floor at the mint's tier (`None` =
+    /// standard tier, same default as the buy leg).
     async fn sell(
         &self,
         position: &LivePosition,
         price_usd: f64,
         sol_usd: f64,
         liquidity_usd: f64,
+        venue_fee_bps: Option<f64>,
     ) -> Result<String, LiveError>;
 
     /// True when at least one buy awaits confirmation (default: none).
@@ -153,8 +177,9 @@ impl LiveSink for LiveTrader {
         price_usd: f64,
         sol_usd: f64,
         liquidity_usd: f64,
+        venue_fee_bps: Option<f64>,
     ) -> Result<String, LiveError> {
-        self.sell(position, price_usd, sol_usd, liquidity_usd).await
+        self.sell(position, price_usd, sol_usd, liquidity_usd, venue_fee_bps).await
     }
 
     fn has_pending(&self) -> bool {
@@ -906,6 +931,7 @@ mod tests {
             _price_usd: f64,
             _sol_usd: f64,
             _liquidity_usd: f64,
+            _venue_fee_bps: Option<f64>,
         ) -> Result<String, LiveError> {
             if self
                 .inner
@@ -1691,6 +1717,12 @@ mod tests {
                 (pipe.portfolio.lock().await.venue_fee_for("MINT") - want).abs() < 1e-9,
                 "fee={fee:?}"
             );
+            // Fee-aware stop: the moderate −8 stop survives the standard
+            // tier but widens past round-trip costs on 345 bps (−10.9).
+            let id = pipe.portfolio.lock().await.position_ids()[0];
+            let sl = pipe.portfolio.lock().await.position(id).expect("pos").sl_percent;
+            let want_sl = if want > 125.0 { -(2.0 * want / 100.0 + 4.0) } else { -8.0 };
+            assert!((sl - want_sl).abs() < 1e-9, "fee={fee:?} sl={sl}");
         }
     }
 

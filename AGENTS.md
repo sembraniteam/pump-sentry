@@ -16,7 +16,7 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 355 tests; live probes stay ignored
+cargo test --workspace            # 381 tests; live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
@@ -31,9 +31,10 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - `crates/ids` is the single source of truth for on-chain constants (program IDs, discriminators, fee/volume addresses).
   A program upgrade
   edits exactly one file there — never duplicate a constant elsewhere.
-- `src/pipeline.rs` (~2900 lines) is the orchestrator: gate → risk →
-  paper ledger → live mirror. `LiveExecution` and `DailyBreaker` are
-  split out; method bodies still live on `Pipeline`.
+- `src/pipeline.rs` (~3100 lines) is the orchestrator: gate → risk →
+  paper ledger → live mirror. `LiveExecution`/`live_mirror` (live
+  dispatch), `gate` (watchlist + opens), and `DailyBreaker` are split
+  out; method bodies live on `Pipeline` via those modules.
 - `src/live.rs` sizes/orders live trades; `crates/executor` builds and
   sends them. Paper ledger is authoritative; live legs only mirror it.
 - Risk flow: `risk-engine` profile → `strategy` rewrite (`adaptive`/`scalp`/`runner`) → `simulator` exits
