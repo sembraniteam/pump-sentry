@@ -250,10 +250,18 @@ type Observation = (
     Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError>,
 );
 
-/// Concurrent RPC fanout per gate phase: a full `join_all` over a
+/// Concurrent RPC fanout ceiling per gate phase: a full `join_all` over a
 /// thousand-entry watchlist opens a thousand concurrent RPCs (rate-limit
 /// mass timeouts); 16 at a time keeps rounds moving without hammering.
+/// The live width adapts per round (see `GateState::fanout`): slow rounds
+/// halve it toward [`GATE_FANOUT_MIN`], fast rounds recover toward this
+/// ceiling one step at a time.
 const GATE_FANOUT: usize = 16;
+/// Floor for adaptive gate fanout: serial progress beats a wedged node.
+const GATE_FANOUT_MIN: usize = 1;
+/// Round slower than this (seconds, phases 1+3 wall time) halves the
+/// gate fanout for the next round (rate-limit/backoff signal).
+const SLOW_GATE_ROUND_SECS: u64 = 10;
 
 /// Map screened dev history to a 0.4–1.0 trust score for the risk
 /// input. Screening already rejected young/prolific wallets; survivors
@@ -555,11 +563,16 @@ pub struct GateState {
     pub poll_busy: bool,
     /// `now_secs` of the current `poll_busy` claim (0 when free).
     pub poll_started_secs: u64,
+    /// Live fanout width for this round's phase 1+3 (adaptive between
+    /// [`GATE_FANOUT_MIN`] and [`GATE_FANOUT`]; see `poll_gates`).
+    pub fanout: usize,
 }
 
 /// Age after which a gate-poll claim is considered leaked and eligible
-/// for takeover (normal rounds finish in seconds; margin is generous).
-pub const STALE_POLL_SECS: u64 = 120;
+/// for takeover. Normal rounds finish in seconds (phase budgets top out
+/// near 15s); 30s of silence means the owning task died mid-round, so
+/// the gate self-heals instead of stalling confirms for two minutes.
+pub const STALE_POLL_SECS: u64 = 30;
 
 /// Minimum spacing between audit retries for one watchlisted mint.
 /// RugCheck 400s on seconds-old mints (indexing latency) resolve in
@@ -616,6 +629,7 @@ impl GateState {
             meta: HashMap::new(),
             poll_busy: false,
             poll_started_secs: 0,
+            fanout: GATE_FANOUT,
         }
     }
 }
@@ -876,17 +890,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// critical section per mint), (3) concurrent bundle forensics +
     /// confirms (the slowest RPC path, never serial).
     pub async fn poll_gates(&self) {
-        let mints: Vec<(String, PendingSignal)> = {
-            self.gate_state
-                .lock()
-                .await
+        let round_start = std::time::Instant::now();
+        let (mints, fanout): (Vec<(String, PendingSignal)>, usize) = {
+            let state = self.gate_state.lock().await;
+            let mints = state
                 .meta
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+                .collect();
+            (mints, state.fanout.clamp(GATE_FANOUT_MIN, GATE_FANOUT))
         };
         // Phase 1: concurrent observations, bounded so a large
-        // watchlist cannot open one RPC per mint at once.
+        // watchlist cannot open one RPC per mint at once. Width is the
+        // adaptive live value, not the ceiling.
         use futures_util::stream::{self, StreamExt};
         let observations: Vec<Observation> =
             stream::iter(mints.into_iter().map(|(mint, signal)| async move {
@@ -896,7 +912,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     .await;
                 (mint, signal, observed)
             }))
-            .buffered(GATE_FANOUT)
+            .buffered(fanout.max(1))
             .collect()
             .await;
         // Phase 2: gate state machine (fast, sequential for determinism).
@@ -1043,9 +1059,26 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                 }
             }))
-            .buffered(GATE_FANOUT)
+            .buffered(fanout.max(1))
             .collect::<Vec<()>>()
             .await;
+        }
+        // Adapt the fanout for the next round: a slow round (phases 1+3
+        // wall time past the threshold) means the node is throttling us,
+        // so halve toward serial; a fast round recovers one step toward
+        // the ceiling. Additive-increase / multiplicative-decrease keeps
+        // throughput high on healthy nodes without hammering sick ones.
+        {
+            let mut state = self.gate_state.lock().await;
+            if round_start.elapsed().as_secs() >= SLOW_GATE_ROUND_SECS {
+                let cut = (state.fanout / 2).max(GATE_FANOUT_MIN);
+                if cut != state.fanout {
+                    warn!(from = state.fanout, to = cut, "slow gate round; halving fanout");
+                    state.fanout = cut;
+                }
+            } else if state.fanout < GATE_FANOUT {
+                state.fanout += 1;
+            }
         }
         let now = now_secs();
         // Collect under one short critical section: iterating while
@@ -1418,6 +1451,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 let buy_tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
                 if buy_tip_usd.is_finite() && buy_tip_usd > 0.0 {
                     self.daily.lock().await.record(-buy_tip_usd, now_secs());
+                    self.portfolio.lock().await.debit_dispatch_cost(buy_tip_usd);
                 }
                 warn!(%mint, "LIVE buy dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_buy(mint, &bundle, amount));
@@ -1434,6 +1468,22 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     .await
                     .insert(mint.to_string(), *position);
                 self.emit(format!("LIVE buy dispatch unknown on {mint}; MANUAL REVIEW REQUIRED (fill unknown)"));
+            }
+            Err(LiveError::Unconfirmed(msg))
+                if msg.contains("Confirmed failure:") =>
+            {
+                // Proven on-chain failure fast path (bundle errored,
+                // never a fill): the pending entry is already untracked
+                // inside the trader. No funds at risk — but paper is now
+                // live-fake, so mark it diverged like any other no-fill
+                // instead of pretending it is still pending recheck.
+                warn!(%mint, error = %msg, "LIVE buy CONFIRMED-FAILED on-chain (no fill); paper still open but DIVERGED");
+                self.exec
+                    .live_diverged
+                    .lock()
+                    .await
+                    .insert(mint.to_string(), msg);
+                self.emit(format!("LIVE buy confirmed-failed on {mint}; paper open WITHOUT live cover"));
             }
             Err(LiveError::Unconfirmed(msg)) => {
                 // Pending is already tracked inside the trader for the
@@ -1498,6 +1548,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         let tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
                         if tip_usd.is_finite() && tip_usd > 0.0 {
                             self.daily.lock().await.record(-tip_usd, now_secs());
+                            self.portfolio.lock().await.debit_dispatch_cost(tip_usd);
                         }
                     }
                     warn!(mint = %mint, "LIVE buy confirmed late; now tracked with exits");
@@ -1670,6 +1721,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 let tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
                 if tip_usd.is_finite() && tip_usd > 0.0 {
                     self.daily.lock().await.record(-tip_usd, now_secs());
+                    self.portfolio.lock().await.debit_dispatch_cost(tip_usd);
                 }
                 warn!(%mint, %bundle, "LIVE sell dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_sell(mint, &bundle));

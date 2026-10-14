@@ -63,6 +63,10 @@ pub struct Settings {
     pub _sol_usd_retired: f64,
     /// Bonding-curve poll interval in milliseconds.
     pub tick_interval_ms: u64,
+    /// Post-migration pool poll interval in milliseconds (separate from
+    /// the curve ticker: pool ticks only feed spike alerts, so they can
+    /// run slower and save RPC budget).
+    pub vault_tick_interval_ms: u64,
     /// OpenAI-compatible chat-completions endpoint.
     pub inference_endpoint: String,
     /// Model identifier for inference requests.
@@ -135,6 +139,7 @@ impl std::fmt::Debug for Settings {
             .field("quote_usd", &self.quote_usd)
             .field("sol_usd", &self._sol_usd_retired)
             .field("tick_interval_ms", &self.tick_interval_ms)
+            .field("vault_tick_interval_ms", &self.vault_tick_interval_ms)
             .field("inference_endpoint", &self.inference_endpoint)
             .field("inference_model", &self.inference_model)
             .field("inference_timeout_ms", &self.inference_timeout_ms)
@@ -187,6 +192,7 @@ impl Settings {
             quote_usd: parse_quote_usd(vars, &mut notes),
             _sol_usd_retired: parse_retired_sol_usd(vars, &mut notes),
             tick_interval_ms: get_int(vars, "TICK_INTERVAL_MS", 1000, &mut notes),
+            vault_tick_interval_ms: get_int(vars, "VAULT_TICK_INTERVAL_MS", 5000, &mut notes),
             inference_endpoint: get_string(
                 vars,
                 "INFERENCE_ENDPOINT",
@@ -306,6 +312,9 @@ impl Settings {
         }
         if self.tick_interval_ms == 0 {
             out.push("TICK_INTERVAL_MS=0 must be positive; startup refuses this".to_string());
+        }
+        if self.vault_tick_interval_ms == 0 {
+            out.push("VAULT_TICK_INTERVAL_MS=0 must be positive; startup refuses this".to_string());
         }
         if self.inference_timeout_ms == 0 {
             out.push(
@@ -480,7 +489,9 @@ fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> O
 /// Local unix seconds; `0` when the clock is unavailable (never panics).
 /// A broken clock corrupts day buckets, gate deadlines, and cooldowns —
 /// warn once (loud on first use, silent after, so a wedged clock cannot
-/// spam every tick).
+/// spam every tick). `saturating_sub` everywhere keeps clock-0 (and any
+/// backward step) fail-open, never panicking or underflowing — at worst
+/// timeouts fire immediately and cooldowns look expired.
 pub fn now_secs() -> u64 {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -380,6 +380,10 @@ async fn run_pipeline(live_arg: bool) {
         eprintln!("bad TICK_INTERVAL_MS=0: tick interval must be positive");
         std::process::exit(1);
     }
+    if settings.vault_tick_interval_ms == 0 {
+        eprintln!("bad VAULT_TICK_INTERVAL_MS=0: vault tick interval must be positive");
+        std::process::exit(1);
+    }
 
     let alerts = settings.discord_alerts.then(|| match &settings.discord_channel {
         Some(channel) => {
@@ -395,7 +399,7 @@ async fn run_pipeline(live_arg: bool) {
     let vault_ticker = match VaultTicker::new(
         &settings.http_url,
         commitment,
-        Duration::from_millis(settings.tick_interval_ms),
+        Duration::from_millis(settings.vault_tick_interval_ms),
         Arc::clone(&sol_feed),
     ) {
         Ok(ticker) => ticker,

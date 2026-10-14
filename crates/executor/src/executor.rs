@@ -817,8 +817,12 @@ impl SwapExecutor {
                 }
             }
             Ok(Err(_)) => {
-                // ATA missing/unreadable: the sell cannot fill; fail here
-                // instead of after fees.
+                // Canonical ATA missing/unreadable: our own holdings are
+                // always created via the idempotent ATA prefix, so this
+                // is a transient RPC read (or a fund-drain outside the
+                // bot) — not an aux-account layout. Third-party aux
+                // holdings only mattered for the retired sell_v2 parser;
+                // v3 fills are ours, canonical by construction.
                 return Err(ExecutorError::BadOrder(
                     "sell ATA missing or unreadable".to_string(),
                 ));

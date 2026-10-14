@@ -36,7 +36,9 @@ pub enum LiveError {
     /// Dispatch failed: {0}
     #[error("dispatch failed: {0}")]
     Dispatch(#[from] ExecutorError),
-    /// Bundle accepted but never confirmed (still holding / never filled).
+    /// Bundle accepted but never confirmed. Proven on-chain failures
+    /// carry the `Confirmed failure:` prefix (never rechecked; no fill);
+    /// everything else is pending (rechecked until proven).
     #[error("unconfirmed live fill: {0}")]
     Unconfirmed(String),
     /// Dispatch timed out with no signature: the bundle may or may not
@@ -846,7 +848,7 @@ impl LiveTrader {
                 // replay never re-polls a dead bundle.
                 self.write_wal_settled(&receipt.bundle_id);
                 Err(LiveError::Unconfirmed(format!(
-                    "buy bundle {} errored on-chain; no fill",
+                    "buy bundle {} Confirmed failure: errored on-chain; no fill",
                     receipt.bundle_id
                 )))
             }
@@ -889,7 +891,7 @@ impl LiveTrader {
                     &receipt,
                 );
                 Err(LiveError::Unconfirmed(format!(
-                    "buy bundle {} confirmRPC failed ({e}); tracked as pending, rechecking",
+                    "buy bundle {} confirm RPC failed ({e}); tracked as pending, rechecking",
                     receipt.bundle_id
                 )))
             }
@@ -947,6 +949,9 @@ impl LiveTrader {
 
     /// Append one WAL line (best-effort: IO failure warns, never fails
     /// the dispatch — the in-memory map stays authoritative this run).
+    /// No `fsync`: a lost tail replays as recheck-then-track (safe), and
+    /// a sync per dispatch would serialize every sell through disk
+    /// latency on the hot path.
     fn wal_append(&self, line: String) {
         let Some(path) = self.wal_path.as_ref() else {
             return;

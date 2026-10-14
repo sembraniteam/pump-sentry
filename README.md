@@ -96,7 +96,7 @@ START_BALANCE="100" FEE_BPS="30" NOTIONAL_USD="10" TRAIL_PERCENT="5" \
 INFERENCE_ENDPOINT="http://127.0.0.1:11434/v1/chat/completions" \
 INFERENCE_MODEL="llama3.2:1b" INFERENCE_TIMEOUT_MS="300" \
 QUOTE_USD="0.000001" \
-TICK_INTERVAL_MS="1000" \
+TICK_INTERVAL_MS="1000" VAULT_TICK_INTERVAL_MS="5000" \
 cargo run
 ```
 
@@ -115,6 +115,7 @@ cargo run
 | `LIQUIDITY_USD`                                                         | `0`                           | Liquidity fallback when the reserve read fails (normally live from reserves)       |
 | `DISCORD_ALERTS`                                                        | `true`                        | Trade cards via `hermes send --to discord`; `false` silences                       |
 | `TICK_INTERVAL_MS`                                                        | `1000`                        | Curve exit-poll interval                                                           |
+| `VAULT_TICK_INTERVAL_MS`                                                  | `5000`                        | Post-migration pool poll interval (spike alerts only)                              |
 | `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine inference (OpenAI-compatible; Hermes Agent ready)                      |
 | `INFERENCE_API_KEY`                                                     | *(unset)*                     | Bearer token for providers that require auth                                       |
 | `IS_LIVE` / `--live`                                                    | *(unset)*                     | Live mode: mirror signals with real Jito-routed swaps (needs `SOLANA_PRIVATE_KEY`) |

@@ -225,6 +225,18 @@ impl PaperPortfolio {
         self.cash
     }
 
+    /// Debit out-of-band on-chain overhead (Jito tip + priority fee per
+    /// live dispatch). Live dispatch costs real SOL that never passes
+    /// through paper fills: without this the paper ledger overstates the
+    /// wallet it mirrors, so equity drifts optimistic on every dispatch.
+    /// Floored at zero (fees can bleed the book to broke, never below),
+    /// non-finite/negative inputs ignored.
+    pub fn debit_dispatch_cost(&mut self, cost_usd: f64) {
+        if cost_usd.is_finite() && cost_usd > 0.0 {
+            self.cash = (self.cash - cost_usd).max(0.0);
+        }
+    }
+
     /// Starting balance in USD.
     pub fn starting_balance(&self) -> f64 {
         self.starting_balance
@@ -1173,5 +1185,20 @@ mod tests {
         // Position untouched by rejected closes.
         assert_eq!(pf.position(id).expect("p").quantity, 40.0);
         assert_eq!(pf.cash(), 60.0);
+    }
+
+    #[test]
+    fn debit_dispatch_cost_bleeds_cash_and_floors_at_zero() {
+        let mut pf = PaperPortfolio::new(10.0, 0.0);
+        pf.debit_dispatch_cost(2.5);
+        assert!((pf.cash() - 7.5).abs() < 1e-9);
+        pf.debit_dispatch_cost(100.0);
+        assert_eq!(pf.cash(), 0.0);
+        // Non-finite/negative inputs are ignored.
+        let mut pf2 = PaperPortfolio::new(10.0, 0.0);
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            pf2.debit_dispatch_cost(bad);
+            assert_eq!(pf2.cash(), 10.0, "bad={bad}");
+        }
     }
 }

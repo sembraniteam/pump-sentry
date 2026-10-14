@@ -1543,15 +1543,20 @@ impl RpcScreener {
         if missing.is_empty() {
             return pairs;
         }
-        let fresh = futures_util::future::join_all(missing.iter().map(|buyer| async move {
-            let found = tokio::time::timeout(FUNDER_TRACE_TIMEOUT, self.genesis_funder(buyer))
-                .await
-                .ok()
-                .flatten()
-                .map(|funder| funder.to_string());
-            (*buyer, found)
-        }))
-        .await;
+        use futures_util::stream::{self, StreamExt};
+        let fresh: Vec<(Pubkey, Option<String>)> =
+            stream::iter(missing)
+                .map(|buyer| async move {
+                    let found = tokio::time::timeout(FUNDER_TRACE_TIMEOUT, self.genesis_funder(&buyer))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|funder| funder.to_string());
+                    (buyer, found)
+                })
+                .buffered(FUNDER_TRACE_FANOUT)
+                .collect()
+                .await;
         {
             let mut cache = self.funder_cache.lock().await;
             for (buyer, funder) in &fresh {
@@ -1705,6 +1710,11 @@ pub const FUNDER_OP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Dev-history fan-out width: 20 sequential fetches could consume the
 /// whole screening budget; 20 concurrent ones hammer the node.
 pub const DEV_SCREEN_FANOUT: usize = 5;
+/// Concurrent genesis-trace walks: one confirm may trace up to
+/// [`MAX_TRACED_BUYERS`] buyers, each walking [`MAX_FUNDER_PAGES`] pages.
+/// Bounded like every other fan-out in this module (4 keeps one confirm
+/// from opening 8 concurrent page-walks against the node).
+pub const FUNDER_TRACE_FANOUT: usize = 4;
 /// Curve-swap signature page size and page cap: 3 pages × 25 = 75 newest
 /// signatures per round. Beyond that the watermark is stale and the
 /// caller is warned via `truncated` handling upstream.
