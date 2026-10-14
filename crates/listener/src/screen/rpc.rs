@@ -252,10 +252,10 @@ pub struct DetectedMigration {
     pub signature: String,
     /// Where liquidity landed.
     pub destination: MigrationDestination,
-    /// New AMM account for Raydium hits.
+    /// New pool account for resolved hits.
     pub amm_id: Option<Pubkey>,
-    /// Parsed pool for Raydium hits.
-    pub pool: Option<RaydiumV4Pool>,
+    /// Parsed pool for resolved hits.
+    pub pool: Option<MigratedPool>,
 }
 
 /// Plain-string migration report for cross-crate use.
@@ -285,10 +285,10 @@ impl DetectedMigration {
             signature: self.signature.clone(),
             destination: self.destination,
             amm_id: self.amm_id.map(|k| k.to_string()),
-            base_mint: self.pool.as_ref().map(|p| p.base_mint.to_string()),
-            quote_mint: self.pool.as_ref().map(|p| p.quote_mint.to_string()),
-            base_vault: self.pool.as_ref().map(|p| p.base_vault.to_string()),
-            quote_vault: self.pool.as_ref().map(|p| p.quote_vault.to_string()),
+            base_mint: self.pool.as_ref().map(|p| p.base_mint().to_string()),
+            quote_mint: self.pool.as_ref().map(|p| p.quote_mint().to_string()),
+            base_vault: self.pool.as_ref().map(|p| p.base_vault().to_string()),
+            quote_vault: self.pool.as_ref().map(|p| p.quote_vault().to_string()),
         }
     }
 }
@@ -309,12 +309,36 @@ pub fn initialize2_amm_id(instructions: &[(Pubkey, Vec<Pubkey>)]) -> Option<Pubk
         .and_then(|(_, accounts)| accounts.get(INITIALIZE2_AMM_INDEX).copied())
 }
 
+/// Resolve the new PumpSwap pool: accounts[9] of `migrate`,
+/// accounts[10] of `migrate_v2` (per pump IDL). Matches on the pump
+/// program plus the instruction discriminator, so a co-bundled
+/// unrelated pump ix can't promote a wrong pool past the pool trust
+/// gate (`parse_validated` still must pass owner/mints).
+pub fn migrate_pool_id(decoded: &[DecodedIx]) -> Option<Pubkey> {
+    decoded.iter().find_map(|ix| {
+        if ix.program != PUMP_PROGRAM_ID || ix.data.len() < 8 {
+            return None;
+        }
+        let index = if ix.data[..8] == PUMP_MIGRATE_DISCRIMINATOR {
+            MIGRATE_POOL_ACCOUNT_INDEX
+        } else if ix.data[..8] == PUMP_MIGRATE_V2_DISCRIMINATOR {
+            MIGRATE_V2_POOL_ACCOUNT_INDEX
+        } else {
+            return None;
+        };
+        ix.accounts.get(index).copied()
+    })
+}
+
 /// One decoded ix: program, keys, raw data.
 #[derive(Debug, Clone)]
-pub(crate) struct DecodedIx {
-    pub(crate) program: Pubkey,
-    pub(crate) accounts: Vec<Pubkey>,
-    pub(crate) data: Vec<u8>,
+pub struct DecodedIx {
+    /// Executing program.
+    pub program: Pubkey,
+    /// Resolved account keys.
+    pub accounts: Vec<Pubkey>,
+    /// Raw instruction data.
+    pub data: Vec<u8>,
 }
 
 /// Decode one tx for migration checks.
@@ -531,9 +555,9 @@ impl RpcScreener {
                 };
                 let mut ix_datas: Vec<Vec<u8>> = Vec::with_capacity(decoded.len());
                 let mut pairs: Vec<(Pubkey, Vec<Pubkey>)> = Vec::with_capacity(decoded.len());
-                for ix in decoded {
-                    ix_datas.push(ix.data);
-                    pairs.push((ix.program, ix.accounts));
+                for ix in &decoded {
+                    ix_datas.push(ix.data.clone());
+                    pairs.push((ix.program, ix.accounts.clone()));
                 }
                 match monitor.classify_migration(
                     &keys,
@@ -564,7 +588,7 @@ impl RpcScreener {
                                     &account.owner,
                                     expected_token_mint,
                                 ) {
-                                    Some(pool) => Some(pool),
+                                    Some(pool) => Some(MigratedPool::RaydiumV4(pool)),
                                     None => {
                                         debug!(%amm, "pool failed trust gate; skipping unproven hit, continuing hunt");
                                         continue;
@@ -584,11 +608,44 @@ impl RpcScreener {
                         }));
                     }
                     Some(MigrationDestination::PumpSwap) => {
+                        let pool_id = migrate_pool_id(&decoded);
+                        let pool = match pool_id {
+                            Some(pool_id) => {
+                                let account = match tokio::time::timeout(
+                                    TX_FETCH_TIMEOUT,
+                                    self.rpc.get_account(&pool_id),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(account)) => account,
+                                    _ => {
+                                        debug!(%pool_id, "pool account fetch failed; skipping unproven hit, continuing hunt");
+                                        continue;
+                                    }
+                                };
+                                match PumpSwapPool::parse_validated(
+                                    &pool_id,
+                                    &account.data,
+                                    &account.owner,
+                                    expected_token_mint,
+                                ) {
+                                    Some(pool) => Some(MigratedPool::PumpSwap(pool)),
+                                    None => {
+                                        debug!(%pool_id, "pool failed trust gate (wrong owner/mint, or non-WSOL quote); skipping unproven hit, continuing hunt");
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => {
+                                debug!("pumpswap migration without resolvable pool; skipping unproven hit, continuing hunt");
+                                continue;
+                            }
+                        };
                         return Ok(Some(DetectedMigration {
                             signature: status.signature.clone(),
                             destination: MigrationDestination::PumpSwap,
-                            amm_id: None,
-                            pool: None,
+                            amm_id: pool_id,
+                            pool,
                         }));
                     }
                     None => continue,

@@ -43,6 +43,12 @@ pub const PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR: [u8; 8] =
 pub const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 /// `migrate` instruction discriminator (skill solana-raydium-migration).
 pub const PUMP_MIGRATE_DISCRIMINATOR: [u8; 8] = [155, 234, 231, 146, 236, 158, 162, 30];
+/// `migrate_v2` discriminator (pump-coin quotes, per-IDL account order).
+pub const PUMP_MIGRATE_V2_DISCRIMINATOR: [u8; 8] = [187, 203, 18, 31, 206, 237, 254, 41];
+/// Pool account index in `migrate` (per pump IDL).
+pub const MIGRATE_POOL_ACCOUNT_INDEX: usize = 9;
+/// Pool account index in `migrate_v2` (per pump IDL).
+pub const MIGRATE_V2_POOL_ACCOUNT_INDEX: usize = 10;
 /// Fee config account: swap fee schedule (position 14).
 pub const FEE_CONFIG_ACCOUNT: Pubkey =
     Pubkey::from_str_const("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt");
@@ -127,6 +133,7 @@ mod tests {
             PUMP_SELL_V3_DISCRIMINATOR,
             PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR,
             PUMP_MIGRATE_DISCRIMINATOR,
+            PUMP_MIGRATE_V2_DISCRIMINATOR,
         ];
         for (i, a) in discs.iter().enumerate() {
             for b in &discs[i + 1..] {

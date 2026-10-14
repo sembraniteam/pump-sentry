@@ -5,12 +5,16 @@ use crate::parser::{
     decode_ix_data,
 };
 pub use ids::{
-    ASSOCIATED_TOKEN_PROGRAM_ID, PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR,
-    PUMP_BUY_V3_DISCRIMINATOR, PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR,
-    PUMP_MIGRATE_DISCRIMINATOR, PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR,
+    ASSOCIATED_TOKEN_PROGRAM_ID, MIGRATE_POOL_ACCOUNT_INDEX, MIGRATE_V2_POOL_ACCOUNT_INDEX,
+    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR,
+    PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR,
+    PUMP_MIGRATE_V2_DISCRIMINATOR, PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR,
     PUMP_SELL_V3_DISCRIMINATOR, SYSTEM_PROGRAM_ID,
 };
-use migration::{MigrationDestination, MigrationMonitor, RAYDIUM_V4_PROGRAM_ID, RaydiumV4Pool};
+use migration::{
+    MigratedPool, MigrationDestination, MigrationMonitor, PumpSwapPool, RAYDIUM_V4_PROGRAM_ID,
+    RaydiumV4Pool,
+};
 use solana_client::{
     client_error::ClientError, nonblocking::rpc_client::RpcClient,
     rpc_client::GetConfirmedSignaturesForAddress2Config, rpc_config::RpcTransactionConfig,
@@ -46,8 +50,9 @@ pub use entry::{
     MAX_PENDING_ENTRIES, judge_developer,
 };
 pub use rpc::{
-    DetectedMigration, MigrationReport, RpcScreener, INITIALIZE2_AMM_INDEX, MAX_TRACED_BUYERS,
-    find_funding_source, initialize2_amm_id, read_curve_swaps, screen_developer,
+    DecodedIx, DetectedMigration, MigrationReport, RpcScreener, INITIALIZE2_AMM_INDEX,
+    MAX_TRACED_BUYERS, find_funding_source, initialize2_amm_id, migrate_pool_id, read_curve_swaps,
+    screen_developer,
 };
 pub use swaps::{
     IDX_CREATE_USER, IDX_SWAP_USER, IDX_SWAP_V2_USER, IDX_SWAP_V3_USER, SwapRecord,
@@ -899,6 +904,33 @@ mod tests {
             ),
             Some(MigrationDestination::PumpSwap)
         );
+    }
+
+    #[test]
+    fn migrate_pool_extracts_index_10() {
+        // Same frozen MigrateV2 tx: the pool sits at accounts[10] of
+        // the pump `migrate_v2` ix (per pump IDL), proven by the live
+        // pool account it points at.
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/migrate_v2_pumpswap.json"))
+                .expect("fixture");
+        let fetched: EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let Some((_, decoded, _)) = decode_migration_tx(&fetched) else {
+            panic!("fixture must decode");
+        };
+        assert_eq!(
+            migrate_pool_id(&decoded).map(|p| p.to_string()).as_deref(),
+            Some("GeWJCTs9HW5KP7N4mkovNgRjCEszntTb7czmHtXbRrCK")
+        );
+        // Non-migrate pump ixs and short account lists yield nothing.
+        let other = vec![DecodedIx {
+            program: PUMP_PROGRAM_ID,
+            accounts: vec![Pubkey::new_from_array([1; 32])],
+            data: vec![0u8; 8],
+        }];
+        assert_eq!(migrate_pool_id(&other), None);
+        assert_eq!(migrate_pool_id(&[]), None);
     }
 
     #[test]

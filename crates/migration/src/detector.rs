@@ -5,7 +5,8 @@ use solana_pubkey::Pubkey;
 use thiserror::Error;
 
 pub use ids::{
-    PUMP_MIGRATE_DISCRIMINATOR, PUMP_MIGRATION_AUTHORITY, PUMP_PROGRAM_ID, RAYDIUM_V4_PROGRAM_ID,
+    PUMP_AMM_PROGRAM_ID, PUMP_MIGRATE_DISCRIMINATOR, PUMP_MIGRATION_AUTHORITY, PUMP_PROGRAM_ID,
+    RAYDIUM_V4_PROGRAM_ID,
 };
 
 /// PumpSwap log marker (matched case-insensitively).
