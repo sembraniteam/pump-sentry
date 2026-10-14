@@ -190,7 +190,20 @@ pub struct PaperPortfolio {
     next_id: PositionId,
     positions: HashMap<PositionId, Position>,
     history: Vec<ClosedTrade>,
+    /// Running aggregates so [`PaperPortfolio::realized_pnl`] and
+    /// [`PaperPortfolio::win_rate`] stay exact when `history` is capped
+    /// below (detail is bounded; accounting is not).
+    realized_sum: f64,
+    win_count: usize,
+    closed_total: usize,
 }
+
+/// Detail-history cap: per-mint cooldown checks only need recent closes
+/// (default 1h window), while aggregates above carry lifetime stats.
+/// 50k closes is orders of magnitude past any cooldown window at this
+/// bot's throughput (≤3 concurrent positions) — eviction only drops
+/// per-trade detail, never accounting.
+pub const MAX_HISTORY_TRADES: usize = 50_000;
 
 impl PaperPortfolio {
     /// Fund a portfolio: `starting_balance_usd` (e.g. `100.0`) with
@@ -211,6 +224,9 @@ impl PaperPortfolio {
             next_id: 1,
             positions: HashMap::new(),
             history: Vec::new(),
+            realized_sum: 0.0,
+            win_count: 0,
+            closed_total: 0,
         }
     }
 
@@ -455,7 +471,7 @@ impl PaperPortfolio {
                 reason,
                 now_secs,
             );
-            self.history.push(trade.clone());
+            self.record(trade.clone());
             return Ok(trade);
         }
         let slice = {
@@ -488,8 +504,27 @@ impl PaperPortfolio {
                 open.moonbag_percent = 0.0;
             }
         }
-        self.history.push(trade.clone());
+        self.record(trade.clone());
         Ok(trade)
+    }
+
+    /// Record one close: fold the lifetime aggregates, then bound detail.
+    /// Aggregates stay exact past the cap; only per-trade detail evicts
+    /// (oldest first), which cooldown checks never miss in practice (see
+    /// [`MAX_HISTORY_TRADES`]).
+    fn record(&mut self, trade: ClosedTrade) {
+        if trade.net_pnl.is_finite() {
+            self.realized_sum += trade.net_pnl;
+        }
+        if trade.net_pnl > 0.0 {
+            self.win_count += 1;
+        }
+        self.closed_total += 1;
+        self.history.push(trade);
+        if self.history.len() > MAX_HISTORY_TRADES {
+            let drop_n = self.history.len() - MAX_HISTORY_TRADES;
+            self.history.drain(..drop_n);
+        }
     }
 
     /// Price one slice and credit its proceeds to cash.
@@ -546,9 +581,10 @@ impl PaperPortfolio {
         self.positions.get_mut(&id)
     }
 
-    /// Sum of net PnL over closed trades.
+    /// Sum of net PnL over closed trades (running total: exact past the
+    /// detail cap, non-finite trades excluded).
     pub fn realized_pnl(&self) -> f64 {
-        self.history.iter().map(|t| t.net_pnl).sum()
+        self.realized_sum
     }
 
     /// Mark-to-market snapshot. `quotes` maps mint → current price; missing
@@ -585,17 +621,16 @@ impl PaperPortfolio {
             realized_pnl: self.realized_pnl(),
             unrealized_pnl: unrealized,
             open_count: self.positions.len(),
-            closed_count: self.history.len(),
+            closed_count: self.closed_total,
         }
     }
 
     /// Win rate over closed trades (`None` when nothing closed yet).
     pub fn win_rate(&self) -> Option<f64> {
-        if self.history.is_empty() {
+        if self.closed_total == 0 {
             return None;
         }
-        let wins = self.history.iter().filter(|t| t.net_pnl > 0.0).count();
-        Some(wins as f64 / self.history.len() as f64)
+        Some(self.win_count as f64 / self.closed_total as f64)
     }
 }
 
@@ -1201,5 +1236,38 @@ mod tests {
             pf2.debit_dispatch_cost(bad);
             assert_eq!(pf2.cash(), 10.0, "bad={bad}");
         }
+    }
+
+    #[test]
+    fn history_caps_detail_but_not_accounting() {
+        let mut pf = PaperPortfolio::new(1_000_000.0, 0.0);
+        let n = MAX_HISTORY_TRADES + 500;
+        for i in 0..n {
+            let id = pf
+                .open_position_params(&OpenPositionParams {
+                    mint: "MINT",
+                    side: Side::Long,
+                    quote: 1.0,
+                    notional_usd: 10.0,
+                    liquidity_usd: 1e9,
+                    tp_percent: 100.0,
+                    sl_percent: -50.0,
+                    trailing: false,
+                    trail_percent: 0.0,
+                    timeout_seconds: 0,
+                    moonbag_percent: 0.0,
+                    now_secs: i as u64,
+                })
+                .expect("open");
+            pf.close_position(id, 1.0, 1e9, ExitReason::Manual, i as u64)
+                .expect("close");
+        }
+        let _ = HashMap::<String, ()>::new();
+        assert_eq!(pf.history().len(), MAX_HISTORY_TRADES);
+        // Accounting covers every close, including evicted ones.
+        let snap = pf.snapshot(&HashMap::new());
+        assert!(snap.realized_pnl.is_finite());
+        assert_eq!(snap.closed_count, n);
+        assert_eq!(pf.win_rate(), Some(0.0));
     }
 }

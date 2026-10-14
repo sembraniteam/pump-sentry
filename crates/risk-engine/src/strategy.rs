@@ -42,6 +42,18 @@ pub enum StrategyMode {
     Runner,
 }
 
+impl StrategyMode {
+    /// Deprecated aliases kept parsing for one release cycle — warn on
+    /// use so configs migrate before removal (`scalp_quick`,
+    /// `moon_bag`; canonical: `scalp`, `runner`).
+    pub fn is_deprecated_alias(s: &str) -> bool {
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "scalp_quick" | "moon_bag"
+        )
+    }
+}
+
 impl FromStr for StrategyMode {
     type Err = String;
 

@@ -439,9 +439,11 @@ pub struct LiveExecution<L = LiveTrader> {
     /// immediately would let paper profit mask real live loss at the
     /// day-loss gate, but dropping it (as before) undercounts the loss
     /// forever. Stashed here on defer, flushed into the breaker when the
-    /// live leg settles (sold / manual-parked / gone). Bounded: one entry
-    /// per mint, removed on flush and on book-empty cleanup.
-    pub deferred_pnl: Mutex<HashMap<String, Vec<f64>>>,
+    /// live leg settles (sold / manual-parked / gone). Bounded O(1) per
+    /// mint: a running `(total, count)` (sums are what the breaker
+    /// records, so aggregation is exact), removed on flush and on
+    /// book-empty cleanup.
+    pub deferred_pnl: Mutex<HashMap<String, (f64, usize)>>,
     /// Per-mint dispatch locks: probe sizing and tracking updates must
     /// not interleave across concurrent ticks for one mint, but a slow
     /// confirm on mint A must never block exits on mint B (a global
@@ -668,6 +670,9 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         sol_feed: Arc<SolUsdFeed>,
     ) -> Arc<Self> {
         let gate = EntryGate::new(settings.gate_window_secs, settings.gate_min_buyers);
+        if StrategyMode::is_deprecated_alias(&settings.strategy_mode) {
+            warn!(mode = %settings.strategy_mode, "deprecated strategy alias; use `scalp` or `runner` (removal in a future release)");
+        }
         let strategy = settings.strategy_mode.parse().unwrap_or_else(|e| {
             warn!(mode = %settings.strategy_mode, error = %e, "bad strategy mode; using adaptive");
             StrategyMode::Adaptive
@@ -1407,13 +1412,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // second fill would orphan), and a buy racing a sell for the
         // same mint must not interleave sizing with custody updates.
         // Other mints proceed freely.
-        let serial = {
-            let mut locks = self.exec.live_sell_locks.lock().await;
-            locks
-                .entry(mint.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let serial = Self::lock_for(&self.exec.live_sell_locks, mint).await;
         let _serial = serial.lock().await;
         // Live heat: paper heat caps paper slots exactly, but live bags
         // outlive paper (failed sells park to manual/pending while the
@@ -1638,19 +1637,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// recorded — same exclusion as the fast path. Idempotent: the entry
     /// is removed, so a second flush is a no-op.
     async fn flush_deferred_pnl(&self, mint: &str) {
-        let pnls = self.exec.deferred_pnl.lock().await.remove(mint);
-        let Some(pnls) = pnls else { return };
-        if pnls.is_empty() {
+        let stashed = self.exec.deferred_pnl.lock().await.remove(mint);
+        let Some((total, n)) = stashed else { return };
+        if n == 0 {
             return;
         }
         if self.exec.synthetic_mints.lock().await.contains(mint) {
-            warn!(mint = %mint, n = pnls.len(), "synthetic deferred PnL excluded from day-loss breaker (override price, no market)");
+            warn!(mint = %mint, n, "synthetic deferred PnL excluded from day-loss breaker (override price, no market)");
             return;
         }
         let now = now_secs();
         let mut daily = self.daily.lock().await;
-        for pnl in pnls {
-            daily.record(pnl, now);
+        if total.is_finite() {
+            daily.record(total, now);
         }
     }
 
@@ -1676,13 +1675,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         // Per-mint serialization: sizing and tracking stay atomic across
         // concurrent ticks for THIS mint, while other mints exit freely.
-        let serial = {
-            let mut locks = self.exec.live_sell_locks.lock().await;
-            locks
-                .entry(mint.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let serial = Self::lock_for(&self.exec.live_sell_locks, mint).await;
         let _serial = serial.lock().await;
         // Cooldown + attempt budget: never spam bundles at a dead market.
         // Only the last FAILURE is tracked — successes reset the budget
@@ -1953,13 +1946,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         } else {
             warn!(mint = %tick.mint, "manual sell: live still holds; breaker PnL deferred, request kept");
             if !closed_pnls.is_empty() {
-                self.exec
-                    .deferred_pnl
-                    .lock()
-                    .await
-                    .entry(tick.mint.clone())
-                    .or_default()
-                    .extend(closed_pnls);
+                let mut stashed = self.exec.deferred_pnl.lock().await;
+                let slot = stashed.entry(tick.mint.clone()).or_insert((0.0, 0));
+                for pnl in closed_pnls {
+                    // Mirror `DailyBreaker::record`: non-finite PnL never
+                    // feeds the gate (skip here so one NaN cannot poison
+                    // the stashed total into a skip-everything).
+                    if pnl.is_finite() {
+                        slot.0 += pnl;
+                        slot.1 += 1;
+                    }
+                }
             }
             return false;
         }
@@ -1994,20 +1991,30 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
+    /// Clone the per-mint serialization mutex, creating it on first use.
+    /// Single home for the entry-or-insert dance (buy/sell/tick paths
+    /// share it): one small mutex per mint, clones keep working after
+    /// eviction. The map guard is released before the mutex is locked
+    /// (never held across), so [`Pipeline::maybe_unwatch`] eviction
+    /// cannot deadlock against this path.
+    async fn lock_for(
+        map: &Mutex<HashMap<String, Arc<Mutex<()>>>>,
+        mint: &str,
+    ) -> Arc<Mutex<()>> {
+        map.lock()
+            .await
+            .entry(mint.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Clone the per-mint tick mutex, creating it on first use. The map
     /// guard is released before the mutex is locked (never held across),
     /// so [`Pipeline::maybe_unwatch`] eviction cannot deadlock against
     /// this path: clones held by in-flight tasks keep working after
     /// eviction, and eviction only happens on a confirmed-empty book.
     async fn mint_serial(&self, mint: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let serial = {
-            let mut locks = self.tick_locks.lock().await;
-            locks
-                .entry(mint.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        serial.lock_owned().await
+        Self::lock_for(&self.tick_locks, mint).await.lock_owned().await
     }
 
     /// Drop a mint's serialization entries without a tick. Used by
@@ -2219,13 +2226,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Stash (don't drop): flushed into the breaker when the live
             // leg settles — otherwise the loss vanishes from the gate.
             if !closed_pnls.is_empty() {
-                self.exec
-                    .deferred_pnl
-                    .lock()
-                    .await
-                    .entry(tick.mint.clone())
-                    .or_default()
-                    .extend(closed_pnls);
+                let mut stashed = self.exec.deferred_pnl.lock().await;
+                let slot = stashed.entry(tick.mint.clone()).or_insert((0.0, 0));
+                for pnl in closed_pnls {
+                    // Mirror `DailyBreaker::record`: non-finite PnL never
+                    // feeds the gate (skip here so one NaN cannot poison
+                    // the stashed total into a skip-everything).
+                    if pnl.is_finite() {
+                        slot.0 += pnl;
+                        slot.1 += 1;
+                    }
+                }
             }
         }
         // Pending buys recheck before the unwatch decision so a late

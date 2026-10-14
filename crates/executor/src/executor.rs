@@ -182,17 +182,29 @@ pub fn parse_curve_state(owner: &Pubkey, data: &[u8]) -> Option<CurveState> {
     })
 }
 
+/// Deadline for single read RPCs on the sniper hot path (account,
+/// balance, supply). One shared budget instead of per-call literals.
+pub const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One deadline-bound RPC read. `None` on timeout or transport failure —
+/// callers fall back or fail closed, never guess.
+async fn rpc_timeout<T>(
+    timeout: Duration,
+    fut: impl std::future::Future<Output = Result<T, ClientError>>,
+) -> Option<T> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Some(v),
+        _ => None,
+    }
+}
+
 /// Mint supply for fee-tier market caps on non-mayhem curves (SPL Mint
 /// layout `supply @36..44`, shared by classic + Token-2022 bases).
 /// `None` on any transport/shape failure — callers fall back to the
 /// order guard instead of quoting blind.
 async fn mint_supply(rpc: &RpcClient, mint: &Pubkey) -> Option<u64> {
     use crate::instructions::{TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID};
-    let account =
-        match tokio::time::timeout(Duration::from_secs(10), rpc.get_account(mint)).await {
-            Ok(Ok(account)) => account,
-            _ => return None,
-        };
+    let account = rpc_timeout(RPC_READ_TIMEOUT, rpc.get_account(mint)).await?;
     if account.owner != TOKEN_PROGRAM_ID && account.owner != TOKEN_2022_PROGRAM_ID {
         return None;
     }
@@ -213,30 +225,16 @@ async fn fetch_fee_inputs(rpc: &RpcClient) -> Option<(bool, crate::quote::FeeSch
     use crate::quote::{parse_fee_gate, parse_fee_schedule};
     let (global, schedule) = tokio::join!(
         async {
-            let account = match tokio::time::timeout(
-                Duration::from_secs(10),
-                rpc.get_account(&GLOBAL_ACCOUNT),
-            )
-            .await
-            {
-                Ok(Ok(account)) => account,
-                _ => return None,
-            };
+            let account =
+                rpc_timeout(RPC_READ_TIMEOUT, rpc.get_account(&GLOBAL_ACCOUNT)).await?;
             if account.owner != crate::instructions::PUMP_PROGRAM_ID {
                 return None;
             }
             parse_fee_gate(&account.data).ok()
         },
         async {
-            let account = match tokio::time::timeout(
-                Duration::from_secs(10),
-                rpc.get_account(&FEE_CONFIG_ACCOUNT),
-            )
-            .await
-            {
-                Ok(Ok(account)) => account,
-                _ => return None,
-            };
+            let account =
+                rpc_timeout(RPC_READ_TIMEOUT, rpc.get_account(&FEE_CONFIG_ACCOUNT)).await?;
             if account.owner != FEE_CONFIG_PROGRAM {
                 return None;
             }
@@ -411,15 +409,11 @@ impl SwapExecutor {
         let required = self
             .effective_tip(tip_lamports, true)
             .saturating_add(crate::wallet::MIN_SOL_RESERVE_LAMPORTS);
-        let native_balance = match tokio::time::timeout(
+        let native_balance = rpc_timeout(
             Duration::from_secs(15),
             self.rpc.get_balance(&self.wallet.pubkey()),
         )
-        .await
-        {
-            Ok(Ok(balance)) => Some(balance),
-            _ => None,
-        };
+        .await;
         // WSOL is always classic SPL, but resolve the program off-chain
         // like every dispatch path instead of assuming it.
         let wsol_ata = match self.token_program(&WSOL_MINT).await {
@@ -447,15 +441,7 @@ impl SwapExecutor {
     /// Fail-closed (`None`) when the mint account is unreadable —
     /// building with a guessed program burns fees for certain.
     async fn token_program(&self, mint: &Pubkey) -> Option<Pubkey> {
-        let account = match tokio::time::timeout(
-            Duration::from_secs(10),
-            self.rpc.get_account(mint),
-        )
-        .await
-        {
-            Ok(Ok(account)) => account,
-            _ => return None,
-        };
+        let account = rpc_timeout(RPC_READ_TIMEOUT, self.rpc.get_account(mint)).await?;
         // Allowlist like `mint_supply` below: a garbage/closed mint owner
         // must fail closed here, not surface as a confusing sim failure
         // after extra RPCs.
@@ -541,12 +527,9 @@ impl SwapExecutor {
     /// Quote-token balance of `ata` (`None` on transport/shape failure —
     /// callers proceed to simulation instead of refusing on unknowns).
     async fn quote_balance(&self, ata: &Pubkey) -> Option<u64> {
-        match tokio::time::timeout(Duration::from_secs(10), self.rpc.get_token_account_balance(ata))
-            .await
-        {
-            Ok(Ok(balance)) => balance.amount.parse().ok(),
-            _ => None,
-        }
+        let balance =
+            rpc_timeout(RPC_READ_TIMEOUT, self.rpc.get_token_account_balance(ata)).await?;
+        balance.amount.parse().ok()
     }
 
     /// Fetch and decode the curve's trade state for shape routing
@@ -556,15 +539,7 @@ impl SwapExecutor {
     /// parse plus the v2 reference path; sells fall back to the v2
     /// reference path. Never panics, never guesses.
     async fn read_curve_state(&self, curve: &Pubkey) -> Option<CurveState> {
-        let account = match tokio::time::timeout(
-            Duration::from_secs(10),
-            self.rpc.get_account(curve),
-        )
-        .await
-        {
-            Ok(Ok(account)) => account,
-            _ => return None,
-        };
+        let account = rpc_timeout(RPC_READ_TIMEOUT, self.rpc.get_account(curve)).await?;
         parse_curve_state(&account.owner, &account.data)
     }
 
@@ -1045,9 +1020,9 @@ impl SwapExecutor {
         ata: &Pubkey,
         token_program: &Pubkey,
     ) -> Vec<solana_instruction::Instruction> {
-        match tokio::time::timeout(Duration::from_secs(10), self.rpc.get_account(ata)).await {
-            Ok(Ok(_)) => Vec::new(),
-            _ => {
+        match rpc_timeout(RPC_READ_TIMEOUT, self.rpc.get_account(ata)).await {
+            Some(_) => Vec::new(),
+            None => {
                 use crate::instructions::build_create_ata_ix;
                 vec![build_create_ata_ix(payer, owner, mint, ata, token_program)]
             }

@@ -72,9 +72,9 @@ impl ListenerConfig {
                 "listener WS and HTTP hosts differ; ensure both serve the same cluster"
             );
         }
-        match self.commitment.as_str() {
-            "processed" | "confirmed" | "finalized" => {}
-            other => return Err(ConfigError::BadCommitment(other.to_string())),
+        match self.commitment_config() {
+            Some(_) => {}
+            None => return Err(ConfigError::BadCommitment(self.commitment.clone())),
         }
         Ok(())
     }

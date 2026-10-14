@@ -67,4 +67,4 @@ crates/executor/   # live swaps via Jito (only with --live)
 crates/curve|auditor|risk-engine|simulator|ids|alert|migration/
 ```
 
-Each crate has its own README. Tests: `cargo test --workspace` (346, live probes ignored) · `cargo clippy --all-targets` (zero warnings).
+Each crate has its own README. Tests: `cargo test --workspace` (347, live probes ignored) · `cargo clippy --all-targets` (zero warnings).

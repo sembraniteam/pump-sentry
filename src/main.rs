@@ -17,6 +17,7 @@ mod cli;
 mod live;
 mod pipeline;
 mod settings;
+mod wal;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,7 +76,7 @@ async fn replay_live_wal(
     pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
     ticker: &CurveTicker,
 ) {
-    use crate::live::wal;
+    use crate::wal;
     let path = live_wal_path();
     let replay = wal::replay_file(&path);
     if replay.pending.is_empty() && replay.positions.is_empty() && replay.manual.is_empty() {
@@ -199,7 +200,7 @@ async fn run_pipeline(live_arg: bool) {
     let settings = Settings::from_env();
 
     // Fail closed on unknown commitment (no silent coercion to confirmed).
-    if !matches!(settings.commitment.as_str(), "processed" | "confirmed" | "finalized") {
+    if CurveTicker::parse_commitment(&settings.commitment).is_none() {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
         std::process::exit(1);
     }
@@ -289,6 +290,38 @@ async fn run_pipeline(live_arg: bool) {
         if settings.quote_usd.is_some() {
             eprintln!("live mode refuses QUOTE_USD override (static fallback is paper-only by construction)");
             std::process::exit(1);
+        }
+        // Cluster coherence without RPC: devnet RPC + mainnet Jito (or
+        // vice versa) can never land — tips go to the wrong network while
+        // reads come from another. Only enforced when BOTH endpoints
+        // positively identify their cluster; unknown/custom endpoints
+        // warn instead of blocking (a private RPC need not say so).
+        fn cluster_of(url: &str) -> Option<&'static str> {
+            let lower = url.to_ascii_lowercase();
+            if lower.contains("devnet") {
+                Some("devnet")
+            } else if lower.contains("testnet") {
+                Some("testnet")
+            } else if lower.contains("mainnet") {
+                Some("mainnet")
+            } else {
+                None
+            }
+        }
+        match (
+            cluster_of(&settings.http_url),
+            cluster_of(&settings.jito_endpoint),
+        ) {
+            (Some(rpc), Some(jito)) if rpc != jito => {
+                eprintln!(
+                    "live mode refuses split-brain clusters: RPC is {rpc}, Jito is {jito} (tips would never land)"
+                );
+                std::process::exit(1);
+            }
+            (None, _) | (_, None) => {
+                warn!("config: RPC/Jito cluster unidentifiable from URLs; ensure both serve the same cluster");
+            }
+            _ => {}
         }
         if settings.priority_fee_micro_lamports == 0 {
             warn!("config: live without PRIORITY_FEE_MICRO_LAMPORTS — landing odds drop under congestion");

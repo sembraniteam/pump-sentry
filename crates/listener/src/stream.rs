@@ -27,7 +27,7 @@ use solana_client::{
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::{
-    EncodedTransaction, UiCompiledInstruction, UiInstruction, UiMessage, UiTransactionEncoding,
+    EncodedTransaction, UiCompiledInstruction, UiInstruction, UiMessage,
     option_serializer::OptionSerializer,
 };
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -428,25 +428,10 @@ impl PumpFunListener {
     /// Spawn a listener and return the bounded receiver + stats + task handle.
     ///
     /// Channel capacity is [`EVENT_CHANNEL_CAPACITY`] (10_000) with
-    /// drop-on-full semantics.
+    /// drop-on-full semantics. (A capacity parameter would be YAGNI:
+    /// the single production caller always uses the constant.)
     pub async fn subscribe(
         config: ListenerConfig,
-    ) -> Result<
-        (
-            mpsc::Receiver<ListenerEvent>,
-            Arc<ListenerStats>,
-            JoinHandle<()>,
-        ),
-        ListenerError,
-    > {
-        Self::subscribe_with_capacity(config, EVENT_CHANNEL_CAPACITY).await
-    }
-
-    /// Spawn a listener with an explicit channel capacity (tests tune
-    /// this down to exercise drop-on-full paths without 10k events).
-    pub async fn subscribe_with_capacity(
-        config: ListenerConfig,
-        capacity: usize,
     ) -> Result<
         (
             mpsc::Receiver<ListenerEvent>,
@@ -458,7 +443,7 @@ impl PumpFunListener {
         let listener = PumpFunListener::new(config)?;
         let stats = listener.stats();
         let stats_out = Arc::clone(&stats);
-        let (tx, rx) = mpsc::channel::<ListenerEvent>(capacity.max(1));
+        let (tx, rx) = mpsc::channel::<ListenerEvent>(EVENT_CHANNEL_CAPACITY.max(1));
         let handle: JoinHandle<()> = tokio::spawn(async move {
             if let Err(e) = listener.run(tx).await {
                 warn!(error = %e, "listener exited with error");
@@ -628,19 +613,12 @@ async fn fetch_and_emit(
         }
     };
 
-    // NOTE: `Json` encoding yields the structured `accountKeys` /
-    // compiled-instruction form the parser expects (base58 `data`,
-    // `loadedAddresses` split). Binary payloads are rejected below
-    // (`UnsupportedEncoding`) — a node forcing binary drops launches.
-    // Version through v1: current Pump.fun launches are v1 envelopes and
-    // `Some(0)` makes the RPC refuse them (-32015); see `json_tx_config`.
-    // If the program ever ships v2 envelopes, every fetch here fails
-    // deterministically (-32015) — loud in logs, unmissable in sims.
-    let tx_config = RpcTransactionConfig {
-        encoding: Some(UiTransactionEncoding::Json),
-        commitment: Some(commitment),
-        max_supported_transaction_version: Some(1),
-    };
+    // Shared JSON fetch shape (`screen::json_tx_config`): structured
+    // `accountKeys` / compiled-instruction form the parser expects.
+    // Binary payloads are rejected below (`UnsupportedEncoding`) — a
+    // node forcing binary drops launches. See the version-envelope
+    // notes on `json_tx_config` (v1 required; v2 fails loud).
+    let tx_config = crate::screen::json_tx_config(commitment);
 
     // Whole fetch is deadline-bound (one throttled/overloaded retry, then
     // give up: a missed launch beats a wedged worker) so hung RPCs cannot

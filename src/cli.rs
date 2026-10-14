@@ -59,6 +59,12 @@ pub const DEFAULT_LOG_LINES: usize = 100;
 pub const STOP_GRACE_SECS: u64 = 45;
 /// Poll cadence while waiting for the daemon to exit.
 pub const STOP_POLL_MS: u64 = 200;
+/// Settle delay after SIGKILL before reaping the exit status.
+pub const SIGKILL_SETTLE_MS: u64 = 500;
+/// Breathing room between `stop` and `start` inside `restart`.
+pub const RESTART_PAUSE_MS: u64 = 500;
+/// Poll cadence for `logs --follow` file growth.
+pub const LOG_FOLLOW_POLL_MS: u64 = 500;
 
 /// Usage text printed when no (valid) subcommand is given.
 pub const USAGE: &str = "\
@@ -778,8 +784,7 @@ pub fn stop_daemon() -> i32 {
             unsafe {
                 libc::kill(info.pid as libc::pid_t, libc::SIGKILL);
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(SIGKILL_SETTLE_MS));
         }
     }
     #[cfg(not(unix))]
@@ -814,7 +819,7 @@ pub fn cmd_restart(live: bool) -> ! {
         eprintln!("stop failed; restart aborted.");
         std::process::exit(code);
     }
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_millis(RESTART_PAUSE_MS));
     cmd_start(live, "restart");
 }
 
@@ -866,7 +871,7 @@ pub async fn cmd_logs(lines: usize, follow: bool) -> ! {
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => std::process::exit(0),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(LOG_FOLLOW_POLL_MS)) => {},
             }
             let len = std::fs::metadata(&log_file).map(|m| m.len()).unwrap_or(pos);
             if len < pos {
