@@ -19,6 +19,7 @@ set -euo pipefail
 
 APP="pump-sentry"
 REPO="sembraniteam/pump-sentry"
+[ -n "${HOME:-}" ] || die "HOME is unset"
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -37,13 +38,26 @@ case "$(uname -m)" in
     *)              die "unsupported arch: $(uname -m) (x86_64/arm64 only)" ;;
 esac
 
+# Argument check first: --help / bad flags must not trigger network.
+case "${1:-}" in
+    -h|--help)
+        awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"
+        exit 0
+        ;;
+    --from-source|"") ;;
+    *) die "unknown argument '$1' (only --from-source is supported)" ;;
+esac
+
 if [ -n "${VERSION:-}" ]; then
     TAG="$VERSION"
 else
-    TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-        | grep '"tag_name"' \
-        | sed 's/.*"tag_name": *"//;s/".*//')"
-    [ -n "$TAG" ] || die "could not resolve latest release (set VERSION=vX.Y.Z to pin one)"
+    # Split fetch vs parse: under `pipefail` a failed curl (or a valid
+    # response with no releases) would otherwise exit silently with no
+    # message — fail loudly instead.
+    API_RESP="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+        || die "could not fetch latest release info (network/API down? set VERSION=vX.Y.Z to pin one)")"
+    TAG="$(printf '%s\n' "$API_RESP" | grep '"tag_name"' | sed 's/.*"tag_name": *"//;s/".*//' || true)"
+    [ -n "$TAG" ] || die "no releases published yet (set VERSION=vX.Y.Z once one exists)"
 fi
 
 if [ -n "${INSTALL_DIR:-}" ]; then

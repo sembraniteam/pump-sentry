@@ -8,6 +8,7 @@
 set -euo pipefail
 
 APP="pump-sentry"
+[ -n "${HOME:-}" ] || { printf 'error: HOME is unset\n' >&2; exit 1; }
 STATE_DIR="$HOME/.pump-sentry"
 
 log() { printf '%s\n' "$*"; }
