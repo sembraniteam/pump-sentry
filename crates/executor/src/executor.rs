@@ -427,10 +427,66 @@ impl SwapExecutor {
         Some(account.owner)
     }
 
+    /// Fee-aware sell floor. Re-quotes the net from live state and
+    /// takes the tighter (higher) of the sized floor and the fresh net:
+    /// a stale floor in a rising market offers no sandwich tightening.
+    /// Refuses on quote failure (exits retry next tick; a loose floor
+    /// is real money, a missed sell is not).
+    async fn quote_sell_floor(
+        &self,
+        mint: &Pubkey,
+        state: &CurveState,
+        amount: u64,
+        fallback_min: u64,
+    ) -> Result<u64, ExecutorError> {
+        let refuse = |why: &str| {
+            warn!(mint = %mint, "sell re-quote failed ({why}); refusing loose floor (fail-closed)");
+            ExecutorError::BadOrder(format!("sell re-quote failed ({why}); refusing"))
+        };
+        let (fees, supply) = tokio::join!(
+            fetch_fee_inputs(&self.rpc),
+            async {
+                if state.is_mayhem {
+                    Some(state.token_total_supply)
+                } else {
+                    mint_supply(&self.rpc, mint).await
+                }
+            }
+        );
+        let (Some((gate_on, schedule)), Some(supply)) = (fees, supply) else {
+            return Err(refuse("fee inputs unreadable"));
+        };
+        let view = crate::quote::CurveView {
+            vt: state.vt,
+            vq: state.vq,
+            real_tokens: state.real_tokens,
+            token_total_supply: state.token_total_supply,
+            coin_creator_fee_bps: state.coin_creator_fee_bps,
+            quote: if state.quote_mint == crate::instructions::WSOL_MINT {
+                crate::quote::QuoteKind::SolLike
+            } else if state.quote_mint == crate::instructions::USDC_MINT {
+                crate::quote::QuoteKind::Usdc
+            } else {
+                crate::quote::QuoteKind::Other
+            },
+            is_mayhem: state.is_mayhem,
+        };
+        match crate::quote::sell_out_after_fees(&schedule, gate_on, &view, supply, amount) {
+            Ok(net) => {
+                let floor = net.max(fallback_min);
+                if floor != fallback_min {
+                    info!(mint = %mint, quoted = net, floor, fallback = fallback_min,
+                        "fee-aware sell floor recomputed");
+                }
+                Ok(floor)
+            }
+            Err(e) => Err(refuse(&format!("quote failed ({e})"))),
+        }
+    }
+
     /// Fee-inclusive spend guard. Falls back to the order guard when
     /// unreadable. Never exceeds the order ceiling.
-    async fn quote_buy_guard(
-        &self,
+    async fn quote_buy_guard(        &self,
         mint: &Pubkey,
         state: Option<&CurveState>,
         amount: u64,
@@ -523,7 +579,8 @@ impl SwapExecutor {
     }
 
     /// Poll a signature until it lands or `timeout` ends.
-    pub async fn confirm_signature(        &self,
+    pub async fn confirm_signature(
+        &self,
         signature_str: &str,
         timeout: Duration,
     ) -> Result<ConfirmOutcome, ExecutorError> {
@@ -1298,6 +1355,10 @@ impl SwapExecutor {
         };
         let buyback_wallet = crate::instructions::DEFAULT_BUYBACK_FEE_RECIPIENT;
         let buyback = buyback_account(&buyback_wallet, &quote_mint, &quote_program);
+        // Tighten the floor against live reserves (see `quote_sell_floor`).
+        let floor = self
+            .quote_sell_floor(&order.mint, state, order.amount_tokens, order.min_sol_output)
+            .await?;
         let mut ixs = Vec::new();
         // Quote ATA [10] must exist; prefix is idempotent.
         let user_quote =
@@ -1320,7 +1381,7 @@ impl SwapExecutor {
         }
         ixs.push(PumpSwapBuilder::build_sell_v3_ix(
             order.amount_tokens,
-            order.min_sol_output,
+            floor,
             &crate::instructions::SellV3Accounts {
                 payer,
                 mint: &order.mint,

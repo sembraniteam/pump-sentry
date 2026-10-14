@@ -2,7 +2,7 @@
 
 Paper-trading Solana memecoin sniper: catches new Pump.fun launches → screens risk → paper-trades with auto-exits. Paper-only by default; `--live` adds real Jito-routed execution.
 
-Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms, else heuristic) → paper position → auto-exit → migration hunt → Raydium tracking (PumpSwap: no pool, nothing followed; Raydium: spike cards + live exits through the validated pool leg).
+Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms, else heuristic) → paper position → auto-exit → migration hunt → pool tracking (PumpSwap: effective-quote ticks + live `sell_v2` exits; Raydium legacy: spike cards + live exits through the validated pool leg).
 
 ## Install
 

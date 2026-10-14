@@ -11,7 +11,7 @@ use listener::{
 };
 use migration::VaultTicker;
 use risk_engine::{RiskEngine, StrategyMode};
-use simulator::{ExitReason, Mark, PaperPortfolio, check_exit};
+use simulator::{ExitReason, Mark, PaperPortfolio};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -573,14 +573,27 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             if tick.complete {
                 warn!(mint = %tick.mint, "curve migrated; closing positions (spot stale)");
             }
+            // Paper-only bleed legs (live debits actuals instead).
+            if self.exec.live.is_none()
+                && let Some(sol_usd) = self.sol_feed.price()
+            {
+                let (open_leg, close_leg) = crate::live::paper_dispatch_legs_usd(
+                    self.settings.tip_lamports,
+                    sol_usd,
+                );
+                portfolio.set_paper_dispatch_legs(open_leg, close_leg);
+            }
             for id in ids {
                 let reason = if tick.complete {
                     Some(ExitReason::Manual)
                 } else {
-                    match portfolio.position_mut(id) {
-                        Some(position) => check_exit(position, tick.price_usd, tick.observed_at),
-                        None => None,
-                    }
+                    // Realizable basis: triggers agree with settlement.
+                    portfolio.check_exit_realizable(
+                        id,
+                        tick.price_usd,
+                        tick.liquidity_usd,
+                        tick.observed_at,
+                    )
                 };
                 let Some(reason) = reason else { continue };
                 // Moonbag TP scales out once.
@@ -602,17 +615,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     tick.observed_at,
                 ) {
                     Ok(trade) => {
-                        // Defer the breaker feed.
-                        closed_pnls.push(trade.net_pnl);
+                        // Defer the breaker feed. Headlines net of
+                        // dispatch bleed (pct stays edge-based).
+                        let headline = trade.net_pnl - trade.dispatch_usd;
+                        closed_pnls.push(headline);
                         let is_moonbag_exit = trade.fraction_closed < 1.0;
                         let equity = portfolio.snapshot(&card_marks).equity;
                         info!(mint = %tick.mint, id, reason = ?trade.reason,
-                        net = format!("{:+.2}", trade.net_pnl),
+                        net = format!("{:+.2}", headline),
                         pct = format!("{:+.2}%", trade.net_pnl_percent),
                         "paper position closed");
                         closed_cards.push((
                             format!("{:?}", trade.reason),
-                            trade.net_pnl,
+                            headline,
                             trade.net_pnl_percent,
                             equity,
                             is_moonbag_exit,
@@ -2643,6 +2658,45 @@ mod tests {
             vec![("MINT".to_string(), "POOL".to_string(), 1_000)]
         );
         assert!(pipe.exec.live_positions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn paper_only_stop_fires_on_realizable_and_nets_bleed() {
+        // No live leg: exits price the fee-aware fill (M1) and the
+        // ledger nets dispatch bleed (M3). Default 125bps/side.
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            PaperPortfolio::new(100.0, 0.0),
+            screener,
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+        // -7.7% gross: a gross-mark stop holds here, but the fill nets
+        // past -8% (125bps exit cost), so the realizable stop fires.
+        pipe.on_tick(&tick("MINT", 1.87)).await;
+        let portfolio = pipe.portfolio.lock().await;
+        assert!(portfolio.position_ids().is_empty());
+        assert_eq!(portfolio.history().len(), 1);
+        let trade = portfolio.history()[0].clone();
+        assert_eq!(trade.reason, ExitReason::StopLoss);
+        let gross_move = (1.87 - trade.entry_price) / trade.entry_price * 100.0;
+        assert!(gross_move > -8.0, "gross must hold: {gross_move}");
+        // Paper bleed at sol $150, tip 100k: open (100k+5k+rent),
+        // close (100k+5k), modeled on both legs.
+        let open_leg = 2_144_280.0 / 1_000_000_000.0 * 150.0;
+        let close_leg = 105_000.0 / 1_000_000_000.0 * 150.0;
+        assert!((trade.dispatch_usd - close_leg).abs() < 1e-9);
+        assert!((portfolio.total_dispatch_usd() - (open_leg + close_leg)).abs() < 1e-6);
+        // Breaker and cards see edge net of bleed.
+        let day_net = pipe.daily.lock().await.day_net;
+        assert!((day_net - (trade.net_pnl - trade.dispatch_usd)).abs() < 1e-9);
     }
 
     #[tokio::test]

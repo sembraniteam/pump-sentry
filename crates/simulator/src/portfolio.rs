@@ -154,6 +154,9 @@ pub struct PaperPortfolio {
     /// [`Self::debit_dispatch_cost`]. Kept parallel to `realized_sum`
     /// so `cash`/`equity` and headline PnL can't diverge silently.
     total_dispatch_usd: f64,
+    /// Paper-mode per-leg bleed estimates (open, close), USD. Live
+    /// mode debits actuals instead (see `set_paper_dispatch_legs`).
+    paper_dispatch_legs: (f64, f64),
 }
 
 /// Detail history cap.
@@ -175,6 +178,7 @@ impl PaperPortfolio {
             win_count: 0,
             closed_total: 0,
             total_dispatch_usd: 0.0,
+            paper_dispatch_legs: (0.0, 0.0),
         }
     }
 
@@ -224,6 +228,14 @@ impl PaperPortfolio {
             self.total_dispatch_usd += cost_usd;
             self.cash = (self.cash - cost_usd).max(0.0);
         }
+    }
+
+    /// Estimated per-leg dispatch bleed for paper-only mode (live
+    /// mode debits actuals instead; never set both). The open leg
+    /// debits at open, the close leg pro-rata at settle. Last write
+    /// wins (legs move with SOL); zero disables.
+    pub fn set_paper_dispatch_legs(&mut self, open_usd: f64, close_usd: f64) {
+        self.paper_dispatch_legs = (open_usd, close_usd);
     }
 
     /// Cumulative dispatch bleed debited so far.
@@ -384,6 +396,8 @@ impl PaperPortfolio {
                 moonbag_percent: finite_or_zero(p.moonbag_percent).clamp(0.0, 100.0),
             },
         );
+        // Paper-only bleed (live debits actuals instead).
+        self.debit_dispatch_cost(self.paper_dispatch_legs.0);
         Ok(id)
     }
 
@@ -526,6 +540,10 @@ impl PaperPortfolio {
         } else {
             0.0
         };
+        // Paper-only bleed, pro-rata (live debits actuals instead).
+        let dispatch =
+            finite_or_zero(self.paper_dispatch_legs.1 * slice.fraction).max(0.0);
+        self.debit_dispatch_cost(dispatch);
 
         match slice.side {
             Side::Long => self.cash += exit_notional - exit_fee,
@@ -548,13 +566,37 @@ impl PaperPortfolio {
             opened_at: slice.opened_at,
             closed_at: now_secs,
             hold_seconds: now_secs.saturating_sub(slice.opened_at),
-            dispatch_usd: 0.0,
+            dispatch_usd: dispatch,
         }
     }
 
     /// Mutable position access.
     pub fn position_mut(&mut self, id: PositionId) -> Option<&mut Position> {
         self.positions.get_mut(&id)
+    }
+
+    /// Exit trigger on the realizable fill (fee-aware), not the gross
+    /// mark. Evaluated on a full-exit basis; `None` holds (except
+    /// timeout) when the fill is unknowable.
+    pub fn check_exit_realizable(
+        &mut self,
+        id: PositionId,
+        quote: f64,
+        liquidity_usd: f64,
+        now_secs: u64,
+    ) -> Option<ExitReason> {
+        let mint = self.positions.get(&id)?.mint.clone();
+        let fill = self.fill_for_mint(&mint);
+        let position = self.positions.get_mut(&id)?;
+        let exit_notional = position.quantity.abs() * quote;
+        crate::market::check_exit_realizable(
+            &fill,
+            position,
+            quote,
+            exit_notional,
+            liquidity_usd,
+            now_secs,
+        )
     }
 
     /// Net PnL of closed trades.
@@ -1256,6 +1298,48 @@ mod tests {
         ));
         assert_eq!(pf.position(id).expect("p").quantity, 40.0);
         assert_eq!(pf.cash(), 60.0);
+    }
+
+    #[test]
+    fn paper_dispatch_legs_bleed_cash_and_tag_trades() {
+        let mut pf = funded();
+        pf.set_paper_dispatch_legs(0.30, 0.05);
+        let id = open_40_at_1(&mut pf);
+        // Open leg bled from cash.
+        assert!((pf.cash() - (60.0 - 0.30)).abs() < 1e-9, "cash={}", pf.cash());
+        let trade = pf
+            .close_position(id, 2.0, 1e9, ExitReason::Manual, 1100)
+            .expect("close");
+        // Close leg pro-rata on the trade; edge untouched.
+        assert!((trade.dispatch_usd - 0.05).abs() < 1e-9);
+        assert_eq!(trade.net_pnl, 40.0);
+        assert!((pf.cash() - (140.0 - 0.35)).abs() < 1e-9, "cash={}", pf.cash());
+        assert!((pf.total_dispatch_usd() - 0.35).abs() < 1e-9);
+        assert!((pf.realized_net_pnl() - (40.0 - 0.35)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paper_dispatch_partial_close_pro_rata() {
+        let mut pf = funded();
+        pf.set_paper_dispatch_legs(0.0, 0.10);
+        let id = open_40_at_1(&mut pf);
+        let part = pf
+            .close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::Manual, 1100)
+            .expect("partial");
+        assert!((part.dispatch_usd - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paper_dispatch_defaults_off() {
+        // Zero legs: legacy accounting bit-for-bit.
+        let mut pf = funded();
+        let id = open_40_at_1(&mut pf);
+        assert_eq!(pf.cash(), 60.0);
+        let trade = pf
+            .close_position(id, 2.0, 1e9, ExitReason::Manual, 1100)
+            .expect("close");
+        assert_eq!(trade.dispatch_usd, 0.0);
+        assert_eq!(pf.cash(), 140.0);
     }
 
     #[test]

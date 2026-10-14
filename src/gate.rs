@@ -768,6 +768,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 profile.sl_percent = widened;
             }
         }
+        // Paper-only bleed: live legs debit actuals, so without them
+        // the ledger would never see dispatch costs. Skipped when
+        // priceless (legs keep their last values).
+        if self.exec.live.is_none()
+            && let Some((sol_usd, _)) = sol
+        {
+            let (open_leg, close_leg) =
+                crate::live::paper_dispatch_legs_usd(self.settings.tip_lamports, sol_usd);
+            portfolio.set_paper_dispatch_legs(open_leg, close_leg);
+        }
         match portfolio.open_position_params(&simulator::OpenPositionParams {
             mint,
             side: Side::Long,

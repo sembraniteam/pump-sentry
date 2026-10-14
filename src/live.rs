@@ -160,6 +160,25 @@ pub fn escalated_tip(base_tip_lamports: u64, failed_attempts: u32) -> u64 {
     base_tip_lamports.saturating_mul(mult as u64)
 }
 
+/// Paper-mode dispatch-bleed estimate per leg (open, close), USD.
+/// Mirrors live debiting (first-touch plus ATA rent on open, dispatch
+/// on close) so paper-only PnL nets the same bleed live pays.
+/// Zero when priceless.
+pub fn paper_dispatch_legs_usd(tip_lamports: u64, sol_usd: f64) -> (f64, f64) {
+    if !sol_usd.is_finite() || sol_usd <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let leg = |lamports: u64| lamports as f64 / LAMPORTS_PER_SOL * sol_usd;
+    (
+        leg(
+            tip_lamports
+                .saturating_add(BASE_TX_FEE_LAMPORTS)
+                .saturating_add(ATA_RENT_LAMPORTS),
+        ),
+        leg(tip_lamports.saturating_add(BASE_TX_FEE_LAMPORTS)),
+    )
+}
+
 /// Guard over a fee-inclusive quote: quote plus `slippage_bps`, up.
 /// `None` on zero or overflow (fail-closed).
 pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option<u64> {

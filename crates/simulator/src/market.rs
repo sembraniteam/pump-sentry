@@ -212,6 +212,33 @@ pub fn move_percent(side: Side, entry_price: f64, price: f64) -> f64 {
     }
 }
 
+/// Exit check against the realizable exit price (fee-aware fill), not
+/// the gross mark: SL must fire on what the exit actually nets, and TP
+/// must not book phantom edge the fill never pays. Timeout still fires
+/// on unknowable fills; anything else holds (settlement prices the
+/// same fill, so triggers and books agree by construction).
+pub fn check_exit_realizable(
+    fill: &FillModel,
+    position: &mut Position,
+    quote: f64,
+    exit_notional_usd: f64,
+    liquidity_usd: f64,
+    now_secs: u64,
+) -> Option<ExitReason> {
+    // Timeout ignores pricing.
+    if position.timeout_seconds > 0
+        && now_secs.saturating_sub(position.opened_at) >= position.timeout_seconds
+    {
+        return Some(ExitReason::Timeout);
+    }
+    let flip = match position.side {
+        Side::Long => Side::Short,
+        Side::Short => Side::Long,
+    };
+    let price = fill.try_fill_price(flip, quote, exit_notional_usd, liquidity_usd)?;
+    check_exit(position, price, now_secs)
+}
+
 /// Exit check: timeout, TP, SL, trailing.
 pub fn check_exit(position: &mut Position, price: f64, now_secs: u64) -> Option<ExitReason> {
     // Timeout ignores bad prices.
@@ -341,6 +368,37 @@ mod tests {
         assert_eq!(check_exit(&mut p, 1.75, 1001), Some(ExitReason::TakeProfit));
         assert_eq!(check_exit(&mut p, 0.91, 1001), Some(ExitReason::StopLoss));
         assert_eq!(check_exit(&mut p, 1.10, 1001), None);
+    }
+
+    #[test]
+    fn realizable_triggers_agree_with_settlement() {
+        // Default 125bps/side. Gross +76% is only +73.8% net: TP holds
+        // on the realizable basis (no phantom edge).
+        let fill = FillModel::default();
+        let mut p = long(75.0, -8.0);
+        assert_eq!(
+            check_exit_realizable(&fill, &mut p, 1.76, 176.0, 1e9, 1001),
+            None
+        );
+        // Gross -7.5% is -8.7% net: SL fires a tick earlier than gross.
+        let mut p = long(75.0, -8.0);
+        assert_eq!(
+            check_exit_realizable(&fill, &mut p, 0.925, 92.5, 1e9, 1001),
+            Some(ExitReason::StopLoss)
+        );
+        // Timeout still fires when the fill is unknowable.
+        let mut p = long(75.0, -8.0);
+        p.timeout_seconds = 60;
+        assert_eq!(
+            check_exit_realizable(&fill, &mut p, f64::NAN, 100.0, 1e9, 1060),
+            Some(ExitReason::Timeout)
+        );
+        // ...but nothing else does.
+        let mut p = long(75.0, -8.0);
+        assert_eq!(
+            check_exit_realizable(&fill, &mut p, f64::NAN, 100.0, 1e9, 1001),
+            None
+        );
     }
 
     #[test]
