@@ -121,6 +121,20 @@ impl PumpSwapPool {
     }
 }
 
+/// Signed virtual quote reserves from a pool account (effective-quote
+/// pricing). `None` on wrong owner, short data, or foreign account.
+pub fn virtual_reserves(data: &[u8], owner: &Pubkey) -> Option<i128> {
+    if *owner != PUMP_AMM_PROGRAM_ID || data.len() < POOL_MIN_LEN {
+        return None;
+    }
+    if data[..8] != PUMP_AMM_POOL_DISCRIMINATOR {
+        return None;
+    }
+    data.get(POOL_VIRT_Q_OFFSET..POOL_VIRT_Q_OFFSET + 16)
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        .map(i128::from_le_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,8 +230,23 @@ mod tests {
     }
 
     #[test]
-    fn short_layouts_default_trailing_fees() {
-        // Older pools end at virtual reserves: counters read 0.
+    fn virtual_reserves_read_needs_owner_and_shape() {
+        use crate::detector::PUMP_AMM_PROGRAM_ID;
+        let (_, owner, data) = frozen_pool();
+        assert_eq!(owner, PUMP_AMM_PROGRAM_ID);
+        assert_eq!(
+            virtual_reserves(&data, &owner),
+            Some(987_731_733_625)
+        );
+        // Wrong owner, short data, foreign discriminator: no reserves.
+        let stranger = Pubkey::new_from_array([9; 32]);
+        assert_eq!(virtual_reserves(&data, &stranger), None);
+        assert_eq!(virtual_reserves(&data[..100], &owner), None);
+        assert_eq!(virtual_reserves(&vec![0u8; 300], &owner), None);
+    }
+
+    #[test]
+    fn short_layouts_default_trailing_fees() {        // Older pools end at virtual reserves: counters read 0.
         let (pool, _, data) = frozen_pool();
         let short = &data[..POOL_MIN_LEN];
         let parsed = PumpSwapPool::parse(&pool, short).expect("parse");

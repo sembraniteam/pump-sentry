@@ -12,7 +12,7 @@ pub use detector::{
     PUMP_AMM_PROGRAM_ID, PUMP_MIGRATE_DISCRIMINATOR, PUMP_MIGRATE_V2_LOG, RAYDIUM_V4_PROGRAM_ID,
 };
 pub use pool::{RaydiumV4Pool, WSOL_MINT};
-pub use pumpswap::PumpSwapPool;
+pub use pumpswap::{PumpSwapPool, virtual_reserves};
 pub use vault::{PoolTick, VaultTicker};
 
 /// Parsed migration pool, either venue. Vault/mint accessors speak

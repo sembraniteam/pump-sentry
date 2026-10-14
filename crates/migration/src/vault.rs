@@ -70,6 +70,9 @@ struct WatchedPool {
     quote_vault: Pubkey,
     base_decimals: u8,
     quote_decimals: u8,
+    /// PumpSwap pool account (virtual reserves read per round).
+    /// `None` on Raydium legs (raw vault pricing).
+    pool: Option<Pubkey>,
 }
 
 /// Polling vault ticker. Cloneable; watch set is shared.
@@ -128,6 +131,45 @@ impl VaultTicker {
         base_decimals: u8,
         quote_decimals: u8,
     ) -> Result<(), VaultError> {
+        self.watch_inner(mint, amm_id, None, base_vault, quote_vault, base_decimals, quote_decimals)
+            .await
+    }
+
+    /// Watch a PumpSwap pool: same vault orientation, plus the pool
+    /// account for per-round virtual reserves (effective-quote pricing).
+    pub async fn watch_pumpswap(
+        &self,
+        mint: &str,
+        amm_id: &str,
+        pool: &str,
+        base_vault: &str,
+        quote_vault: &str,
+        base_decimals: u8,
+        quote_decimals: u8,
+    ) -> Result<(), VaultError> {
+        let pool = Pubkey::from_str(pool).map_err(|_| VaultError::BadAddress(pool.to_string()))?;
+        self.watch_inner(
+            mint,
+            amm_id,
+            Some(pool),
+            base_vault,
+            quote_vault,
+            base_decimals,
+            quote_decimals,
+        )
+        .await
+    }
+
+    async fn watch_inner(
+        &self,
+        mint: &str,
+        amm_id: &str,
+        pool: Option<Pubkey>,
+        base_vault: &str,
+        quote_vault: &str,
+        base_decimals: u8,
+        quote_decimals: u8,
+    ) -> Result<(), VaultError> {
         if base_decimals > 18 || quote_decimals > 18 {
             return Err(VaultError::BadConfig(base_decimals, quote_decimals));
         }
@@ -147,6 +189,7 @@ impl VaultTicker {
             quote_vault: parse(quote_vault)?,
             base_decimals,
             quote_decimals,
+            pool,
         };
         self.subs.write().await.insert(mint, entry);
         Ok(())
@@ -163,6 +206,27 @@ impl VaultTicker {
         self.watch(
             mint,
             amm_id,
+            base_vault,
+            quote_vault,
+            WSOL_DECIMALS_DEFAULT,
+            PUMP_TOKEN_DECIMALS_DEFAULT,
+        )
+        .await
+    }
+
+    /// Watch a PumpSwap pool with standard decimals (9/6).
+    pub async fn watch_pumpswap_defaults(
+        &self,
+        mint: &str,
+        amm_id: &str,
+        pool: &str,
+        base_vault: &str,
+        quote_vault: &str,
+    ) -> Result<(), VaultError> {
+        self.watch_pumpswap(
+            mint,
+            amm_id,
+            pool,
             base_vault,
             quote_vault,
             WSOL_DECIMALS_DEFAULT,
@@ -226,19 +290,54 @@ impl VaultTicker {
                     continue;
                 }
             };
-            if accounts.len() != watched.len() * 2 {
+            let expected: usize = watched
+                .iter()
+                .map(|w| if w.pool.is_some() { 3 } else { 2 })
+                .sum();
+            if accounts.len() != expected {
                 warn!(
-                    expected = watched.len() * 2,
+                    expected,
                     got = accounts.len(),
                     "vault batch length mismatch; skipping round"
                 );
                 tokio::time::sleep(self.backoff.fail_sleep()).await;
                 continue;
             }
-            for (pool, pair) in watched.iter().zip(accounts.as_chunks::<2>().0) {
-                let (Some(base), Some(quote)) = (&pair[0], &pair[1]) else {
+            let mut cursor = 0usize;
+            for pool in &watched {
+                let stride = if pool.pool.is_some() { 3 } else { 2 };
+                let Some(slice) = accounts.get(cursor..cursor + stride) else {
+                    warn!("vault batch cursor overran; skipping round");
+                    break;
+                };
+                cursor += stride;
+                let (Some(base), Some(quote)) = (&slice[0], &slice[1]) else {
                     debug!(mint = %pool.mint, "pool vault missing");
                     continue;
+                };
+                // PumpSwap legs price the WSOL side at effective
+                // reserves (vault plus signed virtual reserves, read
+                // fresh every round — v2 trades move it).
+                let wsol_adj: i128 = match pool.pool {
+                    Some(_) => match &slice[2] {
+                        Some(pool_acct) => {
+                            match crate::pumpswap::virtual_reserves(
+                                &pool_acct.data,
+                                &pool_acct.owner,
+                            ) {
+                                Some(virt) => virt,
+                                None => {
+                                    debug!(mint = %pool.mint, "pool account unreadable; skipping tick");
+                                    continue;
+                                }
+                            }
+                        }
+                        None => {
+                            debug!(mint = %pool.mint, "pool account missing");
+                            continue;
+                        }
+                    },
+                    None => 0,
                 };
                 let Some(tick) = price_tick(
                     pool,
@@ -246,6 +345,7 @@ impl VaultTicker {
                     &base.owner,
                     &quote.data,
                     &quote.owner,
+                    wsol_adj,
                     sol_usd,
                 ) else {
                     if warn_throttled(&PRICE_WARN_AT) {
@@ -270,11 +370,17 @@ impl VaultTicker {
 
     /// One round of chunked reads. Short vec skips the round.
     async fn poll_round(&self, watched: &[WatchedPool]) -> Vec<Option<solana_account::Account>> {
-        let mut accounts = Vec::with_capacity(watched.len() * 2);
+        let mut accounts = Vec::with_capacity(watched.len() * 3);
         for pool_chunk in watched.chunks(Self::VAULT_BATCH_CHUNK_PAIRS.max(1)) {
             let keys: Vec<Pubkey> = pool_chunk
                 .iter()
-                .flat_map(|w| [w.base_vault, w.quote_vault])
+                .flat_map(|w| {
+                    let mut keys = vec![w.base_vault, w.quote_vault];
+                    if let Some(pool) = w.pool {
+                        keys.push(pool);
+                    }
+                    keys
+                })
                 .collect();
             match tokio::time::timeout(
                 Duration::from_secs(15),
@@ -319,7 +425,8 @@ fn is_token_program(owner: &Pubkey) -> bool {
 }
 
 /// Price one pool from raw vaults. Pure.
-/// BASE holds WSOL, QUOTE the token.
+/// BASE holds WSOL, QUOTE the token. `wsol_adj_lamports` is the signed
+/// PumpSwap virtual-reserve adjustment to the WSOL side (0 elsewhere).
 /// `None` on wrong owner, wrong mint, or bad amount.
 fn price_tick(
     pool: &WatchedPool,
@@ -327,6 +434,7 @@ fn price_tick(
     base_owner: &Pubkey,
     quote_data: &[u8],
     quote_owner: &Pubkey,
+    wsol_adj_lamports: i128,
     sol_usd: f64,
 ) -> Option<PoolTick> {
     if !is_token_program(base_owner) || !is_token_program(quote_owner) {
@@ -343,7 +451,12 @@ fn price_tick(
     if quote_mint.to_string() != pool.mint {
         return None;
     }
-    let base_ui = token_amount(base_data)? as f64 / 10f64.powi(i32::from(pool.base_decimals));
+    let base_raw = token_amount(base_data)?;
+    let base_eff = (i128::from(base_raw)).checked_add(wsol_adj_lamports)?;
+    if base_eff <= 0 {
+        return None;
+    }
+    let base_ui = base_eff as f64 / 10f64.powi(i32::from(pool.base_decimals));
     let quote_ui = token_amount(quote_data)? as f64 / 10f64.powi(i32::from(pool.quote_decimals));
     if !base_ui.is_finite() || base_ui <= 0.0 || !quote_ui.is_finite() || quote_ui <= 0.0 {
         return None;
@@ -390,6 +503,7 @@ mod tests {
             quote_vault: Pubkey::new_from_array([2; 32]),
             base_decimals: 9,
             quote_decimals: 6,
+            pool: None,
         }
     }
 
@@ -400,6 +514,19 @@ mod tests {
             &ids::TOKEN_PROGRAM_ID,
             &vault_bytes(&token_mint(), quote_token_units),
             &ids::TOKEN_PROGRAM_ID,
+            0,
+            150.0,
+        )
+    }
+
+    fn tick_adj(base_sol_lamports: u64, quote_token_units: u64, wsol_adj: i128) -> Option<PoolTick> {
+        price_tick(
+            &pool(),
+            &vault_bytes(&ids::WSOL_MINT, base_sol_lamports),
+            &ids::TOKEN_PROGRAM_ID,
+            &vault_bytes(&token_mint(), quote_token_units),
+            &ids::TOKEN_PROGRAM_ID,
+            wsol_adj,
             150.0,
         )
     }
@@ -427,6 +554,7 @@ mod tests {
                 &ids::TOKEN_PROGRAM_ID,
                 &vault_bytes(&token_mint(), 1),
                 &ids::TOKEN_PROGRAM_ID,
+                0,
                 150.0,
             )
             .is_none()
@@ -438,6 +566,7 @@ mod tests {
                 &ids::TOKEN_PROGRAM_ID,
                 &vault_bytes(&token_mint(), 1),
                 &ids::TOKEN_PROGRAM_ID,
+                0,
                 150.0,
             )
             .is_none()
@@ -449,6 +578,7 @@ mod tests {
                 &ids::TOKEN_PROGRAM_ID,
                 &vault_bytes(&token_mint(), 1),
                 &ids::TOKEN_PROGRAM_ID,
+                0,
                 0.0,
             )
             .is_none()
@@ -465,6 +595,7 @@ mod tests {
                 &stranger,
                 &vault_bytes(&token_mint(), 1_000_000),
                 &ids::TOKEN_PROGRAM_ID,
+                0,
                 150.0,
             )
             .is_none()
@@ -477,6 +608,7 @@ mod tests {
                 &ids::TOKEN_2022_PROGRAM_ID,
                 &vault_bytes(&token_mint(), 1_000_000_000_000),
                 &ids::TOKEN_2022_PROGRAM_ID,
+                0,
                 150.0,
             )
             .is_some()
@@ -489,6 +621,7 @@ mod tests {
                 &ids::TOKEN_PROGRAM_ID,
                 &vault_bytes(&token_mint(), 1_000_000),
                 &ids::TOKEN_PROGRAM_ID,
+                0,
                 150.0,
             )
             .is_none()
@@ -501,10 +634,26 @@ mod tests {
                 &ids::TOKEN_PROGRAM_ID,
                 &vault_bytes(&Pubkey::new_from_array([7; 32]), 1_000_000),
                 &ids::TOKEN_PROGRAM_ID,
+                0,
                 150.0,
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn virtual_reserves_adjust_effective_price() {
+        // 30 SOL vault + 15 SOL virtual vs 1M tokens: effective 45
+        // SOL prices $0.00675, not the raw $0.0045.
+        let tick = tick_adj(30_000_000_000, 1_000_000_000_000, 15_000_000_000).expect("tick");
+        assert!((tick.price_usd - 0.00675).abs() < 1e-9, "price={}", tick.price_usd);
+        assert!((tick.liquidity_usd - 6750.0).abs() < 1e-9);
+        // Negative virtual within the vault still prices.
+        let tick = tick_adj(30_000_000_000, 1_000_000_000_000, -10_000_000_000).expect("tick");
+        assert!((tick.price_usd - 0.003).abs() < 1e-12, "price={}", tick.price_usd);
+        // Virtual at or past the vault empties effective reserves: no tick.
+        assert!(tick_adj(30_000_000_000, 1_000_000_000_000, -30_000_000_000).is_none());
+        assert!(tick_adj(30_000_000_000, 1_000_000_000_000, -31_000_000_000).is_none());
     }
 
     #[test]

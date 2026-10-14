@@ -2,7 +2,7 @@
 
 use alert::Alerter;
 use listener::MigrationReport;
-use migration::PoolTick;
+use migration::{MigrationDestination, PoolTick};
 use tracing::{info, warn};
 
 use crate::pipeline::{AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener};
@@ -82,7 +82,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     }
 
     /// Register a migrated pool for tracking and exits.
-    /// PumpSwap has no pool: nothing to follow.
+    /// PumpSwap legs watch the pool account too (effective-quote
+    /// pricing); on both venues BASE-side is WSOL by report contract.
     async fn follow_pool(&self, mint: &str, report: &MigrationReport) {
         let (Some(amm), Some(base_vault), Some(quote_vault)) = (
             report.amm_id.clone(),
@@ -93,11 +94,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(mint = %mint, amm = ?report.amm_id, "migration without resolvable pool; not following");
             return;
         };
-        if let Err(e) = self
-            .vaults
-            .watch_defaults(mint, &amm, &base_vault, &quote_vault)
-            .await
-        {
+        let watched = if report.destination == MigrationDestination::PumpSwap {
+            // amm_id IS the pool on this venue.
+            self.vaults
+                .watch_pumpswap_defaults(mint, &amm, &amm, &base_vault, &quote_vault)
+                .await
+        } else {
+            self.vaults
+                .watch_defaults(mint, &amm, &base_vault, &quote_vault)
+                .await
+        };
+        if let Err(e) = watched {
             warn!(amm = %amm, error = %e, "pool watch failed");
             return;
         }
