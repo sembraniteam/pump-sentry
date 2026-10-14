@@ -8,8 +8,32 @@ permissions:
   contents: write
 
 jobs:
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: clippy all targets, warnings deny
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test workspace
+    needs: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: test workspace
+        run: cargo test --workspace
+
   build:
     name: build (${{ matrix.asset }})
+    needs: test
     strategy:
       fail-fast: false
       matrix:
