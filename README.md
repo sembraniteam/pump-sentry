@@ -62,9 +62,10 @@ Live funding: SOL-pair v3 buys pay **native SOL** (official BUY.md/TRADE_V3.md) 
 
 ```
 src/               # cli (supervisor) / settings / pipeline (orchestrator) / live (sizing+dispatch)
+                   # gate (watchlist+opens) / live_mirror (live dispatch) / follow (migration watch) / wal (custody log)
 crates/listener/   # WS ingestion + parser + screening + quorum gate
 crates/executor/   # live swaps via Jito (only with --live)
 crates/curve|auditor|risk-engine|simulator|ids|alert|migration/
 ```
 
-Each crate has its own README. Tests: `cargo test --workspace` (347, live probes ignored) · `cargo clippy --all-targets` (zero warnings).
+Each crate has its own README. Tests: `cargo test --workspace` (355, live probes ignored) · `cargo clippy --all-targets` (zero warnings).

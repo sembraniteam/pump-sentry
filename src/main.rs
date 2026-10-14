@@ -14,6 +14,8 @@
 //! all unit-tested.
 
 mod cli;
+mod follow;
+mod gate;
 mod live;
 mod live_mirror;
 mod pipeline;

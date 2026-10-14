@@ -42,29 +42,17 @@ pub enum StrategyMode {
     Runner,
 }
 
-impl StrategyMode {
-    /// Deprecated aliases kept parsing for one release cycle — warn on
-    /// use so configs migrate before removal (`scalp_quick`,
-    /// `moon_bag`; canonical: `scalp`, `runner`).
-    pub fn is_deprecated_alias(s: &str) -> bool {
-        matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "scalp_quick" | "moon_bag"
-        )
-    }
-}
-
 impl FromStr for StrategyMode {
     type Err = String;
 
-    /// Parses `adaptive` | `scalp` | `scalpquick` | `runner` | `moonbag`
-    /// (case-insensitive); anything else is an error (fail-closed: the
-    /// caller falls back to [`StrategyMode::Adaptive`]).
+    /// Parses `adaptive` | `scalp` | `runner` (case-insensitive);
+    /// anything else is an error (fail-closed: the caller falls back
+    /// to [`StrategyMode::Adaptive`]).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "adaptive" => Ok(StrategyMode::Adaptive),
-            "scalp" | "scalpquick" | "scalp_quick" => Ok(StrategyMode::ScalpQuick),
-            "runner" | "moonbag" | "moon_bag" => Ok(StrategyMode::Runner),
+            "scalp" => Ok(StrategyMode::ScalpQuick),
+            "runner" => Ok(StrategyMode::Runner),
             other => Err(format!("unknown strategy mode '{other}'")),
         }
     }
@@ -167,8 +155,11 @@ mod tests {
     fn mode_parses_case_insensitively() {
         assert_eq!("adaptive".parse(), Ok(StrategyMode::Adaptive));
         assert_eq!("SCALP".parse(), Ok(StrategyMode::ScalpQuick));
-        assert_eq!("MoonBag".parse(), Ok(StrategyMode::Runner));
+        assert_eq!("Runner".parse(), Ok(StrategyMode::Runner));
         assert!("yolo".parse::<StrategyMode>().is_err());
+        // Removed aliases stay removed (fail-closed to adaptive).
+        assert!("MoonBag".parse::<StrategyMode>().is_err());
+        assert!("scalp_quick".parse::<StrategyMode>().is_err());
     }
 
     #[test]
