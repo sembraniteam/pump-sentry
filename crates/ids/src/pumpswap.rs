@@ -21,6 +21,14 @@ pub const PUMP_AMM_FEE_CONFIG: Pubkey =
     Pubkey::from_str_const("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx");
 /// Seed for the CPI event-authority PDA.
 pub const PUMP_AMM_EVENT_AUTHORITY_SEED: &[u8] = b"__event_authority";
+/// Mayhem fixed supply for fee-tier market caps (per SDK).
+pub const PUMP_AMM_MAYHEM_SUPPLY: u64 = 1_000_000_000_000_000;
+/// Admin disable-flags byte (any nonzero refuses: unknown admin state).
+pub const PUMP_AMM_GLOBAL_DISABLE_FLAGS_OFFSET: usize = 56;
+/// `creator_fee_configurable` byte in GlobalConfig (proven live: 1).
+pub const PUMP_AMM_GLOBAL_CREATOR_GATE_OFFSET: usize = 940;
+/// GlobalConfig account length.
+pub const PUMP_AMM_GLOBAL_LEN: usize = 949;
 /// `sell_v2` discriminator: 17-account PumpSwap sells, fees stay in
 /// the pool. `sha256("global:sell_v2")[..8]` reproduces these bytes.
 pub const PUMP_AMM_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];

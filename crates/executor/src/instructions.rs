@@ -20,12 +20,12 @@ pub use ids::{
     CURVE_CASHBACK_FLAG_OFFSET, CURVE_COMPLETE_OFFSET, CURVE_CREATOR_END, CURVE_CREATOR_OFFSET,
     CURVE_MAYHEM_FLAG_OFFSET, CURVE_MIN_LEN, CURVE_QUOTE_MINT_END, CURVE_QUOTE_MINT_OFFSET,
     DEFAULT_BUYBACK_FEE_RECIPIENT, EVENT_AUTHORITY, FEE_CONFIG_ACCOUNT, FEE_CONFIG_PROGRAM,
-    FEE_RECIPIENT, GLOBAL_ACCOUNT, PUMP_BUY_DISCRIMINATOR,
-    PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR, PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR,
-    PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_SELL_V3_DISCRIMINATOR,
-    RENT_SYSVAR_ID, SYSTEM_PROGRAM_ID,
-    TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, USDC_MINT, USER_VOLUME_ACCUMULATOR_SEED,
-    WSOL_MINT,
+    FEE_RECIPIENT, GLOBAL_ACCOUNT, PUMP_AMM_EVENT_AUTHORITY_SEED, PUMP_AMM_FEE_CONFIG,
+    PUMP_AMM_GLOBAL_CONFIG, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SELL_V2_DISCRIMINATOR,
+    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR,
+    PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID,
+    PUMP_SELL_V3_DISCRIMINATOR, RENT_SYSVAR_ID, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID, USDC_MINT, USER_VOLUME_ACCUMULATOR_SEED, WSOL_MINT,
 };
 
 /// v3 buy args. 24-byte payload with no `partial_fill` tail.
@@ -196,6 +196,97 @@ impl PumpSwapBuilder {
         Self::build_v3_ix(data, accts.payer, accts.mint, accts.quote_mint, accts.bonding_curve,
             accts.associated_bonding_curve, accts.base_token_program, accts.quote_token_program,
             accts.buyback_recipient)
+    }
+}
+
+/// PumpSwap `sell_v2` args: 24-byte payload.
+#[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
+pub struct PumpAmmSellV2Args {
+    /// Exact base tokens to sell.
+    pub base_amount_in: u64,
+    /// Least quote accepted after all fees.
+    pub min_quote_amount_out: u64,
+}
+
+/// PumpSwap `sell_v2` accounts (17, doc order). Fees stay in the pool.
+#[derive(Debug, Clone, Copy)]
+pub struct PumpAmmSellV2Accounts<'a> {
+    /// Pool account.
+    pub pool: &'a Pubkey,
+    /// Payer and signer.
+    pub user: &'a Pubkey,
+    /// Base mint (sold token).
+    pub base_mint: &'a Pubkey,
+    /// Quote mint (WSOL on SOL pools).
+    pub quote_mint: &'a Pubkey,
+    /// User base token account (must exist).
+    pub user_base_token_account: &'a Pubkey,
+    /// User quote token account (must exist).
+    pub user_quote_token_account: &'a Pubkey,
+    /// Pool base vault.
+    pub pool_base_token_account: &'a Pubkey,
+    /// Pool quote vault.
+    pub pool_quote_token_account: &'a Pubkey,
+    /// Token program owning `base_mint`.
+    pub base_token_program: &'a Pubkey,
+    /// Token program owning `quote_mint`.
+    pub quote_token_program: &'a Pubkey,
+    /// Buyback recipient quote ATA (must exist, never created).
+    pub buyback_fee_recipient: &'a Pubkey,
+}
+
+/// PumpSwap user-volume PDA (program-created when missing).
+pub fn amm_user_volume_accumulator_pda(user: &Pubkey) -> Pubkey {
+    let (pda, _) = Pubkey::find_program_address(
+        &[USER_VOLUME_ACCUMULATOR_SEED, user.as_ref()],
+        &PUMP_AMM_PROGRAM_ID,
+    );
+    pda
+}
+
+/// PumpSwap event-authority PDA.
+pub fn amm_event_authority_pda() -> Pubkey {
+    let (pda, _) = Pubkey::find_program_address(
+        &[PUMP_AMM_EVENT_AUTHORITY_SEED],
+        &PUMP_AMM_PROGRAM_ID,
+    );
+    pda
+}
+
+impl PumpSwapBuilder {
+    /// PumpSwap `sell_v2` ix: 17 accounts per `PUMP_SWAP_TRADE_V2.md`.
+    /// Sim gates every build.
+    pub fn build_sell_pumpswap_v2_ix(
+        base_amount_in: u64,
+        min_quote_amount_out: u64,
+        accts: &PumpAmmSellV2Accounts<'_>,
+    ) -> Instruction {
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&PUMP_AMM_SELL_V2_DISCRIMINATOR);
+        PumpAmmSellV2Args { base_amount_in, min_quote_amount_out }
+            .serialize(&mut data)
+            .expect("in-memory Borsh encode cannot fail");
+        let accounts = vec![
+            AccountMeta::new(*accts.pool, false),                          // [0]
+            AccountMeta::new(*accts.user, true),                           // [1]
+            AccountMeta::new_readonly(PUMP_AMM_GLOBAL_CONFIG, false),      // [2]
+            AccountMeta::new_readonly(*accts.base_mint, false),            // [3]
+            AccountMeta::new_readonly(*accts.quote_mint, false),           // [4]
+            AccountMeta::new(*accts.user_base_token_account, false),       // [5]
+            AccountMeta::new(*accts.user_quote_token_account, false),      // [6]
+            AccountMeta::new(*accts.pool_base_token_account, false),       // [7]
+            AccountMeta::new(*accts.pool_quote_token_account, false),      // [8]
+            AccountMeta::new_readonly(*accts.base_token_program, false),   // [9]
+            AccountMeta::new_readonly(*accts.quote_token_program, false),  // [10]
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),           // [11]
+            AccountMeta::new(amm_user_volume_accumulator_pda(accts.user), false), // [12]
+            AccountMeta::new_readonly(PUMP_AMM_FEE_CONFIG, false),         // [13]
+            AccountMeta::new(*accts.buyback_fee_recipient, false),         // [14]
+            AccountMeta::new_readonly(amm_event_authority_pda(), false),   // [15]
+            AccountMeta::new_readonly(PUMP_AMM_PROGRAM_ID, false),         // [16]
+        ];
+        debug_assert_eq!(accounts.len(), 17);
+        Instruction { program_id: PUMP_AMM_PROGRAM_ID, accounts, data }
     }
 }
 
@@ -403,6 +494,60 @@ mod tests {
             assert_eq!(*meta, expect, "flags {i}");
         }
         assert_eq!(built.data, data);
+    }
+
+    #[test]
+    fn sell_pumpswap_v2_matches_documented_layout() {
+        // No frozen sell_v2 fill yet: pins the 17-account table from
+        // PUMP_SWAP_TRADE_V2.md plus IDL writability (pool/user/volumes
+        // writable, configs/programs readonly, user signer).
+        use std::collections::HashSet;
+        let key = |b: u8| Pubkey::new_from_array([b; 32]);
+        let accts = PumpAmmSellV2Accounts {
+            pool: &PUMP_AMM_PROGRAM_ID,
+            user: &key(1),
+            base_mint: &key(3),
+            quote_mint: &WSOL_MINT,
+            user_base_token_account: &key(5),
+            user_quote_token_account: &key(6),
+            pool_base_token_account: &key(7),
+            pool_quote_token_account: &key(8),
+            base_token_program: &TOKEN_PROGRAM_ID,
+            quote_token_program: &TOKEN_PROGRAM_ID,
+            buyback_fee_recipient: &key(14),
+        };
+        let built = PumpSwapBuilder::build_sell_pumpswap_v2_ix(1_000_000, 900_000, &accts);
+        assert_eq!(built.program_id, PUMP_AMM_PROGRAM_ID);
+        assert_eq!(built.accounts.len(), 17);
+        assert_eq!(&built.data[..8], &PUMP_AMM_SELL_V2_DISCRIMINATOR);
+        assert_eq!(
+            u64::from_le_bytes(built.data[8..16].try_into().expect("u64")),
+            1_000_000
+        );
+        assert_eq!(
+            u64::from_le_bytes(built.data[16..24].try_into().expect("u64")),
+            900_000
+        );
+        assert_eq!(built.data.len(), 24);
+        let writable: HashSet<usize> =
+            [0, 1, 5, 6, 7, 8, 12, 14].into_iter().collect();
+        let expect_keys = [
+            PUMP_AMM_PROGRAM_ID, key(1), PUMP_AMM_GLOBAL_CONFIG, key(3), WSOL_MINT, key(5),
+            key(6), key(7), key(8), TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID,
+            amm_user_volume_accumulator_pda(&key(1)), PUMP_AMM_FEE_CONFIG, key(14),
+            amm_event_authority_pda(), PUMP_AMM_PROGRAM_ID,
+        ];
+        for (i, meta) in built.accounts.iter().enumerate() {
+            assert_eq!(meta.pubkey, expect_keys[i], "position {i}");
+            let expect = if i == 1 {
+                AccountMeta::new(expect_keys[i], true)
+            } else if writable.contains(&i) {
+                AccountMeta::new(expect_keys[i], false)
+            } else {
+                AccountMeta::new_readonly(expect_keys[i], false)
+            };
+            assert_eq!(*meta, expect, "flags {i}");
+        }
     }
 
     #[test]

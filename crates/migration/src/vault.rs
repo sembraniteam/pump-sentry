@@ -137,6 +137,7 @@ impl VaultTicker {
 
     /// Watch a PumpSwap pool: same vault orientation, plus the pool
     /// account for per-round virtual reserves (effective-quote pricing).
+    #[allow(clippy::too_many_arguments)]
     pub async fn watch_pumpswap(
         &self,
         mint: &str,
@@ -160,6 +161,7 @@ impl VaultTicker {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn watch_inner(
         &self,
         mint: &str,

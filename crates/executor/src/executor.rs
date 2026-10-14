@@ -101,6 +101,25 @@ pub struct SellRaydiumOrder {
     pub tip_lamports: u64,
 }
 
+/// Post-migration PumpSwap sell: token -> WSOL on a validated pool.
+/// Floor quotes from live reserves plus the fee schedule in preflight.
+pub struct SellPumpSwapOrder {
+    /// Token mint (pool base).
+    pub mint: Pubkey,
+    /// PumpSwap pool.
+    pub pool: Pubkey,
+    /// Token-side vault (pool base vault).
+    pub base_vault: Pubkey,
+    /// WSOL-side vault (pool quote vault).
+    pub quote_vault: Pubkey,
+    /// Token base units to sell.
+    pub amount_tokens: u64,
+    /// Slippage bps over the fee-aware quote (`>= 10000` refuses).
+    pub slippage_bps: u64,
+    /// Jito tip (see [`BuyOrder::tip_lamports`]).
+    pub tip_lamports: u64,
+}
+
 /// Curve trade state (offsets in [`ids`]).
 /// Zero quote = SOL-paired -> WSOL. Complete = migrated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -740,6 +759,284 @@ impl SwapExecutor {
                 ExecutorError::BadOrder("raydium swap ix refused to build".to_string())
             })?,
         );
+        Ok(ixs)
+    }
+
+    /// Post-migration PumpSwap sell via Jito. Floor quotes from live
+    /// reserves plus the fee schedule in preflight.
+    pub async fn sell_pumpswap_jito(
+        &self,
+        order: &SellPumpSwapOrder,
+    ) -> Result<JitoReceipt, ExecutorError> {
+        let mut ixs = self.preflight_sell_pumpswap(order, true).await?;
+        self.push_tip(&mut ixs, order.tip_lamports).await;
+        self.send_bundle(&ixs, "sell-pumpswap-jito").await
+    }
+
+    /// PumpSwap sell checks, then the 17-account `sell_v2` shape.
+    /// Sim gates the bundle, so a stale reserve read dies free.
+    /// No fee-input cache: exits are rare and retry-bounded, and every
+    /// leg re-reads live reserves anyway.
+    async fn preflight_sell_pumpswap(
+        &self,
+        order: &SellPumpSwapOrder,
+        bundled: bool,
+    ) -> Result<Vec<solana_instruction::Instruction>, ExecutorError> {
+        use crate::instructions::{
+            DEFAULT_BUYBACK_FEE_RECIPIENT, PUMP_AMM_FEE_CONFIG, PUMP_AMM_PROGRAM_ID, TOKEN_PROGRAM_ID,
+            WSOL_MINT, user_ata_with_program,
+        };
+        use crate::quote::{
+            market_cap, parse_amm_creator_gate, parse_fee_schedule, pumpswap_fee_bps,
+            pumpswap_sell_floor, pumpswap_sell_out,
+        };
+        use migration::pumpswap::PumpSwapPool;
+        if order.amount_tokens == 0 {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap sell amount_tokens is 0".to_string(),
+            ));
+        }
+        if order.slippage_bps >= 10_000 {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap sell slippage >= 100%: refusing unguarded floor".to_string(),
+            ));
+        }
+        let balance = self
+            .wallet
+            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
+            .await?;
+        info!(mint = %order.mint, balance, amount = order.amount_tokens, "pumpswap sell pre-flight ok");
+        let payer = self.wallet.pubkey();
+        // PumpSwap supports both token programs: the vault owners decide.
+        let Some(token_program) = self.token_program(&order.mint).await else {
+            return Err(ExecutorError::BadOrder("mint account unreadable; token program unknown".to_string()));
+        };
+        let source_ata = user_ata_with_program(&payer, &order.mint, &token_program);
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.rpc.get_token_account_balance(&source_ata),
+        )
+        .await
+        {
+            Ok(Ok(balance)) => {
+                let held: u64 = balance.amount.parse().map_err(|_| {
+                    ExecutorError::BadOrder(format!(
+                        "pumpswap sell balance unreadable for {} (RPC shape change?); refusing",
+                        order.mint
+                    ))
+                })?;
+                if held < order.amount_tokens {
+                    return Err(ExecutorError::BadOrder(format!(
+                        "pumpswap sell amount {} exceeds ATA balance {held}",
+                        order.amount_tokens
+                    )));
+                }
+            }
+            Ok(Err(_)) => {
+                return Err(ExecutorError::BadOrder(
+                    "pumpswap sell ATA missing or unreadable".to_string(),
+                ));
+            }
+            Err(_) => return Err(ExecutorError::Timeout("pumpswap sell balance read")),
+        }
+        // Pool, vaults, fee inputs, supply: one joined round.
+        let (pool, base_vault, quote_vault, global, schedule, supply) = tokio::join!(
+            async {
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.pool)).await
+            },
+            async {
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.base_vault)).await
+            },
+            async {
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.quote_vault)).await
+            },
+            async {
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&ids::PUMP_AMM_GLOBAL_CONFIG)).await
+            },
+            async {
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&PUMP_AMM_FEE_CONFIG)).await
+            },
+            async { mint_supply(&self.rpc, &order.mint).await }
+        );
+        let (Ok(Ok(pool)), Ok(Ok(base_vault)), Ok(Ok(quote_vault))) = (pool, base_vault, quote_vault)
+        else {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap pool or vaults unreadable; refusing unroutable dispatch (fail-closed)"
+                    .to_string(),
+            ));
+        };
+        // Trust gate: AMM owner, our mint at base, WSOL quote.
+        let Some(parsed) = PumpSwapPool::parse_validated(
+            &order.pool,
+            &pool.data,
+            &pool.owner,
+            &order.mint,
+        ) else {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap pool failed trust gate (owner/mint/quote); refusing (fail-closed)"
+                    .to_string(),
+            ));
+        };
+        if parsed.is_cashback {
+            warn!(mint = %order.mint, "cashback pool: sell_v2 refuses on-chain (6079); v1 fallback is manual-only");
+            return Err(ExecutorError::BadOrder(
+                "cashback pool: sell_v2 unsupported; refusing (fail-closed)".to_string(),
+            ));
+        }
+        // Order vaults must be the pool's own (wiring guard).
+        if order.base_vault != parsed.base_vault || order.quote_vault != parsed.quote_vault {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap order vaults differ from pool vaults; refusing".to_string(),
+            ));
+        }
+        // Vault programs decide the ix programs (classic or 2022).
+        for (vault, role) in [(&base_vault, "base"), (&quote_vault, "quote")] {
+            use crate::instructions::TOKEN_2022_PROGRAM_ID;
+            if vault.owner != TOKEN_PROGRAM_ID && vault.owner != TOKEN_2022_PROGRAM_ID {
+                return Err(ExecutorError::BadOrder(format!(
+                    "pumpswap {role} vault owner is not a token program; refusing"
+                )));
+            }
+        }
+        let vault_amount = |data: &[u8]| -> Option<u64> {
+            data.get(64..72)?.try_into().ok().map(u64::from_le_bytes)
+        };
+        let (Some(base_reserve), Some(quote_reserve)) = (
+            vault_amount(&base_vault.data),
+            vault_amount(&quote_vault.data),
+        ) else {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap vault balances unreadable; refusing".to_string(),
+            ));
+        };
+        // Fee inputs: global gates + schedule, mint supply for tiers.
+        let (Ok(Ok(global)), Ok(Ok(fee_config))) = (global, schedule) else {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap fee inputs unreadable; refusing unpriced dispatch (fail-closed)"
+                    .to_string(),
+            ));
+        };
+        if global.owner != PUMP_AMM_PROGRAM_ID {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap global config owner mismatch; refusing".to_string(),
+            ));
+        }
+        if fee_config.owner != crate::instructions::FEE_CONFIG_PROGRAM {
+            return Err(ExecutorError::BadOrder(
+                "pumpswap fee config owner mismatch; refusing".to_string(),
+            ));
+        }
+        let gate_on =
+            parse_amm_creator_gate(&global.data).map_err(|_| {
+                ExecutorError::BadOrder("pumpswap global gate unparsable; refusing".to_string())
+            })?;
+        if global
+            .data
+            .get(ids::PUMP_AMM_GLOBAL_DISABLE_FLAGS_OFFSET)
+            .copied()
+            .unwrap_or(1)
+            != 0
+        {
+            warn!(mint = %order.mint, "pumpswap disable_flags set: admin-halted instructions; refusing (fail-closed)");
+            return Err(ExecutorError::BadOrder(
+                "pumpswap instructions disabled by admin; refusing".to_string(),
+            ));
+        }
+        let schedule =
+            parse_fee_schedule(&fee_config.data).map_err(|_| {
+                ExecutorError::BadOrder("pumpswap fee schedule unparsable; refusing".to_string())
+            })?;
+        // Effective quote: vault plus signed virtual reserves.
+        let eff_quote = (i128::from(quote_reserve))
+            .checked_add(parsed.virtual_quote_reserves)
+            .and_then(|v| u64::try_from(v).ok())
+            .filter(|v| *v > 0)
+            .ok_or_else(|| {
+                ExecutorError::BadOrder("pumpswap effective reserves non-positive; refusing".to_string())
+            })?;
+        let real_cap = u64::try_from(parsed.fee_buckets)
+            .ok()
+            .and_then(|buckets| quote_reserve.checked_sub(buckets))
+            .ok_or_else(|| {
+                ExecutorError::BadOrder("pumpswap fee buckets exceed vault; refusing".to_string())
+            })?;
+        let circulating = if parsed.is_mayhem {
+            ids::PUMP_AMM_MAYHEM_SUPPLY
+        } else {
+            supply.ok_or_else(|| {
+                ExecutorError::BadOrder("pumpswap mint supply unreadable; refusing unpriced dispatch".to_string())
+            })?
+        };
+        let mcap = market_cap(eff_quote, base_reserve, circulating).map_err(|_| {
+            ExecutorError::BadOrder("pumpswap market cap uncomputable; refusing".to_string())
+        })?;
+        let fees = pumpswap_fee_bps(
+            &schedule,
+            gate_on,
+            parsed.creator_fee_bps,
+            parsed.coin_creator == Pubkey::default(),
+            mcap,
+        )
+        .map_err(|_| {
+            ExecutorError::BadOrder("pumpswap fee tier unresolvable; refusing".to_string())
+        })?;
+        let net = pumpswap_sell_out(
+            &crate::quote::PoolView {
+                base_reserve,
+                eff_quote_reserve: eff_quote,
+                real_quote_cap: real_cap,
+                lp_bps: fees.lp,
+                proto_bps: fees.protocol,
+                creator_bps: fees.creator,
+            },
+            order.amount_tokens,
+        )
+        .map_err(|_| {
+            ExecutorError::BadOrder("pumpswap quote unroutable at this size".to_string())
+        })?;
+        let floor = pumpswap_sell_floor(net, order.slippage_bps).ok_or_else(|| {
+            ExecutorError::BadOrder("pumpswap floor unguardable (dust); refusing".to_string())
+        })?;
+        // Quote-side WSOL ATA [6] must exist; prefix is idempotent.
+        let quote_program = &quote_vault.owner;
+        let user_quote = user_ata_with_program(&payer, &WSOL_MINT, quote_program);
+        let mut ixs = Vec::new();
+        ixs.extend(
+            self.maybe_create_ata_ix(&payer, &payer, &WSOL_MINT, &user_quote, quote_program)
+                .await,
+        );
+        // Buyback recipient ATA must exist; never funded by the trade.
+        let buyback = user_ata_with_program(
+            &DEFAULT_BUYBACK_FEE_RECIPIENT,
+            &WSOL_MINT,
+            quote_program,
+        );
+        match tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&buyback)).await {
+            Ok(Ok(_)) => {}
+            _ => {
+                return Err(ExecutorError::BadOrder(
+                    "pumpswap buyback recipient ATA missing; refusing (never funded by the trade)"
+                        .to_string(),
+                ));
+            }
+        }
+        ixs.push(crate::instructions::PumpSwapBuilder::build_sell_pumpswap_v2_ix(
+            order.amount_tokens,
+            floor,
+            &crate::instructions::PumpAmmSellV2Accounts {
+                pool: &order.pool,
+                user: &payer,
+                base_mint: &order.mint,
+                quote_mint: &WSOL_MINT,
+                user_base_token_account: &source_ata,
+                user_quote_token_account: &user_quote,
+                pool_base_token_account: &order.base_vault,
+                pool_quote_token_account: &order.quote_vault,
+                base_token_program: &token_program,
+                quote_token_program: quote_program,
+                buyback_fee_recipient: &buyback,
+            },
+        ));
         Ok(ixs)
     }
 

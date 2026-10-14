@@ -358,8 +358,7 @@ pub fn sell_out_after_fees(
 }
 
 /// Tokens out for an exact quote input. `Ok(0)` when input can't cover fees.
-pub fn buy_tokens_for_exact_in(
-    schedule: &FeeSchedule,
+pub fn buy_tokens_for_exact_in(    schedule: &FeeSchedule,
     gate_on: bool,
     view: &CurveView,
     mint_supply: u64,
@@ -390,6 +389,103 @@ pub fn buy_tokens_for_exact_in(
         u128::from(view.vt),
     )?;
     Ok(tokens.min(u128::from(view.real_tokens)) as u64)
+}
+
+/// PumpSwap pool inputs for quoting a `sell_v2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolView {
+    /// Base reserve: token vault amount.
+    pub base_reserve: u64,
+    /// Effective quote reserve: WSOL vault plus signed virtual reserves.
+    pub eff_quote_reserve: u64,
+    /// Real WSOL vault minus kept-fee buckets (payout cap).
+    pub real_quote_cap: u64,
+    /// LP fee bps (AMM global config).
+    pub lp_bps: u64,
+    /// Protocol fee bps (AMM global config).
+    pub proto_bps: u64,
+    /// Creator fee bps (tier or pool override, zeroed when creatorless).
+    pub creator_bps: u64,
+}
+
+/// Proceeds for a PumpSwap `sell_v2`: constant-product exact-in on
+/// effective reserves minus ceil'd fees, capped by real reserves.
+/// Mirrors `@pump-fun/pump-swap-sdk` `sellBaseInput`/`sellAmounts`.
+pub fn pumpswap_sell_out(view: &PoolView, amount: u64) -> Result<u64, QuoteError> {
+    if amount == 0 {
+        return Ok(0);
+    }
+    if view.base_reserve == 0 || view.eff_quote_reserve == 0 {
+        return Err(QuoteError::EmptyReserves);
+    }
+    let gross = swap_exact_input(
+        u128::from(amount),
+        u128::from(view.base_reserve),
+        u128::from(view.eff_quote_reserve),
+    )?;
+    let without_lp = gross
+        .checked_sub(fee_amount(gross, view.lp_bps)?)
+        .ok_or(QuoteError::FeesExceedOutput)?;
+    // Payouts come from real vault lamports, not virtual reserves.
+    if u128::from(view.real_quote_cap) < without_lp {
+        return Err(QuoteError::FeesExceedOutput);
+    }
+    let net = without_lp
+        .checked_sub(fee_amount(gross, view.proto_bps)?)
+        .and_then(|v| v.checked_sub(fee_amount(gross, view.creator_bps).ok()?))
+        .ok_or(QuoteError::FeesExceedOutput)?;
+    if net == 0 {
+        return Err(QuoteError::FeesExceedOutput);
+    }
+    u64::try_from(net).map_err(|_| QuoteError::MathOverflow)
+}
+
+/// Slippage floor over a PumpSwap net quote (rounds down).
+/// `None` on degenerate input or zero floor.
+pub fn pumpswap_sell_floor(net_quote: u64, slippage_bps: u64) -> Option<u64> {
+    if net_quote == 0 || u128::from(slippage_bps) >= BPS_DENOMINATOR {
+        return None;
+    }
+    let floor = u128::from(net_quote)
+        .checked_mul(BPS_DENOMINATOR - u128::from(slippage_bps))?
+        .checked_div(BPS_DENOMINATOR)?;
+    u64::try_from(floor).ok().filter(|f| *f > 0)
+}
+
+/// `(lp, protocol, creator)` bps for a PumpSwap sell: SOL-like tiers
+/// by mcap, pool creator-rate override under the global gate, and the
+/// creator leg zeroed when the pool is creatorless. Mirrors the SDK
+/// `computeFeesBps` plus the default-key rule.
+pub fn pumpswap_fee_bps(
+    schedule: &FeeSchedule,
+    gate_on: bool,
+    pool_creator_fee_bps: u64,
+    coin_creator_default: bool,
+    mcap: u128,
+) -> Result<FeesBps, QuoteError> {
+    let tier = tier_for(&schedule.tiers, mcap).ok_or(QuoteError::EmptyFeeTiers)?;
+    let creator = if gate_on && pool_creator_fee_bps != 0 {
+        pool_creator_fee_bps
+    } else {
+        tier.creator
+    };
+    Ok(FeesBps {
+        lp: tier.lp,
+        protocol: tier.protocol,
+        creator: if coin_creator_default { 0 } else { creator },
+    })
+}
+
+/// Creator-fee gate from AMM GlobalConfig bytes. With a readable
+/// fee schedule the tier rates rule (SDK `computeFeesBps`); the
+/// global lp/proto fields are then unused, so only the gate parses.
+/// `Err` on short/bad bytes.
+pub fn parse_amm_creator_gate(data: &[u8]) -> Result<bool, QuoteError> {
+    match data.get(ids::PUMP_AMM_GLOBAL_CREATOR_GATE_OFFSET) {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(QuoteError::BadAccount),
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +573,122 @@ mod tests {
             Ok(27_513_965)
         );
         assert_eq!(sell_out_after_fees(&s, false, &v, 0, 0), Ok(0));
+    }
+
+    fn pool_view() -> PoolView {
+        PoolView {
+            base_reserve: 1_000_000_000_000,
+            eff_quote_reserve: 30_000_000_000,
+            real_quote_cap: 30_000_000_000,
+            lp_bps: 20,
+            proto_bps: 5,
+            creator_bps: 30,
+        }
+    }
+
+    #[test]
+    fn pumpswap_sell_matches_reference_math() {
+        // gross = 10e9*30e9/1010e9 = 297_029_702 (floor);
+        // lp = ceil(20bps) = 594_060; proto = ceil(5bps) = 148_515;
+        // creator = ceil(30bps) = 891_090;
+        // net = 297_029_702 - 594_060 - 148_515 - 891_090 = 295_396_037.
+        let v = pool_view();
+        assert_eq!(pumpswap_sell_out(&v, 10_000_000_000), Ok(295_396_037));
+        assert_eq!(pumpswap_sell_out(&v, 0), Ok(0));
+        // Real-reserve cap below the LP-stripped gross refuses.
+        let capped = PoolView { real_quote_cap: 100_000_000, ..v };
+        assert_eq!(
+            pumpswap_sell_out(&capped, 10_000_000_000),
+            Err(QuoteError::FeesExceedOutput)
+        );
+        // Empty reserves refuse.
+        let empty = PoolView { base_reserve: 0, ..v };
+        assert_eq!(
+            pumpswap_sell_out(&empty, 10_000_000_000),
+            Err(QuoteError::EmptyReserves)
+        );
+    }
+
+    #[test]
+    fn pumpswap_floor_rounds_down() {
+        // 295_396_037 - 200bps -> 289_488_116 (floor).
+        assert_eq!(pumpswap_sell_floor(295_396_037, 200), Some(289_488_116));
+        assert_eq!(pumpswap_sell_floor(295_396_037, 0), Some(295_396_037));
+        assert_eq!(pumpswap_sell_floor(0, 200), None);
+        assert_eq!(pumpswap_sell_floor(1, 9_999), None);
+        assert_eq!(pumpswap_sell_floor(1_000_000, 10_000), None);
+    }
+
+    #[test]
+    fn pumpswap_fee_bps_follows_tiers_and_gate() {
+        let sched = FeeSchedule {
+            tiers: vec![
+                (0u128, FeesBps { lp: 20, protocol: 5, creator: 95 }),
+                (1_000_000_000_000u128, FeesBps { lp: 20, protocol: 5, creator: 30 }),
+            ],
+            stable: vec![],
+            flat: FeesBps::default(),
+            exotic: FeesBps::default(),
+        };
+        // Below top tier: first-row creator.
+        assert_eq!(
+            pumpswap_fee_bps(&sched, true, 0, false, 500),
+            Ok(FeesBps { lp: 20, protocol: 5, creator: 95 })
+        );
+        // At/above: top-row creator.
+        assert_eq!(
+            pumpswap_fee_bps(&sched, true, 0, false, 1_000_000_000_000),
+            Ok(FeesBps { lp: 20, protocol: 5, creator: 30 })
+        );
+        // Pool override wins only under gate + nonzero.
+        assert_eq!(
+            pumpswap_fee_bps(&sched, true, 100, false, 1_000_000_000_000),
+            Ok(FeesBps { lp: 20, protocol: 5, creator: 100 })
+        );
+        assert_eq!(
+            pumpswap_fee_bps(&sched, false, 100, false, 1_000_000_000_000),
+            Ok(FeesBps { lp: 20, protocol: 5, creator: 30 })
+        );
+        // Creatorless pool: no creator leg.
+        assert_eq!(
+            pumpswap_fee_bps(&sched, true, 100, true, 1_000_000_000_000),
+            Ok(FeesBps { lp: 20, protocol: 5, creator: 0 })
+        );
+        // Empty tiers fail closed.
+        let empty = FeeSchedule { tiers: vec![], ..sched };
+        assert_eq!(
+            pumpswap_fee_bps(&empty, true, 0, false, 0),
+            Err(QuoteError::EmptyFeeTiers)
+        );
+    }
+
+    #[test]
+    fn amm_global_decodes_live_gate() {
+        let bytes: &[u8] =
+            include_bytes!("../../listener/tests/fixtures/amm_global_config_live.bin");
+        assert_eq!(bytes.len(), ids::PUMP_AMM_GLOBAL_LEN);
+        assert_eq!(parse_amm_creator_gate(bytes), Ok(true));
+        assert_eq!(parse_amm_creator_gate(&bytes[..100]), Err(QuoteError::BadAccount));
+        let mut bad_gate = bytes.to_vec();
+        bad_gate[ids::PUMP_AMM_GLOBAL_CREATOR_GATE_OFFSET] = 7;
+        assert_eq!(parse_amm_creator_gate(&bad_gate), Err(QuoteError::BadAccount));
+    }
+
+    #[test]
+    fn amm_fee_schedule_decodes_live_tiers() {
+        // Same FeeConfig layout as the curve schedule: 25 live tiers.
+        let bytes: &[u8] =
+            include_bytes!("../../listener/tests/fixtures/amm_fee_config_live.bin");
+        let sched = parse_fee_schedule(bytes).expect("live AMM schedule decodes");
+        assert_eq!(sched.tiers.len(), 25);
+        assert_eq!(
+            sched.tiers[0],
+            (0u128, FeesBps { lp: 2, protocol: 93, creator: 30 })
+        );
+        assert_eq!(
+            sched.tiers[1],
+            (420_000_000_000u128, FeesBps { lp: 20, protocol: 5, creator: 95 })
+        );
     }
 
     #[test]
