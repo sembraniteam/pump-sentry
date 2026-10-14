@@ -1,10 +1,4 @@
-//! Inference engine: LLM first, heuristic fallback on any failure.
-//!
-//! [`RiskEngine::evaluate`] wraps the model call in
-//! `tokio::time::timeout(FALLBACK_TIMEOUT)` (300ms per the skill).
-//! Timeout, transport error, non-2xx status, invalid JSON, or an
-//! out-of-schema profile all resolve to [`evaluate_heuristic_fallback`],
-//! so the hot path never blocks and never errors on model trouble.
+//! LLM-first risk engine with heuristic fallback.
 
 use crate::fallback::evaluate_metrics_fallback;
 use crate::schema::{RiskProfile, TokenMetrics, build_prompt};
@@ -18,28 +12,21 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-/// Skill-mandated inference deadline: fall back after 300ms.
+/// Inference deadline before fallback (300ms).
 pub const FALLBACK_TIMEOUT: Duration = Duration::from_millis(300);
-/// Low temperature keeps model output near-deterministic.
+/// Sampling temperature for near-deterministic output.
 pub const DEFAULT_TEMPERATURE: f32 = 0.1;
-/// Small cap: the output schema fits in a few dozen tokens.
+/// Response token cap.
 pub const DEFAULT_MAX_TOKENS: u32 = 128;
-/// Hard ceiling for the inference deadline: a caller-configured hour
-/// would stall the hot path, so [`RiskEngineBuilder::timeout`] values
-/// clamp here at build time.
+/// Max caller-configured timeout (clamped at build).
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(2);
-/// Floor for the inference budget: a zero budget would time out every
-/// `evaluate` into the fallback, silently disabling the model path.
-/// Misconfiguration clamps here instead of failing the build (the bot
-/// must boot on bad knobs; the fallback is always available).
+/// Min inference budget (clamped at build).
 pub const MIN_TIMEOUT: Duration = Duration::from_millis(50);
-/// Token budget bounds: 0 starves the model into permanent fallback,
-/// unbounded budgets burn latency and cost.
+/// Token budget bounds (clamped at build).
 pub const MIN_MAX_TOKENS: u32 = 16;
-/// See [`MIN_MAX_TOKENS`].
 pub const MAX_MAX_TOKENS: u32 = 512;
 
-/// Engine failures that are *not* model trouble (i.e. caller bugs).
+/// Engine failures unrelated to model trouble.
 #[derive(Error, Debug)]
 pub enum RiskEngineError {
     /// Endpoint URL is missing or invalid.
@@ -53,9 +40,9 @@ pub enum RiskEngineError {
 /// Where a [`RiskDecision`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionSource {
-    /// LLM inference within budget with a valid profile.
+    /// Model inference within budget with a valid profile.
     Model,
-    /// Deterministic heuristic (timeout, error, or invalid output).
+    /// Heuristic (timeout, error, or bad model output).
     Fallback,
 }
 
@@ -118,35 +105,32 @@ impl RiskEngineBuilder {
         self
     }
 
-    /// Bearer token; omitted for local (keyless) servers.
+    /// Bearer token; skipped for local servers.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
     }
 
-    /// Inference deadline before falling back (default 300ms, clamped
-    /// to [`MAX_TIMEOUT`] at build so a misconfigured hour cannot stall
-    /// the hot path).
+    /// Inference deadline (clamped at build).
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Sampling temperature, clamped to `0.0..=1.0` at build.
+    /// Sampling temperature, clamped to `0.0..=1.0`.
     pub fn temperature(mut self, temperature: f32) -> Self {
         self.temperature = temperature;
         self
     }
 
-    /// Build, validating the endpoint URL eagerly.
+    /// Build, validating the endpoint URL.
     pub fn build(self) -> Result<RiskEngine, RiskEngineError> {
         RiskEngine::from_builder(self)
     }
 }
 
-/// Quantitative risk engine. Cheap to clone (pooled HTTP client).
-/// Custom [`std::fmt::Debug`]: the bearer token never appears in logs,
-/// even on a careless whole-struct debug-print.
+/// Risk engine. Cheap to clone.
+/// Custom [`std::fmt::Debug`]: token never appears in logs.
 #[derive(Clone)]
 pub struct RiskEngine {
     client: Client,
@@ -156,8 +140,7 @@ pub struct RiskEngine {
     timeout: Duration,
     temperature: f32,
     max_tokens: u32,
-    /// Heuristic-fallback count (observability: silent model trouble
-    /// hides outages; `fallback_count` exposes the fallback rate).
+    /// Heuristic-fallback count.
     fallback_count: Arc<AtomicU64>,
 }
 
@@ -176,7 +159,7 @@ impl std::fmt::Debug for RiskEngine {
 }
 
 impl RiskEngine {
-    /// Engine with skill defaults (local endpoint, 300ms budget).
+    /// Engine with defaults (local endpoint, 300ms budget).
     pub fn new() -> Result<Self, RiskEngineError> {
         RiskEngineBuilder::default().build()
     }
@@ -192,9 +175,7 @@ impl RiskEngine {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             _ => return Err(RiskEngineError::BadEndpoint(b.endpoint)),
         }
-        // Clamp caller-controlled budgets: an hour-long timeout or a
-        // zero/unbounded token budget would break the 300ms hot-path
-        // contract (falling back always, or never).
+        // Clamp budgets to protect the hot path.
         let timeout = b.timeout.clamp(MIN_TIMEOUT, MAX_TIMEOUT);
         let max_tokens = b.max_tokens.clamp(MIN_MAX_TOKENS, MAX_MAX_TOKENS);
         let client = Client::builder()
@@ -214,20 +195,12 @@ impl RiskEngine {
         })
     }
 
-    /// Heuristic-fallback count since construction (model-trouble
-    /// fallbacks via [`RiskEngine::evaluate`] plus explicit
-    /// [`RiskEngine::evaluate_fallback`] calls — both resolve to the
-    /// heuristic, so both count. The engine-`None` path in the pipeline
-    /// bypasses the engine entirely and is NOT counted here.)
+    /// Heuristic-fallback count since construction.
     pub fn fallback_count(&self) -> u64 {
         self.fallback_count.load(Ordering::Relaxed)
     }
 
-    /// Evaluate metrics: model inference within budget, else heuristic.
-    ///
-    /// Never fails on model trouble — the fallback always produces a
-    /// valid profile. Only builder-level misconfiguration can error,
-    /// and that is caught at [`RiskEngineBuilder::build`].
+    /// Model inference within budget, else heuristic.
     pub async fn evaluate(&self, metrics: &TokenMetrics) -> RiskDecision {
         let (system, user) = build_prompt(metrics);
         let request = ChatRequest {
@@ -256,8 +229,7 @@ impl RiskEngine {
             },
             Ok(None) => {
                 self.fallback_count.fetch_add(1, Ordering::Relaxed);
-                // Debug, not warn: `infer` already warned the specific
-                // cause above — one warn per fallback, not two.
+                // `infer` already warned the cause; stay at debug here.
                 debug!(
                     endpoint = %self.endpoint, model = %self.model,
                     fallbacks = self.fallback_count(),
@@ -284,8 +256,7 @@ impl RiskEngine {
         }
     }
 
-    /// Synchronous heuristic-only evaluation (no I/O; for tests/tools).
-    /// Counts as a fallback (it resolves to the heuristic by request).
+    /// Heuristic-only evaluation (no I/O).
     pub fn evaluate_fallback(&self, metrics: &TokenMetrics) -> RiskDecision {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
         RiskDecision {
@@ -294,8 +265,7 @@ impl RiskEngine {
         }
     }
 
-    /// One inference attempt. `None` = unusable (transport, status,
-    /// shape) — the caller falls back.
+    /// One inference attempt. `None` means fall back.
     async fn infer(&self, request: ChatRequest) -> Option<RiskProfile> {
         let mut req = self.client.post(&self.endpoint).json(&request);
         if let Some(key) = &self.api_key {
@@ -320,7 +290,7 @@ impl RiskEngine {
             }
         };
         let content = body.choices.first()?.message.content.trim();
-        // Tolerate fenced output (` ```json ... ``` `) from chatty models.
+        // Tolerate fenced output from chatty models.
         let json = strip_code_fence(content);
         let profile: RiskProfile = match serde_json::from_str(json) {
             Ok(profile) => profile,
@@ -347,7 +317,7 @@ struct ChatRequest {
     response_format: ResponseFormat,
 }
 
-/// Single chat message.
+/// One chat message.
 #[derive(Debug, Clone, Serialize)]
 struct ChatMessage {
     role: &'static str,
@@ -360,28 +330,25 @@ struct ResponseFormat {
     r#type: &'static str,
 }
 
-/// Minimal chat response shape (only what we consume).
+/// Minimal chat response shape (only what is consumed).
 #[derive(Debug, Clone, Deserialize)]
 struct ChatResponse {
     #[serde(default)]
     choices: Vec<ChatChoice>,
 }
 
-/// Minimal chat response shape (only what we consume).
 #[derive(Debug, Clone, Deserialize)]
 struct ChatChoice {
     message: ChatContent,
 }
 
-/// Minimal chat response shape (only what we consume).
 #[derive(Debug, Clone, Deserialize)]
 struct ChatContent {
     #[serde(default)]
     content: String,
 }
 
-/// Cut model output to 200 chars for log lines (full bodies belong in
-/// debug traces, not warn spam on the hot path).
+/// Cap model output at 200 chars for logs.
 fn truncate200(s: &str) -> String {
     const MAX: usize = 200;
     if s.len() <= MAX {
@@ -394,7 +361,7 @@ fn truncate200(s: &str) -> String {
     format!("{}…", &s[..end])
 }
 
-/// Remove one layer of markdown fencing, if present.
+/// Strip one layer of markdown fencing.
 fn strip_code_fence(s: &str) -> &str {
     let s = s.trim();
     let inner = s
@@ -420,8 +387,7 @@ mod tests {
         }
     }
 
-    /// Canned HTTP server: each connection gets the next `(delay_ms,
-    /// status, body)` tuple, then the socket closes.
+    /// Canned HTTP server: replays `(delay_ms, status, body)` per connection.
     async fn serve_scripted(script: Vec<(u64, u16, &'static str)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");

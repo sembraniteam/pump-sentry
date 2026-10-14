@@ -1,10 +1,7 @@
 //! Pump.fun new-token listener.
 //!
-//! Architecture: `logsSubscribe` (WebSocket) → `getTransaction` (HTTP RPC)
-//! → in-place Borsh parse → bounded `mpsc` channel.
-//!
-//! Hot paths never panic, never block the socket read loop on network I/O,
-//! and use `try_send` with drop-on-full backpressure accounting.
+//! `logsSubscribe` → `getTransaction` → parse → bounded channel.
+//! Hot paths never panic and never block the socket loop.
 
 pub mod parser;
 pub mod screen;

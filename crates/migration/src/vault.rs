@@ -1,12 +1,8 @@
-//! Post-migration pool price ticker over HTTP RPC.
+//! Pool price ticker over RPC.
 //!
-//! Reads both SPL vault balances of each watched Raydium pool in one
-//! batched `getMultipleAccounts` round and converts them to USD spot.
-//! Pump.fun tokens use 6 decimals, WSOL 9 (overridable per watch).
-//! Missed rounds log and continue; the loop ends when the receiver drops.
+//! One batched vault read per round. Missed rounds skip.
 //!
-//! SPL token account layout (only bytes 64..72 are read):
-//! `mint(32) owner(32) amount(u64 LE) ...` — 165 bytes total.
+//! SPL layout (bytes 64..72 read): `mint(32) owner(32) amount(u64)`.
 
 use curve::SolUsdFeed;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -17,16 +13,16 @@ use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
-/// SPL token account amount offset/length.
+/// SPL amount offset/length.
 const TOKEN_AMOUNT_OFFSET: usize = 64;
-/// Minimum account data holding the amount field.
+/// Min data length holding the amount.
 const TOKEN_ACCOUNT_MIN_LEN: usize = 72;
 /// Pump.fun token decimals.
 pub const PUMP_TOKEN_DECIMALS_DEFAULT: u8 = 6;
 /// WSOL decimals.
 pub const WSOL_DECIMALS_DEFAULT: u8 = 9;
 
-/// Vault ticker failures (configuration only; the loop never returns).
+/// Vault ticker failures (setup only; loop never returns).
 #[derive(Error, Debug)]
 pub enum VaultError {
     /// RPC endpoint URL is invalid.
@@ -35,17 +31,15 @@ pub enum VaultError {
     /// Address is not a valid pubkey: {0}
     #[error("invalid address: {0}")]
     BadAddress(String),
-    /// Vault decimals are not plausible (base={0} quote={1}): SPL mints
-    /// cap at 18 decimals, so anything above is a misconfiguration that
-    /// would misprice the pool silently.
+/// Vault decimals must be plausible (SPL caps at 18).
     #[error("invalid vault decimals: base={0} quote={1}")]
     BadConfig(u8, u8),
-    /// SOL→USD feed has no fresh price (stale or never fetched).
+    /// SOL/USD feed has no fresh price.
     #[error("SOL/USD feed stale: no fresh price")]
     StaleSolUsd,
 }
 
-/// One pool price observation in USD.
+/// One pool price point in USD.
 #[derive(Debug, Clone)]
 pub struct PoolTick {
     /// Token mint (base58).
@@ -54,9 +48,9 @@ pub struct PoolTick {
     pub amm_id: String,
     /// Spot USD per whole token.
     pub price_usd: f64,
-    /// Quote-side liquidity proxy in USD.
+    /// Quote-side liquidity in USD.
     pub liquidity_usd: f64,
-    /// Local unix seconds when observed.
+    /// Unix seconds when seen.
     pub observed_at: u64,
 }
 
@@ -71,20 +65,19 @@ struct WatchedPool {
     quote_decimals: u8,
 }
 
-/// Polling Raydium vault ticker. Cloneable; the watch set is shared.
+/// Polling vault ticker. Cloneable; watch set is shared.
 #[derive(Clone)]
 pub struct VaultTicker {
     rpc: Arc<RpcClient>,
     subs: Arc<RwLock<HashMap<String, WatchedPool>>>,
     interval: Duration,
     sol_feed: Arc<SolUsdFeed>,
-    /// Ticks dropped on a full downstream queue (see `run`).
+    /// Ticks dropped on a full queue.
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl VaultTicker {
-    /// Build a ticker: `http_url` + commitment for reads, `interval`
-    /// between poll rounds, `sol_feed` for SOL→USD (dynamic, stale-gated).
+    /// Build a ticker: URL, commitment, interval, SOL feed.
     pub fn new(
         http_url: &str,
         commitment: CommitmentConfig,
@@ -107,14 +100,13 @@ impl VaultTicker {
         })
     }
 
-    /// Ticks dropped on a full downstream queue (backpressure accounting).
+    /// Ticks dropped on a full queue.
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Watch a pool's vaults (idempotent per mint). On Pump.fun migration
-    /// pools the base vault holds WSOL (`base_decimals` 9) and the quote
-    /// vault holds the token (`quote_decimals` 6) — see `pool` docs.
+    /// Watch a pool (idempotent per mint).
+    /// Base vault holds WSOL (9dp), quote the token (6dp).
     pub async fn watch(
         &self,
         mint: &str,
@@ -148,8 +140,7 @@ impl VaultTicker {
         Ok(())
     }
 
-    /// Watch with standard WSOL/token decimals (9/6): base vault holds
-    /// WSOL, quote vault holds the Pump.fun token.
+    /// Watch with standard WSOL/token decimals (9/6).
     pub async fn watch_defaults(
         &self,
         mint: &str,
@@ -168,7 +159,7 @@ impl VaultTicker {
         .await
     }
 
-    /// Stop watching a mint. Returns true when an entry was removed.
+    /// Stop watching a mint. True when removed.
     pub async fn unwatch(&self, mint: &str) -> bool {
         self.subs.write().await.remove(mint).is_some()
     }
@@ -178,26 +169,15 @@ impl VaultTicker {
         self.subs.read().await.len()
     }
 
-    /// Maximum vault pools per `getMultipleAccounts` round chunk.
-    /// Mirrors the curve ticker's chunking: one oversized request must not
-    /// fail (or rate-limit) the whole round.
+    /// Max pools per batched round.
     pub const VAULT_BATCH_CHUNK_PAIRS: usize = 50;
 
-/// Poll loop: one batched vault read per round, one tick per pool.
-/// Interval-based (no drift); batch failures back off. Ends when the
-/// receiver drops. Delivery is drop-on-full (with a counter): one slow
-/// consumer must not stall every followed pool.
-///
-/// Mirrors `curve::CurveTicker::run` on purpose (vault pairs here vs
-/// single accounts there, chunked batching): the shared shape is timer
-/// → closed-check → snapshot → deadline-bound fetch → length check →
-/// parse → drop-on-full send. Keep the backpressure contract (drop +
-/// counter + deadlines) in sync across both.
+/// Poll loop: one batched read per round, one tick per pool.
+/// Ends when the receiver drops. Drop-on-full with counter.
     pub async fn run(self, tx: mpsc::Sender<PoolTick>) {
         let mut timer = tokio::time::interval(self.interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Discard the immediate first tick: one full interval before the
-        // first round, matching the curve ticker.
+        // Discard the first immediate tick.
         timer.tick().await;
         loop {
             timer.tick().await;
@@ -214,11 +194,7 @@ impl VaultTicker {
                 tokio::time::sleep(self.interval).await;
                 continue;
             };
-            // Flatten to chunked batched calls: [base0, quote0, ...] per
-            // chunk so pool growth cannot breach per-request limits.
-            // Chunks preserve pool order; results are concatenated. The
-            // whole round is deadline-bound (sequential 15s chunks would
-            // otherwise pile missed ticks behind a huge watchlist).
+            // Chunked reads: pool growth can't break the round.
             let accounts = match tokio::time::timeout(
                 Duration::from_secs(60),
                 self.poll_round(&watched),
@@ -271,9 +247,7 @@ impl VaultTicker {
         }
     }
 
-    /// One round of chunked vault reads (extracted for the round-level
-    /// deadline above). A failed chunk aborts the round with a short vec
-    /// (the length-mismatch path skips loudly, never half-prices).
+    /// One round of chunked reads. Short vec skips the round.
     async fn poll_round(&self, watched: &[WatchedPool]) -> Vec<Option<solana_account::Account>> {
         let mut accounts = Vec::with_capacity(watched.len() * 2);
         for pool_chunk in watched.chunks(Self::VAULT_BATCH_CHUNK_PAIRS.max(1)) {
@@ -302,7 +276,7 @@ impl VaultTicker {
     }
 }
 
-/// Current unix seconds (0 on clock failure; never panics).
+/// Unix seconds now (0 on failure).
 fn now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -311,35 +285,21 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read a raw SPL token amount from account data.
+/// Read SPL token amount from account data.
 fn token_amount(data: &[u8]) -> Option<u64> {
     data.get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8)
         .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
         .map(u64::from_le_bytes)
 }
 
-/// True for the two token programs whose accounts share the classic
-/// 165-byte layout (extensions may extend Token-2022 accounts, never
-/// move the mint/owner/amount prefix).
+/// True for token programs sharing the 165-byte layout.
 fn is_token_program(owner: &Pubkey) -> bool {
     owner == &ids::TOKEN_PROGRAM_ID || owner == &ids::TOKEN_2022_PROGRAM_ID
 }
 
-/// Price one pool from raw vault accounts. Pure; unit-tested.
-/// f64 ratios hold ~1e-16 relative precision at any magnitude; only the
-/// final USD values are range-checked.
-///
-/// Orientation (chain-verified, see `pool` docs): on Pump.fun migration
-/// pools the BASE vault holds WSOL and the QUOTE vault holds the token.
-/// Spot = SOL-per-token (base over quote) × SOL/USD; liquidity = the
-/// SOL side in USD.
-///
-/// Trust gates (fail-closed `None`): both vaults must be owned by a
-/// token program (classic SPL or Token-2022 — anything else is not a
-/// token account), and the embedded mints must match the watched pair
-/// (base vault holds WSOL, quote vault holds the token). A misconfigured
-/// watch (swapped vaults, wrong pool) prices the wrong pair silently
-/// without these.
+/// Price one pool from raw vaults. Pure.
+/// BASE holds WSOL, QUOTE the token.
+/// `None` on wrong owner, wrong mint, or bad amount.
 fn price_tick(
     pool: &WatchedPool,
     base_data: &[u8],
@@ -391,7 +351,7 @@ mod tests {
     fn vault_bytes(mint: &Pubkey, amount: u64) -> Vec<u8> {
         let mut data = vec![0u8; 165];
         data[0..32].copy_from_slice(&mint.to_bytes());
-        data[32..64].copy_from_slice(&[4u8; 32]); // owner placeholder
+        data[32..64].copy_from_slice(&[4u8; 32]);
         data[64..72].copy_from_slice(&amount.to_le_bytes());
         data
     }
@@ -400,8 +360,7 @@ mod tests {
         Pubkey::new_from_array([5; 32])
     }
 
-    /// Migration orientation: base vault holds WSOL (9dp), quote vault
-    /// holds the token (6dp).
+    /// Migration orientation: base vault holds WSOL (9dp), quote the token (6dp).
     fn pool() -> WatchedPool {
         WatchedPool {
             mint: token_mint().to_string(),
@@ -477,7 +436,6 @@ mod tests {
 
     #[test]
     fn rejects_foreign_owner_and_wrong_mints() {
-        // Non-token program owner is not a token account.
         let stranger = Pubkey::new_from_array([9; 32]);
         assert!(
             price_tick(
@@ -562,8 +520,7 @@ mod tests {
             assert!(matches!(err, VaultError::BadConfig(b, q) if b == base && q == quote));
         }
         assert_eq!(ticker.watched_count().await, 0);
-        // Non-standard but plausible decimals (e.g. swapped 6/9) are
-        // accepted with a warn, not silently: the caller owns the pair.
+        // Non-standard but plausible decimals are accepted with a warn.
         ticker
             .watch(mint, mint, mint, mint, 6, 9)
             .await

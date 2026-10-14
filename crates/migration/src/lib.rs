@@ -1,11 +1,6 @@
-//! Pump.fun graduation and Raydium migration detector (skill
-//! `solana-raydium-migration`).
+//! Graduation and migration detector.
 //!
-//! [`detector::MigrationMonitor`] spots graduation (bonding-curve
-//! `complete` flag) and classifies migration transactions by destination.
-//! [`pool::RaydiumV4Pool`] parses fresh Raydium AMM V4 pool accounts into
-//! swap-ready addresses. [`vault::VaultTicker`] polls pool vault balances
-//! for post-migration USD pricing. Pure parsing: no I/O, no panics.
+//! Pure parsing: no I/O, no panics.
 
 pub mod detector;
 pub mod pool;

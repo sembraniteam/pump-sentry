@@ -1,17 +1,4 @@
-//! Paper pipeline binary: listen → audit → reserves → risk → simulate.
-//!
-//! Default mode is paper trading (no funds move). With `--live` (or
-//! `IS_LIVE=true`) the same signals additionally dispatch real Jito-routed
-//! swaps through `crates/executor` — read its README before enabling.
-//!
-//! The binary never runs bare: it only acts through an explicit
-//! subcommand (`start` / `stop` / `restart` / `status` / `logs` / `run`).
-//! Anything else prints usage and exits without touching the pipeline.
-//!
-//! Wiring only — all logic lives in [`settings`] (knobs), [`pipeline`]
-//! (launch handling, tick exits), [`live`] (live sizing/dispatch), and
-//! [`cli`] (supervisor commands, daemon files, shutdown signals),
-//! all unit-tested.
+//! Paper pipeline binary. Default is paper; `--live` moves real funds.
 
 mod cli;
 mod follow;
@@ -61,7 +48,7 @@ async fn main() {
     }
 }
 
-/// WAL path next to the log file (same dir as shutdown snapshots).
+/// WAL path next to the log file.
 fn live_wal_path() -> std::path::PathBuf {
     let (_, log_file) = cli::resolve_paths();
     log_file
@@ -70,11 +57,7 @@ fn live_wal_path() -> std::path::PathBuf {
         .unwrap_or_else(|| "live-wal.jsonl".into())
 }
 
-/// Boot replay of the live WAL (live mode only): restores custody that a
-/// SIGKILL/abort stranded mid-dispatch. Pending buys re-enter the recheck
-/// loop, tracked/manual bags regain exit automation via re-watch (the
-/// ticker watch set is in-memory and starts empty). Loud by design: any
-/// recovery means the last shutdown was unclean.
+/// Boot replay of the WAL (live only): restores stranded custody.
 async fn replay_live_wal(
     pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
     ticker: &CurveTicker,
@@ -92,8 +75,6 @@ async fn replay_live_wal(
     for p in &replay.pending {
         watched.push((p.position.mint.clone(), p.position.curve.clone()));
     }
-    // Compact first: the file is rewritten to the surviving state before
-    // any in-memory import, so a crash mid-import replays identically.
     wal::compact_file(&path, &replay);
     if let Some(trader) = pipeline.exec.live.as_ref() {
         n_pending = trader.import_pending(replay.pending);
@@ -126,9 +107,7 @@ async fn replay_live_wal(
             n_manual += 1;
         }
     }
-    // Re-watch BEFORE the loops start (no ticks otherwise, no exits).
-    // A failed watch keeps the bag tracked + reported (same posture as
-    // the open-time watch failure: custody first, feed second).
+    // Re-watch before loops start. Failures keep bags tracked.
     let mut unwatched = 0usize;
     watched.sort();
     watched.dedup();
@@ -148,19 +127,11 @@ async fn replay_live_wal(
     );
 }
 
-/// Foreground pipeline: the body the old bare binary ran. `live_arg`
-/// comes from `run --live` (the daemon child passes it through); the
-/// `IS_LIVE=true` environment fallback is honored as before.
+/// Foreground pipeline.
 async fn run_pipeline(live_arg: bool) {
-    // Must run before any TLS use: the dependency tree enables both the
-    // `ring` and `aws-lc-rs` rustls providers, so auto-detection panics.
-    // `Err` only means another call already installed one — safe to ignore.
+    // Must run before TLS: dual providers panic on auto-detect.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Daemon children redirect stdout/stderr to the log file: no ANSI
-    // color codes there (a colorized log is unreadable ops noise).
-    // Targets are dropped for the same reason (long module paths are
-    // noise in an ops log); levels + timestamps stay.
     let daemon = std::env::var("BOT_DAEMON").is_ok_and(|v| v == "1");
     tracing_subscriber::fmt()
         .with_target(false)
@@ -172,10 +143,7 @@ async fn run_pipeline(live_arg: bool) {
         )
         .init();
 
-    // SIGHUP log reopen (unix): external logrotate renames `bot.log`
-    // then `kill -HUP`s the daemon for a lossless reopen — no
-    // `copytruncate` line loss, no restart. Independent task, no locks:
-    // a failed reopen only warns (writes keep going to the old file).
+    // SIGHUP reopens the log for logrotate.
     #[cfg(unix)]
     {
         tokio::spawn(async {
@@ -202,20 +170,14 @@ async fn run_pipeline(live_arg: bool) {
 
     let settings = Settings::from_env();
 
-    // Fail closed on unknown commitment (no silent coercion to confirmed).
     if CurveTicker::parse_commitment(&settings.commitment).is_none() {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
         std::process::exit(1);
     }
 
-    // Mode gate: paper unless explicitly opted into live risk.
-    // `--live` now arrives via `run --live` (or `start --live` through
-    // the daemon child); the `IS_LIVE=true` fallback is unchanged.
+    // Paper unless explicitly live.
     let live_mode = live_arg || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
-    // `get_bool` elsewhere accepts 1/yes, but the live gate accepts ONLY
-    // the exact string `true`: a set-but-unrecognized value (e.g.
-    // `IS_LIVE=1`) must never silently paper-trade when the operator
-    // meant live — say so loudly at startup.
+    // Only exact `true` enables live.
     if !live_mode
         && let Ok(v) = std::env::var("IS_LIVE")
         && !v.is_empty()
@@ -225,9 +187,6 @@ async fn run_pipeline(live_arg: bool) {
     {
         warn!("config: IS_LIVE='{v}' ignored (only the exact value 'true' enables live; paper mode)");
     }
-    // Startup banner: the supervisor log records WHEN this boot happened
-    // and whether it was a first run or a re-run/restart, so the uptime
-    // question is answered by reading the log, not by memory.
     {
         let invocation = std::env::var("BOT_INVOCATION").unwrap_or_else(|_| "run".to_string());
         let first_run = std::env::var("BOT_FIRST_RUN").is_ok_and(|v| v == "1");
@@ -250,9 +209,7 @@ async fn run_pipeline(live_arg: bool) {
         warn!("Starting in 5s — Ctrl-C now to abort (no confirmation prompt,");
         warn!("so automation never hangs; the delay is the abort window).");
         warn!("================================================================");
-        // Race the delay against the shutdown signal: a Ctrl-C/SIGTERM
-        // inside the window exits cleanly before anything boots (nothing
-        // is running yet, so there is nothing to drain).
+        // Ctrl-C inside the window exits before boot.
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(5)) => {},
             _ = crate::cli::shutdown_signal() => {
@@ -262,13 +219,11 @@ async fn run_pipeline(live_arg: bool) {
         }
     }
 
-    // Surface suspicious config (typos fall back to defaults silently).
+    // Surface bad config (typos fall back silently).
     for warning in settings.warnings() {
         warn!("config: {warning}");
     }
-    // Live fail-closed gates: real funds never run on warn-and-proceed
-    // defaults (no breaker, unproven sims, unbounded guards, tipless
-    // bundles, reorgable prints, or static fallback prices).
+    // Live gates: real funds never run on defaults.
     if live_mode {
         if !(settings.max_daily_loss_usd.is_finite() && settings.max_daily_loss_usd > 0.0) {
             eprintln!("live mode requires MAX_DAILY_LOSS_USD>0 (portfolio circuit breaker)");
@@ -294,11 +249,7 @@ async fn run_pipeline(live_arg: bool) {
             eprintln!("live mode refuses QUOTE_USD override (static fallback is paper-only by construction)");
             std::process::exit(1);
         }
-        // Cluster coherence without RPC: devnet RPC + mainnet Jito (or
-        // vice versa) can never land — tips go to the wrong network while
-        // reads come from another. Only enforced when BOTH endpoints
-        // positively identify their cluster; unknown/custom endpoints
-        // warn instead of blocking (a private RPC need not say so).
+        // Split-brain clusters can never land. Enforced when both identify.
         fn cluster_of(url: &str) -> Option<&'static str> {
             let lower = url.to_ascii_lowercase();
             if lower.contains("devnet") {
@@ -335,10 +286,8 @@ async fn run_pipeline(live_arg: bool) {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
         std::process::exit(1);
     });
-    // One dynamic SOL/USD feed for all pricing + live sizing (no statics).
+    // One SOL/USD feed for pricing plus sizing.
     let sol_feed = curve::SolUsdFeed::with_defaults();
-    // Background refresher: runs for process lifetime (handle aborts on
-    // shutdown below).
     let sol_handle = sol_feed.clone().spawn();
     let ticker = match CurveTicker::new(
         &settings.http_url,
@@ -385,7 +334,7 @@ async fn run_pipeline(live_arg: bool) {
     let start_balance = settings.start_balance;
     let fee_bps = settings.fee_bps;
 
-    // Live stack (fatal on misconfiguration — never half-enable).
+    // Live stack (fatal on misconfig).
     let live = if live_mode {
         let wallet = match WalletGuard::load_from_env() {
             Ok(wallet) => wallet,
@@ -415,13 +364,7 @@ async fn run_pipeline(live_arg: bool) {
                 std::process::exit(1);
             }
         };
-        // Live funding gate (read-only, no funds move): SOL-paired v3
-        // buys transfer native SOL (BUY.md), so the trade guard must sit
-        // natively — enforced per trade in preflight. Native shortfall
-        // (tip + 0.05 reserve) fails closed here; zero/missing WSOL only
-        // informs (a WSOL float funds token-paired quotes alone; the
-        // operator may fund after boot, and per-trade preflight enforces
-        // the exact guard anyway).
+        // Funding gate (read-only): native shortfall fails closed.
         {
             let report: LiveFundingReport =
                 executor.live_funding_report(settings.tip_lamports).await;
@@ -473,8 +416,7 @@ async fn run_pipeline(live_arg: bool) {
 
     let gate_interval = Duration::from_millis(settings.gate_poll_ms);
 
-    // Zero poll intervals panic (`tokio::time::interval(ZERO)`) or spin
-    // the RPC hot: fail closed instead of crashing or burning quota.
+    // Zero intervals panic or spin: fail closed.
     if settings.gate_poll_ms == 0 {
         eprintln!("bad GATE_POLL_MS=0: gate poll interval must be positive");
         std::process::exit(1);
@@ -533,66 +475,41 @@ async fn run_pipeline(live_arg: bool) {
         sol_feed,
     );
 
-    // Crash-recovery replay (live only): the WAL restores custody that a
-    // SIGKILL/abort stranded mid-dispatch — pending buys re-enter the
-    // recheck loop, tracked/manual bags regain exit automation. Every
-    // recovered mint is re-watched (the ticker watch set is in-memory)
-    // and reported loudly; delete the WAL file to clear resolved manual
-    // bags (compaction rewrites it to the surviving state).
+    // Crash replay (live only).
     if live_mode {
         replay_live_wal(&pipeline, &ticker).await;
     }
 
-    // Ticker loop: poll watched curves → auto-close on TP/SL.
+    // Ticker loop: poll curves, auto-close.
     let (tick_tx, mut tick_rx) = mpsc::channel::<PriceTick>(1024);
     let tick_handle = tokio::spawn(async move { ticker.run(tick_tx).await });
 
-    // Pool loop: post-migration Raydium prices → spike alerts.
+    // Pool loop: Raydium prices, spike alerts.
     let (pool_tx, mut pool_rx) = mpsc::channel::<PoolTick>(1024);
     let pool_handle = tokio::spawn(async move { vault_ticker.run(pool_tx).await });
 
-    // Gate loop: poll the watchlist for buyer quorum → confirmed entries.
-    // Each round runs as a JoinSet unit; overlapping rounds are skipped
-    // so two polls can never confirm the same mint twice.
+    // Gate loop: overlaps skip, never double-confirm.
     let mut gate_timer = tokio::time::interval(gate_interval);
     gate_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Heartbeat (P3.2): proof-of-life on quiet markets — a card every
-    // 6h with throughput counters + cash so silence reads as "alive",
-    // never "hung". First tick fires immediately (boot card).
-    /// Heartbeat cadence in seconds.
+    /// Heartbeat cadence.
     const HEARTBEAT_SECS: u64 = 6 * 3_600;
     let boot_ts = settings::now_secs();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // In-flight units run as JoinSet tasks so Ctrl-C never cancels a
-    // half-applied launch/exit mid-await (paper-open without live mirror
-    // and similar partial commits). Shutdown drains them bounded.
-    //
-    // Concurrency is bounded by a semaphore: every event fans out to
-    // RPC-heavy work, and an unbounded spawn lets a Pump.fun burst open
-    // thousands of concurrent RPCs (rate-limit + FD exhaustion). Permits
-    // are `try_acquire`d — never awaited — so saturation drops (loudly)
-    // instead of queueing an unbounded JoinSet backlog that only burns
-    // memory while the RPCs stay throttled anyway.
+    // In-flight tasks never cancel mid-commit. Bounded; drops loudly.
     let mut in_flight = tokio::task::JoinSet::new();
     const MAX_IN_FLIGHT: usize = 32;
-    /// Manual-sell drain cadence in gate rounds (15 rounds ≈ 30s at the
-    /// default 2s cadence): the request scan is filesystem IO every
-    /// round otherwise, and operator exits tolerate the delay.
+    /// Manual-sell drain cadence in gate rounds.
     const MANUAL_SELL_DRAIN_EVERY: u64 = 15;
     let mut gate_rounds: u64 = 0;
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let stats_task = Arc::clone(&stats);
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
-    // Tracks a clean Ctrl-C exit: any other loop end (closed channels,
-    // dead streams) exits nonzero so supervisors notice.
     let mut clean_shutdown = false;
     loop {
-        // Reap finished units every iteration: JoinSet retains completed
-        // outputs until joined, so without this the set grows without
-        // bound over a long run (slow leak at Pump.fun event rates).
+        // Reap finished units.
         while in_flight.try_join_next().is_some() {}
         tokio::select! {
             event = rx.recv() => {
@@ -605,10 +522,6 @@ async fn run_pipeline(live_arg: bool) {
                         debug!(mint = %event.mint, "launch dropped: dispatch saturated");
                         return;
                     };
-                    // Owned first: borrowing `.as_deref()` temporaries
-                    // across the `.await` below would self-borrow the
-                    // future (rejected); named locals live in the future
-                    // state like any other capture.
                     let creator = event.creator.as_ref().map(|c| c.to_string());
                     pipeline
                         .on_launch(
@@ -634,9 +547,7 @@ async fn run_pipeline(live_arg: bool) {
                 let permits = Arc::clone(&permits);
                 in_flight.spawn(async move {
                     let Ok(_permit) = permits.try_acquire_owned() else {
-                        // Ticks drive TP/SL exits: dropping one delays a
-                        // live exit, so this is warn (launches are
-                        // fail-closed drops and stay debug below).
+                        // Tick drops are warn (launches stay debug).
                         warn!(mint = %tick.mint, "tick dropped: dispatch saturated; exit delayed");
                         return;
                     };
@@ -681,19 +592,12 @@ async fn run_pipeline(live_arg: bool) {
                 }
             }
             _ = gate_timer.tick() => {
-                // Manual-sell drain (`sell <mint>` request files): every
-                // 15th round (~30s at the default cadence), not every
-                // round — the scan is a `read_dir` plus a file read per
-                // request, and a spam directory must not burn the gate
-                // cadence or RPC budget. Operator exits tolerate the
-                // delay; unsettled requests persist across rounds.
+                // Manual-sell drain every 15th round.
                 gate_rounds = gate_rounds.wrapping_add(1);
                 if gate_rounds.is_multiple_of(MANUAL_SELL_DRAIN_EVERY) {
                     let (_, log_file) = cli::resolve_paths();
                     for (mint, path) in cli::pending_sell_requests(&log_file) {
-                        // Body must name the same mint as the filename:
-                        // anything else is forged or torn — drop loudly,
-                        // never act on it, never retry it.
+                        // Body must name the file mint; else drop.
                         let body_ok = std::fs::read_to_string(&path)
                             .ok()
                             .and_then(|b| cli::sell_request_body_mint(&b))
@@ -716,10 +620,6 @@ async fn run_pipeline(live_arg: bool) {
                     });
                 }
             }
-            // SIGINT (Ctrl-C) AND SIGTERM (`stop`, systemd, docker): the
-            // old code watched Ctrl-C only, so every supervisor stop
-            // killed the process mid-commit (paper-open without live
-            // mirror and friends) — the non-atomic shutdown.
             _ = cli::shutdown_signal() => {
                 info!("shutdown requested (signal)");
                 clean_shutdown = true;
@@ -728,16 +628,7 @@ async fn run_pipeline(live_arg: bool) {
         }
     }
 
-    // Atomic shutdown in three ordered steps: (1) stop producers so no
-    // NEW work enters, (2) snapshot what is still open so nothing is
-    // lost silently, (3) drain in-flight units bounded — and ABORT what
-    // remains past the deadline instead of exiting over live tasks. A
-    // second signal during the drain force-aborts immediately so a
-    // wedged RPC cannot hold the process hostage (the snapshot then
-    // records `clean: false`).
-    // The listener loop exits on its own once the event channel closes...
-    // except it only checks between sessions, so close the channel AND
-    // abort the task, then await it briefly for a clean join.
+    // Shutdown: stop producers, snapshot, drain bounded.
     rx.close();
     tick_handle.abort();
     pool_handle.abort();
@@ -745,10 +636,7 @@ async fn run_pipeline(live_arg: bool) {
     sol_handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
 
-    // Snapshot BEFORE the drain: paper opens, tracked live fills, and
-    // the watchlist, frozen to `shutdown-<ts>.json` next to the log file plus loud log
-    // lines. Best-effort file IO (a snapshot failure must not fail the
-    // shutdown itself); the log lines always fire.
+    // Snapshot BEFORE the drain.
     let snap_ts = settings::now_secs();
     let paper_open = pipeline.open_position_mints().await;
     let live_tracked = pipeline.live_tracked_mints().await;
@@ -760,7 +648,7 @@ async fn run_pipeline(live_arg: bool) {
         paper_open: paper_open.clone(),
         live_tracked: live_tracked.clone(),
         watchlist_pending,
-        clean: false, // fixed up below once the drain outcome is known
+        clean: false,
     };
     let snap_path = {
         let (_, log_file) = cli::resolve_paths();
@@ -801,7 +689,7 @@ async fn run_pipeline(live_arg: bool) {
     let drain = async {
         while in_flight.join_next().await.is_some() {}
     };
-    // Second signal during the drain: force-abort, snapshot dirty, exit.
+    // Second signal force-aborts.
     let drained = tokio::select! {
         out = tokio::time::timeout(Duration::from_secs(30), drain) => out.is_ok(),
         _ = cli::shutdown_signal() => {
@@ -814,19 +702,13 @@ async fn run_pipeline(live_arg: bool) {
         warn!("shutdown drain timed out; aborting in-flight units");
         in_flight.abort_all();
     }
-    // Re-snapshot AFTER the drain/abort: the pre-drain picture is stale —
-    // an abort can cancel a confirm mid-flight (fill unknown) and the
-    // drain may have settled paper/live state. The rewritten file is the
-    // source of truth; `clean: false` plus the abort warning below tells
-    // the operator to check the explorer for in-flight live mints.
+    // Re-snapshot AFTER the drain.
     let paper_open = pipeline.open_position_mints().await;
     let live_tracked = pipeline.live_tracked_mints().await;
     let watchlist_pending = pipeline.pending_count().await;
     summary.paper_open = paper_open.clone();
     summary.live_tracked = live_tracked.clone();
     summary.watchlist_pending = watchlist_pending;
-    // Record the true outcome in the snapshot (a timed-out/force-aborted
-    // drain leaves `clean: false` for the operator to notice).
     summary.clean = drained && clean_shutdown;
     write_snapshot(&summary);
     if !paper_open.is_empty() || !live_tracked.is_empty() {
@@ -844,8 +726,7 @@ async fn run_pipeline(live_arg: bool) {
     if clean_shutdown {
         info!("shutdown complete (drained={drained})");
     } else {
-        // Streams ended without Ctrl-C (dead RPC, closed channels):
-        // exit nonzero so supervisors and systemd notice the outage.
+        // Streams ended: exit nonzero so supervisors notice.
         warn!("streams ended; open positions need manual review");
         std::process::exit(1);
     }
@@ -853,18 +734,14 @@ async fn run_pipeline(live_arg: bool) {
 
 #[cfg(test)]
 mod tests {
-    /// Guards the rustls dual-provider fix: without an explicitly
-    /// installed default, `get_default` panics when both `ring` and
-    /// `aws-lc-rs` features are enabled (see bot.log panic).
+    /// Guards the rustls fix: a default must be installed.
     #[test]
     fn crypto_provider_installs() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
-    /// Cross-crate invariant: the risk-engine heuristic cap must stay at
-    /// or below the auditor's hard gate, or scores 351–400 would resolve
-    /// to BUY-side profiles the auditor would have rejected outright.
+    /// Heuristic cap must stay within the auditor gate.
     #[test]
     fn heuristic_cap_within_audit_cap() {
         assert!(

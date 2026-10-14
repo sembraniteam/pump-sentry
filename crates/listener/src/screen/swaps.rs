@@ -1,22 +1,14 @@
 use super::*;
 
-/// Account index of the trader (`user`) in buy/sell instructions.
+/// Trader slot in buy/sell ixs.
 pub const IDX_SWAP_USER: usize = 6;
-/// Account index of the trader in v2 (`buy_v2`/`sell_v2`) instructions:
-/// the fee payer (first signer) at position 13. Verified against real
-/// mainnet samples — a `buy_v2` (27 accounts; position 13 resolved to the
-/// fee-payer key) and a `sell_v2` (26 accounts; position 13 resolved to
-/// the fee payer whose token balance decreased by exactly the payload
-/// amount; see the frozen `sell_v2_mainnet` fixture).
+/// Trader slot in v2 ixs: fee payer at 13.
 pub const IDX_SWAP_V2_USER: usize = 13;
-/// Previous name of [`IDX_SWAP_V2_USER`] (kept: the position covers both
-/// v2 sides, not buys only).
+/// Old name of [`IDX_SWAP_V2_USER`]. Kept.
 pub const IDX_BUY_V2_USER: usize = IDX_SWAP_V2_USER;
-/// Account index of the trader in v3 (`buy_v3`/`sell_v3`/
-/// `buy_exact_quote_in_v3`) instructions: position 8 (row 9 `user` of
-/// the official 17-account TRADE_V3.md table).
+/// Trader slot in v3 ixs: position 8.
 pub const IDX_SWAP_V3_USER: usize = 8;
-/// Account index of the creator (`user`) in create instructions.
+/// Creator slot in create ixs.
 pub const IDX_CREATE_USER: usize = 7;
 
 /// Swap direction on the bonding curve.
@@ -26,33 +18,28 @@ pub enum SwapSide {
     Buy,
     /// Tokens sold for SOL.
     Sell,
-    /// Pump.fun instruction with an unmapped discriminator. Still a live
-    /// fail-closed path for future discriminators: side and trader layout
-    /// are unproven (the wallet is the ix's first listed account as a
-    /// best-effort attribution), the amount is always 0, and quorum never
-    /// counts these — they exist only for the dev fail-closed rule in
-    /// [`EntryGate::observe`].
+    /// Unmapped pump ix. Fails closed: no side, no amount.
+    /// Never counted. Only the dev rule reads these.
     Unknown,
 }
 
-/// One classified Pump.fun swap inside a transaction.
+/// One classified swap in a tx.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwapRecord {
     /// Transaction signature (base58).
     pub signature: String,
-    /// Slot the transaction landed in (creation-slot rule input).
+    /// Slot the tx landed in.
     pub slot: u64,
-    /// Trader (`user` account; versioned index: v1=6, v2=13, v3=8 —
-    /// see `IDX_SWAP_USER` / `IDX_SWAP_V2_USER` / `IDX_SWAP_V3_USER`).
+    /// Trader (v1=6, v2=13, v3=8).
     pub wallet: Pubkey,
     /// Direction by discriminator.
     pub side: SwapSide,
-    /// Token base units moved (Borsh `amount` arg; 0 when undecodable).
+    /// Base units moved (0 when undecodable).
     pub amount_base_units: u64,
 }
 
 impl SwapRecord {
-    /// Build from strings (parses the wallet; handy for tests/plumbing).
+    /// Build from strings. Parses the wallet.
     pub fn new(
         signature: &str,
         wallet: &str,
@@ -70,8 +57,7 @@ impl SwapRecord {
     }
 }
 
-/// Classify every Pump.fun buy/sell instruction in a fetched transaction.
-/// Covers legacy `buy`/`sell` plus v2 (`buy_v2`/`sell_v2`: different
+/// Classify every buy/sell ix into records. Covers v1, v2, v3.
 pub fn extract_pump_swaps(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
     sig: &str,
@@ -99,9 +85,7 @@ pub fn extract_pump_swaps(
         let Some(raw) = decode_ix_data(data_b58) else {
             return;
         };
-        // (side, trader account index, amount-u64 offset): each shape
-        // shares the side but not the layout. v3 rows come from the
-        // official TRADE_V3.md 17-account table (user at index 8).
+        // (side, trader index, amount-u64 offset) per shape.
         let (side, user_idx, amount_off) = if raw.starts_with(&PUMP_BUY_DISCRIMINATOR) {
             (SwapSide::Buy, IDX_SWAP_USER, 8)
         } else if raw.starts_with(&PUMP_SELL_DISCRIMINATOR) {
@@ -115,17 +99,11 @@ pub fn extract_pump_swaps(
         } else if raw.starts_with(&PUMP_SELL_V3_DISCRIMINATOR) {
             (SwapSide::Sell, IDX_SWAP_V3_USER, 8)
         } else if raw.starts_with(&PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR) {
-            // Exact-spend buys carry (spend, min_out): attribute the
-            // conservative token-side bound (`min_tokens_out`, second
-            // u64) so monopoly math never overcounts a bundler.
+            // Exact-spend buys carry (spend, min_out). Use min_out.
             (SwapSide::Buy, IDX_SWAP_V3_USER, 16)
         } else {
-            // Unmapped Pump.fun instruction: the trader layout is
-            // unproven, so never attribute a side or an amount.
-            // `create`/`migrate` are benign lifecycle ixs and stay
-            // ignored; anything else is recorded against the first
-            // listed account so the gate can fail closed when it names
-            // the dev wallet.
+            // Unmapped ix: `create`/`migrate` ignored.
+            // Rest recorded on first account for the dev rule.
             if raw.starts_with(&PUMP_CREATE_DISCRIMINATOR)
                 || raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
                 || raw.starts_with(&PUMP_MIGRATE_DISCRIMINATOR)
@@ -153,14 +131,7 @@ pub fn extract_pump_swaps(
         let Some(wallet) = keys.get(usize::from(*account)).copied() else {
             return;
         };
-        // Amount is the first u64 for every variant except exact-quote
-        // v3 (second u64, `min_tokens_out`). Chain-proven for both v2
-        // sides from frozen samples (trader = fee payer at index 13;
-        // token-balance delta equals bytes 8..16 to the unit — two
-        // independent `buy_v2` txs plus one `sell_v2`) and per the skill
-        // for legacy `buy`/`sell`. v3 first-u64 semantics come from the
-        // official TRADE_V3.md argument tables; v3 frozen samples are
-        // still open work (no replay test pins them yet).
+        // Amount is the first u64, except exact-quote v3 (second u64).
         let amount_base_units = raw
             .get(amount_off..amount_off + 8)
             .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
@@ -179,8 +150,7 @@ pub fn extract_pump_swaps(
     out
 }
 
-/// Count Pump.fun `create` instructions authored by `dev` in a transaction.
-/// Powers the prior-launch check. Never panics.
+/// Count `create` ixs by `dev`. Powers the prior-launch check.
 pub fn count_dev_creates(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
     dev: &Pubkey,
@@ -209,9 +179,7 @@ pub fn count_dev_creates(
         let Some(raw) = decode_ix_data(data_b58) else {
             return;
         };
-        // Author position differs by version: v1 `user` sits at index 7,
-        // v2 `user` at index 5 (14-account IDL layout). A single index
-        // here silently undercounts v2 serial launchers into a pass.
+        // Author differs by version: v1 at 7, v2 at 5.
         let author_idx = if raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR) {
             IDX_CREATE_V2_USER
         } else if raw.starts_with(&PUMP_CREATE_DISCRIMINATOR) {
@@ -230,21 +198,18 @@ pub fn count_dev_creates(
     count
 }
 
-/// Parse a base58 address, mapping failure to [`ScreenError`].
+/// Parse a base58 address.
 pub fn parse_address(s: &str) -> Result<Pubkey, ScreenError> {
     Pubkey::from_str(s).map_err(|_| ScreenError::BadAddress(s.to_string()))
 }
 
-/// Deterministic fixture wallet address (base58 of `[byte; 32]`) for
-/// tests and offline plumbing demos.
+/// Fixture wallet: base58 of `[byte; 32]`.
 pub fn fixture_wallet(byte: u8) -> String {
     bs58::encode([byte; 32]).into_string()
 }
 
-/// Resolve the full account-key list for a raw message: static keys plus
-/// address-table-loaded addresses (writable then readonly). `None` on any
-/// undecodable key — callers fail the whole transaction rather than
-/// mis-resolve indices (a wrong program match is worse than a miss).
+/// Resolve full key list: static plus table addresses.
+/// `None` on any bad key: callers drop the tx.
 pub(crate) fn resolve_keys(
     raw: &UiRawMessage,
     meta: &Option<UiTransactionStatusMeta>,
@@ -263,12 +228,8 @@ pub(crate) fn resolve_keys(
     Some(keys)
 }
 
-/// Standard JSON transaction-fetch config (shared by all readers).
-/// Accepts transaction versions through v1: current Pump.fun launches
-/// are v1 envelopes, and `Some(0)` makes the RPC refuse them outright
-/// (-32015). The Json wire shape decodes identically across versions
-/// (proven by the mainnet `create_v2` replay fixture). A future v2
-/// envelope fails deterministically here (-32015, loud) — bump then.
+/// Standard JSON fetch config. Allows v1 envelopes.
+/// New v2 envelopes fail here: bump then.
 pub fn json_tx_config(commitment: CommitmentConfig) -> RpcTransactionConfig {
     RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Json),
@@ -277,10 +238,7 @@ pub fn json_tx_config(commitment: CommitmentConfig) -> RpcTransactionConfig {
     }
 }
 
-/// Single fan-out over every compiled instruction in a fetched
-/// transaction (top-level plus inner compiled). DRY helper shared by
-/// [`extract_pump_swaps`], [`count_dev_creates`], and
-/// [`find_funding_source`] so the top/inner traversal cannot drift.
+/// One fan-out over every compiled ix (top plus inner).
 pub(crate) fn for_each_compiled_ix(
     raw: &UiRawMessage,
     meta: &Option<UiTransactionStatusMeta>,

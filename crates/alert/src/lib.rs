@@ -1,9 +1,7 @@
-//! Non-blocking Discord trade alerts via Hermes CLI (skill
-//! `discord-hermes-alerting`).
+//! Non-blocking Discord alerts via Hermes CLI.
 //!
-//! [`Alerter::send`] spawns a detached task per message — it never blocks
-//! the pricing or swap paths. Delivery failures only emit
-//! `tracing::warn!`; portfolio and trading state are untouched.
+//! [`Alerter::send`] spawns a detached task per message.
+//! Failures only warn.
 
 pub mod discord;
 

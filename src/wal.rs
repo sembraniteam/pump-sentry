@@ -1,51 +1,32 @@
-//! Crash-recovery write-ahead log (JSONL, hand-rolled like
-//! [`crate::cli::PidInfo`]: base58 values never need escaping).
-//!
-//! Every custody-changing event appends BEFORE the in-memory map is
-//! touched, so a SIGKILL/abort between dispatch and bookkeeping replays
-//! to the same state on the next boot instead of stranding funds:
-//!
-//! - `pending` after a bundle receipt (re-polled on boot),
-//! - `settled` once a pending bundle is proven failed (stops re-poll),
-//! - `position` once a fill is tracked (restores `live_positions`),
-//! - `sell` once a sell confirms (subtracts on replay),
-//! - `manual` once a bag parks for human exit (restores `live_manual`).
-//!
-//! Boot replays in file order (ordered fold) and compacts back to the
-//! surviving state. Corrupt lines are skipped with a loud log, never a
-//! panic. `None` path (tests, paper) disables all WAL IO.
+//! Crash log. Write before mutate; replay on boot.
 use crate::live::LivePosition;
 
-/// One replayed pending buy: position plus both identifiers.
+/// One pending buy.
 #[derive(Debug, Clone)]
 pub struct WalPending {
-    /// Intended fill.
     pub position: LivePosition,
-    /// Transaction signature for `confirm_signature` re-polls.
+    /// Tx signature for re-polls.
     pub signature: String,
     /// Engine bundle UUID (dedup key).
     pub bundle_id: String,
 }
 
-/// One replayed human-exit bag: position plus its lookup note.
+/// One human-exit bag.
 #[derive(Debug, Clone)]
 pub struct WalManual {
-    /// Held bag.
     pub position: LivePosition,
-    /// Lookup identifier (bundle, signature, or cause).
+    /// Lookup id (bundle, signature, or cause).
     pub note: String,
 }
 
-/// Replayed boot state.
+/// Boot state.
 #[derive(Debug, Default, Clone)]
 pub struct WalReplay {
-    /// Pending buys whose bundle never settled (recheck on boot).
+    /// Pending buys (recheck on boot).
     pub pending: Vec<WalPending>,
-    /// Tracked fills (`live_positions`).
     pub positions: Vec<LivePosition>,
-    /// Human-exit bags (`live_manual`).
     pub manual: Vec<WalManual>,
-    /// Corrupt lines skipped (operator should inspect the file).
+    /// Corrupt lines skipped.
     pub skipped: usize,
 }
 
@@ -82,8 +63,7 @@ fn position_from(line: &str) -> Option<LivePosition> {
     })
 }
 
-/// Fold WAL lines (in order) into boot state. Pure over lines: the
-/// file read stays in `replay_file` so this is unit-tested directly.
+/// Fold lines in order into boot state.
 pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     use std::collections::HashMap;
     let mut pending: HashMap<String, WalPending> = HashMap::new();
@@ -158,8 +138,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     skipped += 1;
                     continue;
                 };
-                // Pre-note WALs (and hand-written lines) carry no
-                // note: default empty, never skip a real bag.
+                // Old lines lack note; keep bag.
                 let note = field(line, "note").unwrap_or_default();
                 manual
                     .entry(pos.mint.clone())
@@ -180,8 +159,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     }
 }
 
-/// Read + replay a WAL file. Missing file = empty replay (first
-/// boot), never an error. Corrupt lines count in `skipped`.
+/// Read and replay a file. Missing file is empty.
 pub fn replay_file(path: &std::path::Path) -> WalReplay {
     let raw = std::fs::read_to_string(path).unwrap_or_default();
     let replay = replay_lines(raw.lines());
@@ -191,9 +169,7 @@ pub fn replay_file(path: &std::path::Path) -> WalReplay {
     replay
 }
 
-/// Compact back to the surviving state (pending + positions +
-/// manual). Called once per boot after import so the file stays
-/// bounded; in-run appends keep it current after that.
+/// Compact to surviving state. Call once per boot after import.
 pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
     use std::fmt::Write as _;
     let mut out = String::new();

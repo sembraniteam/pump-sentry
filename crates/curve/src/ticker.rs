@@ -1,9 +1,4 @@
 //! Reserve polling ticker over HTTP RPC.
-//!
-//! [`CurveTicker`] holds a dynamic watch set of bonding-curve accounts.
-//! [`CurveTicker::run`] fetches them with `getMultipleAccounts` every
-//! `interval` and emits a [`PriceTick`] per curve. Read failures are
-//! logged and skipped — a missed round never kills the loop.
 
 use crate::layout::{BondingCurveReserves, CurveParseError};
 use crate::sol_feed::SolUsdFeed;
@@ -19,35 +14,25 @@ use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, warn};
 
-/// Ticker failures: configuration and one-shot fetch errors. The
-/// background loop itself never returns these (it logs and continues).
+/// Ticker failures.
 #[derive(Error, Debug)]
 pub enum CurveError {
-    /// RPC endpoint URL is invalid.
     #[error("invalid rpc url: {0}")]
     BadUrl(String),
-    /// Bonding-curve address is not a valid pubkey.
     #[error("invalid curve key '{0}'")]
     BadCurveKey(String),
-    /// Mint address is not a valid pubkey (watch/feeed misrouting).
     #[error("invalid mint key '{0}'")]
     BadMintKey(String),
-    /// SOL→USD feed has no fresh price (stale or never fetched).
     #[error("SOL/USD feed stale: no fresh price")]
     StaleSolUsd,
-    /// RPC transport failure.
     #[error("rpc error: {0}")]
     Rpc(#[from] ClientError),
-    /// RPC read exceeded its deadline.
     #[error("rpc read timed out")]
     Timeout,
-    /// Account does not exist (yet) on this RPC.
     #[error("curve account missing: {0}")]
     AccountMissing(String),
-    /// Reserve parsing failed.
     #[error("reserve parse failed: {0}")]
     Parse(#[from] CurveParseError),
-    /// Reserves present but no computable spot price.
     #[error("no spot price for curve: {0}")]
     NoPrice(String),
 }
@@ -55,17 +40,15 @@ pub enum CurveError {
 /// One reserve observation, priced in USD.
 #[derive(Debug, Clone)]
 pub struct PriceTick {
-    /// Token mint (base58) this curve belongs to.
     pub mint: String,
-    /// Bonding-curve address (base58).
     pub curve: String,
     /// Spot USD per whole token.
     pub price_usd: f64,
-    /// SOL-side liquidity proxy in USD.
+    /// SOL-side liquidity in USD.
     pub liquidity_usd: f64,
-    /// True once migrated (downstream should stop trusting spot).
+    /// True once migrated.
     pub complete: bool,
-    /// Local unix seconds when observed.
+    /// Local unix seconds.
     pub observed_at: u64,
 }
 
@@ -76,35 +59,25 @@ struct Watched {
     curve: Pubkey,
 }
 
-/// Polling price ticker. Cloneable; the watch set is shared.
+/// Polling price ticker.
 #[derive(Clone)]
 pub struct CurveTicker {
     rpc: Arc<RpcClient>,
     subs: Arc<RwLock<HashMap<String, Watched>>>,
     interval: Duration,
     sol_feed: Arc<SolUsdFeed>,
-    /// Ticks dropped because the downstream queue was full (see `run`:
-    /// drop-on-full keeps one slow consumer from stalling every curve).
     dropped: Arc<std::sync::atomic::AtomicU64>,
-    /// Mint → decimals cache for [`CurveTicker::token_decimals`].
-    /// Decimals are immutable on-chain, so entries never expire; the map
-    /// is bounded by distinct mints ever confirmed (arbitrary eviction
-    /// past the cap — order-free, since no entry is hotter than another).
+    /// Mint decimals cache (immutable; evicted past cap).
     decimals: Arc<Mutex<HashMap<String, u8>>>,
-    /// FeeConfig/Global cache for [`CurveTicker::venue_fee_bps`]:
-    /// program-owned globals change only on upgrades (hour TTL), while
-    /// the per-curve account stays fresh per call.
+    /// FeeConfig/Global cache.
     fee_inputs: crate::fee::FeeInputsCache,
 }
 
-/// Cap for the decimals cache (distinct confirmed mints; arbitrary
-/// eviction past it — correctness never depends on which entry goes).
+/// Decimals cache cap.
 pub const DECIMALS_CACHE_CAP: usize = 5_000;
 
 impl CurveTicker {
-    /// Map `"processed" | "confirmed" | "finalized"` to a commitment.
-    /// Returns `None` for unknown strings (fail-closed; the binary's
-    /// startup gate rejects these before this is ever called).
+    /// Map commitment name to config.
     pub fn parse_commitment(s: &str) -> Option<CommitmentConfig> {
         match s {
             "processed" => Some(CommitmentConfig::processed()),
@@ -114,10 +87,7 @@ impl CurveTicker {
         }
     }
 
-    /// Build a ticker: `http_url` + commitment for reads, `interval`
-    /// between poll rounds, `sol_feed` for SOL→USD conversion (dynamic,
-    /// staleness-gated — `fetch_tick`/`run` fail stale rounds instead of
-    /// pricing at a static number).
+    /// Build a ticker.
     pub fn new(
         http_url: &str,
         commitment: CommitmentConfig,
@@ -142,13 +112,12 @@ impl CurveTicker {
         })
     }
 
-    /// Ticks dropped on a full downstream queue (backpressure accounting).
+    /// Ticks dropped on a full queue.
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Watch a curve for a mint (idempotent per mint). Both addresses are
-    /// validated: an empty/garbage mint would silently misroute ticks.
+    /// Watch a curve for a mint.
     pub async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
         Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
         let key =
@@ -169,7 +138,7 @@ impl CurveTicker {
         Ok(())
     }
 
-    /// Stop watching a mint. Returns true when an entry was removed.
+    /// Stop watching a mint.
     pub async fn unwatch(&self, mint: &str) -> bool {
         self.subs.write().await.remove(mint).is_some()
     }
@@ -180,29 +149,18 @@ impl CurveTicker {
     }
 
 
-    /// One-shot reserve read for a curve address. Single retry (transient
-    /// failures only — a missing account is not retried) plus a deadline
-    /// so hung RPCs fail fast instead of stalling the caller. The curve
-    /// account owner must be the Pump.fun program (spoofed price sources
-    /// rejected). Fails with [`CurveError::StaleSolUsd`] when the SOL/USD
-    /// feed has no fresh price (every tick is dynamic — no static fallback).
+    /// One-shot reserve read (one retry, with deadline).
     pub async fn fetch_tick(&self, mint: &str, curve: &str) -> Result<PriceTick, CurveError> {
         Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
         let key =
             Pubkey::from_str(curve).map_err(|_| CurveError::BadCurveKey(curve.to_string()))?;
         let sol_usd = self.sol_feed.price().ok_or(CurveError::StaleSolUsd)?;
         let account = read_with_retry(&self.rpc, &key).await?;
-        // Decimals before pricing (cached; fail-closed like the confirm
-        // gate — a tick at the wrong scale is worse than none).
         let decimals = self.token_decimals(mint).await?;
         tick_from_account(mint, curve, &account.data, &account.owner, sol_usd, decimals)
     }
 
-    /// Mint decimals from the mint account (cached per mint; immutable
-    /// on-chain so entries never expire). Fail-closed `Err` on
-    /// transport/timeout/short data — callers sizing in base units must
-    /// never guess. Both SPL programs share the fixed 44-byte prefix
-    /// (extensions only append), so one offset serves both.
+    /// Mint decimals (cached). Fail-closed.
     pub async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError> {
         if let Some(hit) = self.decimals.lock().await.get(mint) {
             return Ok(*hit);
@@ -231,15 +189,7 @@ impl CurveTicker {
         Ok(decimals)
     }
 
-    /// Venue fee (protocol + coin creator, bps/side) for one curve's fee
-    /// tier, read live: curve account (quote kind + coin override) plus
-    /// Venue fee (protocol + coin creator, bps/side) for one curve's fee
-    /// tier, read live: curve account (quote kind, reserves, supply,
-    /// mayhem flag, coin override) plus the mint supply plus the cached
-    /// FeeConfig/Global inputs. `None` on any failure — callers keep the
-    /// standard 125 bps tier.
-    /// Confirm-path only (bounded deadline, no retry): a missing tier
-    /// must not stall the gate.
+    /// Venue fee for one curve. `None` keeps 125 bps.
     pub async fn venue_fee_bps(&self, mint: &str, curve: &str) -> Option<f64> {
         let mint_key = Pubkey::from_str(mint)
             .map_err(|_| CurveError::BadMintKey(mint.to_string()))
@@ -254,12 +204,7 @@ impl CurveTicker {
         fee
     }
 
-    /// One-shot reserve read plus the curve's venue-fee tier from the
-    /// SAME account bytes (single home for the confirm path, so pricing
-    /// and tiering can never read two different chain states — and one
-    /// fewer RPC per confirm than separate `fetch_tick` + `venue_fee_bps`
-    /// calls). Fee is best-effort `Option` (standard tier on `None`);
-    /// the tick itself still fails closed on bad reserves.
+    /// Reserve read plus venue fee from the same bytes.
     pub async fn fetch_tick_with_fee(
         &self,
         mint: &str,
@@ -288,22 +233,10 @@ impl CurveTicker {
         Ok((tick, fee))
     }
 
-    /// Poll loop: `getMultipleAccounts` per round, one tick per curve.
-    /// Interval-based (no drift accumulation); ends when the receiver
-    /// drops. Batch failures back off instead of hammering the RPC.
-    /// Delivery is drop-on-full (with a counter): one slow consumer must
-    /// not head-of-line-block every watched curve.
-    ///
-    /// Mirrors `migration::VaultTicker::run` on purpose (single-account
-    /// arity here vs vault pairs there, different batching): the shared
-    /// shape is timer → closed-check → snapshot → deadline-bound fetch →
-    /// length check → parse → drop-on-full send. Keep the backpressure
-    /// contract (drop + counter + deadlines) in sync across both.
+    /// Poll loop. Ends when the receiver drops.
     pub async fn run(self, tx: mpsc::Sender<PriceTick>) {
         let mut timer = tokio::time::interval(self.interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Discard the immediate first tick: let subscriptions settle for
-        // one full interval before the first round.
         timer.tick().await;
         loop {
             timer.tick().await;
@@ -315,9 +248,6 @@ impl CurveTicker {
             if watched.is_empty() {
                 continue;
             }
-            // Dynamic SOL price per round: one fresh read gates every tick
-            // in the round (stale feed skips the whole round — no static
-            // fallback).
             let Some(sol_usd) = self.sol_feed.price() else {
                 debug!("sol_usd stale; skipping round");
                 continue;
@@ -350,8 +280,7 @@ impl CurveTicker {
                     debug!(mint = %entry.mint, "curve account missing (not yet indexed?)");
                     continue;
                 };
-                // Real decimals (cached) — a wrong-scale print is worse
-                // than a skipped round.
+                // Wrong-scale prints are worse than skips.
                 let decimals = match self.token_decimals(&entry.mint).await {
                     Ok(d) => d,
                     Err(e) => {
@@ -387,28 +316,19 @@ impl CurveTicker {
     }
 }
 
-/// Overall round deadline: chunked reads run concurrently, but a large
-/// watchlist must still finish (or fail loudly) within budget instead of
-/// piling missed ticks behind a 150s round.
+/// Overall round deadline.
 pub const ROUND_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Per-round RPC deadline: hung reads fail instead of stalling polls.
+/// Per-round RPC deadline.
 pub const ROUND_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Byte offset of `decimals` in an SPL mint account: mint(32) +
-/// mint-authority `COption<Pubkey>`(36) + supply(8) = 44. Shared by the
-/// classic and Token-2022 programs (extensions only append past the
-/// fixed prefix).
+/// Offset of `decimals` in a mint account (shared by both SPL programs).
 pub const MINT_DECIMALS_OFFSET: usize = 44;
 
-/// Deadline for one mint-decimals read (confirm path only; the hot
-/// ticker loop never reads mints).
+/// Deadline for one decimals read.
 pub const DECIMALS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Single account read with one retry and a deadline. The retry fires
-/// only for transient failures (transport/timeout/overload): a missing
-/// account is deterministic and returns at once instead of costing a
-/// second RPC plus 250ms.
+/// Single account read with one retry on transient failures.
 async fn read_with_retry(
     rpc: &RpcClient,
     key: &Pubkey,
@@ -430,10 +350,7 @@ async fn read_with_retry(
     }
 }
 
-/// True for read failures worth one retry: timeouts, transport trouble,
-/// and node-overload codes. Deterministic failures (missing account —
-/// `ForUser`/parse/request errors — and any other RPC response code)
-/// return immediately.
+/// True for read failures worth one retry.
 fn is_transient_read_error(e: &CurveError) -> bool {
     match e {
         CurveError::Timeout => true,
@@ -454,15 +371,10 @@ fn is_transient_read_error(e: &CurveError) -> bool {
     }
 }
 
-/// Maximum accounts per `getMultipleAccounts` call: bounds payload size
-/// and stays clear of per-request account limits on public endpoints.
+/// Max accounts per multi-account call.
 pub const BATCH_CHUNK_SIZE: usize = 100;
 
-/// Batched multi-account read with a deadline (single attempt; the poll
-/// loop backs off and retries next round on failure). Large watchlists
-/// are split into [`BATCH_CHUNK_SIZE`] chunks fetched CONCURRENTLY
-/// (sequential 15s chunks turned 1000 curves into a 150s round); results
-/// preserve key order across chunks (`join_all` is order-preserving).
+/// Batched multi-account read with a deadline.
 async fn poll_round(
     rpc: &RpcClient,
     keys: &[Pubkey],
@@ -493,9 +405,6 @@ fn tick_from_account(
     decimals: u8,
 ) -> Result<PriceTick, CurveError> {
     let reserves = BondingCurveReserves::parse_validated(data, owner)?;
-    // Real mint decimals, not the assumed 6: a non-6 print used to be
-    // emitted at 10^Δ the true price (the confirm gate drops non-6 mints
-    // downstream, but every other tick consumer read garbage).
     let price_usd = reserves
         .price_usd(decimals, sol_usd)
         .ok_or_else(|| CurveError::NoPrice(curve.to_string()))?;
@@ -549,7 +458,6 @@ mod tests {
             .await
             .expect("watch");
         assert_eq!(t.watched_count().await, 1);
-        // Idempotent re-watch of the same mint.
         t.watch(&mint, "11111111111111111111111111111111")
             .await
             .expect("watch");
@@ -586,8 +494,6 @@ mod tests {
         assert!((tick.price_usd - 2.7959e-8 * 150.0).abs() < 1e-12);
         assert!((tick.liquidity_usd - 4500.0).abs() < 1e-9);
         assert!(!tick.complete);
-        // Non-6 decimals scale the same reserves differently (no more
-        // silent 10^Δ misprints at the tick layer).
         let tick9 =
             tick_from_account("MINT", "CURVE", &data, &ids::PUMP_PROGRAM_ID, 150.0, 9).expect("tick");
         assert!((tick9.price_usd - tick.price_usd * 1000.0).abs() < 1e-9);
@@ -617,16 +523,12 @@ mod tests {
     #[test]
     fn feed_stale_fails_closed() {
         use std::time::{SystemTime, UNIX_EPOCH};
-        // Seeded feed forced stale: fetch_tick must fail, never price at
-        // a static fallback.
         let stale = SolUsdFeed::new(
             crate::sol_feed::DEFAULT_JUP_URL,
             120,
             std::time::Duration::from_secs(30),
         );
         stale.set_price(150.0);
-        // Backdate via fresh feed with 0 stale window instead: simplest is
-        // a feed with no price at all (never fetched).
         let empty = SolUsdFeed::new(
             crate::sol_feed::DEFAULT_JUP_URL,
             120,

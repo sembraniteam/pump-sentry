@@ -1,9 +1,4 @@
-//! Live execution sink: USD sizing math plus Jito-routed dispatch.
-//!
-//! [`LiveTrader`] wraps [`SwapExecutor`](SwapExecutor) with the
-//! pipeline's USD-denominated sizing. [`plan_buy`] / [`plan_sell`] are pure
-//! (unit-tested); only [`LiveTrader::buy`] / [`sell`](LiveTrader::sell)
-//! touch the network.
+//! Live sizing plus Jito dispatch. Plans are pure; trader hits network.
 
 use crate::settings::now_secs;
 use crate::wal;
@@ -14,180 +9,105 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
-/// Pump.fun mint decimals (base-unit scale). The confirm path verifies
-/// every mint reads 6 before sizing (see `ReserveFeed::token_decimals`
-/// and the decimals gate in `confirm_open`): non-6 mints are dropped
-/// rather than mispriced, so this constant is a checked invariant, not
-/// an assumption.
+/// Mint decimals. Confirm verifies 6; else drop.
 pub const TOKEN_DECIMALS: u32 = 6;
 /// Lamports per SOL.
 pub const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
-/// Pump.fun standard venue fee priced into sizing when no per-mint tier
-/// is known (protocol + creator, 125 bps total — matches the simulator's
-/// default per-side fee and the live single-tier schedule). Canonical
-/// home for the standard tier in the binary: sizing callers pass the
-/// paper ledger's per-mint tier when one is registered, else this.
-/// Locked to the simulator default by
-/// `standard_tier_matches_simulator_default` — change both together.
-/// Applied BEFORE the slippage ceiling: the chain debits trade + fees,
-/// so a fee-blind guard spends the slippage budget on baseline cost
-/// (a 1.15%-short guard failed live with 6002).
+/// Standard fee tier (bps/side). Matches the simulator default.
 pub const VENUE_FEE_BPS: u64 = 125;
 
-/// Live-trade failures: bad inputs or dispatch errors.
+/// Live-trade failures.
 #[derive(Error, Debug)]
 pub enum LiveError {
-    /// Address or amount cannot be built from market data: {0}
+    /// Bad inputs: {0}
     #[error("bad live order: {0}")]
     BadOrder(String),
     /// Dispatch failed: {0}
     #[error("dispatch failed: {0}")]
     Dispatch(#[from] ExecutorError),
-    /// Bundle accepted but never confirmed. Proven on-chain failures
-    /// carry the `Confirmed failure:` prefix (never rechecked; no fill);
-    /// everything else is pending (rechecked until proven).
+    /// Accepted but never confirmed. `Confirmed failure` means no fill.
     #[error("unconfirmed live fill: {0}")]
     Unconfirmed(String),
-    /// Dispatch timed out with no signature: the bundle may or may not
-    /// have reached the engine. Carries the intended position so the
-    /// pipeline can park it for manual review instead of losing it.
-    /// Boxed: `LivePosition` holds five `String`s, and an unboxed
-    /// variant trips `clippy::result_large_err` on every live call.
+    /// Timed out with no signature: fill unknown, needs review.
+    /// Boxed for `clippy::result_large_err`.
     #[error("unknown dispatch fill: {reason}")]
     UnknownDispatch {
-        /// Intended fill (amounts as sized, fill unknown).
         position: Box<LivePosition>,
-        /// Human-readable cause.
         reason: String,
     },
 }
 
-/// Fill-confirmation deadline per dispatch (bundles land in seconds or
-/// not at all; the gate loop must not stall on one token).
+/// Confirm deadline per dispatch.
 pub const LIVE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
-/// Dispatch deadline per Jito send: only `confirm_signature` used to be
-/// bounded, so a hung RPC/Jito call blocked the caller (and its locks)
-/// forever. A timed-out dispatch has no receipt, so the fill is reported
-/// unknown for manual review rather than assumed either way.
+/// Dispatch deadline. Timeout means unknown fill, needs review.
 pub const LIVE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
-/// Minimum spacing between live-sell retries for one mint.
+/// Min spacing between sell retries per mint.
 pub const SELL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
-/// Failed live sells before tracking is dropped for manual exit.
+/// Failed sells before manual exit.
 pub const SELL_MAX_ATTEMPTS: u32 = 5;
-/// Recheck rounds for an unconfirmed buy before giving up to manual review.
+/// Recheck rounds before manual review.
 pub const PENDING_MAX_ATTEMPTS: u32 = 5;
 
-/// Resolved post-migration Raydium pool leg for one mint: validated
-/// V4 pool addresses (from `parse_validated` stores via the follow
-/// path — never hand-built). Stringly typed like [`LivePosition`];
-/// parsed fail-closed at dispatch.
+/// Raydium pool leg for one mint.
 #[derive(Debug, Clone)]
 pub struct RaydiumPoolLeg {
-    /// Token mint (base58).
     pub mint: String,
-    /// Raydium AMM pool account (base58).
     pub amm: String,
-    /// Coin-side LP vault, WSOL inventory (base58).
+    /// Coin vault (WSOL).
     pub base_vault: String,
-    /// Pc-side LP vault, token inventory (base58).
+    /// Pc vault (token).
     pub quote_vault: String,
 }
 
-/// Tracked live fill (amounts in token base units).
+/// Tracked fill (base units).
 #[derive(Debug, Clone)]
 pub struct LivePosition {
-    /// Token mint (base58).
     pub mint: String,
-    /// Bonding-curve address (base58).
     pub curve: String,
-    /// Curve ATA address (base58).
     pub assoc_curve: String,
-    /// Bought base units (for full-size exits).
+    /// Bought units (for full exits).
     pub amount_tokens: u64,
-    /// Token creator (base58): required for v3 dispatch (cross-checked
-    /// against curve state). `None` fails closed downstream.
+    /// Creator. `None` fails v3 dispatch.
     pub creator: Option<String>,
 }
 
-/// Buy request: sizing inputs plus the optional creator, bundled so
-/// live-dispatch context cannot grow call arity again.
+/// Buy request.
 #[derive(Debug, Clone, Copy)]
 pub struct LiveBuyParams<'a> {
-    /// Token mint (base58).
     pub mint: &'a str,
-    /// Bonding-curve address (base58).
     pub curve: &'a str,
-    /// Curve ATA address (base58).
     pub assoc_curve: &'a str,
     /// Exposure in USD.
     pub notional_usd: f64,
-    /// Execution price in USD per token.
+    /// Price in USD per token.
     pub price_usd: f64,
-    /// SOL price in USD (lamport conversion).
+    /// SOL price in USD.
     pub sol_usd: f64,
-    /// Curve liquidity in USD for impact sizing (mirrors the paper
-    /// [`FillModel`](FillModel): unknown/zero pays fee-only).
+    /// Curve liquidity in USD (zero pays fee-only).
     pub liquidity_usd: f64,
-    /// Venue fee tier (bps/side) for this mint, when the confirm path
-    /// registered one. `None` means the standard tier
-    /// ([`VENUE_FEE_BPS`]) — the same default the paper ledger falls
-    /// back to, so both legs price identically with or without a tier.
+    /// Fee tier. `None` is standard.
     pub venue_fee_bps: Option<f64>,
-    /// Token creator (base58), when the launch carried one.
     pub creator: Option<&'a str>,
 }
 
-/// Planned buy: integer amounts ready for [`BuyOrder`].
+/// Planned buy: amounts ready for dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveBuyPlan {
-    /// Token base units to buy.
     pub amount_tokens: u64,
     /// Slippage guard in lamports.
     pub max_sol_cost: u64,
 }
 
-/// Guard ceiling over a fee-inclusive quote: `quoted_cost_incl_fees`
-/// plus `slippage_bps`, rounded UP (a floored guard underfunds the buy
-/// by a lamport and fails with 6002 `TooMuchSolRequired` — the frozen
-/// failed sample missed by 18,969 lamports, 1.15%). `None` on zero
-/// quotes and on `u64` overflow: an unguardable cost fails closed,
-/// never dispatches unprotected. `slippage_bps` is clamped to 10_000
-/// like every other sizing path. This is THE guard constructor: once a
-/// fee-inclusive on-chain quote engine lands, its output feeds this
-/// function directly (fees must never be added twice — the quote
-/// already includes protocol+creator fees, like the 1_668_970-lamport
-/// `Right` in the frozen 6002 log).
+/// Guard over a fee-inclusive quote: quote plus `slippage_bps`, up.
+/// `None` on zero or overflow (fail-closed).
 pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option<u64> {
-    // Single constructor lives in the executor crate so binary and
-    // executor can never drift apart; this wrapper keeps the
-    // pipeline-facing name stable.
+    // One constructor so both sides match.
     executor::quote::slippage_ceiling(quoted_cost_incl_fees, slippage_bps)
 }
 
-/// Size a buy from USD notional at spot: tokens from `notional/price`
-/// through the paper [`FillModel`](FillModel) at `fee_bps_per_side`
-/// (fee + impact, fee-only when liquidity is unknown — identical inputs
-/// give identical sizes on both legs), spend cap from `notional/sol`
-/// plus `slippage_bps` (clamped to 10_000 = 100% like the sell floor, so a
-/// misconfigured `SLIPPAGE_BPS` cannot authorize unbounded overspend —
-/// and live boot refuses `>= 10000` outright, so the clamp is
-/// defense-in-depth, not the policy).
-/// `fee_bps_per_side` is REQUIRED (no silent tier): callers pass the
-/// paper ledger's per-mint tier, or [`VENUE_FEE_BPS`] for the standard
-/// tier. Sizing and guard share the tier, so custom-fee coins size AND
-/// fund exactly — the fee engine downstream still recomputes
-/// fee-inclusively but is clamped to this guard (never double-counts).
-/// `None` on non-positive inputs, zero quantity, or amounts that do not
-/// fit `u64` (`as`-casts saturate silently past the max — a garbage
-/// print must fail closed, never size a jumbo order).
-/// Truncate a float into `u64`, failing closed outside the range.
-/// `u64::MAX as f64` rounds UP to 2^64, so a `>` bound lets values in
-/// `(u64::MAX, 2^64]` through to a saturating cast (a garbage print
-/// sizing a max-quantity order); `>=` rejects them. Single home for
-/// every float→lamports/token conversion on the live path.
-/// `amount_f` below stays in f64 past 2^53 (1-ulp dust on absurd
-/// notional/price ratios): economically negligible next to the 25% slip
-/// cap, and `u64_from_f64_floor` still fail-closes true overflow.
+/// Size a buy from USD notional through the paper fill model.
+/// Fee tier is required. `None` on bad inputs or overflow (fail-closed).
+/// Float to `u64`, fail-closed outside range.
 fn u64_from_f64_floor(v: f64) -> Option<u64> {
     if !v.is_finite() || v <= 0.0 || v >= u64::MAX as f64 {
         return None;
@@ -215,8 +135,7 @@ pub fn plan_buy(
     if !fee_bps_per_side.is_finite() || fee_bps_per_side < 0.0 {
         return None;
     }
-    // Paper parity: the ledger fills at quote*(1+slip), so size from the
-    // filled price (floored — never oversize custody past 2^53 either).
+    // Paper parity: size from filled price, floored.
     let fill = FillModel::default().with_venue_fee_bps(fee_bps_per_side);
     let slip = fill.slip_fraction(Side::Long, notional_usd, liquidity_usd);
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
@@ -226,19 +145,13 @@ pub fn plan_buy(
         return None;
     }
     let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
-    // Venue fee first, at the SAME tier as sizing (exact integer ceil in
-    // u128; the narrowing `try_from` fails closed if the fee tips a
-    // near-max guard over u64::MAX), then the slippage ceiling. The fee
-    // engine downstream recomputes fee-inclusively but is clamped to this
-    // guard, so pre-paying here never double-counts.
+    // Fee first at sizing tier, then slippage ceiling.
     let with_fee = u64::try_from(
         (u64_from_f64_floor(lamports)? as u128 * (10_000 + fee_bps_per_side.ceil() as u128))
             .div_ceil(10_000),
     )
     .ok()?;
-    // One guard constructor everywhere (ceiling math): the float quote
-    // here stands in for a fee-inclusive on-chain quote until the quote
-    // engine lands — the helper, not ad-hoc math, sets every guard.
+    // One guard everywhere.
     let max_sol_cost = apply_slippage_ceiling(with_fee, slippage_bps)?;
     Some(LiveBuyPlan {
         amount_tokens,
@@ -246,18 +159,8 @@ pub fn plan_buy(
     })
 }
 
-/// Floor for a sell: model proceeds (paper [`FillModel`](FillModel)
-/// at the same inputs AND the same `fee_bps_per_side` tier, so the floor
-/// tracks what the ledger books) minus `slippage_bps`.
-/// `fee_bps_per_side` is REQUIRED like [`plan_buy`]: a floor priced at
-/// the wrong tier authorizes either an unfillable minimum (overstated
-/// proceeds → on-chain failure → manual exit) or a giveaway.
-/// `None` on degenerate inputs — and on a zero floor:
-/// `min_sol_output = 0` authorizes the slot leader to fill at any price
-/// (sandwich drain), so full-slippage configs and sub-lamport dust fail
-/// closed instead of dispatching unprotected. (`slippage_bps >= 10000`
-/// refuses here while [`plan_buy`] clamps: buys are additionally gated
-/// at live boot, so the clamp is defense-in-depth, not policy.)
+/// Sell floor: modeled proceeds minus slippage. Fee tier is required.
+/// `None` on bad inputs and zero floor (zero authorizes any price).
 pub fn plan_sell_floor(
     amount_tokens: u64,
     price_usd: f64,
@@ -279,24 +182,17 @@ pub fn plan_sell_floor(
         return None;
     }
     let scale = 10f64.powi(TOKEN_DECIMALS as i32);
-    // Paper parity: fills land BELOW the quote by the model slip, so the
-    // floor starts from modeled proceeds (a bare-quote floor would price
-    // above reality and fail the fill on-chain).
+    // Paper parity: floor from modeled proceeds.
     let gross_notional = amount_tokens as f64 / scale * price_usd;
     let slip = FillModel::default()
         .with_venue_fee_bps(fee_bps_per_side)
         .slip_fraction(Side::Short, gross_notional, liquidity_usd);
     let lamports = gross_notional * (1.0 - slip).max(0.0) / sol_usd * LAMPORTS_PER_SOL;
-    // Same `>=` boundary as `plan_buy`: `u64::MAX as f64` is 2^64, and
-    // `as u64` below saturates past the max.
+    // Same `>=` edge as `plan_buy` (cast saturates).
     if !lamports.is_finite() || lamports <= 0.0 || lamports >= u64::MAX as f64 {
         return None;
     }
-    // Integer mul-div floor in u128: the old float
-    // `(lamports * (10000-bps)/10000).floor() as u64` loses integer
-    // precision past 2^53, while lamports are exact integers — floor the
-    // quote to whole lamports first, then apply the margin with integer
-    // math (floor by construction via `/`).
+    // Exact mul-div floor in u128.
     let base = lamports.floor() as u64;
     if base == 0 {
         return None;
@@ -308,37 +204,25 @@ pub fn plan_sell_floor(
     Some(floor)
 }
 
-/// Jito-routed live trader over a configured [`SwapExecutor`].
+/// Jito-routed trader over a [`SwapExecutor`].
 #[derive(Clone)]
 pub struct LiveTrader {
     executor: SwapExecutor,
     slippage_bps: u64,
     tip_lamports: u64,
-    /// Priority-fee price for cost accounting (set from the same knobs
-    /// as the executor's compute budget; see `with_dispatch_fees`).
+    /// Priority price for cost math.
     priority_fee_micro_lamports: u64,
-    /// Compute-unit limit for cost accounting.
+    /// Compute limit for cost math.
     compute_unit_limit: u32,
-    /// Write-ahead log for crash/restart recovery (see [`WalReplay`]).
-    /// `None` (tests, paper) disables all WAL IO.
+    /// WAL path (`None` disables IO).
     wal_path: Option<PathBuf>,
-    /// Buys accepted by the engine but unconfirmed when the deadline hit.
-    /// A timed-out bundle may still land late; dropping it here would leave
-    /// real tokens untracked (no exit automation). Entries are re-polled
-    /// via [`LiveTrader::recheck_pending`] until confirmed, failed, or
-    /// out of attempts (then manual review). Short critical sections only.
+    /// Unconfirmed buys, re-polled until settled or out of tries.
     pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
-    /// At most one [`LiveTrader::recheck_pending`] round runs at a time:
-    /// ticks fire every second while a round can take up to the confirm
-    /// timeout, so overlapping rounds would stack identical confirm RPCs
-    /// and race the attempt counters. Late callers skip (empty vec).
+    /// One recheck round at a time.
     recheck_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Buy awaiting confirmation: reserved for the recheck loop, never treated
-/// as a fill until the chain says so. Carries BOTH identifiers: the
-/// base58 `signature` (what `confirm_signature` polls — a bundle UUID
-/// never parses as one) and the engine `bundle_id` (for logs/cards).
+/// Buy awaiting confirmation. Never a fill until the chain says so.
 #[derive(Debug, Clone)]
 struct PendingBuy {
     position: LivePosition,
@@ -347,35 +231,34 @@ struct PendingBuy {
     attempts: u32,
 }
 
-/// Outcome of one [`LiveTrader::recheck_pending`] round per mint.
+/// One recheck round result per mint.
 #[derive(Debug, Clone)]
 pub struct PendingRecheck {
-    /// Expected position (valid only when `outcome` is `Confirmed`).
+    /// Expected position (valid only on `Confirmed`).
     pub position: LivePosition,
     /// Engine bundle UUID.
     pub bundle_id: String,
-    /// Transaction signature (what to look up on-chain on GiveUp).
+    /// Tx signature (lookup on GiveUp).
     pub signature: String,
-    /// What the re-poll found.
     pub outcome: RecheckOutcome,
 }
 
 /// Recheck verdict for one pending buy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecheckOutcome {
-    /// Landed after all: promote to tracked and automate exits.
+    /// Landed: track it and automate exits.
     Confirmed,
-    /// Errored on-chain: nothing held, drop silently-ish (log).
+    /// Errored on-chain: nothing held, drop it.
     FailedOnChain,
-    /// Still unknown: keep pending for the next round.
+    /// Still unknown: keep for next round.
     StillUnknown,
-    /// Out of attempts: drop and escalate to manual review.
+    /// Out of tries: drop and escalate.
     GiveUp,
 }
 
 
 impl LiveTrader {
-    /// Wrap an executor (already Jito-attached) with sizing policy.
+    /// Wrap an executor with sizing policy.
     pub fn new(executor: SwapExecutor, slippage_bps: u64, tip_lamports: u64) -> Self {
         Self {
             executor,
@@ -391,15 +274,13 @@ impl LiveTrader {
         }
     }
 
-    /// Enable the crash-recovery write-ahead log at `path` (live boot
-    /// sets this next to the log file; tests leave it `None`).
+    /// Enable the crash-recovery WAL at `path`.
     pub fn with_wal(mut self, path: PathBuf) -> Self {
         self.wal_path = Some(path);
         self
     }
 
-    /// Compute-budget knobs for cost accounting (mirrors the executor's
-    /// `with_compute_budget`; the trader never builds instructions).
+    /// Compute knobs for cost math (mirrors executor).
     pub fn with_dispatch_fees(
         mut self,
         compute_unit_limit: u32,
@@ -410,14 +291,7 @@ impl LiveTrader {
         self
     }
 
-    /// Per-dispatch on-chain overhead in lamports: Jito tip plus the
-    /// priority fee (`ceil(limit * price / 1e6)`) plus the base
-    /// transaction fee ([`BASE_TX_FEE_LAMPORTS`], single-sourced in
-    /// `ids`), saturating instead of wrapping on absurd configs. Covers
-    /// every dispatch (buy or sell). The breaker prices this into USD so
-    /// the day-loss gate sees live bleed, not paper-only profit.
-    /// First-buy-per-mint ATA rent is NOT included here — see
-    /// [`first_touch_cost_lamports`](Self::first_touch_cost_lamports).
+    /// Per-dispatch overhead: tip plus fees. Excludes first-buy ATA rent.
     pub fn dispatch_cost_lamports(&self) -> u64 {
         let prio = (self.compute_unit_limit as u128)
             .saturating_mul(self.priority_fee_micro_lamports as u128)
@@ -429,21 +303,13 @@ impl LiveTrader {
             .saturating_add(BASE_TX_FEE_LAMPORTS)
     }
 
-    /// First-buy-per-mint all-in cost: dispatch overhead plus one
-    /// [`ATA_RENT_LAMPORTS`] reserve for creating the user's ATA (rent is
-    /// recoverable on close but a real same-day outflow for the gate).
-    /// Use on the buy fast-path and the recheck-confirm path; sells and
-    /// repeat buys use [`dispatch_cost_lamports`](Self::dispatch_cost_lamports).
+    /// First-buy cost: dispatch plus one ATA rent.
     pub fn first_touch_cost_lamports(&self) -> u64 {
         self.dispatch_cost_lamports()
             .saturating_add(ATA_RENT_LAMPORTS)
     }
 
-    /// Run `f` under the pending-tracker lock. Single home for the
-    /// poison policy (loud warn + caller fallback); every pending-map
-    /// access goes through here so the policy cannot drift per call
-    /// site. Takes `&mut` uniformly — read-only callers simply don't
-    /// mutate.
+    /// Run `f` under the pending lock (one poison policy).
     fn with_pending<R>(
         &self,
         op: &'static str,
@@ -459,36 +325,29 @@ impl LiveTrader {
         }
     }
 
-    /// True when at least one buy awaits confirmation.
+    /// True when a buy awaits confirmation.
     pub fn has_pending(&self) -> bool {
         self.with_pending("has_pending", true, |guard| !guard.is_empty())
     }
 
-    /// Mints pending confirmation (cloned).
+    /// Pending mints (cloned).
     pub fn pending_mints(&self) -> Vec<String> {
         self.with_pending("pending_mints", Vec::new(), |guard| {
             guard.keys().cloned().collect()
         })
     }
 
-    /// Re-poll every pending buy once (one fresh confirmation window each).
-    /// Confirmed and failed entries leave the map; unknown ones stay until
-    /// [`PENDING_MAX_ATTEMPTS`] and then report [`RecheckOutcome::GiveUp`].
-    /// Confirms run concurrently (one slow mint must not hold up the
-    /// rest); a round already in flight makes late callers skip.
+    /// Re-poll pending buys once. Unknown stays until budget, then GiveUp.
     pub async fn recheck_pending(&self) -> Vec<PendingRecheck> {
         if self
             .recheck_busy
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            // Ticks fire every second while a round can take up to the
-            // confirm timeout: skips are routine, not lost work. Debug
-            // (not warn) so a slow mint does not spam the ops log.
+            // Skips are routine; debug level.
             tracing::debug!("pending recheck already in flight; skipping round");
             return Vec::new();
         }
-        // Reset on every exit path, including panic unwinds: a stuck flag
-        // would silence all future rechecks.
+        // Reset on every exit: a stuck flag silences rechecks.
         struct ResetOnDrop {
             busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
         }
@@ -534,12 +393,7 @@ impl LiveTrader {
         for (entry, outcome) in results {
             match outcome {
                 RecheckOutcome::StillUnknown => {}
-                // Every terminal recheck verdict retires the WAL pending
-                // line: without the tombstone the next boot replays a
-                // dead bundle back into `pending` (wasteful re-polls), and
-                // a late-confirmed or given-up bag replays twice — once
-                // as pending, once as the parked manual bag (phantom
-                // `#late-…` duplicate demanding review for one fill).
+                // Terminal verdicts retire the WAL line.
                 _ => {
                     self.write_wal_settled(&entry.bundle_id);
                     let mint = entry.position.mint.clone();
@@ -558,9 +412,7 @@ impl LiveTrader {
         out
     }
 
-    /// Build the tracked [`LivePosition`] for one buy (single
-    /// constructor so dispatch, confirm, and pending paths cannot drift
-    /// apart on what a fill carries).
+    /// Build a tracked position (one constructor).
     fn pending_position(
         mint: &str,
         curve: &str,
@@ -577,8 +429,7 @@ impl LiveTrader {
         }
     }
 
-    /// Buy `notional_usd` at `price_usd` via Jito bundle.
-    /// Returns the tracked position plus the bundle UUID.
+    /// Buy `notional_usd` at `price_usd` via Jito.
     pub async fn buy(&self, req: &LiveBuyParams<'_>) -> Result<(LivePosition, String), LiveError> {
         let (mint, curve, assoc_curve, notional_usd, price_usd, sol_usd) = (
             req.mint, req.curve, req.assoc_curve, req.notional_usd, req.price_usd, req.sol_usd,
@@ -620,10 +471,7 @@ impl LiveTrader {
         {
             Ok(dispatch) => dispatch?,
             Err(_) => {
-                // Dispatch hung: the bundle may or may not have reached
-                // the engine, and there is no signature to re-poll — the
-                // fill is unknown and needs a human. Carry the intended
-                // position so the pipeline parks it (never drops it).
+                // No signature: fill unknown, park for review.
                 let position = Self::pending_position(
                     mint,
                     curve,
@@ -641,10 +489,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(%mint, bundle = %receipt.bundle_id, amount = plan.amount_tokens, "LIVE buy dispatched");
-        // Write-ahead tracking: the receipt exists from here on, so an
-        // abort/crash during `confirm_signature` below must not lose it.
-        // Fast-path confirm/failure removes the entry again; timeouts and
-        // transport errors keep it for the recheck loop.
+        // Receipt exists from here; confirm removes it.
         let intended = Self::pending_position(
             mint,
             curve,
@@ -674,8 +519,7 @@ impl LiveTrader {
             }
             Ok(ConfirmOutcome::FailedOnChain) => {
                 Self::untrack_pending(&self.pending, mint);
-                // Proven no-fill: retire the WAL pending line so boot
-                // replay never re-polls a dead bundle.
+                // Proven no-fill: retire the line so boot skips it.
                 self.write_wal_settled(&receipt.bundle_id);
                 Err(LiveError::Unconfirmed(format!(
                     "buy bundle {} Confirmed failure: errored on-chain; no fill",
@@ -683,9 +527,7 @@ impl LiveTrader {
                 )))
             }
             Ok(ConfirmOutcome::Timeout) => {
-                // A timed-out bundle may still land late: track it for the
-                // recheck loop instead of assuming no fill (an untracked bag
-                // would never get exit automation).
+                // May land late: keep for recheck.
                 Self::track_pending(
                     &self.pending,
                     mint,
@@ -704,10 +546,7 @@ impl LiveTrader {
                 )))
             }
             Err(e) => {
-                // Transport failure mid-confirm: the fill is just as
-                // unknown as a timeout (the bundle may already have
-                // landed), so track it identically. Only a proven
-                // on-chain failure means no fill.
+                // Transport failure: same as timeout.
                 Self::track_pending(
                     &self.pending,
                     mint,
@@ -728,12 +567,7 @@ impl LiveTrader {
         }
     }
 
-    /// Record an unconfirmed buy for the recheck loop. Used for timeouts
-    /// AND transport errors alike: in both cases the fill is unknown, and
-    /// only a proven on-chain failure (`FailedOnChain`) means no fill.
-    /// First receipt wins per mint: a second pending buy for the same
-    /// mint is logged loudly for manual review instead of silently
-    /// dropping the first bag's tracking.
+    /// Record an unconfirmed buy. First receipt wins per mint.
     fn track_pending(
         pending: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
         mint: &str,
@@ -753,17 +587,13 @@ impl LiveTrader {
                     attempts: 1,
                 });
             }
-            // A poisoned lock means a prior panic already fired: losing
-            // the bag's tracking silently would strand real funds without
-            // exit automation — escalate loudly instead.
+            // Poisoned lock would strand funds: escalate loudly.
             Err(_) => tracing::warn!(mint = %mint, bundle = %receipt.bundle_id,
                 "pending-tracker lock poisoned; buy fill untracked, MANUAL REVIEW REQUIRED"),
         }
     }
 
-    /// Remove a write-ahead pending entry once the fast path settles
-    /// (confirmed fill or proven on-chain failure). Timeouts and
-    /// transport errors keep the entry for the recheck loop.
+    /// Remove a settled entry. Timeouts stay for recheck.
     fn untrack_pending(
         pending: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
         mint: &str,
@@ -777,12 +607,7 @@ impl LiveTrader {
         }
     }
 
-    /// Append one WAL line (best-effort: IO failure warns, never fails
-    /// the dispatch — the in-memory map stays authoritative this run).
-    /// Durable via `sync_all`: dispatches are seconds apart at most, so
-    /// the fsync cost never serializes a hot path, and a crash between
-    /// receipt and WAL must not lose a real fill (the replay would never
-    /// know to re-poll it).
+    /// Append one line (best-effort, synced).
     fn wal_append(&self, line: String) {
         let Some(path) = self.wal_path.as_ref() else {
             return;
@@ -810,15 +635,14 @@ impl LiveTrader {
         }
     }
 
-    /// JSON value for an optional creator (`null` when unknown).
+    /// JSON creator (`null` when unknown).
     fn wal_creator(creator: Option<&String>) -> String {
         creator
             .map(|c| format!("\"{c}\""))
             .unwrap_or_else(|| "null".to_string())
     }
 
-    /// Record a dispatched bundle BEFORE confirming it (write-ahead: a
-    /// crash during confirm replays to recheck, never to silence).
+    /// Record a dispatch BEFORE confirming.
     fn write_wal_pending(&self, position: &LivePosition, signature: &str, bundle_id: &str) {
         if self.wal_path.is_none() {
             return;
@@ -834,10 +658,7 @@ impl LiveTrader {
         ));
     }
 
-    /// Record a proven-dead bundle so boot replay stops re-polling it.
-    /// (Fast-path confirms are recorded by [`LiveTrader::acknowledge_buy`]
-    /// instead — only AFTER the pipeline tracks the fill, so a crash in
-    /// between replays to a recheck that re-confirms rather than to loss.)
+    /// Record a dead bundle so boot skips it.
     fn write_wal_settled(&self, bundle_id: &str) {
         if self.wal_path.is_none() {
             return;
@@ -848,10 +669,7 @@ impl LiveTrader {
         ));
     }
 
-    /// Record a tracked fill + retire its pending line. Call AFTER
-    /// inserting into `live_positions` (write-behind for the position,
-    /// so a crash replays to recheck-then-track, never to a settled
-    /// tombstone over an untracked bag).
+    /// Record a fill and retire pending. Call AFTER tracking it.
     pub fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
         if self.wal_path.is_none() {
             return;
@@ -868,9 +686,7 @@ impl LiveTrader {
         self.write_wal_settled(bundle_id);
     }
 
-    /// Record a human-exit bag (write-ahead of the `live_manual` insert).
-    /// `note` is a lookup identifier (bundle, signature, or cause) with
-    /// no quotes/backslashes/commas (base58/UUID/plain words only).
+    /// Record a human-exit bag. `note` is a lookup id, unquoted.
     pub fn record_manual(&self, position: &LivePosition, note: &str) {
         if self.wal_path.is_none() {
             return;
@@ -886,7 +702,7 @@ impl LiveTrader {
         ));
     }
 
-    /// Record a confirmed sell (write-ahead of the custody subtract).
+    /// Record a confirmed sell.
     pub fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
         if self.wal_path.is_none() {
             return;
@@ -897,7 +713,7 @@ impl LiveTrader {
         ));
     }
 
-    /// Import boot-replayed pendings into the recheck loop.
+    /// Import boot-replayed pendings into recheck.
     pub fn import_pending(&self, items: Vec<wal::WalPending>) -> usize {
         self.with_pending("wal-import", 0, |guard| {
             let mut n = 0usize;
@@ -914,10 +730,7 @@ impl LiveTrader {
         })
     }
 
-    /// Sell the full tracked amount at `price_usd` via Jito bundle.
-    /// `venue_fee_bps` prices the floor at the mint's tier (`None` =
-    /// standard [`VENUE_FEE_BPS`], same default as the buy leg).
-    /// Returns the bundle UUID.
+    /// Sell the full tracked amount via Jito.
     pub async fn sell(
         &self,
         position: &LivePosition,
@@ -973,9 +786,7 @@ impl LiveTrader {
             .await
         {
             Ok(ConfirmOutcome::Confirmed) => {
-                // Write-ahead of the pipeline's custody subtract: a crash
-                // in between replays to a subtracted position, never to a
-                // resurrected bag (which would double-sell on retry).
+                // Write-ahead of subtract: crash replays subtracted.
                 self.record_sell(&position.mint, position.amount_tokens, &receipt.bundle_id);
                 Ok(receipt.bundle_id)
             }
@@ -987,9 +798,7 @@ impl LiveTrader {
                 "sell bundle {} unconfirmed after {:?}; still holding",
                 receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
             ))),
-            // Transport failure mid-confirm: the bundle may already have
-            // landed, so report it as unconfirmed-but-holding (same retry
-            // path as a timeout) rather than a dispatch error.
+            // Transport failure: same as timeout.
             Err(e) => Err(LiveError::Unconfirmed(format!(
                 "sell bundle {} confirm RPC failed ({e}); still holding",
                 receipt.bundle_id
@@ -997,13 +806,7 @@ impl LiveTrader {
         }
     }
 
-    /// Post-migration Raydium sell of the tracked amount at `pool` via
-    /// Jito bundle. The floor prices from live vault reserves inside the
-    /// executor preflight (no USD price needed — the curve print is gone
-    /// by construction on this path), guarded by the same slippage
-    /// budget as the curve leg. Confirm/recheck semantics are identical
-    /// to [`LiveTrader::sell`]: only a proven on-chain failure means no
-    /// fill. Returns the bundle UUID.
+    /// Raydium sell at `pool` via Jito. Floor prices from vault reserves.
     pub async fn sell_raydium(
         &self,
         position: &LivePosition,
@@ -1042,9 +845,7 @@ impl LiveTrader {
             .await
         {
             Ok(ConfirmOutcome::Confirmed) => {
-                // Write-ahead of the pipeline's custody subtract: a crash
-                // in between replays to a subtracted position, never to a
-                // resurrected bag (which would double-sell on retry).
+                // Write-ahead of subtract: crash replays subtracted.
                 self.record_sell(&position.mint, position.amount_tokens, &receipt.bundle_id);
                 Ok(receipt.bundle_id)
             }
@@ -1056,9 +857,7 @@ impl LiveTrader {
                 "raydium sell bundle {} unconfirmed after {:?}; still holding",
                 receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
             ))),
-            // Transport failure mid-confirm: the bundle may already have
-            // landed, so report it as unconfirmed-but-holding (same retry
-            // path as a timeout) rather than a dispatch error.
+            // Transport failure: same as timeout.
             Err(e) => Err(LiveError::Unconfirmed(format!(
                 "raydium sell bundle {} confirm RPC failed ({e}); still holding",
                 receipt.bundle_id
@@ -1072,53 +871,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slippage_ceiling_covers_fee_inclusive_quotes() {        // The frozen 6002 log: quote required 1_668_970, guard sent
-        // 1_650_001 (1.15% short). At 100bps the guard must be
-        // ceil(1_668_970 * 1.01) = 1_685_660 — above `Right`, never
-        // equal-or-below it.
+    fn slippage_ceiling_covers_fee_inclusive_quotes() {
         assert_eq!(apply_slippage_ceiling(1_668_970, 100), Some(1_685_660));
-        // Ceiling, not floor: 1 lamport of fraction rounds the guard up.
         assert_eq!(apply_slippage_ceiling(10_001, 0), Some(10_001));
         assert_eq!(apply_slippage_ceiling(10_000, 1), Some(10_001));
-        // Degenerate quotes fail closed; bps clamps at 100%.
         assert_eq!(apply_slippage_ceiling(0, 200), None);
         assert_eq!(apply_slippage_ceiling(1_000, 10_000), Some(2_000));
         assert_eq!(apply_slippage_ceiling(1_000, 99_999), Some(2_000));
-        // Overflow fails closed instead of saturating into a jumbo guard.
         assert_eq!(apply_slippage_ceiling(u64::MAX, 10_000), None);
         assert_eq!(apply_slippage_ceiling(u64::MAX, 0), Some(u64::MAX));
     }
 
     #[test]
     fn standard_tier_matches_simulator_default() {
-        // Cross-crate lock: the binary's standard tier and the paper
-        // model's default fee must stay one number, or sizing and the
-        // ledger diverge silently on every trade.
         assert_eq!(VENUE_FEE_BPS as f64, FillModel::default().venue_fee_bps());
     }
 
     #[test]
     fn buy_plan_math() {
-        // $10 at $0.0000042 into $30k liquidity: the paper fill model
-        // takes fee + exact constant-product impact first, so live sizes
-        // ~2.3508M tokens (2_350_783_728_484 base units) — identical
-        // inputs size identically on both legs.
         let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0).expect("plan");
         assert_eq!(plan.amount_tokens, 2_350_783_728_484);
-        // $10 ≈ 66.67M lamports + 1.25% venue fee, then + 2% slippage guard.
         assert_eq!(plan.max_sol_cost, 68_850_000);
     }
 
     #[test]
     fn buy_plan_custom_fee_sizes_and_funds_at_tier() {
-        // A 345 bps coin sizes SMALLER (worse fill) and funds HIGHER
-        // than the standard tier at identical inputs — sizing and guard
-        // share the tier, so custody matches the paper ledger exactly.
         let std = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0).expect("std");
         let cus = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 345.0).expect("custom");
         assert!(cus.amount_tokens < std.amount_tokens);
         assert!(cus.max_sol_cost > std.max_sol_cost);
-        // Parity with the ledger at the same tier.
         use simulator::{PaperPortfolio, Side};
         let mut paper = PaperPortfolio::new(1_000.0, 0.0);
         paper.set_venue_fee_for_mint("MINT", 345.0);
@@ -1138,27 +919,19 @@ mod tests {
         assert_eq!(plan_buy(10.0, 0.0, 150.0, 200, 30_000.0, 125.0), None);
         assert_eq!(plan_buy(10.0, 1.0, 0.0, 200, 30_000.0, 125.0), None);
         assert_eq!(plan_buy(f64::NAN, 1.0, 150.0, 200, 30_000.0, 125.0), None);
-        // Dust that rounds to zero units.
         assert_eq!(plan_buy(1e-12, 1.0, 150.0, 200, 30_000.0, 125.0), None);
-        // Non-finite/negative tiers never price (no silent tier).
         assert_eq!(plan_buy(10.0, 1.0, 150.0, 200, 30_000.0, f64::NAN), None);
         assert_eq!(plan_buy(10.0, 1.0, 150.0, 200, 30_000.0, -1.0), None);
     }
 
     #[test]
     fn sell_floor_math() {
-        // 1e6 units (1 token) at $2, SOL $150: model proceeds land
-        // below quote (fee + impact), then − 2% margin via integer
-        // mul-div floor → 12_902_461.
         let floor = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 125.0).expect("floor");
         assert_eq!(floor, 12_902_461);
     }
 
     #[test]
     fn sell_floor_custom_fee_floors_lower() {
-        // Same proceeds, worse tier → lower floor. A 125-priced floor on
-        // a 345 coin would authorize an unfillable minimum; the tiered
-        // floor tracks on-chain reality instead.
         let std = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 125.0).expect("std");
         let cus = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 345.0).expect("custom");
         assert!(cus < std, "custom {cus} vs std {std}");
@@ -1166,8 +939,6 @@ mod tests {
 
     #[test]
     fn u64_boundary_fails_closed() {
-        // `u64::MAX as f64` IS 2^64: exactly-2^64 must reject (old `>`
-        // bound passed it into a saturating cast → max-quantity order).
         assert_eq!(u64_from_f64_floor(2f64.powi(64)), None);
         assert_eq!(u64_from_f64_floor(f64::NAN), None);
         assert_eq!(u64_from_f64_floor(f64::INFINITY), None);
@@ -1179,30 +950,21 @@ mod tests {
 
     #[test]
     fn buy_plan_rejects_overflow() {
-        // 1e36 base units does not fit u64: fail closed, never saturate.
         assert_eq!(plan_buy(1e20, 1e-10, 150.0, 200, 30_000.0, 125.0), None);
-        // Oversized spend cap (amount fits, cap does not): same treatment.
         assert_eq!(plan_buy(1e13, 1e6, 150.0, 200, 30_000.0, 125.0), None);
     }
 
     #[test]
     fn sell_floor_rejects_zero_floor() {
-        // 100% slippage authorizes any fill price: rejected outright.
         assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_000, 30_000.0, 125.0), None);
         assert_eq!(plan_sell_floor(1_000_000, 2.0, 150.0, 10_001, 30_000.0, 125.0), None);
-        // Sub-lamport dust floors to 0: no unprotected dispatch.
         assert_eq!(plan_sell_floor(1, 1e-9, 1e9, 200, 30_000.0, 125.0), None);
     }
 
     #[test]
     fn sell_floor_uses_integer_math_at_1_lamport_boundary() {
-        // Integer mul-div floor: ~1.31 lamports of modeled proceeds floor
-        // to base 1; 0bps keeps 1, any margin floors to 0 → rejected
-        // (never an unprotected dispatch).
         assert_eq!(plan_sell_floor(1, 0.2, 150.0, 0, f64::NAN, 125.0), Some(1));
         assert_eq!(plan_sell_floor(1, 0.2, 150.0, 1, f64::NAN, 125.0), None);
-        // Exactness of the integer path: 10_001 at 1bps floors to 9_999,
-        // never rounded up by f64.
         let floored = (10_001u64 as u128 * (10_000 - 1) as u128 / 10_000) as u64;
         assert_eq!(floored, 9_999);
     }
@@ -1211,20 +973,14 @@ mod tests {
     fn sell_floor_rejects_degenerate() {
         assert_eq!(plan_sell_floor(0, 2.0, 150.0, 200, 30_000.0, 125.0), None);
         assert_eq!(plan_sell_floor(100, 0.0, 150.0, 200, 30_000.0, 125.0), None);
-        // Absurd proceeds that don't fit u64: fail closed, never saturate.
         assert_eq!(plan_sell_floor(u64::MAX, 1e12, 1e-6, 0, 30_000.0, 125.0), None);
-        // Bad tiers never price.
         assert_eq!(plan_sell_floor(100, 2.0, 150.0, 200, 30_000.0, f64::NAN), None);
         assert_eq!(plan_sell_floor(100, 2.0, 150.0, 200, 30_000.0, -1.0), None);
     }
 
     #[test]
     fn live_sizes_match_paper_ledger() {
-        // Parity lock: identical inputs must size identically on both
-        // legs (paper fills at quote*(1+slip); live sizes from the same
-        // filled price, floored to base units). Commission stays 0 here
-        // to isolate the fill model — live dispatch costs ride the
-        // day-loss breaker, not the sizing math.
+        // Parity lock: same inputs size the same on both legs.
         use simulator::{PaperPortfolio, Side};
         let mut paper = PaperPortfolio::new(1_000.0, 0.0);
         let id = paper
@@ -1235,13 +991,7 @@ mod tests {
             .expect("open");
         let qty = paper.position(id).expect("pos").quantity;
         let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0).expect("plan");
-        // Paper quantity is whole tokens; live tracks base units (1e6).
         assert_eq!(plan.amount_tokens, (qty * 1e6).floor() as u64);
-        // Sell floor sits below modeled gross proceeds (conservative by
-        // construction: model slip first, then the slippage margin).
-        // One token at $3 into $30k liquidity: slip ≈ fee-only, so the
-        // floor lands just under gross (the full-size plan above would
-        // pin the 25% impact cap instead — same model, both legs).
         let floor = plan_sell_floor(1_000_000, 3.0, 150.0, 200, 30_000.0, 125.0).expect("floor");
         let gross = 1_000_000_f64 / 1e6 * 3.0 / 150.0 * LAMPORTS_PER_SOL;
         assert!((floor as f64) < gross, "floor {floor} vs gross {gross}");
@@ -1250,8 +1000,6 @@ mod tests {
 
     #[test]
     fn wal_replay_folds_pending_settled_positions_sells() {
-        // Ordered fold: pending survives, settled retires, sells subtract,
-        // manual restores, corrupt lines count (never panic).
         let lines = [
             r#"{"t":"pending","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}"#,
             r#"{"t":"pending","mint":"DEAD","curve":"CURVE","assoc":"ASSOC","amount":500,"creator":null,"sig":"SIG2","bundle":"B2","ts":2}"#,
@@ -1277,9 +1025,6 @@ mod tests {
 
     #[test]
     fn wal_replay_settled_retires_pending_beside_manual() {
-        // Give-up shape: the recheck loop parks the bag as manual AND
-        // writes the settled tombstone — without it the next boot
-        // replays one fill twice (pending re-poll + manual review).
         let retired = [
             r#"{"t":"pending","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}"#,
             r#"{"t":"manual","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"note":"dispatch-unknown","ts":2}"#,
@@ -1292,8 +1037,6 @@ mod tests {
     }
 
     fn cost_trader(tip_lamports: u64, unit_limit: u32, unit_price: u64) -> LiveTrader {
-        // Throwaway wallet: cost math never touches the network, the
-        // executor is just ballast for the constructor.
         use executor::WalletGuard;
         use solana_commitment_config::CommitmentConfig;
         use solana_keypair::Keypair;
@@ -1312,21 +1055,17 @@ mod tests {
 
     #[test]
     fn dispatch_cost_includes_base_fee() {
-        // tip 10_000 + prio ceil(200_000 * 1_000 / 1e6) = 200, plus the
-        // 5_000 base fee single-sourced in `ids`.
         let trader = cost_trader(10_000, 200_000, 1_000);
         assert_eq!(
             trader.dispatch_cost_lamports(),
             10_000 + 200 + BASE_TX_FEE_LAMPORTS
         );
-        // Zero-fee config still pays the base fee: no free dispatch.
         let bare = cost_trader(0, 0, 0);
         assert_eq!(bare.dispatch_cost_lamports(), BASE_TX_FEE_LAMPORTS);
     }
 
     #[test]
     fn first_touch_adds_ata_rent() {
-        // First buy per mint = dispatch overhead + one ATA rent reserve.
         let trader = cost_trader(10_000, 200_000, 1_000);
         assert_eq!(
             trader.first_touch_cost_lamports(),

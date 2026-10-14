@@ -1,11 +1,7 @@
-//! Jito bundle dispatch for frontrunning protection (skill
-//! `jito-mev-execution`).
+//! Jito bundles for frontrunning protection.
 //!
-//! Flow: fully-signed transaction → bincode → base64 → `sendBundle`
-//! against a regional block engine. The tip from
-//! [`BuyOrder::tip_lamports`](crate::BuyOrder::tip_lamports) travels as a
-//! plain system transfer to a randomly selected tip account *inside* the
-//! same transaction, so a landed bundle always pays its tip.
+//! Signed tx -> bincode -> base64 -> `sendBundle`. The tip is a plain
+//! system transfer in the same tx, so a landed bundle pays.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::Client;
@@ -17,7 +13,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-/// Designated Jito tip accounts (skill `jito-mev-execution`).
+/// Designated Jito tip accounts.
 pub const JITO_TIP_ACCOUNTS: [&str; 4] = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
@@ -31,16 +27,13 @@ const SYSTEM_TRANSFER_DISCRIMINATOR: u32 = 2;
 /// Jito dispatch failures.
 #[derive(Error, Debug)]
 pub enum JitoError {
-    /// HTTP transport failure.
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
-    /// Block engine returned a JSON-RPC error.
+    /// Block engine JSON-RPC error.
     #[error("RPC error: {0}")]
     Rpc(String),
-    /// Transaction serialization failed.
     #[error("Bundle encoding failed: {0}")]
     Encode(String),
-    /// Block-engine URL is invalid.
     #[error("bad Jito endpoint: {0}")]
     BadUrl(String),
 }
@@ -50,24 +43,15 @@ pub enum JitoError {
 pub struct JitoClient {
     client: Client,
     endpoint: String,
-    /// `getTipAccounts` cache: (accounts, unix seconds fetched). The engine
-    /// rotates tip accounts; the compiled-in [`JITO_TIP_ACCOUNTS`] are only
-    /// the fallback when the fetch fails or is stale-blocked.
+    /// `getTipAccounts` cache: (accounts, unix seconds fetched).
     tips: std::sync::Arc<std::sync::Mutex<(Vec<String>, u64)>>,
 }
 
-/// Tip-account list TTL in seconds (one refresh per 15 min at most; a
-/// refresh failure silently keeps the previous list). Short enough that
-/// a disjoint-rejected rotation (hijack guard pins the old list) heals
-/// within a quarter hour, long enough that the engine is not spammed.
+/// Tip-list TTL: 15 min; failures keep the old list.
 pub const TIP_ACCOUNTS_TTL_SECS: u64 = 900;
 
 impl JitoClient {
-    /// Build against a block-engine base URL, e.g.
-    /// `https://mainnet.block-engine.jito.wtf` (global) or a regional
-    /// `https://frankfurt.mainnet.block-engine.jito.wtf`.
-    /// Returns the reason instead of `None` so startup logs say more
-    /// than "bad URL" (fail fast at startup, never half-enable live).
+    /// Build against a block-engine base URL. Bad URLs fail fast.
     pub fn new(region_base_url: &str) -> Result<Self, JitoError> {
         match url::Url::parse(region_base_url) {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
@@ -92,15 +76,10 @@ impl JitoClient {
         &self.endpoint
     }
 
-    /// Submit pre-encoded base64 transactions as one bundle.
-    /// Returns the engine's bundle UUID on acceptance.
+    /// Submit pre-encoded base64 txs. Returns the bundle UUID.
     ///
-    /// The second param is mandatory, not decorative: the block engine
-    /// defaults to base58 decoding when `encoding` is omitted, so a
-    /// base64 bundle without it is rejected with `-32602: transaction #0
-    /// could not be decoded` (verified live against the engine; a prior
-    /// revision omitted the param following an incomplete skill example
-    /// and every bundle would have been refused).
+    /// `params[1]` (`{"encoding": "base64"}`) is mandatory: without it the
+    /// engine assumes base58 and rejects with `-32602`.
     pub async fn send_bundle(&self, bundle_b64: Vec<String>) -> Result<String, JitoError> {
         let payload = bundle_payload(bundle_b64);
         debug!(endpoint = %self.endpoint, txs = payload["params"][0].as_array().map(|a| a.len()).unwrap_or(0), "submitting bundle");
@@ -120,9 +99,7 @@ impl JitoClient {
     }
 }
 
-/// Build the `sendBundle` JSON-RPC payload (pure, unit-tested).
-/// `params[1]` carries `{"encoding": "base64"}` because the engine
-/// decodes base58 by default — see [`JitoClient::send_bundle`].
+/// Build the `sendBundle` payload (pure). `params[1]` picks base64.
 pub fn bundle_payload(bundle_b64: Vec<String>) -> serde_json::Value {
     json!({
         "jsonrpc": "2.0",
@@ -131,18 +108,14 @@ pub fn bundle_payload(bundle_b64: Vec<String>) -> serde_json::Value {
         "params": [bundle_b64, {"encoding": "base64"}],
     })
 }
-/// Pick a tip account deterministically from `seed` (no RNG dependency;
-/// callers pass nanos or a counter).
+/// Pick a tip account from `seed` (no RNG; callers pass nanos/counter).
 pub fn select_tip_account(seed: u64) -> Pubkey {
     let idx = (seed as usize) % JITO_TIP_ACCOUNTS.len();
     Pubkey::from_str_const(JITO_TIP_ACCOUNTS[idx])
 }
 
 impl JitoClient {
-    /// Tip account for this dispatch: the live `getTipAccounts` set when
-    /// fresh (refreshed at most every 15 min, 2s budget, silent fallback), else
-    /// the compiled-in constants. Never fails: worst case is the old
-    /// static rotation.
+    /// Tip account for this dispatch: live set when fresh, else constants.
     pub async fn tip_account(&self, seed: u64) -> Pubkey {
         self.maybe_refresh_tips().await;
         let guard = self.tips.lock().unwrap_or_else(|e| e.into_inner());
@@ -151,15 +124,13 @@ impl JitoClient {
             return select_tip_account(seed);
         }
         let account = &list[(seed as usize) % list.len()];
-        // Never `from_str_const` here: the list is engine-supplied at
-        // runtime and one bad string must fall back, not panic the task.
+        // One bad entry falls back; never panics.
         account
             .parse::<Pubkey>()
             .unwrap_or_else(|_| select_tip_account(seed))
     }
 
-    /// Refresh the tip set when stale. Best-effort: any failure (timeout,
-    /// shape, empty, invalid pubkeys) keeps the previous list.
+    /// Refresh the tip set when stale. Any failure keeps the old list.
     async fn maybe_refresh_tips(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -180,13 +151,8 @@ impl JitoClient {
         }
     }
 
-    /// Query the engine's `getTipAccounts`. `None` on any failure or when
-    /// the response carries no usable pubkeys.
-    ///
-    /// Posts to the SAME bundles endpoint: Jito routes JSON-RPC by the
-    /// `method` field, not the path — posting to the bare base URL
-    /// returns nothing (verified live) and silently pins the static
-    /// fallback forever.
+    /// Query `getTipAccounts`. `None` on any failure.
+    /// Posts to the same endpoint: Jito routes by `method`, not path.
     async fn fetch_tip_accounts(&self) -> Option<Vec<String>> {
         let payload = json!({
             "jsonrpc": "2.0",
@@ -209,19 +175,13 @@ impl JitoClient {
             .as_array()?
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            // Never `from_str_const` on engine-supplied strings: an
-            // invalid entry is skipped, not panicked (fail-closed keeps
-            // the previous list when nothing usable remains).
+            // Skip bad entries; empty keeps the old list.
             .filter(|s| s.parse::<Pubkey>().is_ok_and(|p| p.to_string() == *s))
             .collect();
         if accounts.is_empty() {
             return None;
         }
-        // Rotation accepted with a loud log: a fully-rotated-but-valid
-        // list (clean pubkeys over authenticated HTTPS) heals instead of
-        // pinning stale tips forever. A compromised endpoint is out of
-        // scope for this check (TLS is the trust root); the 15-minute
-        // TTL re-verifies anyway.
+        // A fully rotated but valid list still heals.
         let overlaps = accounts
             .iter()
             .any(|a| JITO_TIP_ACCOUNTS.contains(&a.as_str()));
@@ -233,8 +193,7 @@ impl JitoClient {
     }
 }
 
-/// System transfer instruction (built by hand to avoid another sysvar
-/// crate): `[u32 LE 2, u64 LE lamports]`, from writable+signer.
+/// System transfer ix: from writable+signer.
 pub fn tip_instruction(payer: &Pubkey, tip_account: &Pubkey, lamports: u64) -> Instruction {
     let mut data = Vec::with_capacity(12);
     data.extend_from_slice(&SYSTEM_TRANSFER_DISCRIMINATOR.to_le_bytes());
@@ -249,8 +208,7 @@ pub fn tip_instruction(payer: &Pubkey, tip_account: &Pubkey, lamports: u64) -> I
     }
 }
 
-/// Encode signed transactions the way `sendBundle` expects: bincode →
-/// base64 (standard alphabet).
+/// Encode signed txs for `sendBundle`: bincode -> base64.
 pub fn encode_bundle(txs: &[Transaction]) -> Result<Vec<String>, JitoError> {
     txs.iter()
         .map(|tx| {
@@ -261,7 +219,7 @@ pub fn encode_bundle(txs: &[Transaction]) -> Result<Vec<String>, JitoError> {
         .collect()
 }
 
-/// Nanos seed for [`select_tip_account`] (mirrors the backoff jitter).
+/// Nanos seed for [`select_tip_account`].
 pub fn nanos_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -276,8 +234,7 @@ mod tests {
 
     #[test]
     fn bundle_payload_carries_base64_encoding() {
-        // Regression: omitting params[1] makes the engine decode base58
-        // and refuse every bundle (-32602). Verified live; lock the shape.
+        // Without params[1] the engine decodes base58 and refuses (-32602).
         let payload = bundle_payload(vec!["dGVzdA==".to_string()]);
         assert_eq!(payload["method"], "sendBundle");
         let params = payload["params"].as_array().expect("params array");

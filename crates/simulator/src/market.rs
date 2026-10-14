@@ -1,39 +1,20 @@
-//! Market microstructure helpers: slippage fills and exit triggers.
-//!
-//! [`FillModel`] turns a quote into an execution price given trade size
-//! vs available liquidity. [`check_exit`] evaluates TP / SL / trailing /
-//! timeout against the current price and mutates trailing state.
+//! Slippage fills and exit triggers.
 
 use crate::types::{ExitReason, Position, Side};
 
-/// Execution-price model for paper fills.
-///
-/// Quotes on thin bonding curves are never the fill: every trade pays
-/// the venue fee plus constant-product price impact against its own size.
+/// Execution price for paper fills.
 #[derive(Debug, Clone, Copy)]
 pub enum FillModel {
-    /// Fill exactly at the quote (for benchmarks / tests).
+    /// Fill at quote (tests only).
     Exact,
-    /// Bonding-curve cost: exact asymmetric constant-product impact plus
-    /// the venue fee, clamped to `max_slip_frac`, where
-    /// `s = notional_usd / liquidity_usd` and
-    /// `fee_frac = fee_bps_per_side / 10_000`:
-    ///
-    /// - buys (liquidity removal): `slip = s/(1-s) + fee_frac`;
-    /// - sells (liquidity addition): `slip = s/(1+s) + fee_frac`.
-    ///
-    /// The default 125 bps venue fee on Pump.fun (0.95% protocol + 0.30%
-    /// creator) is identical on buys and sells, so a flat round trip
-    /// costs ~2.53% before impact. Coins with a custom creator rate
-    /// re-tier per mint via [`FillModel::with_venue_fee_bps`] (kept in
-    /// the portfolio's override map, not here). Calibrated 2026-10-11
-    /// against pump.fun/docs/fees after the old 50bps/1% linear model
-    /// understated a $10-into-$4500 fill by ~13x (live round trips
-    /// measured 2–4%).
+    /// Curve cost: impact + venue fee, capped.
+    /// Buys `s/(1-s)+fee`, sells `s/(1+s)+fee`.
+    /// `s` = notional/liquidity, `fee` = bps/10_000.
+    /// Default 125 bps/side; round trip ~2.53%.
     BondingCurve {
-        /// Venue fee per side in basis points (125.0 on Pump.fun).
+        /// Venue fee per side, bps.
         fee_bps_per_side: f64,
-        /// Hard cap on the slip fraction (e.g. `0.25` = 25%).
+        /// Max slip fraction.
         max_slip_frac: f64,
     },
 }
@@ -48,7 +29,7 @@ impl Default for FillModel {
 }
 
 impl FillModel {
-    /// Venue fee in bps for the bonding-curve leg (`0.0` for [`FillModel::Exact`]).
+    /// Venue fee in bps.
     pub fn venue_fee_bps(&self) -> f64 {
         match *self {
             FillModel::Exact => 0.0,
@@ -58,10 +39,7 @@ impl FillModel {
         }
     }
 
-    /// Same model with the venue fee replaced (custom `coin_creator_fee_bps`
-    /// coins price 250+ bps creator instead of the standard 30). Negative
-    /// inputs clamp to zero like [`FillModel::slip_fraction`]; `Exact`
-    /// is returned unchanged (no venue leg to retier).
+    /// Same model with new fee.
     pub fn with_venue_fee_bps(&self, fee_bps_per_side: f64) -> Self {
         match *self {
             FillModel::Exact => FillModel::Exact,
@@ -72,21 +50,11 @@ impl FillModel {
         }
     }
 
-    /// Total cost fraction for one side: exact constant-product impact
-    /// plus venue fee, clamped to the cap. Fee-only when liquidity is
-    /// unknown (non-finite or non-positive). `side` selects the impact
-    /// leg: buys (`Long`) pay `s/(1-s)`, sells (`Short`) pay `s/(1+s)`,
-    /// where `s = notional_usd / liquidity_usd`.
-    ///
-    /// Negative `fee_bps_per_side`/`max_slip_frac` are trusted-config
-    /// mistakes: they clamp to zero (debug-asserted) rather than
-    /// understating costs. Validate user-supplied configs upstream.
+    /// One-side cost, capped.
     pub fn slip_fraction(&self, side: Side, notional_usd: f64, liquidity_usd: f64) -> f64 {
         self.slip_fraction_for_side(side, notional_usd, liquidity_usd)
     }
 
-    /// Side-aware slip fraction (single home for the impact math;
-    /// [`FillModel::slip_fraction`] delegates here).
     pub fn slip_fraction_for_side(&self, side: Side, notional_usd: f64, liquidity_usd: f64) -> f64 {
         if let FillModel::BondingCurve {
             fee_bps_per_side,
@@ -118,8 +86,6 @@ impl FillModel {
         let impact = match *self {
             FillModel::Exact => 0.0,
             FillModel::BondingCurve { .. } => match side {
-                // Buy removes base liquidity: dx/x = s/(1-s); s >= 1
-                // drains the pool (infinite impact → clamped to cap).
                 Side::Long => {
                     if size >= 1.0 {
                         f64::INFINITY
@@ -127,32 +93,12 @@ impl FillModel {
                         size / (1.0 - size)
                     }
                 }
-                // Sell adds base liquidity back: dx/x = s/(1+s).
                 Side::Short => size / (1.0 + size),
             },
         };
         (impact + fee).clamp(0.0, cap)
     }
-    /// Convert a quote into an execution price.
-    ///
-    /// Buys fill *above* the quote, sells *below* it. Degenerate inputs
-    /// fall back to the quote as-is (including a non-finite quote, which
-    /// passes through so callers — not this pure function — decide the
-    /// fail-closed policy; every production caller validates first).
-    /// Unknown liquidity pays the venue fee (no size basis): `slip_fraction`
-    /// already does fee-only there, so no early return here — returning
-    /// the bare quote would understate costs ~1.25% vs the snapshot path.
-    /// Note the deliberate asymmetry: a degenerate *notional* also passes
-    /// the bare quote through (fee-free), while `slip_fraction` for the
-    /// same input reports fee-only. The bare-quote branch means "no trade
-    /// priced", never "a free trade" — all production pricers
-    /// (`open`/`book`/`snapshot`/live sizing) reject non-positive
-    /// notionals before reaching the model, so the two paths agree
-    /// everywhere a fill can book.
-    /// The cap bounds the *total* per-side adverse excursion
-    /// (impact + fee): a pathological fee tier above the cap prices at
-    /// the cap, never above it. Real tiers (≤345 bps observed) sit far
-    /// below, so the clamp only binds on size.
+    /// Quote to execution price.
     pub fn fill_price(&self, side: Side, quote: f64, notional_usd: f64, liquidity_usd: f64) -> f64 {
         if !quote.is_finite() || quote <= 0.0 || !notional_usd.is_finite() || notional_usd <= 0.0 {
             return quote;
@@ -165,8 +111,7 @@ impl FillModel {
     }
 }
 
-/// Signed return since entry: `(price - entry) / entry` for longs,
-/// mirrored for shorts. Returns `0.0` on degenerate entry prices.
+/// Signed return since entry, percent.
 pub fn move_percent(side: Side, entry_price: f64, price: f64) -> f64 {
     if !entry_price.is_finite() || entry_price <= 0.0 || !price.is_finite() {
         return 0.0;
@@ -177,18 +122,9 @@ pub fn move_percent(side: Side, entry_price: f64, price: f64) -> f64 {
     }
 }
 
-/// Evaluate exit triggers for a position at `price` / `now_secs`.
-///
-/// Order: timeout → take-profit → stop-loss → trailing-stop. On a
-/// favorable move the trailing extreme (`best_price`) ratchets; it never
-/// moves against the position. Returns `None` when no trigger fires.
-///
-/// Callers close the position themselves via
-/// [`PaperPortfolio::close_position`](crate::PaperPortfolio::close_position).
+/// Exit check: timeout, TP, SL, trailing.
 pub fn check_exit(position: &mut Position, price: f64, now_secs: u64) -> Option<ExitReason> {
-    // Timeout first, even on a degenerate print: a broken feed must not
-    // trap a timed position forever (price-gated exits below still need a
-    // finite positive print).
+    // Timeout ignores bad prices.
     if position.timeout_seconds > 0
         && now_secs.saturating_sub(position.opened_at) >= position.timeout_seconds
     {
@@ -208,7 +144,6 @@ pub fn check_exit(position: &mut Position, price: f64, now_secs: u64) -> Option<
     }
 
     if position.trailing_stop && position.trail_percent > 0.0 {
-        // Ratchet the extreme on favorable moves only.
         let improved = match position.side {
             Side::Long => price > position.best_price,
             Side::Short => price < position.best_price,
@@ -263,14 +198,10 @@ mod tests {
             fee_bps_per_side: 125.0,
             max_slip_frac: 0.25,
         };
-        // 1% of liquidity: exact constant-product impact is asymmetric —
-        // buy s/(1-s) = 1.0101% + 1.25% fee = 2.2601% against,
-        // sell s/(1+s) = 0.9901% + 1.25% fee = 2.2401% against.
         let buy = model.fill_price(Side::Long, 1.0, 100.0, 10_000.0);
         assert!((buy - 1.022_601_010_101_01).abs() < 1e-12, "buy={buy}");
         let sell = model.fill_price(Side::Short, 1.0, 100.0, 10_000.0);
         assert!((sell - 0.977_599_009_900_99).abs() < 1e-12, "sell={sell}");
-        // 10% of liquidity: buy 11.111% + fee, sell 9.0909% + fee.
         let buy10 = model.slip_fraction_for_side(Side::Long, 1_000.0, 10_000.0);
         assert!(
             (buy10 - (0.1 / 0.9 + 0.0125)).abs() < 1e-12,
@@ -281,7 +212,6 @@ mod tests {
             (sell10 - (0.1 / 1.1 + 0.0125)).abs() < 1e-12,
             "sell10={sell10}"
         );
-        // Cap binds on huge size (both sides).
         let capped = model.fill_price(Side::Long, 1.0, 10_000_000.0, 10_000.0);
         assert!((capped - 1.25).abs() < 1e-12, "capped={capped}");
         let capped_sell = model.fill_price(Side::Short, 1.0, 10_000_000.0, 10_000.0);
@@ -293,13 +223,10 @@ mod tests {
 
     #[test]
     fn realistic_ticket_costs_match_live_band() {
-        // $10 into $4500 virtual liquidity: 0.22% impact + 1.25% fee.
         let model = FillModel::default();
         let buy = model.fill_price(Side::Long, 1.0, 10.0, 4_500.0);
         let slip = buy - 1.0;
         assert!((slip - 0.0147).abs() < 1e-4, "slip={slip}");
-        // Full round trip in token terms: ~2.9% gone, inside the 2–4%
-        // band measured live (old model said ~0.2%).
         let qty = 10.0 / buy;
         let sell_px = model.fill_price(Side::Short, 1.0, qty, 4_500.0);
         let loss = 10.0 - qty * sell_px;
@@ -310,9 +237,6 @@ mod tests {
     fn degenerate_inputs_fall_back_to_quote() {
         let model = FillModel::default();
         assert_eq!(model.fill_price(Side::Long, 0.0, 100.0, 10_000.0), 0.0);
-        // Unknown liquidity pays the venue fee (consistent with
-        // `slip_fraction` and the equity snapshot — the bare quote would
-        // understate a fill ~1.25%).
         assert!((model.fill_price(Side::Long, 1.0, 100.0, 0.0) - 1.0125).abs() < 1e-12);
         assert!(
             !model
@@ -335,9 +259,7 @@ mod tests {
         p.trailing_stop = true;
         assert_eq!(check_exit(&mut p, 1.5, 1001), None);
         assert_eq!(p.best_price, 1.5);
-        // 4% giveback from 1.5: no fire (trail 5%).
         assert_eq!(check_exit(&mut p, 1.44, 1002), None);
-        // 6% giveback: fires.
         assert_eq!(
             check_exit(&mut p, 1.41, 1003),
             Some(ExitReason::TrailingStop)
@@ -353,8 +275,6 @@ mod tests {
 
     #[test]
     fn timeout_fires_on_degenerate_price() {
-        // A broken feed must not trap a timed position: timeout is
-        // evaluated before the finite-price gate.
         let mut p = long(75.0, -8.0);
         p.timeout_seconds = 60;
         assert_eq!(check_exit(&mut p, 0.0, 1060), Some(ExitReason::Timeout));

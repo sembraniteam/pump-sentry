@@ -1,35 +1,19 @@
-//! Security policy: pure invariant checks over a [`RugCheckReport`].
-//!
-//! separated from HTTP fetching so the rules are unit-testable and
-//! reusable (e.g. for cached reports). [`assess`] collects *all*
-//! violations; [`RugCheckClient::evaluate_token`](crate::RugCheckClient::evaluate_token)
-//! joins them into the [`RugCheckError::SecurityRejection`].
+//! Policy checks over a [`RugCheckReport`].
 
 use crate::types::{RugCheckError, RugCheckReport};
 
-/// Tunable acceptance thresholds. [`AuditPolicy::default`] matches the
-/// skill: score cap 400, reject `danger`, reject live authorities.
-///
-/// Note on the 400 vs the risk-engine heuristic's 350
-/// (`risk-engine/src/fallback.rs::RUGCHECK_SCORE_CAP`): the two layers
-/// answer different questions. This policy is the hard on-chain gate —
-/// anything over 400 never reaches the watchlist. The 350 heuristic is
-/// the softer pre-LLM triage — and the model prompt passes above 350
-/// too, so scores 351–400 form a deliberate dead zone (observed, never
-/// bought on any path). Fail-closed by construction.
-/// Keep the strict ordering `heuristic cap <= policy cap` when tuning.
+/// Acceptance thresholds.
+/// Keep `heuristic cap (350) <= policy cap`.
 #[derive(Debug, Clone)]
 pub struct AuditPolicy {
     /// Reports with `score > max_score` are rejected.
     pub max_score: u32,
-    /// Reject when any risk has level `danger` (case-insensitive).
-    /// Fail-closed on unknown levels: only `warn` passes, anything else
-    /// (empty, `critical`, future severities) is rejected rather than
-    /// waved through.
+    /// Reject when any risk has level `danger`.
+    /// Only `warn` passes.
     pub reject_danger: bool,
-    /// Reject when a mint authority is still enabled.
+    /// Reject when mint authority is still on.
     pub reject_mint_authority: bool,
-    /// Reject when a freeze authority is still enabled.
+    /// Reject when freeze authority is still on.
     pub reject_freeze_authority: bool,
 }
 
@@ -49,7 +33,7 @@ impl Default for AuditPolicy {
 pub enum Verdict {
     /// Token passes every enabled invariant.
     Allow,
-    /// Token fails; one entry per violated invariant.
+    /// Token fails; one entry per broken rule.
     Reject {
         /// Human-readable violation descriptions.
         reasons: Vec<String>,
@@ -76,11 +60,8 @@ impl Verdict {
     }
 }
 
-/// Check a report against a policy, collecting every violation.
-///
-/// Fail-closed on missing data: an absent `token` section means the
-/// on-chain authority checks cannot run, so the report is rejected rather
-/// than waved through (a live mint authority is the classic rug).
+/// Check a report against a policy. Collects every violation.
+/// Missing `token` section rejects: authorities can't be checked.
 pub fn assess(report: &RugCheckReport, policy: &AuditPolicy) -> Verdict {
     let mut reasons = Vec::new();
 
@@ -99,8 +80,7 @@ pub fn assess(report: &RugCheckReport, policy: &AuditPolicy) -> Verdict {
                     risk.name, risk.description
                 ));
             } else if !risk.level.eq_ignore_ascii_case("warn") {
-                // Unknown severity (empty, `critical`, future levels):
-                // fail closed instead of waving it through.
+                // Unknown severity fails closed.
                 reasons.push(format!(
                     "Unknown risk severity '{}' on {}: treating as dangerous",
                     risk.level, risk.name
@@ -110,7 +90,7 @@ pub fn assess(report: &RugCheckReport, policy: &AuditPolicy) -> Verdict {
     }
 
     if let Some(token) = &report.token {
-        // Blank strings are as good as absent (some providers emit "").
+        // Blank strings count as absent.
         let mint_auth = token
             .mint_authority
             .as_deref()
@@ -204,8 +184,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_severity() {
-        // Empty (serde default), `critical`, and future levels must fail
-        // closed — only `warn` passes.
+        // Only `warn` passes; everything else fails closed.
         for level in ["", "critical", "HIGH", "info"] {
             let mut report = clean_report();
             report.risks[0].level = level.to_string();
@@ -256,8 +235,6 @@ mod tests {
 
     #[test]
     fn rejects_without_token_info() {
-        // Fail-closed: no on-chain section means authorities cannot be
-        // verified, so the report is rejected instead of waved through.
         let mut report = clean_report();
         report.token = None;
         match assess(&report, &AuditPolicy::default()) {

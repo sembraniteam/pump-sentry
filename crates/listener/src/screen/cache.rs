@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-/// Tiny TTL map for RPC-derived facts. Pure time math — unit-tested.
+/// Tiny TTL map for RPC-derived facts.
 #[derive(Debug, Default)]
 pub(crate) struct TimedCache<V: Clone> {
     ttl_secs: u64,
@@ -15,7 +15,7 @@ impl<V: Clone> TimedCache<V> {
         }
     }
 
-    /// Hit (fresh) or `None` on miss/expiry. Never panics.
+    /// Hit (fresh) or `None` on miss/expiry.
     pub(crate) fn get(&self, key: &str, now_secs: u64) -> Option<V> {
         self.entries.get(key).and_then(|(value, at)| {
             if now_secs.saturating_sub(*at) <= self.ttl_secs {
@@ -27,13 +27,11 @@ impl<V: Clone> TimedCache<V> {
     }
 
     pub(crate) fn put(&mut self, key: String, value: V, now_secs: u64) {
-        // Opportunistic eviction: drop expired entries on every insert so a
-        // long-running sniper cannot grow this map without bound.
-        // `retain` on a small map (<100 entries typical) is negligible.
+        // Drop expired entries on insert.
         let ttl = self.ttl_secs;
         self.entries
             .retain(|_, (_, at)| now_secs.saturating_sub(*at) <= ttl);
-        // Hard cap as a second backstop (funder sybil reuse is bounded).
+        // Hard cap as a second backstop.
         if self.entries.len() > 10_000
             && let Some(oldest) = self
                 .entries

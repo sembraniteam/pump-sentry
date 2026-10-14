@@ -1,18 +1,5 @@
-//! On-chain venue-fee read for the paper ledger.
-//!
-//! [`venue_fee_bps`] resolves a curve's total fee (protocol + coin
-//! creator, bps/side) from live chain state: the curve account (quote
-//! kind, reserves, supply, mayhem flag, the coin's own creator rate),
-//! the mint supply, the FeeConfig schedule, and the Global
-//! configurability gate. The confirm path registers the result per mint
-//! ([`simulator::PaperPortfolio::set_venue_fee_for_mint`]) so custom-fee
-//! coins price exactly instead of at the standard 125 bps.
-//!
-//! Full tier selection (not a single-tier fast path): the applicable
-//! tier is picked by bonding-curve market cap exactly like the
-//! executor's dispatch engine (`executor::quote`), so paper and live
-//! agree on every schedule shape. Any transport/shape failure is `None`
-//! (fail-closed to the default, never a zeroed cost).
+//! Venue-fee read for the paper ledger.
+//! Returns `None` on any failure (caller keeps 125 bps).
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
@@ -20,20 +7,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-/// Deadline for the joined fee-input reads (confirm path only).
+/// Deadline for fee-input reads.
 pub const FEE_TIMEOUT: Duration = Duration::from_secs(10);
-/// FeeConfig/Global cache TTL: program-owned globals change only on
-/// upgrades, so one joined read per hour bounds confirm-path RPCs
-/// (the per-curve account is still read fresh every call — the coin's
-/// own rate lives there).
+/// FeeConfig/Global cache TTL.
 pub const FEE_CACHE_TTL: Duration = Duration::from_secs(3600);
 
-/// Cached global fee inputs: raw FeeConfig bytes, the Global gate byte,
-/// and the fetch time. Raw bytes (not parsed triples) so a future
-/// schedule shape re-parses instead of serving a stale interpretation.
+/// Cached globals: FeeConfig bytes, gate byte, fetch time.
 pub type FeeInputsCache = Arc<Mutex<Option<(Vec<u8>, u8, Instant)>>>;
 
-/// Quote-mint class selecting the fee table.
+/// Quote-mint class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuoteKind {
     SolLike,
@@ -41,9 +23,7 @@ enum QuoteKind {
     Other,
 }
 
-/// Total venue fee (protocol + coin creator, bps/side) for one curve.
-/// `None` on any transport/shape failure — callers keep the standard
-/// tier.
+/// Total venue fee (bps/side) for one curve.
 pub async fn venue_fee_bps(
     rpc: &RpcClient,
     cache: &FeeInputsCache,
@@ -57,9 +37,7 @@ pub async fn venue_fee_bps(
     venue_fee_for_data(rpc, cache, mint, &curve_data.owner, &curve_data.data).await
 }
 
-/// Total venue fee from already-fetched curve bytes (single home for the
-/// combine rule, so one-shot and pre-read paths cannot drift apart).
-/// Owner must be the Pump program; `None` fails closed like above.
+/// Total venue fee from curve bytes (owner must be Pump).
 pub async fn venue_fee_for_data(
     rpc: &RpcClient,
     cache: &FeeInputsCache,
@@ -93,8 +71,7 @@ pub async fn venue_fee_for_data(
     Some(effective_total(proto, coin)? as f64)
 }
 
-/// Combine schedule rates into the venue total (engine rule applied
-/// upstream): pure; `None` past 100% (fail-closed, never a jumbo fee).
+/// Venue total; `None` past 100%.
 fn effective_total(proto: u64, creator: u64) -> Option<u64> {
     let total = proto.checked_add(creator)?;
     if total > 10_000 {
@@ -103,10 +80,7 @@ fn effective_total(proto: u64, creator: u64) -> Option<u64> {
     Some(total)
 }
 
-/// Joined FeeConfig + Global read behind the TTL cache. Owner-verified
-/// (FeeConfig under the fee program, Global under Pump); shape is NOT
-/// validated here — parsing re-runs per call so a schedule upgrade
-/// fails closed instead of serving a cached misread.
+/// Joined FeeConfig + Global read behind the TTL cache.
 async fn cached_fee_inputs(rpc: &RpcClient, cache: &FeeInputsCache) -> Option<(Vec<u8>, u8)> {
     if let Some((bytes, gate, at)) = cache.lock().await.clone()
         && at.elapsed() < FEE_CACHE_TTL
@@ -130,9 +104,7 @@ async fn cached_fee_inputs(rpc: &RpcClient, cache: &FeeInputsCache) -> Option<(V
     Some((fee.data, gate))
 }
 
-/// Curve fee inputs for tier selection: one parse of the curve bytes
-/// (quote kind, reserves, supply, mayhem flag, coin override). Pure;
-/// `None` on short data.
+/// Curve fee inputs for tier selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CurveFeeView {
     kind: QuoteKind,
@@ -143,8 +115,6 @@ struct CurveFeeView {
     is_mayhem: bool,
 }
 
-/// Quote kind + the coin's own creator rate from curve bytes. Pure;
-/// `None` on short data.
 fn curve_fee_inputs(data: &[u8]) -> Option<CurveFeeView> {
     if data.len() < ids::CURVE_COIN_CREATOR_FEE_END {
         return None;
@@ -154,10 +124,7 @@ fn curve_fee_inputs(data: &[u8]) -> Option<CurveFeeView> {
         .try_into()
         .ok()?;
     let quote = Pubkey::new_from_array(raw);
-    // Zero key (legacy storage) and explicit WSOL both mean SOL-paired:
-    // the executor resolves zero → WSOL before tier selection, so paper
-    // must map both to the SOL table or the legs diverge the day the
-    // tables differ (numerically identical while every table is 95/30).
+    // Zero key and WSOL both mean SOL-paired.
     let kind = if quote == Pubkey::default() || quote == ids::WSOL_MINT {
         QuoteKind::SolLike
     } else if quote == ids::USDC_MINT {
@@ -180,9 +147,7 @@ fn curve_fee_inputs(data: &[u8]) -> Option<CurveFeeView> {
     })
 }
 
-/// Mint supply for fee-tier market caps on non-mayhem curves (mayhem
-/// curves carry their tier supply in state). `None` on any failure —
-/// callers keep the standard tier instead of tiering blind.
+/// Mint supply for fee-tier market caps.
 async fn mint_supply(rpc: &RpcClient, mint: &Pubkey) -> Option<u64> {
     let supply = tokio::time::timeout(FEE_TIMEOUT, rpc.get_token_supply(mint))
         .await
@@ -191,8 +156,7 @@ async fn mint_supply(rpc: &RpcClient, mint: &Pubkey) -> Option<u64> {
     supply.amount.parse::<u64>().ok()
 }
 
-/// Bonding-curve market cap in lamports: `vq * supply / vt`. `None` on
-/// empty reserves or overflow — never a guessed tier input.
+/// Market cap, lamports: `vq * supply / vt`.
 fn market_cap(vq: u64, vt: u64, supply: u64) -> Option<u128> {
     if vt == 0 {
         return None;
@@ -202,12 +166,10 @@ fn market_cap(vq: u64, vt: u64, supply: u64) -> Option<u128> {
         .checked_div(u128::from(vt))
 }
 
-/// One fee tier: market-cap threshold (lamports) + (protocol, creator).
+/// One fee tier: threshold (lamports) + (protocol, creator).
 type FeeTierRow = (u128, (u64, u64));
 
-/// Full fee schedule: every tier kept, picked by market cap exactly
-/// like the dispatch engine (highest threshold `<=` mcap, else first;
-/// empty table fails closed like the program's `FeeTiersEmpty`).
+/// Full fee schedule, picked by market cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FeeSchedule {
     tiers: Vec<FeeTierRow>,
@@ -216,12 +178,10 @@ struct FeeSchedule {
     exotic: (u64, u64),
 }
 
-/// Upper bound on decoded tiers per table (DoS bound on hostile vec
-/// lengths; live uses one).
+/// Tier-table bound (DoS cap on hostile lengths).
 pub const MAX_FEE_TIERS: usize = 1024;
 
-/// Highest tier with threshold `<=` mcap, else the first tier; `None`
-/// on an empty table.
+/// Highest tier at or below mcap, else the first.
 fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<(u64, u64)> {
     let first = tiers.first()?;
     if mcap < first.0 {
@@ -236,7 +196,7 @@ fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<(u64, u64)> {
     Some(picked)
 }
 
-/// (protocol, creator) for one quote kind at `mcap`. Pure.
+/// (protocol, creator) for one quote kind at `mcap`.
 fn select_tier(schedule: &FeeSchedule, kind: QuoteKind, mcap: u128) -> Option<(u64, u64)> {
     match kind {
         QuoteKind::SolLike => tier_for(&schedule.tiers, mcap),
@@ -251,11 +211,7 @@ fn select_tier(schedule: &FeeSchedule, kind: QuoteKind, mcap: u128) -> Option<(u
     }
 }
 
-/// Decode the full schedule from FeeConfig bytes (layout mirror of the
-/// executor's decoder: disc 8 + bump 1 + admin 32 + flat triple 24,
-/// then the tiers vec, the stable vec, then the exotic triple with
-/// zeros meaning unset → flat). Pure; `None` on short buffers or
-/// hostile vec lengths.
+/// Decode the schedule from FeeConfig bytes.
 fn parse_schedule(data: &[u8]) -> Option<FeeSchedule> {
     const TIERS_OFF: usize = 8 + 1 + 32 + 24;
     let flat = (u64le(data, 49)?, u64le(data, 57)?);
@@ -276,8 +232,7 @@ fn parse_schedule(data: &[u8]) -> Option<FeeSchedule> {
     })
 }
 
-/// One tier table at `off`: all (threshold, proto, creator) rows plus
-/// the next offset. `None` on hostile lengths.
+/// One tier table at `off` plus the next offset.
 fn parse_tier_vec(data: &[u8], off: usize) -> Option<(Vec<FeeTierRow>, usize)> {
     let n = u32le(data, off)? as usize;
     if n > MAX_FEE_TIERS {
@@ -320,8 +275,6 @@ mod tests {
 
     #[test]
     fn live_schedule_resolves_standard_tier() {
-        // Live FeeConfig (single (0, 95, 30) tier everywhere): SOL and
-        // USDC both price 95 + 30 at any market cap.
         let sched = parse_schedule(&live_fee_bytes()).expect("live decodes");
         assert_eq!(select_tier(&sched, QuoteKind::SolLike, 0), Some((95, 30)));
         assert_eq!(
@@ -332,8 +285,6 @@ mod tests {
         assert_eq!(select_tier(&sched, QuoteKind::Other, 0), Some((95, 30)));
     }
 
-    /// Minimal two-tier FeeConfig: (0 → 95/30), (1M → 80/20) on tiers,
-    /// single (0 → 95/30) stable, flat 95/30, exotic unset.
     fn two_tier_bytes() -> Vec<u8> {
         let mut v = vec![0u8; 8 + 1 + 32];
         v.extend_from_slice(&0u64.to_le_bytes()); // flat lp
@@ -358,8 +309,6 @@ mod tests {
 
     #[test]
     fn multi_tier_selects_by_market_cap() {
-        // Below the second threshold the first tier wins; at/above it
-        // the higher tier wins — exactly like the dispatch engine.
         let sched = parse_schedule(&two_tier_bytes()).expect("two-tier decodes");
         assert_eq!(
             select_tier(&sched, QuoteKind::SolLike, 999_999),
@@ -369,9 +318,7 @@ mod tests {
             select_tier(&sched, QuoteKind::SolLike, 1_000_000),
             Some((80, 20))
         );
-        // Below the first threshold still resolves (first tier).
         assert_eq!(select_tier(&sched, QuoteKind::SolLike, 0), Some((95, 30)));
-        // Empty tables fail closed like the program's FeeTiersEmpty.
         let empty = FeeSchedule {
             tiers: vec![],
             stable: vec![],
@@ -379,7 +326,6 @@ mod tests {
             exotic: (0, 0),
         };
         assert_eq!(select_tier(&empty, QuoteKind::SolLike, 0), None);
-        // Short garbage fails closed too.
         assert_eq!(parse_schedule(&two_tier_bytes()[..72]), None);
     }
 
@@ -402,7 +348,6 @@ mod tests {
         data[16..24].copy_from_slice(&2_000u64.to_le_bytes()); // vq
         data[40..48].copy_from_slice(&3_000u64.to_le_bytes()); // stored supply
         data[115..123].copy_from_slice(&250u64.to_le_bytes()); // override
-        // Zero quote = SOL-paired; override 250.
         let view = curve_fee_inputs(&data).expect("view");
         assert_eq!(view.kind, QuoteKind::SolLike);
         assert_eq!(view.coin_override, 250);
@@ -411,27 +356,19 @@ mod tests {
             (1_000, 2_000, 3_000)
         );
         assert!(!view.is_mayhem);
-        // Explicit WSOL maps to the SOL table too (the executor
-        // resolves zero → WSOL before tier selection — both must agree).
         data[83..115].copy_from_slice(&ids::WSOL_MINT.to_bytes());
         assert_eq!(curve_fee_inputs(&data).expect("w").kind, QuoteKind::SolLike);
-        // USDC quote routes to the stable table.
         data[83..115].copy_from_slice(&ids::USDC_MINT.to_bytes());
         assert_eq!(curve_fee_inputs(&data).expect("u").kind, QuoteKind::Usdc);
-        // Exotic quote.
         data[83..115].copy_from_slice(&[7u8; 32]);
         assert_eq!(curve_fee_inputs(&data).expect("e").kind, QuoteKind::Other);
-        // Mayhem flag reads.
         data[ids::CURVE_MAYHEM_FLAG_OFFSET] = 1;
         assert!(curve_fee_inputs(&data).expect("m").is_mayhem);
-        // Short data fails closed.
         assert_eq!(curve_fee_inputs(&data[..122]), None);
     }
 
     #[test]
     fn override_applies_before_total() {
-        // Engine rule at the call site: gate on + nonzero override wins
-        // (95 + 250 = 345 observed live); otherwise the schedule rate.
         let coin = |gate_on: bool, coin_override: u64, creator: u64| {
             if gate_on && coin_override != 0 {
                 coin_override
@@ -442,7 +379,6 @@ mod tests {
         assert_eq!(effective_total(95, coin(true, 250, 30)), Some(125 + 220));
         assert_eq!(effective_total(95, coin(false, 250, 30)), Some(125));
         assert_eq!(effective_total(95, coin(true, 0, 30)), Some(125));
-        // Absurd totals fail closed, never a jumbo fee.
         assert_eq!(effective_total(u64::MAX, 1), None);
         assert_eq!(effective_total(9_000, 9_000), None);
     }

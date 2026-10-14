@@ -1,17 +1,7 @@
-//! Trading wallet guard (skill `solana-wallet-guard`).
+//! Trading wallet guard.
 //!
-//! Invariants:
-//! 1. Secrets only enter via `SOLANA_PRIVATE_KEY` (base58 64-byte secret
-//!    or 32-byte seed); the env string and every decode buffer are
-//!    zeroized after use (best-effort: allocator copies are out of
-//!    scope). Both lengths decode through ONE zeroizing buffer — the
-//!    keypair crate's own base58 helper is deliberately not used (its
-//!    stack buffer is never wiped).
-//! 2. The loaded key lives for the process lifetime with no `mlock`
-//!    (swappable — run on a host with encrypted swap for live funds).
-//! 3. A hard 0.05 SOL floor ([`MIN_SOL_RESERVE_LAMPORTS`]) is never spent.
-//! 4. [`WalletGuard::assert_solvency`] checks
-//!    `balance >= trade + tip + reserve` before any swap is built.
+//! Secrets enter only via `SOLANA_PRIVATE_KEY` (base58 64-byte secret or
+//! 32-byte seed); buffers are zeroized. A 0.05 SOL floor is never spent.
 
 use solana_client::{client_error::ClientError, nonblocking::rpc_client::RpcClient};
 use solana_keypair::{Keypair, keypair_from_seed};
@@ -21,52 +11,42 @@ use std::env;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-/// Minimum unspendable balance: 0.05 SOL (fees, ATA rent, tips).
+/// Unspendable floor: 0.05 SOL (fees, rent, tips).
 pub const MIN_SOL_RESERVE_LAMPORTS: u64 = 50_000_000;
 
-/// Wallet failures: missing secrets, bad encoding, broke-ness.
+/// Wallet failures.
 #[derive(Error, Debug)]
 pub enum WalletGuardError {
-    /// Environment variable SOLANA_PRIVATE_KEY missing.
     #[error("Environment variable SOLANA_PRIVATE_KEY missing")]
     MissingKeyEnv,
-    /// Failed to decode base58 private key: {0}
     #[error("Failed to decode base58 private key: {0}")]
     Base58Decode(#[from] bs58::decode::Error),
-    /// Key material has {0} bytes; expected a 64-byte secret or 32-byte seed.
+    /// Got {0} bytes; want 64-byte secret or 32-byte seed.
     #[error("Invalid key length {0} bytes: expected 64-byte secret or 32-byte seed")]
     BadKeyLength(usize),
-    /// Key bytes do not form a valid ed25519 keypair: {0}
     #[error("Invalid secret key: {0}")]
     BadSecret(String),
-    /// Insufficient SOL balance: have {available_lamports} lamports, need
-    /// {required_lamports} lamports (including 0.05 SOL reserve).
+    /// Have {available_lamports}, need {required_lamports} (with reserve).
     #[error(
         "Insufficient SOL balance: have {available_lamports} lamports, need {required_lamports} lamports (including 0.05 SOL reserve)"
     )]
     InsufficientFunds {
-        /// On-chain balance in lamports.
         available_lamports: u64,
-        /// Trade + tip + reserve floor in lamports.
         required_lamports: u64,
     },
-    /// RPC query failed: {0}
     #[error("RPC query failed: {0}")]
     Rpc(#[from] ClientError),
-    /// Balance read exceeded its deadline.
     #[error("balance read timed out")]
     Timeout,
 }
 
-/// Loaded trading keypair with solvency enforcement.
+/// Loaded keypair with solvency enforcement.
 pub struct WalletGuard {
     keypair: Keypair,
 }
 
 impl WalletGuard {
-    /// Load from `SOLANA_PRIVATE_KEY` (base58, whitespace-tolerant).
-    /// The env string is held in a [`Zeroizing`] wrapper so the secret
-    /// bytes are wiped when loading finishes.
+    /// Load from `SOLANA_PRIVATE_KEY` (trims whitespace, zeroizes).
     pub fn load_from_env() -> Result<Self, WalletGuardError> {
         let key_str = Zeroizing::new(
             env::var("SOLANA_PRIVATE_KEY").map_err(|_| WalletGuardError::MissingKeyEnv)?,
@@ -74,12 +54,7 @@ impl WalletGuard {
         Self::from_base58(key_str.trim())
     }
 
-    /// Build from a base58 string: 64-byte secret or 32-byte seed.
-    /// Decodes once into a zeroizing buffer and validates through
-    /// [`TryFrom`]: a 64-byte input with a mismatched embedded pubkey
-    /// reports [`WalletGuardError::BadSecret`] (not `BadKeyLength`).
-    /// The input `&str` is caller-owned (see [`Self::load_from_env`]
-    /// for the zeroized path).
+    /// Build from base58: 64-byte secret or 32-byte seed.
     pub fn from_base58(s: &str) -> Result<Self, WalletGuardError> {
         let mut bytes = Zeroizing::new(bs58::decode(s).into_vec()?);
         let result = match bytes.len() {
@@ -105,8 +80,7 @@ impl WalletGuard {
         &self.keypair
     }
 
-    /// Assert `balance >= trade_lamports + tip_lamports + reserve`.
-    /// Returns the balance on success for logging. Deadline-bound.
+    /// Assert `balance >= trade + tip + reserve`. Deadline-bound.
     pub async fn assert_solvency(
         &self,
         rpc: &RpcClient,
@@ -138,7 +112,7 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
-    /// Serializes env-mutating tests (env is process-global).
+    /// Serializes env-mutating tests (process-global env).
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))

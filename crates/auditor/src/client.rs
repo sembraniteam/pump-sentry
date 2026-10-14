@@ -1,14 +1,7 @@
-//! Async RugCheck HTTP client with timeout + bounded retries.
+//! RugCheck HTTP client with timeout and retries.
 //!
-//! [`RugCheckClient::fetch_report`] performs the raw `GET
-//! /tokens/{mint}/report` call; [`RugCheckClient::evaluate_token`]
-//! additionally enforces [`AuditPolicy`] and maps violations to
-//! [`RugCheckError::SecurityRejection`], matching the skill contract.
-//!
-//! Fail-closed boundaries: the mint is validated as a 32-byte base58
-//! address before it touches the URL (no path/parameter injection), the
-//! report's mint must match the request (no cache-poisoned mismatch),
-//! and response bodies are capped so a rogue server cannot OOM the bot.
+//! Fail-closed: mint checked before URL build.
+//! Report mint must match the request.
 
 use crate::policy::{AuditPolicy, assess};
 use crate::types::{RugCheckError, RugCheckReport};
@@ -18,15 +11,13 @@ use tracing::{debug, warn};
 
 /// Default API root.
 pub const DEFAULT_BASE_URL: &str = "https://api.rugcheck.xyz/v1";
-/// Default per-request timeout (matches the skill).
+/// Default per-request timeout.
 pub const DEFAULT_TIMEOUT_MS: u64 = 1500;
-/// Default retry budget for transient failures.
+/// Default retry budget.
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
-/// Hard ceiling for the retry budget: an unbounded `max_retries` would
-/// hang the hot launch path (backoff-capped 2s sleeps, forever).
+/// Retry ceiling (clamped at build).
 pub const MAX_RETRIES_CAP: u32 = 5;
-/// Response body cap: a rogue or compromised server must not OOM the
-/// bot by streaming gigabytes into the JSON buffer.
+/// Response body cap.
 pub const MAX_BODY_BYTES: u64 = 1_000_000;
 
 /// Builder for [`RugCheckClient`].
@@ -50,7 +41,7 @@ impl Default for RugCheckClientBuilder {
 }
 
 impl RugCheckClientBuilder {
-    /// Override the API root (useful for tests / mirrors).
+    /// Override the API root.
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
@@ -62,26 +53,25 @@ impl RugCheckClientBuilder {
         self
     }
 
-    /// Override the retry budget for transient failures (clamped to
-    /// [`MAX_RETRIES_CAP`] at build time).
+    /// Override the retry budget.
     pub fn max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
-    /// Override the acceptance policy used by `evaluate_token`.
+    /// Override the policy used by `evaluate_token`.
     pub fn policy(mut self, policy: AuditPolicy) -> Self {
         self.policy = policy;
         self
     }
 
-    /// Build the client (fails only when the TLS backend is unusable).
+    /// Build the client.
     pub fn build(self) -> Result<RugCheckClient, RugCheckError> {
         RugCheckClient::from_builder(self)
     }
 }
 
-/// RugCheck API client. Cheap to clone (wraps a pooled `reqwest::Client`).
+/// RugCheck API client. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct RugCheckClient {
     client: Client,
@@ -91,12 +81,12 @@ pub struct RugCheckClient {
 }
 
 impl RugCheckClient {
-    /// Build with skill defaults: 1500ms timeout, 30s pool idle, live API.
+    /// Build with defaults.
     pub fn new() -> Result<Self, RugCheckError> {
         RugCheckClientBuilder::default().build()
     }
 
-    /// Start from the default builder for customization.
+    /// Start from defaults.
     pub fn builder() -> RugCheckClientBuilder {
         RugCheckClientBuilder::default()
     }
@@ -119,15 +109,12 @@ impl RugCheckClient {
         })
     }
 
-    /// Report URL for a mint (factored out for testability). The mint
-    /// must already be validated by [`valid_mint`] — base58 carries no
-    /// `/`, `?`, or `#`, so interpolation cannot escape the path.
+    /// Report URL for a mint. Mint must pass [`valid_mint`].
     fn report_url(&self, mint: &str) -> String {
         format!("{}/tokens/{}/report", self.base_url, mint)
     }
 
-    /// Checked report URL: validates the mint before interpolation
-    /// (see [`valid_mint`]); factored out for testability.
+    /// Checked report URL: validates the mint before interpolation.
     fn report_url_checked(&self, mint: &str) -> Result<String, RugCheckError> {
         if !valid_mint(mint) {
             return Err(RugCheckError::SecurityRejection(format!(
@@ -137,7 +124,7 @@ impl RugCheckClient {
         Ok(self.report_url(mint))
     }
 
-    /// Fetch the raw report without enforcing the security policy.
+    /// Fetch the raw report without policy checks.
     pub async fn fetch_report(&self, mint: &str) -> Result<RugCheckReport, RugCheckError> {
         let url = self.report_url_checked(mint)?;
         let mut attempt: u32 = 0;
@@ -162,9 +149,7 @@ impl RugCheckClient {
                 {
                     return Err(oversized_body());
                 }
-                // Body-stream stalls are transport trouble like send
-                // failures: retry within budget instead of failing a
-                // launch on a stall that arrived after the headers.
+                // Slow body reads are transient. Retry in budget.
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(e)
@@ -196,12 +181,8 @@ impl RugCheckClient {
         }
     }
 
-    /// Fetch a report and enforce the acceptance policy.
-    ///
-    /// Returns the report when every invariant holds; otherwise returns
-    /// [`RugCheckError::SecurityRejection`]. The report's mint must match
-    /// the request — a mismatched body smells like a server or cache bug
-    /// laundering one token's verdict onto another.
+    /// Fetch a report and enforce the policy.
+    /// Report mint must match the request.
     pub async fn evaluate_token(&self, mint: &str) -> Result<RugCheckReport, RugCheckError> {
         let report = self.fetch_report(mint).await?;
         if report.mint != mint {
@@ -215,7 +196,7 @@ impl RugCheckClient {
     }
 }
 
-/// A mint is usable in the report path only as a 32-byte base58 address.
+/// A mint is usable only as a 32-byte base58 address.
 fn valid_mint(mint: &str) -> bool {
     bs58::decode(mint)
         .into_vec()
@@ -223,34 +204,26 @@ fn valid_mint(mint: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Capped-body rejection (see [`MAX_BODY_BYTES`]).
+/// Capped-body rejection.
 fn oversized_body() -> RugCheckError {
     RugCheckError::ResponseTooLarge
 }
 
-/// Network errors worth retrying: timeouts and connection failures.
-/// Decode/body failures are deterministic (corrupt payload, not a bad
-/// network) and return at once instead of burning the retry budget plus
-/// backoff on the hot launch path. Non-transient builder/config errors
-/// are not retried either.
+/// Network errors worth retrying.
+/// Decode failures return at once.
 fn is_transient_network_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect()
 }
 
-/// Retry server-side failures, rate limits, and request timeouts;
-/// other client errors (4xx) are terminal HERE by design. HTTP 400
-/// ("not indexed yet" on seconds-old mints) is retryable one layer up
-/// at the pipeline watchlist (`RugCheckError::is_retryable`, seconds
-/// cadence) — retrying it here would burn the millisecond backoff budget
-/// on indexing latency that resolves in seconds, not milliseconds.
+/// Retry server errors, rate limits, and timeouts.
+/// Other 4xx are terminal here.
 fn is_retryable_status(status: StatusCode) -> bool {
     status.is_server_error()
         || status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
 }
 
-/// Exponential backoff: 200ms × 2^attempt, capped at 2s. No extra RNG
-/// dependency; jitter is unnecessary at this request rate.
+/// Backoff: 200ms x 2^attempt, capped at 2s.
 async fn sleep_backoff(attempt: u32) {
     let shift = attempt.min(4);
     let ms = 200u64.saturating_mul(1u64 << shift).min(2000);
@@ -300,7 +273,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_mint_without_network() {
-        // Validation precedes any I/O: no server needed, never queried.
+        // Validation precedes any I/O: no server is queried.
         let client = RugCheckClient::new().expect("client");
         for mint in ["", "MINT123", "not a mint!!", "MINT/123?x=1#frag"] {
             match client.report_url_checked(mint) {
@@ -311,8 +284,7 @@ mod tests {
         assert!(client.report_url_checked(TEST_MINT).is_ok());
     }
 
-    /// Minimal canned HTTP server: replays `responses` in order, then hangs
-    /// up. Each response is a full status line + body pair.
+    /// Minimal canned HTTP server: replays `responses` in order, then hangs up.
     async fn serve_canned(responses: Vec<(u16, &'static str)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -322,7 +294,6 @@ mod tests {
                     return;
                 };
                 let mut buf = vec![0u8; 4096];
-                // Best-effort request read; ignore errors (client may retry).
                 let _ = socket.read(&mut buf).await;
                 let reason = match status {
                     200 => "OK",
@@ -342,8 +313,8 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// Real 32-byte base58 mint (accepts [`valid_mint`]); every network
-    /// test must use it — short strings are now rejected pre-flight.
+    /// Real 32-byte base58 mint for network tests (short strings are
+    /// rejected pre-flight).
     const TEST_MINT: &str = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
 
     const CLEAN_BODY: &str = r#"{
@@ -427,10 +398,8 @@ mod tests {
 
     #[tokio::test]
     async fn bad_request_is_terminal_at_client_layer() {
-        // HTTP 400 (mint not yet indexed) must NOT burn the ms-retry
-        // budget here: the scripted 200 behind it must stay unconsumed
-        // (the pipeline's watchlist retry owns 400s on a seconds
-        // cadence). A retry would drink the 200 and succeed.
+        // HTTP 400 is owned by the pipeline watchlist retry; a retry here
+        // would consume the scripted 200 and wrongly succeed.
         let base = serve_canned(vec![(400, "not indexed"), (200, CLEAN_BODY)]).await;
         let err = test_client(&base)
             .fetch_report(TEST_MINT)
@@ -477,8 +446,6 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_rejects_mint_mismatch() {
-        // Right shape, wrong mint: one token's verdict must never
-        // launder onto another (server/cache bug fail-closed).
         let base = serve_canned(vec![(200, WRONG_MINT_BODY)]).await;
         let err = test_client(&base)
             .evaluate_token(TEST_MINT)

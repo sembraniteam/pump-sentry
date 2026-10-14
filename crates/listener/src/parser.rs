@@ -1,10 +1,4 @@
-//! Exact Pump.fun `Create` instruction parser (see skill `solana-geyser-pumpfun`).
-//!
-//! - Program ID: `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`
-//! - Create discriminator (8 bytes): `[24, 30, 200, 40, 5, 28, 7, 119]`
-//! - Args (Borsh): `name: String, symbol: String, uri: String`
-//! - Accounts: `[0]=mint, [2]=bonding_curve, [3]=associated_bonding_curve,
-//!   [7]=user`, minimum 8 accounts.
+//! Pump.fun `Create` instruction parser.
 
 use borsh::BorshDeserialize;
 use solana_sdk::pubkey::Pubkey;
@@ -12,9 +6,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use thiserror::Error;
 
-/// Canonical addresses and discriminators live in [`ids`]; re-exported
-/// here so the whole workspace shares one definition (a program upgrade
-/// edits exactly one file).
+/// Canonical addresses live in [`ids`]. Re-exported here.
 pub use ids::{
     PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR,
     PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_CREATE_DISCRIMINATOR,
@@ -22,47 +14,39 @@ pub use ids::{
     PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR, PUMP_SELL_V3_DISCRIMINATOR,
 };
 
-/// Minimum number of accounts expected on a `create` instruction.
+/// Min accounts on a `create` ix.
 pub const PUMP_CREATE_MIN_ACCOUNTS: usize = 8;
-/// Maximum Borsh args bytes after the discriminator (name/symbol/uri).
-/// Caps hostile-prefix allocations across concurrent fetch workers.
+/// Max Borsh args bytes after the discriminator (DoS cap).
 pub const MAX_CREATE_ARGS_LEN: usize = 4096;
 
-/// Account indices inside the `create` instruction accounts list.
+/// Account slots in a `create` ix.
 pub const IDX_MINT: usize = 0;
 pub const IDX_BONDING_CURVE: usize = 2;
 pub const IDX_ASSOCIATED_BONDING_CURVE: usize = 3;
 pub const IDX_USER: usize = 7;
 
-/// Account indices inside the `create_v2` instruction accounts list
-/// (verified against the canonical Pump.fun IDL: 14 accounts —
-/// mint, mintAuthority, bondingCurve, associatedBondingCurve, global,
-/// user, systemProgram, tokenProgram, associatedTokenProgram,
-/// mayhemProgram, globalParams, solVault, mayhemState, mayhemTokenVault).
+/// Account slots in a `create_v2` ix (14-account layout).
 pub const IDX_V2_MINT: usize = 0;
 pub const IDX_V2_BONDING_CURVE: usize = 2;
 pub const IDX_V2_ASSOCIATED_BONDING_CURVE: usize = 3;
-/// Payer (`user`) inside `create_v2`. Named `CREATE` (not bare `V2`):
-/// `screen` has its own v2 index — the swap trader at position 13 — and
-/// sharing the name once hid a wrong-index bug in dev-launch counting.
+/// Payer in `create_v2`. Named `CREATE`: `screen` owns the v2 swap index.
 pub const IDX_CREATE_V2_USER: usize = 5;
-/// Minimum number of accounts expected on a `create_v2` instruction.
+/// Min accounts on a `create_v2` ix.
 pub const PUMP_CREATE_V2_MIN_ACCOUNTS: usize = 14;
 
-/// Typed parse errors — no panics on hot paths.
+/// Parse errors. No panics on hot paths.
 #[derive(Error, Debug)]
 pub enum PumpParseError {
-    /// Instruction data shorter than the 8-byte discriminator.
+    /// Data shorter than the 8-byte discriminator.
     #[error("Instruction data too short")]
     DataTooShort,
-    /// First 8 bytes do not match the `create` discriminator.
+    /// First 8 bytes are not the `create` discriminator.
     #[error("Discriminator mismatch")]
     InvalidDiscriminator,
-    /// Borsh decoding of `name/symbol/uri` failed (borsh validates
-    /// `String` as UTF-8, so bad encodings surface here, not elsewhere).
+    /// Borsh decoding of `name/symbol/uri` failed.
     #[error("Failed to decode Borsh data: {0}")]
     Borsh(#[from] std::io::Error),
-    /// Args section exceeds [`MAX_CREATE_ARGS_LEN`] bytes (hostile prefix).
+    /// Args exceed [`MAX_CREATE_ARGS_LEN`].
     #[error("Create args too long: {0} bytes")]
     ArgsTooLong(usize),
     /// Fewer than 8 accounts were supplied.
@@ -70,7 +54,7 @@ pub enum PumpParseError {
     InsufficientAccounts { required: usize, found: usize },
 }
 
-/// Borsh args of Pump.fun `create`: `name`, `symbol`, `uri`.
+/// Borsh args of `create`: `name`, `symbol`, `uri`.
 #[derive(borsh::BorshDeserialize, borsh::BorshSerialize, Debug, Clone, PartialEq, Eq)]
 pub struct PumpCreateInstructionArgs {
     /// Token name.
@@ -81,15 +65,10 @@ pub struct PumpCreateInstructionArgs {
     pub uri: String,
 }
 
-/// Borsh args of Pump.fun `create_v2` as a TEST-ENCODING helper only.
+/// Borsh args of `create_v2`. Test encoding only.
 ///
-/// WARNING — not a wire mirror: live `create_v2` bytes carry the 32-byte
-/// creator IMMEDIATELY after the string triple (vault-PDA verified), so
-/// a bool in this position would misattribute the creator by one byte.
-/// The bool's true wire position is unmapped. Use
-/// [`decode_name_symbol_uri`] + explicit tail reads for wire decoding
-/// (see [`parse_pump_create_v2`]); this struct exists so tests can
-/// encode IDL-shaped payloads.
+/// WARNING: not a wire mirror. Live bytes carry the 32-byte creator
+/// after the triple. Never use for wire decoding.
 #[derive(borsh::BorshDeserialize, borsh::BorshSerialize, Debug, Clone, PartialEq, Eq)]
 pub struct PumpCreateV2InstructionArgs {
     /// Token name.
@@ -102,22 +81,18 @@ pub struct PumpCreateV2InstructionArgs {
     pub is_mayhem_mode: bool,
 }
 
-/// Enriched token-launch event (signature + slot attached).
+/// Token-launch event (signature plus slot attached).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PumpTokenLaunchEvent {
     /// Newly created mint.
     pub mint: Pubkey,
     /// Bonding curve PDA.
     pub bonding_curve: Pubkey,
-    /// Associated bonding curve (token account holding curve inventory).
+    /// Associated curve account (curve inventory).
     pub associated_bonding_curve: Pubkey,
     /// Creator / payer.
     pub user: Pubkey,
-    /// Token creator: `Some` for `create_v2` (32-byte chunk after the
-    /// name/symbol/uri strings — vault-PDA match verified against a real
-    /// mayhem buy), `None` for legacy `create` (no creator field; the
-    /// launcher-equals-creator assumption is unverified, so v1 stays on
-    /// the legacy swap path rather than a guessed vault).
+    /// Creator. `Some` for `create_v2`, `None` for `create`.
     pub creator: Option<Pubkey>,
     /// Token name.
     pub name: String,
@@ -127,47 +102,31 @@ pub struct PumpTokenLaunchEvent {
     pub uri: String,
     /// Transaction signature (base58).
     pub signature: String,
-    /// Slot the transaction was confirmed in.
+    /// Slot the tx was confirmed in.
     pub slot: u64,
 }
 
-/// Fast pre-filter: true when `data` starts with the `create` discriminator.
-///
-/// Never panics: returns `false` for short slices without indexing.
+/// Fast pre-filter for `create`. Safe on short slices.
 #[inline]
 pub fn is_pump_create_ix(data: &[u8]) -> bool {
     data.starts_with(&PUMP_CREATE_DISCRIMINATOR)
 }
 
-/// Fast pre-filter for `create_v2` launches (14-account IDL layout;
-/// parsed by `parse_pump_create_v2`, never by the v1 parser).
-///
-/// Never panics: returns `false` for short slices without indexing.
+/// Fast pre-filter for `create_v2`. Safe on short slices.
 #[inline]
 pub fn is_pump_create_v2_ix(data: &[u8]) -> bool {
     data.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
 }
 
-/// Decode the leading Borsh `(name, symbol, uri)` triple shared by
-/// `create` and `create_v2` args, advancing `cursor` past it and leaving
-/// any versioned tail for the caller. One decode path for both versions:
-/// Borsh `&[u8]` decoding never requires exact consumption (no
-/// `try_from_slice` tail breakage), and allocation is slice-bounded on
-/// top of borsh's cautious 1MB cap — a hostile length prefix fails
-/// without giant allocations.
+/// Decode the shared `(name, symbol, uri)` triple.
+/// One path for both versions. Caller reads the tail.
 fn decode_name_symbol_uri(
     cursor: &mut &[u8],
 ) -> Result<PumpCreateInstructionArgs, PumpParseError> {
     PumpCreateInstructionArgs::deserialize(cursor).map_err(PumpParseError::Borsh)
 }
 
-/// Parse a Pump.fun `create` instruction.
-///
-/// `data` is the raw instruction data (discriminator + Borsh args),
-/// `accounts` is the resolved account list for the instruction in order.
-/// `signature`/`slot` enrich the emitted event without extra lookups.
-///
-/// All failures map to [`PumpParseError`]; no panics, no indexing.
+/// Parse a `create` ix. No panics, no indexing.
 pub fn parse_pump_create(
     data: &[u8],
     accounts: &[Pubkey],
@@ -196,7 +155,7 @@ fn parse_pump_create_inner(
         });
     }
 
-    // Copy out the 4 Pubkeys we need with bounds-checked access only.
+    // Copy the 4 pubkeys with checked access.
     let mint = *accounts
         .get(IDX_MINT)
         .ok_or(PumpParseError::InsufficientAccounts {
@@ -223,10 +182,8 @@ fn parse_pump_create_inner(
             found: accounts.len(),
         })?;
 
-    // Skip the 8-byte discriminator in place (no copy of the full buffer).
-    // Upper bound before Borsh: a hostile prefix length cannot force a
-    // giant allocation across 32 concurrent workers (name/symbol/uri are
-    // tiny on legitimate creates; 4 KiB is generous headroom).
+    // Skip the discriminator in place (no full-buffer copy).
+    // Cap size first: hostile prefixes can't force big allocs.
     let args_start = PUMP_CREATE_DISCRIMINATOR.len();
     let args_bytes: &[u8] = match data.get(args_start..) {
         Some(rest) => rest,
@@ -252,11 +209,7 @@ fn parse_pump_create_inner(
     })
 }
 
-/// Parse a Pump.fun `create_v2` instruction (14-account IDL layout; see
-/// `IDX_V2_*`). Emits the same [`PumpTokenLaunchEvent`] shape — downstream
-/// screening treats v1 and v2 launches identically.
-///
-/// All failures map to [`PumpParseError`]; no panics, no indexing.
+/// Parse a `create_v2` ix. Same event shape. No panics.
 pub fn parse_pump_create_v2(
     data: &[u8],
     accounts: &[Pubkey],
@@ -298,16 +251,8 @@ pub fn parse_pump_create_v2(
     if args_bytes.len() > MAX_CREATE_ARGS_LEN {
         return Err(PumpParseError::ArgsTooLong(args_bytes.len()));
     }
-    // Decode the leading (name, symbol, uri) triple with the shared
-    // helper and read the creator from the versioned tail: the FIRST 32
-    // bytes after the triple. Wire-verified, not IDL-assumed — a frozen
-    // mainnet create_v2 carries triple + creator[32] + 11 unknown tail
-    // bytes, and the creator-vault PDA derived from exactly these bytes
-    // matched a live mayhem buy's vault account. (The IDL-shaped
-    // `PumpCreateV2InstructionArgs` puts a bool right after the triple
-    // and must NOT be used for wire decoding — it would misattribute by
-    // one byte.) Short tail → None (event stays valid, swaps fall back
-    // to the legacy shape).
+    // Creator is the first 32 bytes after the triple.
+    // Short tail gives `None`.
     let mut cursor: &[u8] = args_bytes;
     let args = decode_name_symbol_uri(&mut cursor)?;
     let name = args.name;
@@ -332,14 +277,8 @@ pub fn parse_pump_create_v2(
     })
 }
 
-/// Decode instruction data tolerant to RPC encoding: base58, then
-/// standard base64, then URL-safe base64. Empty payloads never decode.
-/// Single home for every decoder in the crate (stream, screen).
-///
-/// A base64 payload using only bs58-alphabet characters would mis-decode
-/// as base58, so when several decodings succeed the one opening with a
-/// known Pump.fun discriminator wins; otherwise the first success is
-/// kept (previous behavior).
+/// Decode ix data: base58, then base64, then URL-safe base64.
+/// Empty payloads never decode. One home for all decoders.
 pub fn decode_ix_data(data_str: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     let decodings = [
@@ -366,9 +305,7 @@ pub fn decode_ix_data(data_str: &str) -> Option<Vec<u8>> {
     fallback
 }
 
-/// True when `data` opens with any known Pump.fun discriminator
-/// (create/create_v2/buy/sell/buy_v2/sell_v2/buy_v3/sell_v3/
-/// buy_exact_quote_in_v3/migrate).
+/// True when `data` opens with any known Pump.fun discriminator.
 fn starts_with_known_discriminator(data: &[u8]) -> bool {
     data.starts_with(&PUMP_CREATE_DISCRIMINATOR)
         || data.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
@@ -382,8 +319,7 @@ fn starts_with_known_discriminator(data: &[u8]) -> bool {
         || data.starts_with(&PUMP_MIGRATE_DISCRIMINATOR)
 }
 
-/// Parse helper matching the skill signature `parse_pump_create(data, accounts)`
-/// without enrichment (signature/slot defaulted). Test-only.
+/// Parse helper without enrichment (signature/slot defaulted). Test-only.
 #[cfg(test)]
 pub fn parse_pump_create_bare(
     data: &[u8],
@@ -393,7 +329,6 @@ pub fn parse_pump_create_bare(
 }
 
 /// Verify the shared [`ids`] program ID matches its canonical string.
-/// Returns `true` on match; used by tests.
 #[cfg(test)]
 pub fn pump_program_id_bytes_match() -> bool {
     use ids::PUMP_PROGRAM_ID as IDS_PROGRAM_ID;
@@ -483,9 +418,6 @@ mod tests {
 
     #[test]
     fn parse_v2_ok_with_idl_layout() {
-        // 14-account IDL order: mint, mintAuthority, bondingCurve,
-        // assocCurve, global, user, system, token, ata, mayhem, params,
-        // solVault, mayhemState, mayhemVault.
         let data = encode_create_v2("Pepe", "PEPE", "https://x/y.json", false);
         assert!(is_pump_create_v2_ix(&data));
         assert!(!is_pump_create_ix(&data));
@@ -504,12 +436,9 @@ mod tests {
 
     #[test]
     fn parse_v2_pins_live_wire_tail() {
-        // Frozen mainnet create_v2 (146-byte data): string triple, then
-        // creator[32], then an 11-byte versioned tail of unknown layout.
-        // The creator bytes are the same ones whose vault PDA matched a
-        // live mayhem buy — first-32 attribution is evidence-backed. If
-        // anyone "fixes" the parser to the IDL-struct order (bool right
-        // after the triple), this test breaks loudly.
+        // Frozen mainnet create_v2: triple + creator[32] + 11 tail bytes.
+        // Decoding via the IDL struct (bool after the triple) would
+        // misattribute by one byte — this test breaks loudly if tried.
         let raw: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/create_v2_mainnet.json"))
                 .expect("fixture");

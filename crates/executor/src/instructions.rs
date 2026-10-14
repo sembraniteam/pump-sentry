@@ -1,37 +1,14 @@
-//! Pump.fun buy/sell instruction builders (skill `solana-pumpfun-swap`).
+//! Pump.fun buy/sell builders (v3 only).
 //!
-//! Layouts and account order follow the skill exactly. Program addresses
-//! are compile-time constants; SPL program IDs cross-check against the
-//! `spl-token` / `spl-associated-token-account` crates so version drift
-//! fails loudly in tests instead of on-chain.
+//! Layouts and account order are byte-exact vs frozen mainnet samples.
+//! SPL IDs cross-check the SPL crates, so drift fails in tests.
 //!
-//! SHAPES BUILT HERE (v3 only):
-//! - 17-account v3 `buy_v3`/`sell_v3` shapes
-//!   ([`PumpSwapBuilder::build_buy_v3_ix`]/[`PumpSwapBuilder::build_sell_v3_ix`]):
-//!   the official TRADE_V3.md layouts — fees stay on the curve, so no
-//!   fee recipient, creator vault, or sharing config travels. Both sides
-//!   byte-exact vs frozen mainnet samples (positions + payload +
-//!   re-derived PDA/ATAs, one shared 17-account body).
-//! - 17-account `buy_exact_quote_in_v3` shape
-//!   ([`PumpSwapBuilder::build_buy_exact_quote_in_v3_ix`]): same body,
-//!   exact-spend payload.
+//! Shapes: 17-account `buy_v3`/`sell_v3` plus 17-account
+//! `buy_exact_quote_in_v3`. Legacy/18/v2 shapes are deleted;
+//! non-v3 curves fail closed in preflight.
 //!
-//! RETIRED SHAPES (deleted, not deprecated): the 12-account legacy
-//! `buy`/`sell` core, the 16/18-account mayhem buy, and the 27/26-account
-//! `buy_v2`/`sell_v2` shapes. Mainnet evidence as of Oct-2026: legacy
-//! fills are extinct (probes SKIP), and 18/v2 fills occur only on old
-//! curves — every new launch is a v3 curve, so same-curve reference
-//! routing could never resolve for sniper entries anyway. Preflight
-//! refuses non-v3 curves fail-closed (loud diverged/manual, no funds
-//! move); the listener still parses all historical shapes for
-//! screening and quorum.
-//!
-//! RUNTIME (not build-time) ROUTING — never hardcoded here:
-//! - v3 needs no fee recipient (fees stay on the curve); only the
-//!   buyback pick travels (any of the 8 published recipients).
-//! - Token program resolves per mint (classic SPL vs Token-2022); the
-//!   ATA derives bound to it (a 2022 mint through the classic program
-//!   fails with `IncorrectProgramId`, verified live).
+//! Routing is runtime: v3 needs only the buyback pick (any of the 8);
+//! the token program resolves per mint, and the ATA binds to it.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_instruction::{AccountMeta, Instruction};
@@ -51,104 +28,80 @@ pub use ids::{
     WSOL_MINT,
 };
 
-/// v3 buy args: token units requested plus max quote spend (slippage
-/// guard, fees included per TRADE_V3.md). Payload is 24 bytes when the
-/// trailing `partial_fill` flag is omitted (the safe default on mayhem
-/// coins: over-left buys fail with `NotEnoughTokensToBuy` instead of
-/// running past the curve end).
+/// v3 buy args. 24-byte payload with no `partial_fill` tail.
 #[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
 pub struct PumpBuyV3Args {
     /// Token base units requested.
     pub amount: u64,
-    /// Maximum quote in base units allowed (slippage guard, fees in).
+    /// Max quote allowed (fees in).
     pub max_sol_cost: u64,
 }
 
-/// v3 sell args: token units to sell plus the quote floor. Payload is
-/// 24 bytes (discriminator + two u64s).
+/// v3 sell args: 24-byte payload.
 #[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
 pub struct PumpSellV3Args {
     /// Token base units to sell.
     pub amount: u64,
-    /// Minimum quote in base units to receive (slippage guard).
+    /// Min quote to receive.
     pub min_sol_output: u64,
 }
 
-/// v3 exact-quote buy args: spend exactly `spendable_quote_in` for at
-/// least `min_tokens_out` tokens. Payload is 24 bytes (no
-/// `partial_fill` tail). Same 17 accounts as `buy_v3` — enable in
-/// dispatch only after its frozen-sample byte test + sim probe turn
-/// green (the saved `buy_exact_quote_in_v3_mainnet.json` fixture is
-/// that future test's input).
+/// v3 exact-quote buy args: same 17 accounts, 24-byte payload.
 #[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
 pub struct PumpBuyExactQuoteInV3Args {
-    /// Exact quote to spend, fees included.
+    /// Exact quote to spend, fees in.
     pub spendable_quote_in: u64,
     /// Fewest base tokens accepted.
     pub min_tokens_out: u64,
 }
 
-/// Stateless builder for Pump.fun swap instructions (v3 only — see
-/// the module docs for the retired-shapes rationale).
+/// Stateless v3 builder.
 pub struct PumpSwapBuilder;
 
-/// Account set for a v3 (`buy_v3`) buy: the 17-account shape from the
-/// official TRADE_V3.md table. No fee recipient (fees stay on the
-/// curve), no creator vault, no sharing config — the only external
-/// fee-side account is the buyback recipient (any of the 8 published
-/// [`BUYBACK_FEE_RECIPIENTS`]; must exist — pre-create its quote ATA
-/// idempotently for token-paired quotes).
-///
-/// Provenance: caller-supplied (payer, mints, curve, assoc curve,
-/// per-mint programs, buyback pick); builder-derived (user-vol PDA
-/// [11], base/quote user ATAs [9]/[10], curve base/quote ATAs [6]/[7]).
+/// v3 buy accounts (17). No fee recipient: fees stay on the curve.
+/// Buyback is any of the 8 published (its quote ATA on token quotes).
 #[derive(Debug, Clone, Copy)]
 pub struct BuyV3Accounts<'a> {
-    /// Fee payer and signer (also the trader, position 8).
+    /// Payer and signer (position 8).
     pub payer: &'a Pubkey,
-    /// Bought token mint (position 1).
+    /// Token mint (position 1).
     pub mint: &'a Pubkey,
-    /// Quote mint (position 2; WSOL for SOL-paired coins).
+    /// Quote mint (position 2; WSOL on SOL pairs).
     pub quote_mint: &'a Pubkey,
-    /// Bonding-curve PDA (position 5).
+    /// Curve PDA (position 5).
     pub bonding_curve: &'a Pubkey,
-    /// Curve's base-inventory ATA (position 6).
+    /// Curve base ATA (position 6).
     pub associated_bonding_curve: &'a Pubkey,
     /// Token program owning `mint`.
     pub base_token_program: &'a Pubkey,
     /// Token program owning `quote_mint`.
     pub quote_token_program: &'a Pubkey,
-    /// Buyback recipient (position 13): one of [`BUYBACK_FEE_RECIPIENTS`]
-    /// for SOL-paired coins, its quote ATA for token-paired quotes.
+    /// Buyback recipient (position 13).
     pub buyback_recipient: &'a Pubkey,
 }
 
-/// Account set for a v3 (`sell_v3`) sell: same 17 accounts as
-/// [`BuyV3Accounts`], drain direction.
+/// v3 sell accounts (17). Same shape, drain direction.
 #[derive(Debug, Clone, Copy)]
 pub struct SellV3Accounts<'a> {
-    /// Fee payer and signer (also the trader, position 8).
+    /// Payer and signer (position 8).
     pub payer: &'a Pubkey,
-    /// Sold token mint (position 1).
+    /// Token mint (position 1).
     pub mint: &'a Pubkey,
-    /// Quote mint (position 2; WSOL for SOL-paired coins).
+    /// Quote mint (position 2; WSOL on SOL pairs).
     pub quote_mint: &'a Pubkey,
-    /// Bonding-curve PDA (position 5).
+    /// Curve PDA (position 5).
     pub bonding_curve: &'a Pubkey,
-    /// Curve's base-inventory ATA (position 6).
+    /// Curve base ATA (position 6).
     pub associated_bonding_curve: &'a Pubkey,
     /// Token program owning `mint`.
     pub base_token_program: &'a Pubkey,
     /// Token program owning `quote_mint`.
     pub quote_token_program: &'a Pubkey,
-    /// Buyback recipient (position 13): one of [`BUYBACK_FEE_RECIPIENTS`]
-    /// for SOL-paired coins, its quote ATA for token-paired quotes.
+    /// Buyback recipient (position 13).
     pub buyback_recipient: &'a Pubkey,
 }
 
-/// User volume-accumulator PDA: `["user_volume_accumulator", user]`.
-/// Seed and derivation verified byte-exact against live v3 fills; the
-/// PDA travels at v3 position [11] on every dispatch.
+/// User volume PDA: `["user_volume_accumulator", user]` (v3 [11]).
 pub fn user_volume_accumulator_pda(user: &Pubkey) -> Pubkey {
     let (pda, _) = Pubkey::find_program_address(
         &[USER_VOLUME_ACCUMULATOR_SEED, user.as_ref()],
@@ -158,13 +111,7 @@ pub fn user_volume_accumulator_pda(user: &Pubkey) -> Pubkey {
 }
 
 impl PumpSwapBuilder {
-    /// v3 buy instruction: the 17-account shape for entries on any
-    /// non-cashback curve. Fees stay on the curve, so neither a fee
-    /// recipient nor a same-curve reference is needed — only the
-    /// buyback pick plus derived addresses. Pubkeys and payload are
-    /// byte-proven against frozen mainnet samples; writability flags
-    /// are self-consistent by construction (the chain gate is the sim
-    /// probe, not the flags). Preflight simulation gates every build.
+    /// v3 buy ix. Sim gates every build.
     pub fn build_buy_v3_ix(
         amount: u64,
         max_sol_cost: u64,
@@ -180,8 +127,7 @@ impl PumpSwapBuilder {
             accts.buyback_recipient)
     }
 
-    /// v3 sell instruction: the 17-account shape for exits on any curve
-    /// (same cashback exception as [`PumpSwapBuilder::build_buy_v3_ix`]).
+    /// v3 sell ix: same 17 accounts, drain direction.
     pub fn build_sell_v3_ix(
         amount: u64,
         min_sol_output: u64,
@@ -197,8 +143,7 @@ impl PumpSwapBuilder {
             accts.buyback_recipient)
     }
 
-    /// Shared 17-account v3 body: `data` selects the side, everything
-    /// else is positionally identical across `buy_v3`/`sell_v3`.
+    /// Shared 17-account v3 body: `data` picks the side.
     #[allow(clippy::too_many_arguments)]
     fn build_v3_ix(
         data: Vec<u8>,
@@ -237,11 +182,7 @@ impl PumpSwapBuilder {
         Instruction { program_id: PUMP_PROGRAM_ID, accounts, data }
     }
 
-    /// v3 exact-quote buy instruction: spend exactly `spendable_quote_in`
-    /// for at least `min_tokens_out` tokens (same 17 accounts as
-    /// [`PumpSwapBuilder::build_buy_v3_ix`]). Suited to fixed-notional
-    /// sniping (exact spend, floor on proceeds) — enable in dispatch
-    /// only after its frozen-sample byte test + sim probe turn green.
+    /// v3 exact-quote buy: spend `spendable_quote_in` for `min_tokens_out`.
     pub fn build_buy_exact_quote_in_v3_ix(
         spendable_quote_in: u64,
         min_tokens_out: u64,
@@ -258,10 +199,7 @@ impl PumpSwapBuilder {
     }
 }
 
-/// Derive the payer's associated token account for a mint.
-///
-/// Cross-crate conversion via raw bytes keeps this independent of the
-/// `spl-associated-token-account` crate's internal pubkey version.
+/// Derive the payer ATA for a mint.
 pub fn user_ata(payer: &Pubkey, mint: &Pubkey) -> Pubkey {
     let theirs = spl_associated_token_account::get_associated_token_address(
         &pubkey_into_theirs(payer),
@@ -270,14 +208,8 @@ pub fn user_ata(payer: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::new_from_array(theirs.to_bytes())
 }
 
-/// Associated token address bound to an explicit token program.
-/// REQUIRED for Token-2022 mints: the ATA seeds are
-/// `[owner, token_program, mint]`, so the classic helper derives a
-/// DIFFERENT (wrong) address for 2022 mints — creating or trading
-/// through it fails on-chain (verified live: `IncorrectProgramId` in
-/// the ATA program's classic-token CPI). Always prefer this over
-/// [`user_ata`] when the mint owner is known (it always is at
-/// preflight: read it off the mint account).
+/// ATA bound to an explicit token program. Needed for Token-2022:
+/// seeds are `[owner, program, mint]`, so the classic helper is wrong.
 pub fn user_ata_with_program(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     let theirs = spl_associated_token_account::get_associated_token_address_with_program_id(
         &pubkey_into_theirs(owner),
@@ -291,10 +223,7 @@ fn pubkey_into_theirs(key: &Pubkey) -> Pubkey {
     Pubkey::new_from_array(key.to_bytes())
 }
 
-/// Build the compute-budget prefix: `SetComputeUnitLimit` then
-/// `SetComputeUnitPrice` (runtime convention: limit before price).
-/// Zero values are skipped individually, so a default configuration
-/// yields an empty prefix and byte-identical transactions.
+/// Compute-budget prefix: limit then price. Zeros skipped.
 pub fn compute_budget_ixs(unit_limit: u32, unit_price_micro_lamports: u64) -> Vec<Instruction> {
     let mut out = Vec::with_capacity(2);
     if unit_limit > 0 {
@@ -317,12 +246,7 @@ pub fn compute_budget_ixs(unit_limit: u32, unit_price_micro_lamports: u64) -> Ve
     }
     out
 }
-/// Build an idempotent create-associated-token-account instruction
-/// (canonical 7-account layout, `CreateIdempotent` discriminator).
-/// Prepended when the user's ATA for a mint does not exist yet —
-/// otherwise the swap fails on-chain after burning fees. Idempotent
-/// form doubles as race insurance: even if the ATA lands between the
-/// existence check and execution, the prefix succeeds silently.
+/// Idempotent create-ATA ix. Safe on existing ATAs and check-vs-land races.
 pub fn build_create_ata_ix(
     payer: &Pubkey,
     owner: &Pubkey,
@@ -338,26 +262,22 @@ pub fn build_create_ata_ix(
             AccountMeta::new_readonly(*owner, false),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-            // Per-mint program: a Token-2022 mint created through the
-            // classic program fails inside its InitializeAccount CPI
-            // (`IncorrectProgramId`, verified live).
+            // Per-mint program: 2022 via classic fails (`IncorrectProgramId`).
             AccountMeta::new_readonly(*token_program, false),
             AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
         ],
-        // Idempotent variant (`1`, not `0`): safe to prepend even when
-        // the ATA already exists (no duplicate-create failure) and
-        // immune to check-vs-land races between preflight and execution.
+        // Idempotent (`1`, not `0`).
         data: vec![1],
     }
 }
 
-/// Assert our address constants match the SPL crates (drift detector).
+/// SPL address cross-check (drift detector).
 pub fn spl_ids_match() -> bool {
     TOKEN_PROGRAM_ID.to_bytes() == spl_token::ID.to_bytes()
         && ASSOCIATED_TOKEN_PROGRAM_ID.to_bytes() == spl_associated_token_account::ID.to_bytes()
 }
 
-/// Parse helper for tests and plumbing.
+/// Parse helper for plumbing and tests.
 pub fn parse_pubkey(s: &str) -> Result<Pubkey, solana_pubkey::ParsePubkeyError> {
     Pubkey::from_str(s)
 }
@@ -393,22 +313,13 @@ mod tests {
 
     #[test]
     fn sell_v3_matches_frozen_sample() {
-        // Byte-equality against a real mainnet `sell_v3` fill (17
-        // accounts): our builder must reproduce every position plus the
-        // payload. Derived addresses double as independent anchors:
-        // user-vol accumulator ([11]) from the payer plus all four
-        // base/quote ATAs ([6]/[7]/[9]/[10]) recomputed, not copied. The
-        // buyback recipient ([13]) must be a member of the published
-        // 8-list — asserted explicitly (both frozen v3 fills use index
-        // 1). Flags follow the v2 convention minus the removed
-        // accounts; the 17-shape sim probe (not this test) proves them.
+        // Byte-equality vs mainnet `sell_v3` fill (17 accounts).
         use std::collections::HashSet;
         let raw: serde_json::Value = serde_json::from_str(include_str!(
             "../../listener/tests/fixtures/sell_v3_mainnet.json"
         ))
         .expect("fixture");
-        // Shape: bare getTransaction result (no RPC envelope), like the
-        // mayhem fixtures.
+        // Shape: bare getTransaction result.
         let result = &raw;
         // Landed transaction only: a failed fill proves nothing.
         assert!(
@@ -494,20 +405,13 @@ mod tests {
 
     #[test]
     fn buy_v3_matches_frozen_sample() {
-        // Byte-equality against a real mainnet `buy_v3` fill (17
-        // accounts, no `partial_fill` tail): our builder must reproduce
-        // every position plus the payload. Same shared 17-account body
-        // as `sell_v3` — user-vol accumulator ([11]) plus all four
-        // base/quote ATAs ([6]/[7]/[9]/[10]) recomputed, buyback ([13])
-        // pinned to the published 8-list. Flags are the same inferred
-        // set as `sell_v3`; the 17-shape sim probe proves them.
+        // Byte-equality vs mainnet `buy_v3` fill (17 accounts, no tail).
         use std::collections::HashSet;
         let raw: serde_json::Value = serde_json::from_str(include_str!(
             "../../listener/tests/fixtures/buy_v3_mainnet.json"
         ))
         .expect("fixture");
-        // Shape: bare getTransaction result (no RPC envelope), like the
-        // mayhem fixtures.
+        // Shape: bare getTransaction result.
         let result = &raw;
         // Landed transaction only: a failed fill proves nothing.
         assert!(
@@ -594,17 +498,13 @@ mod tests {
 
     #[test]
     fn buy_exact_quote_in_v3_matches_frozen_sample() {
-        // Byte-equality against a real mainnet `buy_exact_quote_in_v3`
-        // fill (17 accounts): same shared body as `buy_v3`/`sell_v3`,
-        // payload (spend, min_out). Spend was exactly 1 SOL, floor
-        // 12_211_736_678_104. Derivation anchors mirror the `buy_v3`
-        // test (uvol PDA, 8-list buyback, four ATAs).
+        // Byte-equality vs mainnet `buy_exact_quote_in_v3` fill (17 accounts).
         use std::collections::HashSet;
         let raw: serde_json::Value = serde_json::from_str(include_str!(
             "../../listener/tests/fixtures/buy_exact_quote_in_v3_mainnet.json"
         ))
         .expect("fixture");
-        // Shape: bare getTransaction result (no RPC envelope).
+        // Shape: bare getTransaction result.
         let result = &raw;
         assert!(
             result
@@ -676,12 +576,8 @@ mod tests {
         // Same inferred set as the other v3 sides (8 is the signer).
         let writable: HashSet<usize> = [5, 6, 7, 8, 9, 10, 11, 13].into_iter().collect();
         for (i, meta) in built.accounts.iter().enumerate() {
-            // Position 9 excepted: this fill's buyer spent from an AUX
-            // base account, not the canonical ATA (same class as the
-            // sim probes' aux-buyer resample rule). OUR builds always
-            // use the canonical ATA — the idempotent prefix guarantees
-            // it exists — so the builder is correct and the sample
-            // simply isn't byte-equal there.
+            // Position 9 excepted: this fill spent from an AUX base account,
+            // not the canonical ATA. Our builds always use the canonical ATA.
             if i != 9 {
                 assert_eq!(meta.pubkey, key(i), "position {i}");
             }
@@ -695,8 +591,7 @@ mod tests {
             if i != 9 {
                 assert_eq!(*meta, expect, "flags {i}");
             } else {
-                // Aux position: flags convention still asserted,
-                // pubkey excluded (see above).
+                // Aux position: flags still asserted, pubkey excluded.
                 assert_eq!(meta.is_signer, expect.is_signer, "flags {i}");
                 assert_eq!(meta.is_writable, expect.is_writable, "flags {i}");
             }
@@ -706,9 +601,7 @@ mod tests {
 
     #[test]
     fn program_bound_ata_differs_for_token_2022() {
-        // Regression from a live mayhem sim: the classic helper derives
-        // a DIFFERENT (wrong) address for Token-2022 mints, and trading
-        // through it fails inside the ATA program (IncorrectProgramId).
+        // Classic helper is wrong for 2022 mints (`IncorrectProgramId`).
         let owner = Pubkey::new_from_array([7; 32]);
         let mint = Pubkey::new_from_array([8; 32]);
         let classic = user_ata(&owner, &mint);
@@ -724,9 +617,8 @@ mod tests {
 
     #[test]
     fn compute_budget_prefix_shapes() {
-        // Default: empty (existing transactions unchanged).
         assert!(compute_budget_ixs(0, 0).is_empty());
-        // Limit only / price only.
+        // Limit only / price only; both: limit first, then price.
         let limit = compute_budget_ixs(200_000, 0);
         assert_eq!(limit.len(), 1);
         assert_eq!(limit[0].program_id, COMPUTE_BUDGET_PROGRAM_ID);
@@ -735,7 +627,6 @@ mod tests {
             u32::from_le_bytes(limit[0].data[1..5].try_into().expect("u32")),
             200_000
         );
-        // Both: limit first, then price (runtime convention).
         let both = compute_budget_ixs(200_000, 1_000);
         assert_eq!(both.len(), 2);
         assert_eq!(both[0].data[0], 2);

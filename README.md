@@ -2,7 +2,7 @@
 
 Paper-trading Solana memecoin sniper: catches new Pump.fun launches → screens risk → paper-trades with auto-exits. Paper-only by default; `--live` adds real Jito-routed execution.
 
-Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms, else heuristic) → paper position → auto-exit → migration hunt → Raydium tracking (price-only: PumpSwap migrations carry no pool so nothing is followed; Raydium follows fire spike cards and track pool prices; post-migration live exits route Raydium sells through the validated pool leg (`crates/executor/src/raydium.rs`, proven: wire order + shared authority + frozen-pool replay + sell-direction sim).
+Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms, else heuristic) → paper position → auto-exit → migration hunt → Raydium tracking (PumpSwap: no pool, nothing followed; Raydium: spike cards + live exits through the validated pool leg).
 
 ## Install
 
@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/sembraniteam/pump-sentry/main/insta
 # VERSION=vX.Y.Z bash install.sh | bash install.sh --from-source | bash uninstall.sh [--purge]
 ```
 
-Needs: mainnet RPC (dedicated recommended for `logsSubscribe`); Rust 1.99+ for source builds only; optional Ollama-compatible inference server (else heuristic fallback).
+Needs: mainnet RPC (dedicated recommended); Rust 1.99+ for source builds; optional Ollama-compatible server (else heuristic).
 
 ## Run
 
@@ -23,42 +23,42 @@ pump-sentry sell <mint>      # manual full exit, no restart
 pump-sentry run              # foreground (debugging)
 ```
 
-State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry` (rename + SIGHUP, lossless).
+State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.
 
-Live funding: SOL-pair v3 buys pay **native SOL** (official BUY.md/TRADE_V3.md) — fund native for trade + fees + tips + 0.05 reserve. A **WSOL** float is only needed for token-paired quotes (USDC/pump coin), which debit the quote ATA via `TransferChecked`.
+Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fees + tips + 0.05 reserve. A **WSOL** float is only needed for token-paired quotes (debit the quote ATA).
 
 ## Config
 
-| Env                                                                     | Default                       | Meaning                                               |
-|-------------------------------------------------------------------------|-------------------------------|-------------------------------------------------------|
-| `MAINNET_WSS_RPC_URL` / `MAINNET_RPC_URL`                               | mainnet-beta                  | RPC endpoints                                         |
-| `COMMITMENT`                                                            | `confirmed`                   | `processed` refused in live mode                      |
-| `START_BALANCE` / `FEE_BPS` / `NOTIONAL_USD`                            | `100` / `0` / `10`            | Virtual cash, extra commission/side in bps (venue 125bps already in fills — keep 0), size/trade (USD) |
-| `TRAIL_PERCENT`                                                         | `5`                           | Trailing-stop giveback (%)                            |
-| `MAX_OPEN_POSITIONS` / `MINT_COOLDOWN_SECS`                             | `3` / `3600`                  | Exposure cap, per-mint re-entry cooldown              |
-| `GATE_WINDOW_SECS` / `GATE_MIN_BUYERS` / `GATE_POLL_MS`                 | `10` / `5` / `2000`           | Watchlist window, quorum, poll cadence                |
-| `DEV_MIN_AGE_SECS` / `DEV_MAX_PRIOR_LAUNCHES` / `DEV_SCREEN_SAMPLE_TXS` | `3600` / `1` / `20`           | Min wallet age, tolerated prior launches, sample size |
-| `TICK_INTERVAL_MS` / `VAULT_TICK_INTERVAL_MS`                           | `1000` / `5000`               | Curve / pool poll intervals                           |
-| `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine LLM (OpenAI-compatible)                   |
-| `STRATEGY_MODE` / `RUNNER_MOONBAG_PERCENT` / `RUNNER_TRAIL_PERCENT`     | `adaptive` / `20` / `20`      | `adaptive`/`scalp`/`runner` + runner shape            |
-| `MAX_DAILY_LOSS_USD`                                                    | `0` (off)                     | Halts new entries past the cap; exits always work     |
-| `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`                  | `200` / `100000` / global      | Buy guard, per-bundle tip, block-engine (global)      |
-| `PRIORITY_FEE_MICRO_LAMPORTS` / `COMPUTE_UNIT_LIMIT`                    | `0` / `0`                     | Compute budget (0 = off)                              |
-| `SIM_STRICT`                                                            | `false`                       | Unproven sims refuse dispatch (required live)         |
-| `QUOTE_USD` / `LIQUIDITY_USD`                                           | *(unset)* / `0`               | Test-only price override / reserve fallback           |
-| `IS_LIVE` / `SOLANA_PRIVATE_KEY`                                        | *(unset)*                     | Live mode + trading keypair (base58)                  |
-| `DISCORD_ALERTS` / `DISCORD_CHANNEL` / `HERMES_BIN`                     | `true` / *(unset)* / `hermes` | Trade cards via Hermes CLI                            |
-| `INFERENCE_API_KEY`                                                     | *(unset)*                     | Bearer token when the provider needs one              |
+| Env                                                                     | Default                       | Meaning                                                                                      |
+|-------------------------------------------------------------------------|-------------------------------|----------------------------------------------------------------------------------------------|
+| `MAINNET_WSS_RPC_URL` / `MAINNET_RPC_URL`                               | mainnet-beta                  | RPC endpoints                                                                                |
+| `COMMITMENT`                                                            | `confirmed`                   | `processed` refused in live mode                                                             |
+| `START_BALANCE` / `FEE_BPS` / `NOTIONAL_USD`                            | `100` / `0` / `10`            | Virtual cash, extra commission/side in bps (venue 125bps already in fills), size/trade (USD) |
+| `TRAIL_PERCENT`                                                         | `5`                           | Trailing-stop giveback (%)                                                                   |
+| `MAX_OPEN_POSITIONS` / `MINT_COOLDOWN_SECS`                             | `3` / `3600`                  | Exposure cap, per-mint re-entry cooldown                                                     |
+| `GATE_WINDOW_SECS` / `GATE_MIN_BUYERS` / `GATE_POLL_MS`                 | `10` / `5` / `2000`           | Watchlist window, quorum, poll cadence                                                       |
+| `DEV_MIN_AGE_SECS` / `DEV_MAX_PRIOR_LAUNCHES` / `DEV_SCREEN_SAMPLE_TXS` | `3600` / `1` / `20`           | Min wallet age, tolerated prior launches, sample size                                        |
+| `TICK_INTERVAL_MS` / `VAULT_TICK_INTERVAL_MS`                           | `1000` / `5000`               | Curve / pool poll intervals                                                                  |
+| `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine LLM (OpenAI-compatible)                                                          |
+| `STRATEGY_MODE` / `RUNNER_MOONBAG_PERCENT` / `RUNNER_TRAIL_PERCENT`     | `adaptive` / `20` / `20`      | `adaptive`/`scalp`/`runner` + runner shape                                                   |
+| `MAX_DAILY_LOSS_USD`                                                    | `0` (off)                     | Halts new entries past the cap; exits always work                                            |
+| `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`                  | `200` / `100000` / global     | Buy guard, per-bundle tip, block-engine (global)                                             |
+| `PRIORITY_FEE_MICRO_LAMPORTS` / `COMPUTE_UNIT_LIMIT`                    | `0` / `0`                     | Compute budget (0 = off)                                                                     |
+| `SIM_STRICT`                                                            | `false`                       | Unproven sims refuse dispatch (required live)                                                |
+| `QUOTE_USD` / `LIQUIDITY_USD`                                           | *(unset)* / `0`               | Test-only price override / reserve fallback                                                  |
+| `IS_LIVE` / `SOLANA_PRIVATE_KEY`                                        | *(unset)*                     | Live mode + trading keypair (base58)                                                         |
+| `DISCORD_ALERTS` / `DISCORD_CHANNEL` / `HERMES_BIN`                     | `true` / *(unset)* / `hermes` | Trade cards via Hermes CLI                                                                   |
+| `INFERENCE_API_KEY`                                                     | *(unset)*                     | Bearer token when the provider needs one                                                     |
 
-`STRATEGY_MODE`: `adaptive` runs the profile verbatim; `scalp` clamps TP into +25…+35% (sub-band honored, never widened); `runner` sells 80%, trails the 20% moonbag wide toward 5x–10x.
+`STRATEGY_MODE`: `adaptive` runs the profile verbatim; `scalp` clamps TP into +25…+35% (sub-band honored); `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
 
-Outside `Settings` (process/daemon plumbing, not parsed by `Settings::from_map`): `HERMES_BIN` (Hermes CLI binary, read by `crates/alert`), `BOT_DAEMON` (set to `1` by the `start` supervisor for the daemonized child, read in `main`), `PID_FILE` / `LOG_FILE` (pid/log path overrides, resolved in `cli`).
+Outside `Settings`: `HERMES_BIN`, `BOT_DAEMON` (daemon child marker), `PID_FILE` / `LOG_FILE` (path overrides).
 
 ## Safety
 
 - Paper-only without `--live`/`IS_LIVE=true`. Live needs a dedicated wallet, small `NOTIONAL_USD`, `MAX_DAILY_LOSS_USD>0`, `SIM_STRICT=true`.
-- Fail-closed everywhere: audit rejects, fresh/serial insiders, non-6-decimal mints, no-quorum timeouts, dev dumps (incl. `sell_v2`), bundled supply monopolies, unconfirmed fills (re-polled, never assumed).
-- Post-migration follows track vault prices and fire spike cards; live post-migration exits route Raydium sells through the validated pool leg (Token-2022 vaults refuse fail-closed to manual exit — unroutable through AMM v4 by program construction, not a missing feature).
+- Fail-closed everywhere: audit rejects, fresh/serial insiders, non-6-decimal mints, no-quorum timeouts, dev dumps, bundled supply monopolies, unconfirmed fills (re-polled, never assumed).
+- Post-migration: vault prices + spike cards; live exits route Raydium sells through the validated pool leg (Token-2022 vaults refuse fail-closed — unroutable through AMM v4 by program construction).
 - Exits never block: TP/SL/trailing/timeout + manual `sell`; breaker halts entries only.
 
 ## Layout

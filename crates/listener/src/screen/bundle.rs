@@ -1,14 +1,13 @@
 use super::*;
 
-/// Creation-slot bundle verdict (skill `sybil-cluster-detection`).
+/// Creation-slot bundle verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleVerdict {
     /// No bundle evidence: organic launch.
     SafeOrganic,
-    /// Bundled but below the supply monopoly threshold: suspicious,
-    /// tradeable only with tightened risk.
+    /// Bundled but below monopoly line: suspicious.
     SuspectLowVolume,
-    /// Bundled wallets control over 15% of initial supply: reject.
+    /// Bundled wallets hold over 15% of supply: reject.
     RejectBundledMonopoly,
 }
 
@@ -17,32 +16,27 @@ pub enum BundleVerdict {
 pub struct BundleAnalysis {
     /// True when bundled by the creation-slot or funder rule.
     pub is_bundled: bool,
-    /// Buy swaps landing in the exact creation slot.
+    /// Buys landing in the exact creation slot.
     pub creation_slot_buys: usize,
     /// Wallets sharing a funder with at least one other wallet.
     pub shared_funder_count: usize,
-    /// Combined supply share of creation-slot buys, in percent.
+    /// Supply share of creation-slot buys, in percent.
     pub total_cluster_supply_pct: f64,
     /// Final call.
     pub verdict: BundleVerdict,
 }
 
-/// Creation-slot bundle detector (skill `sybil-cluster-detection`).
+/// Creation-slot bundle check.
 ///
-/// Hard rule: a Jito bundle lands atomically in one slot, so no
-/// uncoordinated outsider can transact in the token's creation slot —
-/// 3+ buys there means a developer/insider bundle. Shared genesis
-/// funders (2+ wallets per source) independently prove coordination.
-/// Either signal sets `is_bundled`; over 15% creation-slot supply
-/// escalates to [`BundleVerdict::RejectBundledMonopoly`].
+/// 3+ buys in the creation slot means bundled.
+/// 2+ wallets per funder proves coordination too.
+/// Over 15% supply rejects.
 ///
-/// Callers pass **buy** swaps only as `(slot, buyer, supply_pct)` plus
-/// known `(buyer, funder)` ancestry pairs (empty when untraced — the
-/// slot rule still fires).
+/// Takes buy swaps as `(slot, buyer, supply_pct)` plus `(buyer, funder)`.
 pub struct BundleDetector;
 
 impl BundleDetector {
-    /// Evaluate early swaps against the creation slot.
+    /// Check early swaps against the creation slot.
     pub fn evaluate_launch_slot(
         creation_slot: u64,
         early_swaps: &[(u64, Pubkey, f64)],

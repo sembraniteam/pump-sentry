@@ -1,7 +1,4 @@
-//! Post-migration watch: graduation cards, pool follows, spike alerts.
-//!
-//! Moved verbatim from `pipeline.rs` (same `impl Pipeline` block, new
-//! home). Behavior unchanged.
+//! Post-migration watch: cards, pool follows, spike alerts.
 
 use alert::Alerter;
 use listener::MigrationReport;
@@ -11,48 +8,35 @@ use tracing::{info, warn};
 use crate::pipeline::{AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener};
 use crate::settings::now_secs;
 
-/// Post-migration spike multiple that fires the follow alert once.
+/// Spike multiple firing the follow alert once.
 pub const FOLLOW_SPIKE_MULT: f64 = 2.0;
 
-/// Pool ticks older than this (seconds) are ignored: a stale baseline or
-/// spike check is worse than none (thin/manipulated prints linger).
+/// Old pool ticks are ignored.
 pub const POOL_TICK_STALE_SECS: u64 = 300;
 
-/// Post-migration follow state per mint.
-/// Post-migration pool watch entry: price baseline plus the validated
-/// pool leg. The leg is stored (not re-hunted) so post-migration exits
-/// can route Raydium sells without extra RPC at exit time; entries die
-/// with the idle sweep below, degrading to manual exit — never a blind
-/// curve dispatch.
+/// Pool watch entry with exit leg. Dies on idle sweep.
 #[derive(Debug, Clone)]
 pub struct FollowState {
-    /// First pool-tick price (baseline).
+    /// First pool-tick price.
     pub entry_price: f64,
-    /// Whether the spike card already fired.
+    /// Spike card fired.
     pub alerted_spike: bool,
-    /// Last pool-tick time (unix secs): idle follows older than
-    /// [`FOLLOW_TTL_SECS`] are evicted (dead pools, bounded growth).
+    /// Last tick time (unix secs).
     pub last_seen_secs: u64,
-    /// Validated Raydium pool leg for live-exit routing (`None` when the
-    /// migration carried no resolvable pool — PumpSwap or trust-gate
-    /// failure — so exits fall back to the curve leg/manual path).
+    /// Raydium leg (`None` when unresolvable).
     pub pool: Option<crate::live::RaydiumPoolLeg>,
 }
 
-/// Idle-follow TTL: post-migration pools that never spike stop being
-/// polled after a day (evicted with their vault watch).
+/// Idle-follow TTL (a day).
 pub const FOLLOW_TTL_SECS: u64 = 86_400;
-/// Reported-migration memory: entries older than a day are pruned (a
-/// stale entry only risks a duplicate card, never a miss).
+/// Migration memory TTL (a day).
 pub const MIGRATED_TTL_SECS: u64 = 86_400;
-/// Backstop cap for reported-migration memory (oldest-first eviction).
+/// Cap for migration memory (oldest evicted first).
 pub const MIGRATED_CAP: usize = 5_000;
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
 
-    /// Hunt and announce the migration exactly once per mint. Runs after
-    /// positions close: classification plus pool addresses for instant
-    /// Raydium routing follow-ups.
+    /// Announce each migration once.
     pub(crate) async fn report_migration_once(&self, mint: &str, curve: &str) {
         {
             let mut migrated = self.migrated.lock().await;
@@ -60,8 +44,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             if migrated.insert(mint.to_string(), now).is_some() {
                 return;
             }
-            // Bounded growth: graduated mints never un-graduate, so
-            // pruning day-old entries only risks a duplicate card.
+            // Bounded growth: pruning only risks a dup card.
             migrated.retain(|_, at| now.saturating_sub(*at) <= MIGRATED_TTL_SECS);
             if migrated.len() > MIGRATED_CAP
                 && let Some(oldest) = migrated
@@ -87,29 +70,26 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
             Ok(None) => {
                 info!(mint = %mint, "graduated but no migration tx found yet; will retry on later ticks");
-                // Allow a later tick to retry the hunt (the migration tx
-                // may not be indexed yet right after graduation).
+                // Retry later (tx may not be indexed yet).
                 self.migrated.lock().await.remove(mint);
             }
             Err(e) => {
                 warn!(%mint, error = %e, "migration hunt failed");
-                // Allow a later tick to retry the hunt.
+                // Retry later.
                 self.migrated.lock().await.remove(mint);
             }
         }
     }
 
-    /// Register a migrated Raydium pool for post-migration price tracking
-    /// and live-exit routing. PumpSwap migrations carry no pool: nothing
-    /// to follow.
+    /// Register a migrated pool for tracking and exits.
+    /// PumpSwap has no pool: nothing to follow.
     async fn follow_pool(&self, mint: &str, report: &MigrationReport) {
         let (Some(amm), Some(base_vault), Some(quote_vault)) = (
             report.amm_id.clone(),
             report.base_vault.clone(),
             report.quote_vault.clone(),
         ) else {
-            // Pool unresolvable (trust-gate failure or PumpSwap): loud, so
-            // a missing follow is never mistaken for a quiet market.
+            // Loud, so a missing follow is never silent.
             warn!(mint = %mint, amm = ?report.amm_id, "migration without resolvable pool; not following");
             return;
         };
@@ -121,12 +101,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(amm = %amm, error = %e, "pool watch failed");
             return;
         }
-        // Seed the follow entry NOW (baseline set on first valid tick):
-        // pools that never tick would otherwise stay watched forever —
-        // the idle sweep below only sees `followed`, and a dead pool
-        // burns 2 vault RPCs per round with no expiry. `or_insert` keeps
-        // a baseline a racing tick already seeded. The pool leg rides
-        // along so live post-migration exits route without re-hunting.
+        // Seed now: pools that never tick still expire. Keeps raced baseline.
         let pool = Some(crate::live::RaydiumPoolLeg {
             mint: mint.to_string(),
             amm: amm.clone(),
@@ -146,13 +121,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         info!(%mint, amm = %amm, "following migrated pool");
     }
 
-    /// One post-migration pool tick: seed the entry on first sight, then
-    /// alert once the price doubles off it. Ticks are price cards; live
-    /// post-migration exits route through the stored pool leg
-    /// (`live_sell`), never through these ticks.
+    /// One pool tick: seed baseline, alert once on 2x.
     pub async fn on_pool_tick(&self, tick: &PoolTick) {
-        // Validate at the boundary: non-finite/non-positive prices must not
-        // seed baselines or trigger alerts; stale ticks are dropped.
+        // Bad ticks never seed or alert.
         if !tick.price_usd.is_finite() || tick.price_usd <= 0.0 {
             warn!(mint = %tick.mint, price = tick.price_usd, "ignoring degenerate pool tick");
             return;
@@ -162,9 +133,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         }
         let now = now_secs();
-        // Evict idle follows first (dead pools): collect under the guard,
-        // unwatch outside it — vaults own a separate lock that must never
-        // be acquired while `followed` is held.
+        // Evict idle follows first, outside the guard.
         let stale: Vec<String> = {
             let followed = self.followed.lock().await;
             followed
@@ -186,17 +155,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             entry_price: tick.price_usd,
             alerted_spike: false,
             last_seen_secs: now,
-            // Ticks never create pool legs (only the migration hunt
-            // stores validated legs): a tick-first entry routes curve
-            // leg/manual until a hunt resolves the pool.
+            // Ticks never create pool legs.
             pool: None,
         });
         state.last_seen_secs = now;
         if state.alerted_spike {
             return;
         }
-        // Baseline for follows seeded without a first tick (see
-        // `follow_pool`): the first valid print sets it, never alerts.
+        // First print seeds baseline, never alerts.
         if state.entry_price.is_nan() {
             state.entry_price = tick.price_usd;
             return;
@@ -211,11 +177,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 FOLLOW_SPIKE_MULT,
                 tick.price_usd,
             ));
-            // Alert fired: release the pool watch and the follow entry so a
-            // dead pool is not polled forever (unbounded growth) — UNLESS
-            // live custody still needs the pool leg for a Raydium exit.
-            // Keeping a needed leg costs 2 vault RPCs/round; dropping it
-            // strands the exit to manual. Paper-only follows release.
+            // Release unless live still needs the leg.
             let keep_for_exit = match &self.exec.live {
                 Some(trader) => self.is_live_tracked(trader, &mint).await,
                 None => false,
@@ -229,16 +191,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
-    /// Release a post-spike follow once its live custody cleared: a
-    /// follow kept past its spike alert solely for a Raydium exit dies
-    /// with the bag (or it polls 2 vault RPCs/round forever).
-    /// Un-alerted entries belong to paper spike tracking — untouched.
-    /// No live trader (paper mode) reaps unconditionally: legs are never
-    /// routed there. Never drops a needed leg: any tracked, manual-parked
-    /// (exact or suffixed), or pending bag for the mint keeps it.
+    /// Release a post-spike follow once custody cleared.
     pub(crate) async fn maybe_release_follow(&self, mint: &str) {
-        // Stage the flag under the guard, decide after it drops: the
-        // custody check awaits and must never run under this lock.
+        // Decide after the guard drops.
         let alerted = self
             .followed
             .lock()

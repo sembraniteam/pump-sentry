@@ -1,21 +1,18 @@
-//! SOL→USD price feed over Jupiter lite-api.
-//!
-//! Single shared [`SolUsdFeed`] polled in background; tickers and
-//! sizing read [`SolUsdFeed::price`] (fail-closed `None` when stale).
-//! No static fallback in production — every USD price is dynamic.
+//! SOL/USD price feed.
+//! `None` when stale; no fallback price.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// WSOL mint (Jupiter price key).
+/// WSOL mint (price key).
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-/// Jupiter lite-api v3 endpoint (verified 2026-10-26).
+/// Jupiter price endpoint.
 pub const DEFAULT_JUP_URL: &str =
     "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112";
-/// Price older than this is stale (fail-closed, no tick/ no sizing).
+/// Stale age cutoff.
 pub const DEFAULT_STALE_SECS: u64 = 120;
-/// Poll interval for the background refresher.
+/// Poll interval.
 pub const DEFAULT_REFRESH: Duration = Duration::from_secs(30);
 
 fn now_secs() -> u64 {
@@ -30,8 +27,7 @@ struct Inner {
     updated_at: AtomicU64,
 }
 
-/// Cloneable SOL→USD feed. Background task polls Jupiter; readers call
-/// [`Self::price`] (staleness-gated).
+/// Cloneable SOL/USD feed.
 #[derive(Clone)]
 pub struct SolUsdFeed {
     inner: Arc<Inner>,
@@ -52,7 +48,7 @@ impl std::fmt::Debug for SolUsdFeed {
 }
 
 impl SolUsdFeed {
-    /// Production feed: no price yet until first poll succeeds.
+    /// New feed with no price yet.
     pub fn new(url: &str, stale_secs: u64, refresh: Duration) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(Inner {
@@ -69,13 +65,12 @@ impl SolUsdFeed {
         })
     }
 
-    /// Production defaults (Jupiter lite-api, 120s stale, 30s poll).
+    /// Production defaults.
     pub fn with_defaults() -> Arc<Self> {
         Self::new(DEFAULT_JUP_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH)
     }
 
-    /// Test-only feed seeded with `price` at `now` (never stale until
-    /// `stale_secs` elapses). No network.
+    /// Test feed seeded with `price`. No network.
     pub fn new_for_test(price: f64) -> Arc<Self> {
         let feed = Self::new(DEFAULT_JUP_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH);
         if price.is_finite() && price > 0.0 {
@@ -85,7 +80,7 @@ impl SolUsdFeed {
         feed
     }
 
-    /// Test helper: override URL (for mocking) while keeping stale/refresh.
+    /// Test helper: override URL.
     pub fn with_url(self: &Arc<Self>, url: &str) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::clone(&self.inner),
@@ -96,15 +91,12 @@ impl SolUsdFeed {
         })
     }
 
-    /// Current price if fresh (finite >0 and age < `stale_secs`).
+    /// Current price if fresh.
     pub fn price(&self) -> Option<f64> {
         self.stamped_price().map(|(price, _)| price)
     }
 
-    /// Current price with its observation timestamp, if fresh. Lets
-    /// sizing share ONE sol reading with entry pricing instead of
-    /// re-reading seconds later (two reads of a moving price size the
-    /// amount and the guard from different markets).
+    /// Price with its timestamp.
     pub fn stamped_price(&self) -> Option<(f64, u64)> {
         let bits = self.inner.price_bits.load(Ordering::Relaxed);
         if bits == 0 {
@@ -125,14 +117,13 @@ impl SolUsdFeed {
         Some((price, updated))
     }
 
-    /// True when a timestamp read from [`SolUsdFeed::stamped_price`] is
-    /// still inside the freshness window (call at USE time, not read
-    /// time — a gate quorum can age a reading past the deadline).
+    /// True if a `stamped_price` timestamp is still fresh.
+    /// Check at use time.
     pub fn age_ok(&self, updated_at: u64) -> bool {
         now_secs().saturating_sub(updated_at) < self.stale_secs
     }
 
-    /// Seconds since last successful fetch (u64::MAX if never).
+    /// Seconds since last fetch (MAX if never).
     pub fn age_secs(&self) -> u64 {
         let updated = self.inner.updated_at.load(Ordering::Relaxed);
         if updated == 0 {
@@ -146,7 +137,7 @@ impl SolUsdFeed {
         self.price().is_none()
     }
 
-    /// Force-set price (tests / manual override). Updates timestamp to now.
+    /// Force-set price. Updates timestamp to now.
     pub fn set_price(&self, price: f64) {
         if price.is_finite() && price > 0.0 {
             self.inner.price_bits.store(price.to_bits(), Ordering::Relaxed);
@@ -154,7 +145,7 @@ impl SolUsdFeed {
         }
     }
 
-    /// One HTTP fetch (no side-effects). Parses `usdPrice` for SOL_MINT.
+    /// One HTTP fetch. Parses `usdPrice` for SOL.
     pub async fn fetch_once(&self) -> Result<f64, String> {
         let resp = self
             .client
@@ -169,7 +160,7 @@ impl SolUsdFeed {
             .json()
             .await
             .map_err(|e| format!("jup json failed: {e}"))?;
-        // Shape: {"So111...": {"usdPrice": 106.3, ...}}
+        // Shape: {mint: {usdPrice, ...}}
         let entry = body
             .get(SOL_MINT)
             .ok_or_else(|| format!("jup missing key {SOL_MINT}"))?;
@@ -198,19 +189,14 @@ impl SolUsdFeed {
         }
     }
 
-    /// Background loop: immediate refresh, then every `refresh` interval.
-    /// Ends when the feed is dropped (weak reference: the task holds no
-    /// strong count, so the last `Arc` drop stops the loop).
+    /// Background loop. Ends when the feed drops.
     pub async fn run(self: Arc<Self>) {
-        // Immediate attempt; log but don't crash if it fails (retry next tick).
         let _ = self.refresh_once().await;
         let refresh = self.refresh;
         let weak = Arc::downgrade(&self);
         drop(self);
         let mut interval = tokio::time::interval(refresh);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Discard the immediate first tick: without this the loop would
-        // refresh twice back-to-back (once above, once here).
         interval.tick().await;
         loop {
             let Some(feed) = weak.upgrade() else {
@@ -221,8 +207,7 @@ impl SolUsdFeed {
         }
     }
 
-    /// Spawn the background refresher (fire-and-forget). Returns the handle
-    /// so callers can keep it if they want to abort on shutdown.
+    /// Spawn the background refresher.
     pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let feed = Arc::clone(&self);
         tokio::spawn(async move { feed.run().await })
@@ -250,7 +235,6 @@ mod tests {
     #[test]
     fn stale_after_window() {
         let feed = SolUsdFeed::new_for_test(100.0);
-        // Backdate updated_at to force staleness.
         feed.inner
             .updated_at
             .store(now_secs().saturating_sub(9999), Ordering::Relaxed);

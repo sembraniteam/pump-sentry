@@ -22,27 +22,18 @@ pub async fn screen_developer(
     if sigs.is_empty() {
         return Ok(judge_developer(None, 0, cfg));
     }
-    // Newest-first: the last entry is the oldest observed activity.
+    // Newest first. Last entry is oldest activity.
     let age_secs = sigs
         .last()
         .and_then(|s| s.block_time)
         .map(|t| now_secs.saturating_sub(t.max(0) as u64));
-    // Early reject before the expensive fan-out: a wallet that already
-    // fails the age gate (or has no timestamp at all) can never pass
-    // `judge_developer` regardless of its prior-launch count, so
-    // sampling 5-20 full transactions for it only burns RPC quota
-    // (fresh throwaway wallets are 85-90% of Pump.fun devs and 429
-    // directly). Prior count is reported as 0 — irrelevant on a reject.
+    // Early reject skips the fan-out: failing age can never pass.
     if age_secs.is_none_or(|age| age < cfg.min_age_secs) {
         return Ok(judge_developer(age_secs, 0, cfg));
     }
 
     let tx_config = json_tx_config(commitment);
-    // Bounded fan-out (5-wide): 20 sequential fetches could consume the
-    // whole 15s budget, and 20 concurrent ones hammer the node. Failed
-    // transactions are skipped (a reverted `create` never launched);
-    // unreadable ones are counted separately below — a mostly-unreadable
-    // sample must not undercount serial launchers into a pass.
+    // Bounded fan-out (5-wide). Failed txs skipped. Unreadable counted.
     let candidates: Vec<(Signature, bool)> = sigs
         .iter()
         .take(cfg.sample_txs)
@@ -55,12 +46,7 @@ pub async fn screen_developer(
     use futures_util::stream::{self, StreamExt};
     let mut prior_launches: usize = 0;
     let mut fetch_failed: usize = 0;
-    // Owned items through `.map()` + `.buffered()`: each future owns its
-    // `(Signature, bool)` item, so no item borrows escape into the
-    // combinator. (`.map()` over BORROWED items with an async block that
-    // also borrows the environment trips rustc's higher-ranked lifetime
-    // check (E0631) at distant spawn sites; `.then()` would be sequential
-    // and cannot take `buffered` after it.)
+    // Owned items for `.buffered()`: borrowed items trip E0631.
     let total = candidates.len();
     let fetched: Vec<(usize, bool)> = stream::iter(candidates)
         .map(|(sig, failed)| async move {
@@ -76,8 +62,7 @@ pub async fn screen_developer(
                 Ok(Ok(fetched)) => fetched,
                 _ => return (0usize, true),
             };
-            // Defensive: skip failed transactions even if the status flag was
-            // missing (a failed create never launched a token).
+            // Failed tx never launched. Skip even when flag missing.
             let failed_tx = fetched
                 .transaction
                 .meta
@@ -96,9 +81,7 @@ pub async fn screen_developer(
         fetch_failed += usize::from(failed);
     }
     if !sample_trustworthy(fetch_failed, total) {
-        // Most of the sample unreadable: the launch count is a lower
-        // bound that would let serial launchers pass — distrust the
-        // sample and fail closed with the evidence attached.
+        // Mostly-unreadable sample: count is a lower bound. Fail closed.
         return Ok(DevVerdict {
             pass: false,
             age_secs,
@@ -111,30 +94,15 @@ pub async fn screen_developer(
     Ok(judge_developer(age_secs, prior_launches, cfg))
 }
 
-/// True when a dev-history sample is trustworthy enough to count:
-/// unreadable fetches must stay strictly below half the sample, and an
-/// empty sample proves nothing (every signature unparsable or flagged —
-/// counting zero launches would launder a decode failure into a pass).
-/// Pure and unit-tested (the fail-closed boundary for serial launchers).
+/// True when a dev sample is trusted.
+/// Fails stay below half. Empty sample proves nothing.
 pub(crate) fn sample_trustworthy(failed: usize, total: usize) -> bool {
     total > 0 && (failed == 0 || failed * 2 < total)
 }
 
-/// RPC-backed swap reader for one curve: signatures since `since_sig`
-/// (newest-first walk, stop at the watermark), classified records.
-/// Returns `(records, newest_signature, truncated)`.
-///
-/// When `exhaustive` is false (quorum path), `since_sig=None` is the
-/// baseline first read and never truncated; a watermarked read that
-/// never finds its watermark saw a partial view (high-velocity gap or
-/// pruned history) and reports truncated so callers hold instead of
-/// advancing quorum or the watermark over the gap. When `exhaustive`
-/// is true (bundle forensics, which needs the whole creation-slot
-/// history), hitting the page cap on full pages reports truncated even
-/// without a watermark — the fail-closed branch it feeds would
-/// otherwise be dead code on curves with 75+ transactions.
-/// Failed transactions are skipped; undecodable ones simply
-/// contribute no records (gate stays `Wait`: fail-closed for entries).
+/// Swap reader for one curve since `since_sig`.
+/// Returns `(records, newest_sig, truncated)`.
+/// Truncated rounds must not advance quorum.
 pub async fn read_curve_swaps(
     rpc: &RpcClient,
     commitment: CommitmentConfig,
@@ -181,8 +149,7 @@ pub async fn read_curve_swaps(
             let Ok(signature) = Signature::from_str(&status.signature) else {
                 continue;
             };
-            // Per-tx deadline: one slow fetch must not consume the whole
-            // screening budget (outer `with_screen_timeout` is the backstop).
+            // One slow fetch can't eat the budget.
             let fetched = match tokio::time::timeout(
                 TX_FETCH_TIMEOUT,
                 rpc.get_transaction_with_config(&signature, tx_config),
@@ -197,8 +164,7 @@ pub async fn read_curve_swaps(
         if watermark_found {
             break;
         }
-        // Watermark not in this page: continue with `before` cursor, unless
-        // the page was short (history exhausted).
+        // Watermark missed: keep paging unless history ran out.
         if !page_full {
             break;
         }
@@ -210,16 +176,14 @@ pub async fn read_curve_swaps(
     }
 
     let truncated = match (since_sig, exhaustive) {
-        // Watermarked read that never found its watermark: partial view.
+        // Watermark missed: partial view.
         (Some(_), _) => !watermark_found,
-        // Exhaustive read that hit the page cap on full pages: more
-        // history exists than was read.
+        // Exhaustive read hitting the cap: more history exists.
         (None, true) => pages >= CURVE_SWAP_MAX_PAGES,
-        // Baseline first read: complete by definition.
+        // First read is complete by definition.
         (None, false) => false,
     };
     if truncated {
-        // High-velocity gap: newest 75 returned, intermediates missed.
         // Callers must not advance quorum on this partial view.
         debug!(
             pages,
@@ -230,19 +194,14 @@ pub async fn read_curve_swaps(
     Ok((records, newest, truncated))
 }
 
-/// RPC read deadline for screening paths (no unbounded hangs).
+/// Screening deadline. No unbounded hangs.
 ///
-/// Timeout budget per path (outer → inner, inner must fire first):
-/// - screening (`dev_verdict`, `curve_swaps`, `hunt_migration`,
-///   `bundle_verdict`): 15s outer / 5s per-tx fetch.
-/// - funder tracing: 15s outer / 8s per-buyer walk (page-capped).
-/// - curve/vault tickers: 15s per round (`ROUND_TIMEOUT`), 1s poll
-///   interval (a slow round skips; misses back off).
-/// - executor: 90s send-and-confirm, 15s blockhash/poll, 10s balance
-///   reads, 2s Jito HTTP; live confirm window 60s with pending recheck.
+/// Budget per path (outer first, inner fires first):
+/// screen 15s / 5s fetch; funder 15s / 8s walk;
+/// tickers 15s; executor 90s.
 pub const SCREEN_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Run an RPC future with the screening deadline. `None` on timeout.
+/// Run a future with the screening deadline. `None` on timeout.
 async fn with_screen_timeout<F, T>(future: F) -> Option<T>
 where
     F: Future<Output = T>,
@@ -250,34 +209,23 @@ where
     tokio::time::timeout(SCREEN_RPC_TIMEOUT, future).await.ok()
 }
 
-/// Detected migration, ready for alerting and swap routing.
+/// Found migration, ready for alerts and routing.
 ///
-/// RPC-layer shape: holds typed [`Pubkey`]s and the parsed
-/// [`RaydiumV4Pool`]. Convert to [`MigrationReport`] at the crate
-/// boundary (see [`RpcScreener::hunt_migration`] callers) — the two types
-/// are an intentional layer split, not duplication: typed inside
-/// `listener`, plain strings outside it.
+/// Typed shape. Pipeline speaks only the plain-string report.
 #[derive(Debug, Clone)]
 pub struct DetectedMigration {
     /// Migration transaction signature (base58).
     pub signature: String,
     /// Where liquidity landed.
     pub destination: MigrationDestination,
-    /// New AMM account for Raydium migrations (initialize2 account 4,
-    /// [`INITIALIZE2_AMM_INDEX`]).
+    /// New AMM account for Raydium hits.
     pub amm_id: Option<Pubkey>,
-    /// Parsed pool for Raydium migrations (swap-ready addresses).
+    /// Parsed pool for Raydium hits.
     pub pool: Option<RaydiumV4Pool>,
 }
 
-/// Binary-friendly migration report (plain strings for cross-crate use).
-/// Produced from [`DetectedMigration::report`]; the pipeline's `Screener`
-/// trait speaks only this shape so the binary never depends on RPC-layer
-/// key types.
-///
-/// Orientation: on Pump.fun Raydium migrations the base side is WSOL and
-/// the quote side is the migrated token (chain-verified, see
-/// `migration::pool` docs).
+/// Plain-string migration report for cross-crate use.
+/// BASE is WSOL, QUOTE the token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationReport {
     /// Migration transaction signature (base58).
@@ -297,7 +245,7 @@ pub struct MigrationReport {
 }
 
 impl DetectedMigration {
-    /// Convert to the plain report shape.
+    /// Convert to the plain report.
     pub fn report(&self) -> MigrationReport {
         MigrationReport {
             signature: self.signature.clone(),
@@ -311,18 +259,11 @@ impl DetectedMigration {
     }
 }
 
-/// AMM account index inside a Raydium `initialize2` instruction.
-/// Verified against `raydium-amm/program/src/instruction.rs::initialize2`:
-/// `[0]=SPL Token program, [1]=ATA program, [2]=system program,
-/// [3]=rent sysvar, [4]=new AMM pool` (then authority, open-orders, ...).
-/// (A prior revision used index 1, confusing `initialize2` with the
-/// `Deposit`/`Swap` layouts where index 1 is the AMM; index 1 here is the
-/// ATA *program*, so pool resolution never succeeded.)
+/// AMM slot in `initialize2`: `[0]=token, [1]=ATA, [2]=system,
+/// [3]=rent, [4]=new AMM`.
 pub const INITIALIZE2_AMM_INDEX: usize = 4;
 
-/// Resolve the new AMM id from decoded instructions given as
-/// `(program_id, resolved account keys)` pairs. Returns the accounts[4]
-/// of the first Raydium-program instruction. Pure and unit-tested.
+/// Resolve the new AMM id: accounts[4] of the first Raydium ix.
 pub fn initialize2_amm_id(instructions: &[(Pubkey, Vec<Pubkey>)]) -> Option<Pubkey> {
     instructions
         .iter()
@@ -330,8 +271,7 @@ pub fn initialize2_amm_id(instructions: &[(Pubkey, Vec<Pubkey>)]) -> Option<Pubk
         .and_then(|(_, accounts)| accounts.get(INITIALIZE2_AMM_INDEX).copied())
 }
 
-/// One decoded instruction for migration classification: program,
-/// resolved account keys, and raw instruction data.
+/// One decoded ix: program, keys, raw data.
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedIx {
     pub(crate) program: Pubkey,
@@ -339,10 +279,8 @@ pub(crate) struct DecodedIx {
     pub(crate) data: Vec<u8>,
 }
 
-/// Decode one fetched transaction for migration classification:
-/// full account keys, [`DecodedIx`] per instruction (top-level plus
-/// inner compiled), and program logs. `None` on any undecodable key.
-/// Pure and unit-tested via downstream asserts.
+/// Decode one tx for migration checks.
+/// `None` on any bad key.
 pub(crate) fn decode_migration_tx(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
 ) -> Option<(Vec<Pubkey>, Vec<DecodedIx>, Vec<String>)> {
@@ -363,8 +301,7 @@ pub(crate) fn decode_migration_tx(
         for idx in accounts {
             resolved.push(keys.get(usize::from(*idx)).copied()?);
         }
-        // Single decode path shared with `decode_ix_data` semantics:
-        // bs58 first (Pump/Raydium wire), base64 fallback (RPC JSON).
+        // One shared decode: bs58 first, base64 fallback.
         let raw = decode_ix_data(data_str)?;
         decoded.push(DecodedIx { program, accounts: resolved, data: raw });
         Some(())
@@ -389,8 +326,7 @@ pub(crate) fn decode_migration_tx(
     Some((keys, decoded, logs))
 }
 
-/// RPC-backed screening client: developer verdicts plus incremental
-/// curve-swap reads with a per-mint signature watermark.
+/// Screening client: dev verdicts plus curve reads.
 #[derive(Clone)]
 pub struct RpcScreener {
     rpc: Arc<RpcClient>,
@@ -401,7 +337,7 @@ pub struct RpcScreener {
 }
 
 impl RpcScreener {
-    /// Build against an HTTP RPC URL with explicit commitment and dev policy.
+    /// Build with URL, commitment, and dev policy.
     pub fn new(
         http_url: &str,
         commitment: CommitmentConfig,
@@ -425,13 +361,9 @@ impl RpcScreener {
         })
     }
 
-    /// Developer history verdict (fail-closed on transport errors).
-    /// Repeat wallets are served from a TTL cache (history barely moves)
-    /// — except early age-rejects (no-history or below-minimum-age with
-    /// an unsampled prior count): age is time-sensitive, and rechecking
-    /// costs one cheap signature page (the fan-out stays skipped), so a
-    /// wallet that ages past the gate is trusted on its next launch,
-    /// not an hour later.
+    /// Dev verdict. Fails closed on transport errors.
+    /// Full verdicts cache. Early age-rejects don't:
+    /// young wallets age out.
     pub async fn dev_verdict(
         &self,
         dev: &Pubkey,
@@ -452,10 +384,7 @@ impl RpcScreener {
             None => return Err(ScreenError::Timeout("dev_verdict")),
             Some(result) => result?,
         };
-        // Only full-sample verdicts are cacheable: early age-rejects
-        // (`!pass` with no sampled priors) would freeze a young wallet
-        // as rejected past its aging-out, with a fabricated `priors: 0`.
-        // (Unreachable otherwise: the full path only rejects on priors.)
+        // Only full verdicts cache. Early rejects would freeze youth.
         if verdict.pass || verdict.prior_launches > 0 {
             self.dev_cache
                 .lock()
@@ -465,9 +394,7 @@ impl RpcScreener {
         Ok(verdict)
     }
 
-    /// Swap records for a curve since `since_sig`, plus the new watermark
-    /// and a truncation flag (see [`read_curve_swaps`]: a truncated round
-    /// must not advance quorum).
+    /// Swaps for a curve since `since_sig`. Truncated rounds hold quorum.
     pub async fn curve_swaps(
         &self,
         curve: &Pubkey,
@@ -487,16 +414,9 @@ impl RpcScreener {
         }
     }
 
-    /// Hunt the migration transaction for a graduated curve: scan recent
-    /// signatures, classify each candidate, and on a Raydium hit resolve
-    /// the new AMM id (initialize2 account 4, [`INITIALIZE2_AMM_INDEX`])
-    /// plus its parsed pool.
-    /// The pool is trusted only after the full gate: Raydium-owned
-    /// account, WSOL base, and quote matching `expected_token_mint` —
-    /// anything else keeps scanning. Returns `None` when no migration is
-    /// found. Runs once per mint upstream — never in a hot loop.
-    /// Bounded by [`SCREEN_RPC_TIMEOUT`] like every other screening path
-    /// (previously this was the only unbounded RPC path).
+    /// Hunt the migration tx for a graduated curve.
+    /// Raydium hits need the trust gate (owner, WSOL base, quote).
+    /// `None` when nothing found. Bounded by timeout.
     pub async fn hunt_migration(
         &self,
         curve: &Pubkey,
@@ -515,10 +435,7 @@ impl RpcScreener {
     ) -> Result<Option<DetectedMigration>, ClientError> {
         let monitor = MigrationMonitor::new();
         let tx_config = json_tx_config(self.commitment);
-        // First Raydium detection whose pool cannot be resolved yet
-        // (transient RPC or unparseable account): kept as a fallback and
-        // returned only after every candidate is scanned, so one bad
-        // account never hides the real migration behind it.
+        // First bad Raydium hit is fallback. Returned after full scan.
         let mut fallback: Option<(String, Option<Pubkey>)> = None;
         let mut before: Option<Signature> = None;
         let mut fetches: usize = 0;
@@ -662,10 +579,7 @@ impl RpcScreener {
         Ok(None)
     }
 
-    /// Full bundle forensics for a curve at confirm time: recent buy
-    /// swaps with slots and supply shares, genesis funders for the first
-    /// few distinct buyers, evaluated against `creation_slot`.
-    /// Transport errors propagate (fail-closed upstream).
+    /// Bundle check for a curve at confirm time. Fails closed.
     pub async fn bundle_verdict(
         &self,
         curve: &Pubkey,
@@ -677,17 +591,11 @@ impl RpcScreener {
         }
     }
 
-    /// Two-tier shortcut is applied by the caller shape below: when the
-    /// slot rule alone already proves a bundle, funders cannot change the
-    /// verdict, so [`Self::bundle_verdict`] skips their walks entirely.
-    /// Returns `(analysis, walked_funders)`.
+    /// Slot rule alone can prove a bundle (3+ buys skips funder walks).
     ///
-    /// Slot attribution uses the buyer's **earliest** slot (`min`), and the
-    /// supply share counts **creation-slot buys only** — previously the
-    /// newest-first order plus all-slot sums overcounted the monopoly rule
-    /// into false Rejects. When funder tracing is mostly untraceable the
-    /// verdict is escalated to `SuspectLowVolume` (fail-closed: unknown is
-    /// not organic).
+    /// Slot attribution uses each buyer's **earliest** slot; the supply
+    /// share counts **creation-slot buys only**. Mostly-untraceable
+    /// funders escalate to `SuspectLowVolume` (unknown is not organic).
     async fn bundle_verdict_tiered(
         &self,
         curve: &Pubkey,
@@ -696,9 +604,7 @@ impl RpcScreener {
         let (records, _, truncated) =
             read_curve_swaps(&self.rpc, self.commitment, curve, None, true).await?;
         if truncated {
-            // Partial newest-75 view: early creation-slot buys may be
-            // missing, so the monopoly share undercounts toward a false
-            // SafeOrganic. Fail closed to paper-only suspicion.
+            // Partial view: early buys may hide. Fail closed.
             return Ok((
                 BundleAnalysis {
                     is_bundled: true,
@@ -710,14 +616,10 @@ impl RpcScreener {
                 false,
             ));
         }
-        // Fail closed on unreadable supply: a zero fallback would neuter
-        // the >15% monopoly rule into a permanent Suspect.
+        // Bad supply can't zero the monopoly math. Propagate.
         let total_supply = self.curve_total_supply(curve).await?;
 
-        // Distinct buyers, first-seen order, bounded (RPC budget).
-        // Only proven `Buy` sides count: `Unknown` records (future
-        // unmapped layouts) carry no trustworthy amount or side, so the
-        // monopoly math ignores them rather than guessing.
+        // Distinct buyers, first-seen order, bounded. Only Buys count.
         let mut seen: HashSet<Pubkey> = HashSet::new();
         let mut buyers: Vec<Pubkey> = Vec::new();
         for record in records.iter().filter(|r| r.side == SwapSide::Buy) {
@@ -731,16 +633,14 @@ impl RpcScreener {
 
         let mut swaps: Vec<(u64, Pubkey, f64)> = Vec::new();
         for buyer in &buyers {
-            // Earliest slot across this buyer's buys (records are
-            // newest-first from RPC; `find` would return the newest).
+            // Earliest slot per buyer (records are newest-first).
             let slot = records
                 .iter()
                 .filter(|r| r.side == SwapSide::Buy && r.wallet == *buyer)
                 .map(|r| r.slot)
                 .min()
                 .unwrap_or(u64::MAX);
-            // Creation-slot amount only: later accumulation must not
-            // inflate the monopoly share attributed to the launch slot.
+            // Creation-slot amount only. Later buys don't count.
             let creation_amount: u64 = records
                 .iter()
                 .filter(|r| {
@@ -769,14 +669,12 @@ impl RpcScreener {
 
         let mut analysis =
             BundleDetector::evaluate_launch_slot(creation_slot, &swaps, &funding_parents);
-        // Fail-closed on untraceable funders: when we walked but resolved
-        // fewer than half the buyers (cache + fresh), unknown ancestry must
-        // not read as organic. Escalate Safe → Suspect.
+        // Few traces resolved: Safe becomes Suspect.
         if walked && analysis.verdict == BundleVerdict::SafeOrganic {
             let traced: HashSet<Pubkey> =
                 funding_parents.iter().map(|(b, _)| *b).collect();
             let resolved = buyers.iter().filter(|b| traced.contains(b)).count();
-            // `+1` avoids divide noise on tiny sets; threshold = <50%.
+            // Threshold is below half.
             if !buyers.is_empty() && resolved * 2 < buyers.len() {
                 analysis.verdict = BundleVerdict::SuspectLowVolume;
                 analysis.is_bundled = true;
@@ -786,9 +684,7 @@ impl RpcScreener {
         Ok((analysis, walked))
     }
 
-    /// Cached, concurrent, deadline-bound funder tracing.
-    /// `now` is the caller's wall-clock snapshot (single source per round;
-    /// see [`unix_now`]) so TTL edges are deterministic within one verdict.
+    /// Cached funder tracing. `now` fixes TTL edges per verdict.
     async fn trace_funders(&self, buyers: &[Pubkey], now: u64) -> Vec<(Pubkey, Pubkey)> {
         let mut pairs: Vec<(Pubkey, Pubkey)> = Vec::new();
         let mut missing: Vec<Pubkey> = Vec::new();
@@ -810,9 +706,7 @@ impl RpcScreener {
             return pairs;
         }
         use futures_util::stream::{self, StreamExt};
-        // Outer `Err` (deadline or transport) is transient: never
-        // cached, retried next round. `Ok` (found or conclusively
-        // untraceable) is stable for 24h.
+        // Transport errors never cache. Found and untraceable cache 24h.
         let fresh: Vec<(Pubkey, Result<Option<String>, ()>)> =
             stream::iter(missing)
                 .map(|buyer| async move {
@@ -845,12 +739,7 @@ impl RpcScreener {
         pairs
     }
 
-    /// Total token supply from the curve account (`token_total_supply`
-    /// u64 at offset 40). Fail-closed: any unreadable supply (transport
-    /// error, timeout, short data) propagates as `Err` so the >15%
-    /// monopoly rule can never silently degrade to `Suspect` on a zero
-    /// fallback. Bounded by [`TX_FETCH_TIMEOUT`] so one slow account
-    /// fetch cannot stall the bundle verdict.
+    /// Total supply from the curve account. Errors propagate.
     async fn curve_total_supply(&self, curve: &Pubkey) -> Result<u64, ClientError> {
         let account = match tokio::time::timeout(TX_FETCH_TIMEOUT, self.rpc.get_account(curve)).await
         {
@@ -877,15 +766,8 @@ impl RpcScreener {
         Ok(supply)
     }
 
-    /// Genesis funder: walk the wallet's signature history newest-first
-    /// (pages of 1000, capped at [`MAX_FUNDER_PAGES`]) down to its first
-    /// transaction, then return the source of the first SOL funding
-    /// found there (oldest few tried in order). `Ok(None)` when the walk
-    /// conclusively ends (no history, page cap, nothing parses) —
-    /// stable enough to cache. `Err(())` on transport/timeout trouble —
-    /// the caller must NOT cache it (a blip would freeze as
-    /// "untraceable" for 24h). The caller deadline-bounds each trace
-    /// via [`FUNDER_TRACE_TIMEOUT`].
+    /// Genesis funder: walk history to the first tx, return its funder.
+    /// `Ok(None)` ends the walk and caches. `Err` never caches.
     async fn genesis_funder(&self, buyer: &Pubkey) -> Result<Option<Pubkey>, ()> {
         let mut before: Option<Signature> = None;
         let mut oldest_page: Vec<(String, bool)> = Vec::new();
@@ -932,12 +814,7 @@ impl RpcScreener {
             return Ok(None);
         }
         let tx_config = json_tx_config(self.commitment);
-        // Oldest first; a few fallbacks in case the very first
-        // transaction carries no parseable funding. Failed
-        // transactions never fund anyone. A fetch that fails here only
-        // skips that candidate (the next trail slot may still resolve);
-        // total unreadability falls through to `Ok(None)` — the trail
-        // was walked, just unresolvable.
+        // Oldest first. A few fallbacks when the first tx has no funder.
         for (sig, failed) in oldest_page.iter().rev().take(FUNDER_TRAIL) {
             if *failed {
                 continue;
@@ -962,56 +839,38 @@ impl RpcScreener {
     }
 }
 
-/// Migration-hunt depth: 3 pages × 10 signatures with a 10-fetch
-/// budget. A migration deeper than 30 signatures is missed (returns
-/// `None`, and the pipeline retries the hunt on later ticks) — depth is
-/// capped for RPC budget, and per-tx fetches stay under the outer 15s
-/// screening deadline instead of ballooning to 10 × 5s unsupervised.
+/// Hunt depth: 3 pages x 10 sigs, 10-fetch budget.
+/// Deeper hits miss (`None`; retried on later ticks).
 pub const HUNT_MAX_PAGES: usize = 3;
 /// See [`HUNT_MAX_PAGES`].
 pub const HUNT_PAGE_LIMIT: usize = 10;
 /// See [`HUNT_MAX_PAGES`].
 pub const HUNT_MAX_FETCHES: usize = 10;
-/// Maximum distinct buyers traced for funders per evaluation.
+/// Max buyers traced per check.
 pub const MAX_TRACED_BUYERS: usize = 8;
-/// Per-buyer genesis-trace deadline: bounds the stall when one wallet
-/// has a pathological history (the page walk itself is page-capped).
-/// Must stay below [`SCREEN_RPC_TIMEOUT`] so the inner deadline fires
-/// first and the outer timeout remains a backstop, not the primary path.
+/// Per-buyer trace deadline (inside the screening deadline).
 pub const FUNDER_TRACE_TIMEOUT: Duration = Duration::from_secs(8);
-/// Per-transaction fetch deadline inside fan-out reads (dev sampling,
-/// curve pages). Keeps one slow RPC from consuming the whole 15s budget.
+/// Per-tx fetch deadline in fan-out reads.
 pub const TX_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Per-operation deadline inside the genesis walk (signature pages and
-/// single transaction fetches): one slow page must not eat the whole
-/// 8s [`FUNDER_TRACE_TIMEOUT`] budget. The outer timeout stays the
-/// backstop, not the primary path.
+/// Per-op deadline in the genesis walk.
 pub const FUNDER_OP_TIMEOUT: Duration = Duration::from_secs(3);
-/// Dev-history fan-out width: 20 sequential fetches could consume the
-/// whole screening budget; 20 concurrent ones hammer the node.
+/// Dev-history fan-out width.
 pub const DEV_SCREEN_FANOUT: usize = 5;
-/// Concurrent genesis-trace walks: one confirm may trace up to
-/// [`MAX_TRACED_BUYERS`] buyers, each walking [`MAX_FUNDER_PAGES`] pages.
-/// Bounded like every other fan-out in this module (4 keeps one confirm
-/// from opening 8 concurrent page-walks against the node).
+/// Concurrent genesis-trace walks per confirm.
 pub const FUNDER_TRACE_FANOUT: usize = 4;
-/// Curve-swap signature page size and page cap: 3 pages × 25 = 75 newest
-/// signatures per round. Beyond that the watermark is stale and the
-/// caller is warned via `truncated` handling upstream.
+/// Curve pages: 3 x 25 newest sigs. Past that, watermark is stale.
 pub const CURVE_SWAP_PAGE_LIMIT: usize = 25;
 pub const CURVE_SWAP_MAX_PAGES: usize = 3;
-/// Genesis funder page-walk cap: 10 pages × 1000 signatures. Beyond this
-/// the wallet is treated as untraceable (RPC budget over completeness).
+/// Genesis walk cap: 10 x 1000 sigs. Past that, untraceable.
 pub const MAX_FUNDER_PAGES: u32 = 10;
-/// Funder ancestry cache TTL: sybil infrastructure is reused across
-/// launches, so repeat buyers cost zero RPC.
+/// Funder cache TTL: infra is reused across launches.
 pub const FUNDER_CACHE_TTL_SECS: u64 = 86_400;
-/// Dev-verdict cache TTL: history barely moves within an hour.
+/// Dev verdict cache TTL: history moves slowly.
 pub const DEV_CACHE_TTL_SECS: u64 = 3_600;
 /// Signatures kept from the oldest page for funding fallbacks.
 const FUNDER_TRAIL: usize = 4;
 
-/// Local unix seconds for cache TTLs.
+/// Unix seconds for cache TTLs.
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1019,25 +878,9 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Find the source of a native SOL transfer into `beneficiary` inside a
-/// fetched transaction (top-level and inner instructions). Handles the
-/// system funding shapes: `transfer` (u32 LE 2, 12 bytes, accounts
-/// `[from, to]`), `createAccount` (u32 LE 0, 52 bytes, accounts
-/// `[funder, new]`), `createAccountWithSeed` (u32 LE 3, ≥92 bytes,
-/// accounts `[from, new, base]`), and `transferWithSeed` (u32 LE 11,
-/// ≥52 bytes, accounts `[from, base, to]`). Multisig/CPI-routed funding
-/// is covered whenever it executes one of these as an inner instruction
-/// (the traversal below visits them). Also attributes ATA creation paid
-/// by someone else: a `createAssociatedTokenAccount`/`CreateIdempotent`
-/// instruction (`[payer, ata, owner, ...]`) whose `owner` is the
-/// beneficiary names the SPL onboarding funder. Pure; `None` when no
-/// such transfer exists.
-///
-/// Best-effort by construction: raw SPL-token `Transfer`/`TransferChecked`
-/// amounts carry no ATA→owner map without account fetches, and exchange
-/// payouts outside these shapes, do not match any arm and read as
-/// untraceable (callers escalate low trace rates to `Suspect`, never to
-/// organic).
+/// Find the SOL funding source of `beneficiary` in a tx.
+/// Covers system transfers, creations, seeded forms, and ATA creation.
+/// Other shapes read as untraceable.
 pub fn find_funding_source(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
     beneficiary: &Pubkey,
@@ -1078,12 +921,8 @@ pub fn find_funding_source(
     found
 }
 
-/// System-program arm of [`find_funding_source`]: SOL transfers and
-/// account creations paying into `beneficiary`, including the seeded
-/// variants (`TransferWithSeed` tag 11, `CreateAccountWithSeed` tag 3 —
-/// account orders verified against the SDK constructors).
-/// Length-guarded BEFORE slicing: short payloads are not funding, never
-/// a panic.
+/// System arm: transfers and creations paying `beneficiary`.
+/// Length-checked before slicing.
 fn scan_system_funding(
     keys: &[Pubkey],
     accounts: &[u8],
@@ -1110,10 +949,7 @@ fn scan_system_funding(
     (to == *beneficiary).then_some(from)
 }
 
-/// ATA-program arm of [`find_funding_source`]: someone paying the rent
-/// to create `beneficiary`'s associated token account is an SPL funding
-/// link. Matches `Create` (`[0]`) and `CreateIdempotent` (`[1]`) single
-/// bytes with `[payer, ata, owner, ...]` account order.
+/// ATA arm: payer creating `beneficiary`'s ATA is a funding link.
 fn scan_ata_funding(
     keys: &[Pubkey],
     accounts: &[u8],

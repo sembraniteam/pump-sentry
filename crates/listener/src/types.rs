@@ -1,4 +1,4 @@
-//! Shared listener types: config, events, stats.
+//! Listener config, events, stats.
 
 use crate::parser::PumpTokenLaunchEvent;
 use solana_commitment_config::CommitmentConfig;
@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
-/// Channel capacity for the bounded event queue (backpressure-aware).
+/// Bounded event queue capacity.
 pub const EVENT_CHANNEL_CAPACITY: usize = 10_000;
 
-/// Configuration for the Pump.fun listener.
+/// Listener config.
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
     /// WebSocket RPC URL, e.g. `wss://api.mainnet-beta.solana.com`.
@@ -45,7 +45,7 @@ pub enum ConfigError {
 }
 
 impl ListenerConfig {
-    /// Validate URLs and commitment without doing any I/O.
+    /// Validate URLs and commitment. No I/O.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let ws = match url::Url::parse(&self.ws_url) {
             Ok(u) if u.scheme() == "ws" || u.scheme() == "wss" => u,
@@ -55,16 +55,14 @@ impl ListenerConfig {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => u,
             _ => return Err(ConfigError::BadHttpUrl(self.http_url.clone())),
         };
-        // Hostless URLs (`wss://`, `https:///x`) always mis-resolve.
+        // Hostless URLs mis-resolve.
         if ws.host_str().is_none_or(|h| h.is_empty()) {
             return Err(ConfigError::BadWsUrl(self.ws_url.clone()));
         }
         if http.host_str().is_none_or(|h| h.is_empty()) {
             return Err(ConfigError::BadHttpUrl(self.http_url.clone()));
         }
-        // Split-brain networks (mainnet WS + devnet HTTP) mis-resolve
-        // addresses silently: loud, but not fatal — dedicated WS
-        // providers legitimately differ from the HTTP endpoint.
+        // Split hosts warn only: providers may differ.
         if ws.host_str() != http.host_str() {
             tracing::warn!(
                 ws = %self.ws_url,
@@ -79,19 +77,13 @@ impl ListenerConfig {
         Ok(())
     }
 
-    /// Map the commitment string to a [`CommitmentConfig`].
-    /// Delegates to [`curve::CurveTicker::parse_commitment`] (single
-    /// source — a new level is added in exactly one place). Returns
-    /// `None` for unknown strings (fail-closed: callers must not
-    /// silently coerce to `confirmed`; [`ListenerConfig::validate`] and
-    /// the binary's startup gate reject these first).
+    /// Map commitment string to config. `None` when unknown.
     pub fn commitment_config(&self) -> Option<CommitmentConfig> {
         curve::CurveTicker::parse_commitment(&self.commitment)
     }
 }
 
-/// Event emitted downstream. `Arc` avoids cloning the (potentially large
-/// `uri`) payload across consumers.
+/// Event sent downstream. `Arc` avoids clones.
 pub type ListenerEvent = Arc<PumpTokenLaunchEvent>;
 
 /// Runtime counters (all atomics; cheap to share across tasks).
@@ -103,7 +95,7 @@ pub struct ListenerStats {
     pub candidates: AtomicU64,
     /// `getTransaction` RPCs that returned a decodable transaction.
     pub fetch_ok: AtomicU64,
-    /// `getTransaction` RPCs that failed / returned `None`.
+    /// Fetches that failed or returned `None`.
     pub fetch_err: AtomicU64,
     /// Instructions successfully parsed as `create`.
     pub parse_ok: AtomicU64,
@@ -111,13 +103,13 @@ pub struct ListenerStats {
     pub parse_err: AtomicU64,
     /// Events emitted into the channel.
     pub events_emitted: AtomicU64,
-    /// Events dropped because the bounded channel was full.
+    /// Events dropped on a full channel.
     pub dropped_full: AtomicU64,
-    /// Candidates dropped because all fetch permits were busy.
+    /// Candidates dropped with no free fetch permit.
     pub dropped_throttled: AtomicU64,
 }
 
-/// Point-in-time snapshot (for logging / metrics export).
+/// Point-in-time counters for logs and metrics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ListenerStatsSnapshot {
     /// See [`ListenerStats::logs_seen`].
@@ -141,12 +133,12 @@ pub struct ListenerStatsSnapshot {
 }
 
 impl ListenerStats {
-    /// Create a zeroed counter set.
+    /// Create zeroed counters.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Load all counters (relaxed ordering is fine for metrics).
+    /// Load all counters.
     pub fn snapshot(&self) -> ListenerStatsSnapshot {
         ListenerStatsSnapshot {
             logs_seen: self.logs_seen.load(Ordering::Relaxed),
@@ -165,7 +157,7 @@ impl ListenerStats {
     pub fn inc_logs_seen(&self) {
         self.logs_seen.fetch_add(1, Ordering::Relaxed);
     }
-    /// Current logs-seen count (for health checks like backoff reset).
+    /// Read logs-seen count.
     pub fn logs_seen(&self) -> u64 {
         self.logs_seen.load(Ordering::Relaxed)
     }

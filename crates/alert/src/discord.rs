@@ -1,4 +1,4 @@
-//! Hermes CLI dispatch plus Discord markdown card formatters.
+//! Hermes dispatch plus Discord card formatters.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,41 +6,31 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-/// Per-message dispatch deadline (failure tolerance per skill).
+/// Per-message dispatch deadline.
 pub const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hermes binary invoked for delivery.
 pub const HERMES_BIN: &str = "hermes";
-/// Env override for the Hermes binary path. Prefer an absolute path here:
-/// a bare `"hermes"` resolves via `PATH`, and a writable directory early
-/// in `PATH` lets an attacker substitute the alert binary.
+/// Env override for the Hermes binary path.
 pub const HERMES_BIN_ENV: &str = "HERMES_BIN";
-/// Maximum concurrent Hermes children: every `send` forks a process, so
-/// an exit storm must queue behind permits instead of fork-bombing the
-/// host. Excess messages are dropped with a counter (see
-/// [`Alerter::dropped_count`]) — alerts are observability, never consensus.
+/// Max Hermes children. Excess drops with a counter.
 pub const MAX_INFLIGHT_ALERTS: usize = 4;
 
-/// Fire-and-forget Discord alerter. Cloneable and cheap.
+/// Fire-and-forget alerter. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Alerter {
     binary: String,
     enabled: bool,
     timeout: Duration,
-    /// Optional Hermes channel target. `None` preserves the skill's
-    /// exact argv (`send --to discord <msg>`), leaving channel routing
-    /// to the host Hermes configuration. `Some(id)` sends to
-    /// `--to discord:<id>` (confirmed Hermes syntax for a specific
-    /// channel). Channel IDs are numeric snowflakes; anything else is
-    /// rejected at set time (fail-closed, keeps the default target).
+    /// Optional channel target. `None` uses the default.
+    /// Non-numeric ids stay on default.
     channel: Option<String>,
-    /// Dispatch permits shared across clones (see [`MAX_INFLIGHT_ALERTS`]).
+    /// Permits shared across clones.
     permits: Arc<Semaphore>,
-    /// Messages dropped for lack of a permit (shared across clones).
+    /// Messages dropped for lack of a permit.
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Heartbeat payload: counters + cash snapshot, bundled so new
-/// fields cannot grow the formatter arity again.
+/// Heartbeat payload: counters plus cash.
 pub struct HeartbeatReport<'a> {
     /// `live` or `paper`.
     pub mode: &'a str,
@@ -58,9 +48,7 @@ pub struct HeartbeatReport<'a> {
     pub watchlist_pending: usize,
     /// Open paper positions.
     pub open_positions: usize,
-    /// Live bags parked for manual exit (post-migration graduates,
-    /// exhausted sell retries). Real custody invisible to paper equity —
-    /// surfaced here so a quiet market never hides a stuck bag.
+    /// Live bags held for manual exit. Hidden from paper equity.
     pub manual_bags: usize,
     /// Free paper cash (USD).
     pub cash_usd: f64,
@@ -68,8 +56,7 @@ pub struct HeartbeatReport<'a> {
     pub equity_usd: f64,
 }
 
-/// Resolve the Hermes binary: explicit override first, `HERMES_BIN` env
-/// second, bare `"hermes"` on `PATH` last.
+/// Resolve the Hermes binary: override, env, then PATH.
 fn resolve_binary() -> String {
     match std::env::var(HERMES_BIN_ENV) {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -84,7 +71,7 @@ impl Default for Alerter {
 }
 
 impl Alerter {
-    /// Enabled alerter shelling out to Hermes (see [`resolve_binary`]).
+    /// Enabled alerter using Hermes.
     pub fn new() -> Self {
         Self {
             binary: resolve_binary(),
@@ -108,21 +95,18 @@ impl Alerter {
         }
     }
 
-    /// Messages dropped for lack of a dispatch permit (storm backpressure).
+    /// Messages dropped for lack of a permit.
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Override the binary (tests point this at `echo`/`false`).
+    /// Override the binary (tests use `echo`/`false`).
     pub fn with_binary(mut self, binary: &str) -> Self {
         self.binary = binary.to_string();
         self
     }
 
-    /// Route to a specific Hermes Discord channel (`--to
-    /// `discord:<channel-id>`). Non-numeric input is rejected (keeps the
-    /// default `discord` target) since channel IDs are numeric snowflakes.
-    /// Overlong input is rejected too (argv bloat fails the spawn).
+    /// Route to a Hermes Discord channel. Bad input keeps default.
     pub fn with_channel(mut self, channel: &str) -> Self {
         let channel = channel.trim();
         if !channel.is_empty()
@@ -134,10 +118,7 @@ impl Alerter {
         self
     }
 
-    /// argv for one dispatch (pure, unit-tested): the skill's exact
-    /// `send --to discord <msg>`, or `send --to discord:<id> <msg>` when
-    /// a channel is configured. The `--to` value is assembled here (never
-    /// through `sanitize`, which strips `:`).
+    /// argv for one dispatch (pure). Target built here, not via `sanitize`.
     fn argv(&self, message: &str) -> Vec<String> {
         let target = match &self.channel {
             Some(id) => format!("discord:{id}"),
@@ -146,17 +127,11 @@ impl Alerter {
         vec!["send".to_string(), "--to".to_string(), target, message.to_string()]
     }
 
-    /// Dispatch `message` as a detached task. Never blocks, never fails
-    /// the caller: delivery problems only log. At most
-    /// [`MAX_INFLIGHT_ALERTS`] children run at once; excess messages are
-    /// dropped with a counter rather than forking unboundedly.
+    /// Send `message` as a detached task. Never blocks the caller.
+    /// Excess load drops with a counter.
     ///
-    /// Pass formatter output (`format_entry`, ...): the message travels
-    /// as a positional argv element after `--to`, so a payload starting
-    /// with `-` could parse as a Hermes flag. Formatters sanitize their
-    /// fields; raw caller strings are not re-sanitized here (no shell is
-    /// involved — `Command` execs directly — but flag injection is a
-    /// parser property of Hermes, whose `--` support is unverified).
+    /// Pass formatter output. Message goes as argv, so a leading `-`
+    /// could parse as a flag. Formatters sanitize fields already.
     pub fn send(&self, message: String) {
         if !self.enabled {
             return;
@@ -173,11 +148,9 @@ impl Alerter {
         let timeout = self.timeout;
         let args = self.argv(&message);
         tokio::spawn(async move {
-            // Hold the permit for the whole child lifetime.
             let _permit = permit;
             let mut cmd = Command::new(&binary);
-            // A timed-out future drops here: kill the orphan so a late
-            // child cannot deliver a duplicate after the timeout.
+            // Timed-out future drops here. Kill the child.
             cmd.kill_on_drop(true);
             let run = cmd.args(&args).output();
             match tokio::time::timeout(timeout, run).await {
@@ -193,7 +166,7 @@ impl Alerter {
         });
     }
 
-    /// Entry card (skill format, verbatim).
+    /// Entry card.
     pub fn format_entry(
         mint: &str,
         entry_usd: f64,
@@ -212,13 +185,8 @@ impl Alerter {
         )
     }
 
-    /// Strip markdown/Discord control characters from interpolated fields.
-    /// Current callers only pass base58 pubkeys, bundle UUIDs, and internal
-    /// enums (all inert today), but any future field (token name/symbol)
-    /// is attacker-controlled — sanitize at the boundary so a new card
-    /// cannot become a mention/embed injection. Brackets and parens go
-    /// too (`[text](url)` links), as do Unicode format characters
-    /// (zero-width/bidi overrides, which `char::is_control` misses).
+    /// Strip markdown and control chars from fields.
+    /// Brackets and parens go too (no `[text](url)` links).
     fn sanitize(s: &str) -> String {
         s.chars()
             .filter(|c| {
@@ -233,7 +201,7 @@ impl Alerter {
             .collect()
     }
 
-    /// Exit card (skill format, verbatim).
+    /// Exit card.
     pub fn format_exit(
         mint: &str,
         reason: &str,
@@ -259,7 +227,7 @@ impl Alerter {
         )
     }
 
-    /// Live buy dispatch card (bundle UUID for tracking).
+    /// Live buy card (bundle id for tracking).
     pub fn format_live_buy(mint: &str, bundle_id: &str, amount_tokens: u64) -> String {
         let mint = Self::sanitize(mint);
         let bundle_id = Self::sanitize(bundle_id);
@@ -284,8 +252,7 @@ impl Alerter {
         )
     }
 
-    /// Migration card: destination plus pool addresses when resolved.
-    /// `amm_id` / `base_mint` / `quote_mint` render as `unknown` when absent.
+    /// Migration card. Missing ids render as `unknown`.
     pub fn format_migration(
         mint: &str,
         destination: &str,
@@ -312,9 +279,7 @@ impl Alerter {
         )
     }
 
-    /// Heartbeat card: periodic proof-of-life for quiet markets. All
-    /// inputs are counters (no addresses), so nothing needs sanitizing
-    /// beyond the mode label.
+    /// Heartbeat card. Only mode needs sanitize (rest are numbers).
     pub fn format_heartbeat(r: &HeartbeatReport<'_>) -> String {
         let mode = Self::sanitize(r.mode);
         let uptime_h = r.uptime_secs / 3_600;
@@ -344,8 +309,7 @@ impl Alerter {
         )
     }
 
-    /// Post-migration spike card: price crossed `multiple` off the first
-    /// pool tick after migration.
+    /// Post-migration spike card.
     pub fn format_follow_spike(mint: &str, multiple: f64, price_usd: f64) -> String {
         let mint = Self::sanitize(mint);
         format!(
@@ -358,9 +322,7 @@ impl Alerter {
     }
 }
 
-/// Unicode format characters (`Cf`) smuggled past `char::is_control`:
-/// zero-width spaces/joiners and bidi overrides that reorder displayed
-/// text (spoofed mints, fake mentions).
+/// Format chars that `is_control` misses: zero-width and bidi marks.
 fn is_format_char(c: char) -> bool {
     matches!(
         c,
@@ -441,9 +403,7 @@ mod tests {
 
     #[test]
     fn interpolated_fields_are_sanitized() {
-        // Attacker-shaped inputs must not survive into the card as
-        // markdown mentions, code fences, or links (template backticks
-        // around fields are by design; payload backticks must be gone).
+        // Attacker-shaped inputs must not survive as mentions, fences, or links.
         let card = Alerter::format_exit("@everyone `x`", "TakeProfit", 1.0, 1.0, 1.0, false);
         assert!(!card.contains("@everyone"));
         assert!(!card.contains("`x`"));
@@ -457,15 +417,13 @@ mod tests {
         );
         assert!(!mig.contains('@'));
         assert!(!mig.contains("https://evil.example"));
-        // Backtick payloads collapse to plain text inside the template's
-        // own code span (no breakout): "`A`M`M`" renders as "`AMM`".
+        // Backtick payloads collapse to plain text inside the template's own span.
         let tricky = Alerter::format_migration("M", "X", "s", Some("`A`M`M`"), None, None);
         assert!(tricky.contains("`AMM`"));
     }
 
     #[test]
     fn sanitize_blocks_links_and_bidi() {
-        // Markdown links die with their brackets and parens.
         let card = Alerter::format_exit("[click](https://evil.example)", "TakeProfit", 1.0, 1.0, 1.0, false);
         assert!(!card.contains("https://evil.example"));
         assert!(!card.contains("[click]"));
@@ -477,8 +435,7 @@ mod tests {
 
     #[test]
     fn storm_drops_behind_permits() {
-        // Permit pool is 4: exhaust it, then the next send drops loudly
-        // instead of forking.
+        // Exhaust the permit pool; the next send drops instead of forking.
         let alert = Alerter::new().with_binary("/bin/echo");
         let mut held = Vec::new();
         for _ in 0..MAX_INFLIGHT_ALERTS {
@@ -499,7 +456,6 @@ mod tests {
 
     #[test]
     fn argv_defaults_to_skill_shape() {
-        // No channel: byte-identical to the skill's argv.
         assert_eq!(
             Alerter::new().argv("hi"),
             vec!["send", "--to", "discord", "hi"]
@@ -522,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_never_spawns() {
-        // Would fail loudly if executed: proves early return.
+        // A bad binary proves the early return (never spawned).
         Alerter::disabled()
             .with_binary("/nonexistent-binary-xyz")
             .send("hi".to_string());

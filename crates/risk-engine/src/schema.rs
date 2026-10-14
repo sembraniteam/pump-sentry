@@ -1,15 +1,11 @@
-//! Prompt I/O schema (see skill `adaptive-risk-prompting`).
-//!
-//! [`TokenMetrics`] serializes to the skill's `INPUT PAYLOAD` and
-//! [`RiskProfile`] deserializes from its `OUTPUT SCHEMA`. [`build_prompt`]
-//! renders the `(system, user)` message pair sent to the model.
+//! Prompt I/O schema: input metrics, output profile.
 
 use serde::{Deserialize, Serialize};
 
-/// Trade decision. Serializes exactly as the skill's `"BUY" | "PASS"`.
+/// Trade decision: `"BUY" | "PASS"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
-    /// Take the trade with the attached TP/SL parameters.
+    /// Take the trade with these TP/SL settings.
     #[serde(rename = "BUY")]
     Buy,
     /// Skip the trade.
@@ -17,12 +13,12 @@ pub enum Action {
     Pass,
 }
 
-/// Token snapshot fed to the model and to the heuristic fallback.
+/// Token snapshot for model and heuristic.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TokenMetrics {
     /// Liquidity in USD.
     pub liquidity_usd: f64,
-    /// Buys observed in the last 5 seconds.
+    /// Buys in the last 5 seconds.
     pub buy_velocity_5s: u32,
     /// Deployer reputation in `0.0..=1.0`.
     pub dev_reputation: f64,
@@ -30,33 +26,26 @@ pub struct TokenMetrics {
     pub rugcheck_score: u32,
 }
 
-/// Model output: TP/SL percentages plus exit policy.
+/// Model output: TP/SL plus exit policy.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RiskProfile {
     /// Trade decision.
     pub action: Action,
-    /// Take-profit target in percent (e.g. `75.0` = +75%).
+    /// Take-profit target in percent.
     pub tp_percent: f64,
-    /// Stop-loss trigger in percent (negative, e.g. `-8.0`).
+    /// Stop-loss trigger in percent (negative).
     pub sl_percent: f64,
-    /// Whether to trail the stop once in profit.
+    /// Trail the stop once in profit.
     pub trailing_stop: bool,
-    /// Position exit timeout in seconds (`0` for [`Action::Pass`]).
+    /// Exit timeout in seconds (`0` for [`Action::Pass`]).
     pub timeout_seconds: u64,
-    /// Moonbag runner in percent [0–100): share left riding after TP.
-    /// 100 is rejected by [`RiskProfile::is_valid`]: a TP that sells
-    /// nothing could never exit.
-    /// Skill `adaptive-risk-prompting`: 20 on high momentum, else 0.
+    /// Moonbag share left riding after TP, in percent.
     #[serde(default)]
     pub moonbag_percent: f64,
 }
 
 impl RiskProfile {
-    /// Admission policy for model/LLM profiles (enforced by the engine
-    /// before any profile reaches the ledger): TP in `(0, 1000%]`, SL in
-    /// `[-100%, 0)`, timeout within an hour (`0` = no time-stop, used by
-    /// moonbag runners). Unbounded magnitudes would create positions
-    /// that never TP or never expire.
+    /// Admission check for model profiles.
     pub fn is_valid(&self) -> bool {
         if !self.tp_percent.is_finite() || !self.sl_percent.is_finite() {
             return false;
@@ -86,19 +75,14 @@ impl RiskProfile {
     }
 }
 
-/// Maximum take-profit in percent (10x): beyond this a position would
-/// effectively never take profit.
+/// Max take-profit in percent (10x).
 pub const MAX_TP_PERCENT: f64 = 1000.0;
-/// Minimum stop-loss in percent (-100% = total loss): beyond this is
-/// not a stop at all.
+/// Min stop-loss in percent (-100% = full loss).
 pub const MIN_SL_PERCENT: f64 = -100.0;
-/// Maximum exit timeout in seconds (one hour): beyond this a position
-/// would effectively never expire.
+/// Max exit timeout in seconds (one hour).
 pub const MAX_TIMEOUT_SECS: u64 = 3600;
 
-/// System instruction sent to the model (skill prompt specification
-/// plus the decision bands, so the model follows the same table as the
-/// heuristic fallback).
+/// System instruction sent to the model.
 pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8.";
 
 impl TokenMetrics {
@@ -237,8 +221,7 @@ mod tests {
         };
         assert!(!huge_timeout.is_valid());
 
-        // Boundary values are still admitted (moonbag stays below
-        // 100%: a TP that sells nothing could never exit).
+        // Boundary values are still admitted (moonbag stays below 100%).
         let capped = RiskProfile {
             action: Action::Buy,
             tp_percent: MAX_TP_PERCENT,

@@ -1,64 +1,40 @@
-//! Virtual portfolio: cash ledger, open positions, realized history.
-//!
-//! Construct with [`PaperPortfolio::new`] (e.g. `$100`), open positions
-//! with [`PaperPortfolio::open_position`], close with
-//! [`PaperPortfolio::close_position`]. All prices are USD per token;
-//! timestamps are caller-provided unix seconds so backtests stay
-//! deterministic.
+//! Virtual portfolio.
 
 use crate::market::FillModel;
 use crate::types::{ClosedTrade, ExitReason, Position, PositionId, Side};
 use std::collections::HashMap;
 use thiserror::Error;
 
-/// Moonbag-runner backstop: a TakeProfit scale-out lifts the position
-/// time-stop to 24h from open (not zero) so a sideways runner still
-/// expires when trailing never fires.
+/// Runner backstop (24h).
 pub const RUNNER_BACKSTOP_SECS: u64 = 86_400;
 
-/// Portfolio failures: no leverage, no partial fills — every violation is
-/// an explicit error.
+/// Portfolio errors.
 #[derive(Error, Debug, PartialEq)]
 pub enum PortfolioError {
-    /// Quote is not a positive finite price.
     #[error("invalid price: {0}")]
     InvalidPrice(f64),
-    /// Notional must be positive and finite.
     #[error("invalid notional: {0}")]
     InvalidNotional(f64),
-    /// Cash balance cannot cover entry notional + entry fee.
     #[error("insufficient funds: need {need:.2}, have {have:.2}")]
     InsufficientFunds {
-        /// Required cash.
         need: f64,
-        /// Available cash.
         have: f64,
     },
-    /// No open position with this id.
     #[error("position not found: {0}")]
     PositionNotFound(PositionId),
-    /// Take-profit must be a positive percent (would fire instantly).
     #[error("invalid take-profit: {0}")]
     InvalidTakeProfit(f64),
-    /// Stop-loss must be a negative percent (would fire instantly).
     #[error("invalid stop-loss: {0}")]
     InvalidStopLoss(f64),
-    /// Close fraction must satisfy `0 < fraction <= 1` (e.g. `0.8`: exit
-    /// 80%, keep a 20% moonbag runner).
     #[error("invalid close fraction: {0}")]
     InvalidFraction(f64),
-    /// Mint must be a non-empty address string.
     #[error("invalid mint: {0:?}")]
     InvalidMint(String),
-    /// Position-id space exhausted (2^64 opens without restart).
-    /// Unreachable in practice; fail-closed instead of reusing an id
-    /// (a silent reuse would overwrite a live position).
     #[error("position id space exhausted")]
     IdExhausted,
 }
 
-/// Pro-rata slice of a position being settled. Owns its data so the
-/// ledger can price it while the open position is borrowed separately.
+/// Position slice being settled.
 struct CloseSlice {
     id: PositionId,
     mint: String,
@@ -72,7 +48,6 @@ struct CloseSlice {
 }
 
 impl CloseSlice {
-    /// Whole position (full close).
     fn whole(position: &Position) -> Self {
         Self {
             id: position.id,
@@ -87,7 +62,6 @@ impl CloseSlice {
         }
     }
 
-    /// `fraction` share (`0 < fraction < 1`; caller validates).
     fn part(position: &Position, fraction: f64) -> Self {
         Self {
             id: position.id,
@@ -103,7 +77,7 @@ impl CloseSlice {
     }
 }
 
-/// Opposite side: exits always trade against the entry direction.
+/// Opposite side.
 fn flip_side(side: Side) -> Side {
     match side {
         Side::Long => Side::Short,
@@ -111,125 +85,76 @@ fn flip_side(side: Side) -> Side {
     }
 }
 
-/// Finite `v`, else disarmed `0.0` (for trail/moonbag normalization:
-/// NaN would poison downstream exit math through `clamp`/`max`).
+/// Finite value or zero.
 fn finite_or_zero(v: f64) -> f64 {
     if v.is_finite() { v } else { 0.0 }
 }
 
-/// Mark-to-market quote for one mint: price plus the liquidity context
-/// needed to estimate exit costs.
+/// Mark-to-market quote for one mint.
 #[derive(Debug, Clone, Copy)]
 pub struct Mark {
-    /// Current price in USD per token.
     pub price: f64,
-    /// Available liquidity in USD (fee-only estimate when unknown).
     pub liquidity_usd: f64,
 }
 
 impl Mark {
-    /// Price without liquidity context (exit-cost estimate is fee-only).
+    /// Price without liquidity.
     pub fn price_only(price: f64) -> Self {
         Self { price, liquidity_usd: f64::NAN }
     }
 }
 
-/// All inputs for opening a position, bundled so callers cannot
-/// transpose arguments and new knobs don't grow the arity.
-/// Prefer [`PaperPortfolio::open_position_params`] for new code;
-/// [`PaperPortfolio::open_position`] is a thin shim over it.
+/// Open-position inputs.
 #[derive(Debug, Clone)]
 pub struct OpenPositionParams<'a> {
-    /// Token mint (base58).
     pub mint: &'a str,
-    /// Direction (`Long` for spot snipes; `Short` is PnL-math generality
-    /// only — the pipeline opens `Long` exclusively, shorts are never
-    /// dispatched live).
     pub side: Side,
-    /// Current quote in USD per token.
     pub quote: f64,
-    /// Exposure in USD.
     pub notional_usd: f64,
-    /// Pool liquidity in USD (slippage context).
     pub liquidity_usd: f64,
-    /// Take-profit in percent (> 0).
     pub tp_percent: f64,
-    /// Stop-loss in percent (< 0).
     pub sl_percent: f64,
-    /// Whether the trailing stop is armed.
     pub trailing: bool,
-    /// Trailing giveback in percent (ignored unless `trailing`).
     pub trail_percent: f64,
-    /// Time-stop in seconds (0 = none).
     pub timeout_seconds: u64,
-    /// Share kept riding after a TakeProfit scale-out (0–100, clamped).
     pub moonbag_percent: f64,
-    /// Now in unix seconds (hold-time accounting).
     pub now_secs: u64,
 }
 
-/// Point-in-time accounting snapshot.
+/// Accounting snapshot.
 #[derive(Debug, Clone)]
 pub struct PortfolioSnapshot {
-    /// Free cash in USD.
     pub cash: f64,
-    /// Cash locked in open positions (signed entry notionals: +long,
-    /// −short — short proceeds sit in cash, the shares are owed).
     pub locked: f64,
-    /// Mark-to-market equity = cash + Σ position values.
     pub equity: f64,
-    /// Sum of net PnL over all closed trades.
     pub realized_pnl: f64,
-    /// Σ (current value − entry notional) over open positions.
     pub unrealized_pnl: f64,
-    /// Open position count.
     pub open_count: usize,
-    /// Closed trade count.
     pub closed_count: usize,
 }
 
-/// Paper-trading portfolio over one virtual balance.
+/// Paper-trading portfolio.
 #[derive(Debug)]
 pub struct PaperPortfolio {
     starting_balance: f64,
     cash: f64,
     fee_bps: f64,
     fill: FillModel,
-    /// Per-mint venue-fee overrides (protocol + coin creator, bps/side)
-    /// for custom-fee coins. Absent mints use [`FillModel`]'s fee, so
-    /// standard 125 bps coins need no registration. Bounded in practice
-    /// by the heat cap (≤3 live mints); entries for closed books are
-    /// evicted by [`PaperPortfolio::clear_venue_fee_for_mint`] and never
-    /// grow without bound on long runs.
+    /// Per-mint venue fees (bps/side).
     venue_fees: HashMap<String, f64>,
     next_id: PositionId,
     positions: HashMap<PositionId, Position>,
     history: Vec<ClosedTrade>,
-    /// Running aggregates so [`PaperPortfolio::realized_pnl`] and
-    /// [`PaperPortfolio::win_rate`] stay exact when `history` is capped
-    /// below (detail is bounded; accounting is not).
     realized_sum: f64,
     win_count: usize,
     closed_total: usize,
 }
 
-/// Detail-history cap: per-mint cooldown checks only need recent closes
-/// (default 1h window), while aggregates above carry lifetime stats.
-/// 50k closes is orders of magnitude past any cooldown window at this
-/// bot's throughput (≤3 concurrent positions) — eviction only drops
-/// per-trade detail, never accounting.
+/// Detail history cap.
 pub const MAX_HISTORY_TRADES: usize = 50_000;
 
 impl PaperPortfolio {
-    /// Fund a portfolio: `starting_balance_usd` (e.g. `100.0`) with
-    /// `fee_bps` commission per side (e.g. `30.0` = 0.30%).
-    ///
-    /// Two fee layers apply — do not confuse them: `fee_bps` is the
-    /// *commission* charged here on entry/exit notionals, while the
-    /// [`FillModel::BondingCurve`] fill prices already embed the *venue*
-    /// fee (125 bps/side on Pump.fun) plus price impact. Setting
-    /// `fee_bps = 125` on top of the default fill model would
-    /// double-count the venue fee; keep `fee_bps` to commission only.
+    /// Fund a portfolio.
     pub fn new(starting_balance_usd: f64, fee_bps: f64) -> Self {
         Self {
             starting_balance: starting_balance_usd.max(0.0),
@@ -246,22 +171,13 @@ impl PaperPortfolio {
         }
     }
 
-    /// Override the fill model (default: bonding-curve cost model).
-    /// Per-mint venue overrides survive: they re-tier whatever model is
-    /// installed here — except [`FillModel::Exact`], which has no venue
-    /// leg, so overrides are silently inert under it. Production always
-    /// runs the bonding-curve model; use `Exact` only for fee-free
-    /// benchmarks, never to price custom-fee coins.
+    /// Set fill model.
     pub fn with_fill_model(mut self, fill: FillModel) -> Self {
         self.fill = fill;
         self
     }
 
-    /// Register a custom venue fee (bps/side) for one mint: protocol +
-    /// coin creator total (e.g. `345.0` for a 95 + 250 coin). Non-finite
-    /// or negative inputs are ignored (fail-closed to the default tier,
-    /// never a zeroed cost). Call when the on-chain fee schedule is
-    /// known; standard coins need no registration.
+    /// Set venue fee for one mint.
     pub fn set_venue_fee_for_mint(&mut self, mint: &str, fee_bps_per_side: f64) {
         if mint.is_empty() || !fee_bps_per_side.is_finite() || fee_bps_per_side < 0.0 {
             return;
@@ -269,12 +185,12 @@ impl PaperPortfolio {
         self.venue_fees.insert(mint.to_string(), fee_bps_per_side);
     }
 
-    /// Drop a mint's venue override (position lifecycle ended).
+    /// Drop a mint override.
     pub fn clear_venue_fee_for_mint(&mut self, mint: &str) {
         self.venue_fees.remove(mint);
     }
 
-    /// Effective venue fee (bps/side) for one mint: override or default.
+    /// Venue fee for one mint.
     pub fn venue_fee_for(&self, mint: &str) -> f64 {
         self.venue_fees
             .get(mint)
@@ -282,8 +198,6 @@ impl PaperPortfolio {
             .unwrap_or_else(|| self.fill.venue_fee_bps())
     }
 
-    /// Effective fill model for one mint: base model re-tiered to the
-    /// mint's venue fee. Single home so open/book/snapshot cannot drift.
     fn fill_for_mint(&self, mint: &str) -> FillModel {
         match self.venue_fees.get(mint) {
             Some(fee) => self.fill.with_venue_fee_bps(*fee),
@@ -291,46 +205,33 @@ impl PaperPortfolio {
         }
     }
 
-    /// Free cash in USD.
     pub fn cash(&self) -> f64 {
         self.cash
     }
 
-    /// Debit out-of-band on-chain overhead (Jito tip + priority fee per
-    /// live dispatch). Live dispatch costs real SOL that never passes
-    /// through paper fills: without this the paper ledger overstates the
-    /// wallet it mirrors, so equity drifts optimistic on every dispatch.
-    /// Floored at zero (fees can bleed the book to broke, never below),
-    /// non-finite/negative inputs ignored.
+    /// Debit dispatch cost.
     pub fn debit_dispatch_cost(&mut self, cost_usd: f64) {
         if cost_usd.is_finite() && cost_usd > 0.0 {
             self.cash = (self.cash - cost_usd).max(0.0);
         }
     }
 
-    /// Starting balance in USD.
     pub fn starting_balance(&self) -> f64 {
         self.starting_balance
     }
 
-    /// Open position handles, in arbitrary map order (sort when
-    /// deterministic order matters).
     pub fn position_ids(&self) -> Vec<PositionId> {
         self.positions.keys().copied().collect()
     }
 
-    /// Borrow an open position.
     pub fn position(&self, id: PositionId) -> Option<&Position> {
         self.positions.get(&id)
     }
 
-    /// Full closed-trade history in close order.
     pub fn history(&self) -> &[ClosedTrade] {
         &self.history
     }
 
-    /// Handles of open positions for one mint (no intermediate alloc
-    /// beyond the returned ids).
     pub fn positions_for_mint(&self, mint: &str) -> Vec<PositionId> {
         self.positions
             .iter()
@@ -339,24 +240,11 @@ impl PaperPortfolio {
             .collect()
     }
 
-    /// Fee for a notional at the configured rate.
     fn fee_for(&self, notional: f64) -> f64 {
         notional * self.fee_bps / 10_000.0
     }
 
-    /// Open a long/short at `quote` with `notional_usd` exposure.
-    ///
-    /// Execution uses the fill model against `liquidity_usd`; entry fee is
-    /// charged on the executed notional. Longs debit `notional + fee`,
-    /// shorts credit `notional − fee` (shorts are PnL-math generality —
-    /// the pipeline opens `Long` only).
-    /// `trail_percent` is the giveback that fires the trailing stop when
-    /// `trailing` is set (ignored otherwise). `moonbag_percent` (0–100,
-    /// clamped) is the share kept riding after a TakeProfit scale-out.
-    ///
-    /// Thin shim over [`Self::open_position_params`]; kept so existing
-    /// callers don't churn. New code should pass
-    /// [`OpenPositionParams`] directly.
+    /// Open a position.
     #[allow(clippy::too_many_arguments)]
     pub fn open_position(
         &mut self,
@@ -389,13 +277,7 @@ impl PaperPortfolio {
         })
     }
 
-    /// Open a position from [`OpenPositionParams`] (preferred entry point).
-    ///
-    /// Cash flow is side-aware: longs debit `notional + entry fee`
-    /// (custody), shorts credit `notional − entry fee` (sale proceeds —
-    /// no margin model, so only the entry fee needs covering cash).
-    /// `Short` exists for PnL-math generality; the pipeline opens `Long`
-    /// exclusively and never dispatches a short live.
+    /// Open from params.
     pub fn open_position_params(
         &mut self,
         p: &OpenPositionParams<'_>,
@@ -425,7 +307,6 @@ impl PaperPortfolio {
                 .fill_price(p.side, quote, notional_usd, p.liquidity_usd);
         let entry_fee = self.fee_for(notional_usd);
 
-        // Quantity follows executed notional so slippage is accounted in size.
         let quantity = match p.side {
             Side::Long => notional_usd / entry_price,
             Side::Short => -(notional_usd / entry_price),
@@ -443,9 +324,6 @@ impl PaperPortfolio {
                 self.cash -= need;
             }
             Side::Short => {
-                // Short sale: receive proceeds minus fee. Only the fee
-                // needs covering cash (no margin model — shorts are
-                // paper-generality, never dispatched live).
                 if entry_fee > self.cash {
                     return Err(PortfolioError::InsufficientFunds {
                         need: entry_fee,
@@ -456,9 +334,6 @@ impl PaperPortfolio {
             }
         }
         let id = self.next_id;
-        // 2^64 positions is unreachable; a silent saturating reuse would
-        // overwrite a live position, so fail loudly instead (precedent:
-        // Borsh-encode expects elsewhere in the tree).
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -475,8 +350,6 @@ impl PaperPortfolio {
                 entry_fee,
                 tp_percent,
                 sl_percent,
-                // Non-finite trail/moonbag normalize to disarmed (0):
-                // NaN clamps to NaN and would poison downstream math.
                 trail_percent: finite_or_zero(p.trail_percent).max(0.0),
                 trailing_stop: p.trailing,
                 best_price: entry_price,
@@ -488,11 +361,7 @@ impl PaperPortfolio {
         Ok(id)
     }
 
-    /// Close a position at `quote` (exit also runs through the fill model).
-    ///
-    /// Proceeds = exit notional − exit fee are credited back to cash.
-    /// Equivalent to [`PaperPortfolio::close_partial_position`] with
-    /// `fraction = 1.0`.
+    /// Close a position.
     pub fn close_position(
         &mut self,
         id: PositionId,
@@ -504,14 +373,7 @@ impl PaperPortfolio {
         self.settle(id, 1.0, quote, liquidity_usd, reason, now_secs)
     }
 
-    /// Close `fraction` of a position (`0 < fraction <= 1`, e.g. `0.8`
-    /// exits 80% and leaves a 20% moonbag runner with identical entry
-    /// terms). The closed slice is accounted proportionally (notional,
-    /// quantity, entry fee); the remainder keeps running with its
-    /// original TP/trailing state, except a TakeProfit scale-out ratchets
-    /// its stop to breakeven (`max(sl, 0.0)` — never loosened).
-    /// `fraction == 1.0` removes the position exactly like
-    /// [`PaperPortfolio::close_position`].
+    /// Close a fraction.
     pub fn close_partial_position(
         &mut self,
         id: PositionId,
@@ -527,8 +389,6 @@ impl PaperPortfolio {
         self.settle(id, fraction, quote, liquidity_usd, reason, now_secs)
     }
 
-    /// Shared settlement: price the `fraction` slice through the fill
-    /// model, credit cash, shrink or remove the position, record history.
     fn settle(
         &mut self,
         id: PositionId,
@@ -568,18 +428,7 @@ impl PaperPortfolio {
             open.quantity -= slice.quantity;
             open.entry_notional -= slice.entry_notional;
             open.entry_fee -= slice.entry_fee;
-            // Moonbag protection, TakeProfit scale-outs ONLY: the runner's
-            // stop ratchets to breakeven (never loosens an already-tighter
-            // stop) and the moonbag disarms so it rides on trailing alone.
-            // The time-stop lifts to a 24h backstop (not zero): an old
-            // runner must still expire instead of riding sideways
-            // forever when trailing never fires. A Manual trim must not
-            // do any of this — otherwise a 1% rebalance accidentally
-            // creates a never-expiring, never-scalable position.
-            //
-            // Note the ratchet is move-breakeven, not net-breakeven:
-            // entry+exit fees and slippage still apply, so a stopped
-            // runner nets a small bounded loss by design.
+            // TP scale-out: stop to breakeven, 24h backstop.
             if reason == ExitReason::TakeProfit && fraction < 1.0 {
                 open.sl_percent = open.sl_percent.max(0.0);
                 open.timeout_seconds = RUNNER_BACKSTOP_SECS;
@@ -590,10 +439,6 @@ impl PaperPortfolio {
         Ok(trade)
     }
 
-    /// Record one close: fold the lifetime aggregates, then bound detail.
-    /// Aggregates stay exact past the cap; only per-trade detail evicts
-    /// (oldest first), which cooldown checks never miss in practice (see
-    /// [`MAX_HISTORY_TRADES`]).
     fn record(&mut self, trade: ClosedTrade) {
         if trade.net_pnl.is_finite() {
             self.realized_sum += trade.net_pnl;
@@ -609,12 +454,6 @@ impl PaperPortfolio {
         }
     }
 
-    /// Price one slice and settle its cash leg.
-    ///
-    /// Longs credit `exit_notional − exit fee` (sale); shorts debit
-    /// `exit_notional + exit fee` (buy-back). Either way
-    /// `net_pnl = (exit − entry) * qty − fees`, so a flat-price round
-    /// trip nets exactly `−fees`.
     fn book(
         &mut self,
         slice: &CloseSlice,
@@ -641,8 +480,6 @@ impl PaperPortfolio {
             0.0
         };
 
-        // Settle the exit leg: longs receive sale proceeds, shorts pay
-        // the buy-back (both net of their own commission).
         match slice.side {
             Side::Long => self.cash += exit_notional - exit_fee,
             Side::Short => self.cash -= exit_notional + exit_fee,
@@ -667,32 +504,21 @@ impl PaperPortfolio {
         }
     }
 
-    /// Mutable access for [`check_exit`](crate::check_exit)-style polling.
+    /// Mutable position access.
     pub fn position_mut(&mut self, id: PositionId) -> Option<&mut Position> {
         self.positions.get_mut(&id)
     }
 
-    /// Sum of net PnL over closed trades (running total: exact past the
-    /// detail cap, non-finite trades excluded).
+    /// Net PnL of closed trades.
     pub fn realized_pnl(&self) -> f64 {
         self.realized_sum
     }
 
-    /// Mark-to-market snapshot. `quotes` maps mint → current price; missing
-    /// mints are marked at entry (zero unrealized).
-    /// Mark-to-market snapshot. Each open position is valued at its
-    /// estimated exit leg through the fill model (longs: exit proceeds
-    /// minus exit commission; shorts: negative buy-back cost inclusive
-    /// of exit commission), so `equity` already reflects the cost of
-    /// liquidating. Mints without marks contribute zero unrealized.
-    /// `locked` sums signed entry notionals (+long, −short); `equity`
-    /// is always `cash + Σ position values`.
+    /// Mark-to-market snapshot.
     pub fn snapshot(&self, marks: &HashMap<String, Mark>) -> PortfolioSnapshot {
         let mut locked = 0.0;
         let mut unrealized = 0.0;
         for position in self.positions.values() {
-            // Signed basis: longs lock cash, shorts posted negative
-            // notional (proceeds sit in cash, the shares are owed).
             let basis = match position.side {
                 Side::Long => position.entry_notional,
                 Side::Short => -position.entry_notional,
@@ -732,7 +558,7 @@ impl PaperPortfolio {
         }
     }
 
-    /// Win rate over closed trades (`None` when nothing closed yet).
+    /// Win rate, if any closes.
     pub fn win_rate(&self) -> Option<f64> {
         if self.closed_total == 0 {
             return None;
@@ -753,9 +579,6 @@ mod tests {
 
     #[test]
     fn moonbag_scale_out_lifts_timeout_and_disarms() {
-        // Runner freedom: after a partial TP exit the survivor's timeout
-        // lifts to the 24h backstop (rides to trailing/SL/TP) and cannot
-        // scale out twice.
         let mut pf = funded();
         let id = pf
             .open_position_params(&OpenPositionParams {
@@ -782,7 +605,6 @@ mod tests {
         assert_eq!(runner.moonbag_percent, 0.0);
         assert_eq!(runner.sl_percent, 0.0);
         assert!(runner.trailing_stop);
-        // Full closes still remove the position (no survivor to lift).
         let id2 = pf
             .open_position_params(&OpenPositionParams {
                 mint: "M2",
@@ -806,8 +628,6 @@ mod tests {
 
     #[test]
     fn open_position_params_matches_shim() {
-        // Locks the 12-arg shim to the struct path: same inputs must yield
-        // the same position, so future callers can migrate without drift.
         let mut via_shim = funded();
         let mut via_struct = funded();
         let params = OpenPositionParams {
@@ -902,12 +722,10 @@ mod tests {
                 0,
             )
             .expect("open");
-        // Entry fee 1% of 50 = 0.50; cash = 100 - 50.50.
         assert!((pf.cash() - 49.50).abs() < 1e-9);
         let trade = pf
             .close_position(id, 1.0, 1e9, ExitReason::Manual, 1)
             .expect("close");
-        // Flat price: gross 0, fees 0.50 + 0.50.
         assert!((trade.fees - 1.0).abs() < 1e-9);
         assert!((trade.net_pnl + 1.0).abs() < 1e-9);
         assert!((pf.cash() - 99.0).abs() < 1e-9);
@@ -915,8 +733,6 @@ mod tests {
 
     #[test]
     fn short_roundtrip_flat_price_nets_minus_fees() {
-        // Short economics: open credits proceeds, close debits the
-        // buy-back — a flat round trip loses exactly both commissions.
         let mut pf = PaperPortfolio::new(100.0, 100.0).with_fill_model(FillModel::Exact);
         let id = pf
             .open_position(
@@ -934,7 +750,6 @@ mod tests {
                 0,
             )
             .expect("open");
-        // Proceeds credited: 100 + 50 − 0.50 entry fee.
         assert!((pf.cash() - 149.50).abs() < 1e-9, "cash={}", pf.cash());
         assert_eq!(pf.position(id).expect("p").quantity, -50.0);
         let trade = pf
@@ -944,8 +759,6 @@ mod tests {
         assert!((trade.fees - 1.0).abs() < 1e-9, "fees={}", trade.fees);
         assert!((trade.net_pnl + 1.0).abs() < 1e-9, "net={}", trade.net_pnl);
         assert!((pf.cash() - 99.0).abs() < 1e-9, "cash={}", pf.cash());
-        // Equity is whole: snapshot before close already priced the
-        // buy-back liability (cash + value == close cash).
         let mut pf2 = PaperPortfolio::new(100.0, 100.0).with_fill_model(FillModel::Exact);
         let id2 = pf2
             .open_position(
@@ -1053,7 +866,6 @@ mod tests {
             )
             .expect("open");
         let position = pf.position(id).expect("position");
-        // 1% of liquidity at 50 bps/1% -> fill 1.005, fewer tokens.
         assert!(position.entry_price > 1.0);
         assert!(position.quantity < 50.0);
     }
@@ -1088,8 +900,6 @@ mod tests {
 
     #[test]
     fn snapshot_matches_realizable_close() {
-        // Default model + 1% commission: snapshot must predict exactly
-        // what close_position will realize at the same mark.
         let mut pf = PaperPortfolio::new(100.0, 100.0);
         let id = pf
             .open_position("A", Side::Long, 1.0, 40.0, 5_000.0, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
@@ -1097,17 +907,14 @@ mod tests {
         let mut marks = HashMap::new();
         marks.insert("A".to_string(), Mark { price: 1.5, liquidity_usd: 5_000.0 });
         let snap = pf.snapshot(&marks);
-        // Costs deducted: below the naive (mark-entry)*qty figure.
         let naive = (1.5 - pf.position(id).expect("p").entry_price)
             * pf.position(id).expect("p").quantity;
         assert!(snap.unrealized_pnl < naive);
         let trade = pf
             .close_position(id, 1.5, 5_000.0, ExitReason::Manual, 1)
             .expect("close");
-        // Unrealized excludes the sunk entry fee (0.4); realized nets it.
         assert!((trade.net_pnl - (snap.unrealized_pnl - 0.4)).abs() < 1e-9);
         assert!((pf.cash() - snap.equity).abs() < 1e-9);
-        // Missing marks and NaN marks contribute zero unrealized.
         let mut pf2 = PaperPortfolio::new(100.0, 0.0);
         pf2
             .open_position("B", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
@@ -1222,7 +1029,6 @@ mod tests {
     fn partial_80_20_split_matches_full_close_totals() {
         let mut pf = funded();
         let id = open_40_at_1(&mut pf);
-        // Scale out 80% at 2x: 32 of 40 notional, gross +32.
         let part = pf
             .close_partial_position(id, 0.8, 2.0, 1e9, ExitReason::TakeProfit, 1100)
             .expect("partial");
@@ -1233,12 +1039,10 @@ mod tests {
         assert_eq!(part.net_pnl_percent, 100.0);
         assert_eq!(pf.cash(), 60.0 + 32.0 + 32.0);
 
-        // Moonbag runner keeps TP but its stop ratchets to breakeven.
         let open = pf.position(id).expect("runner");
         assert_eq!((open.quantity, open.entry_notional), (8.0, 8.0));
         assert_eq!((open.tp_percent, open.sl_percent), (75.0, 0.0));
 
-        // Exiting the runner settles exactly like an equivalent full close.
         let rest = pf
             .close_partial_position(id, 1.0, 2.0, 1e9, ExitReason::TakeProfit, 1200)
             .expect("rest");
@@ -1256,21 +1060,18 @@ mod tests {
         assert_eq!(pf.position(id).expect("p").sl_percent, -8.0);
         pf.close_partial_position(id, 0.8, 2.0, 1e9, ExitReason::TakeProfit, 1)
             .expect("partial");
-        // Runner can no longer lose: stop moved from -8% to entry.
         assert_eq!(pf.position(id).expect("runner").sl_percent, 0.0);
     }
 
     #[test]
     fn ratchet_never_loosens_and_ignores_other_reasons() {
         let mut pf = funded();
-        // Already-tight stop survives a TP scale-out untouched.
         let id = open_40_at_1(&mut pf);
         pf.position_mut(id).expect("p").sl_percent = 5.0;
         pf.close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::TakeProfit, 1)
             .expect("partial");
         assert_eq!(pf.position(id).expect("p").sl_percent, 5.0);
 
-        // Manual scale-outs never move stops.
         let id2 = open_40_at_1(&mut pf);
         pf.close_partial_position(id2, 0.5, 2.0, 1e9, ExitReason::Manual, 1)
             .expect("partial");
@@ -1279,8 +1080,6 @@ mod tests {
 
     #[test]
     fn manual_partial_preserves_runner_terms() {
-        // Only TakeProfit scale-outs ratchet the stop, lift the timeout,
-        // and disarm the moonbag: a Manual trim keeps all three intact.
         let mut pf = funded();
         let id = pf
             .open_position("M", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, true, 5.0, 90, 20.0, 0)
@@ -1291,8 +1090,6 @@ mod tests {
         assert_eq!(p.sl_percent, -8.0);
         assert_eq!(p.timeout_seconds, 90);
         assert_eq!(p.moonbag_percent, 20.0);
-        // ...while a TakeProfit scale-out transforms all three (stop to
-        // breakeven, timeout to the 24h backstop, moonbag disarmed).
         pf.close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::TakeProfit, 2)
             .expect("partial");
         let p = pf.position(id).expect("runner");
@@ -1325,8 +1122,6 @@ mod tests {
 
     #[test]
     fn custom_venue_fee_prices_worse_fills_per_mint() {
-        // A 95 + 250 = 345 bps custom-fee coin must fill worse than the
-        // standard 125 bps tier, without touching other mints.
         let mut pf = PaperPortfolio::new(1_000.0, 0.0);
         pf.set_venue_fee_for_mint("CUSTOM", 345.0);
         assert!((pf.venue_fee_for("CUSTOM") - 345.0).abs() < 1e-9);
@@ -1340,10 +1135,7 @@ mod tests {
         let std_px = pf.position(std_id).expect("std").entry_price;
         let cus_px = pf.position(cus_id).expect("cus").entry_price;
         assert!(cus_px > std_px, "custom {cus_px} vs std {std_px}");
-        // ~2.2pp wider per side on fee alone (345 - 125 = 220 bps).
         assert!((cus_px - std_px - 0.022).abs() < 1e-9, "cus={cus_px} std={std_px}");
-        // Clearing reverts to the default tier; garbage inputs never
-        // zero costs silently.
         pf.clear_venue_fee_for_mint("CUSTOM");
         assert!((pf.venue_fee_for("CUSTOM") - 125.0).abs() < 1e-9);
         pf.set_venue_fee_for_mint("", 999.0);
@@ -1392,7 +1184,6 @@ mod tests {
         let part = pf
             .close_partial_position(id, 0.5, 1.0, 1e9, ExitReason::TakeProfit, 1)
             .expect("partial");
-        // Price halved: short gains (1-2)*(-10) = +10 on half size.
         assert_eq!(part.quantity, -10.0);
         assert_eq!(part.gross_pnl, 10.0);
         assert_eq!(pf.position(id).expect("p").quantity, -10.0);
@@ -1415,7 +1206,6 @@ mod tests {
             pf.close_partial_position(999, 0.5, 2.0, 1e9, ExitReason::Manual, 0),
             Err(PortfolioError::PositionNotFound(999))
         ));
-        // Position untouched by rejected closes.
         assert_eq!(pf.position(id).expect("p").quantity, 40.0);
         assert_eq!(pf.cash(), 60.0);
     }
@@ -1427,7 +1217,6 @@ mod tests {
         assert!((pf.cash() - 7.5).abs() < 1e-9);
         pf.debit_dispatch_cost(100.0);
         assert_eq!(pf.cash(), 0.0);
-        // Non-finite/negative inputs are ignored.
         let mut pf2 = PaperPortfolio::new(10.0, 0.0);
         for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
             pf2.debit_dispatch_cost(bad);
@@ -1461,7 +1250,6 @@ mod tests {
         }
         let _ = HashMap::<String, ()>::new();
         assert_eq!(pf.history().len(), MAX_HISTORY_TRADES);
-        // Accounting covers every close, including evicted ones.
         let snap = pf.snapshot(&HashMap::new());
         assert!(snap.realized_pnl.is_finite());
         assert_eq!(snap.closed_count, n);

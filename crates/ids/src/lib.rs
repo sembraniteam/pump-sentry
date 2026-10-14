@@ -1,9 +1,5 @@
-//! Single source of truth for on-chain addresses and instruction
-//! discriminators shared across crates.
-//!
-//! A program upgrade or discriminator change must be edited exactly once,
-//! here — the compiler links every consumer, so drift becomes a build
-//! break instead of silent mainnet misbehavior.
+//! On-chain addresses and discriminators. Edit once here.
+
 
 pub mod pump;
 pub mod raydium;

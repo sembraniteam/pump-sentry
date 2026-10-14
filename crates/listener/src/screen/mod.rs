@@ -1,11 +1,4 @@
-//! Entry confirmation gate + developer screening (win-rate hardening).
-//!
-//! - [`extract_pump_swaps`]: classify Pump.fun buy/sell instructions in a
-//!   fetched transaction into [`SwapRecord`]s.
-//! - [`EntryGate`]: pure watchlist state machine — submit on signal,
-//!   confirm on distinct-buyer quorum, abort on dev dump or timeout.
-//! - [`screen_developer`]: RPC dev-wallet history (age + prior launches),
-//!   fail-closed on transport errors.
+//! Entry gate plus dev screening.
 
 use crate::parser::{
     IDX_CREATE_V2_USER, PUMP_CREATE_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID,
@@ -46,9 +39,7 @@ mod entry;
 mod rpc;
 mod swaps;
 pub(crate) use cache::TimedCache;
-// Crate-public surface (re-exported by `listener::` in lib.rs, and by
-// `screen::` for in-crate users like `stream`): every name keeps the
-// exact path it had when this was one file.
+// Re-exported by `listener::` in lib.rs; names keep their original paths.
 pub use bundle::{BundleAnalysis, BundleDetector, BundleVerdict};
 pub use entry::{
     DevScreenConfig, DevVerdict, EntryGate, GATE_POLL_INTERVAL, GateOutcome, MAX_COHORT_WALLETS,
@@ -62,7 +53,7 @@ pub use swaps::{
     IDX_BUY_V2_USER, IDX_CREATE_USER, IDX_SWAP_USER, IDX_SWAP_V2_USER, IDX_SWAP_V3_USER, SwapRecord,
     SwapSide, count_dev_creates, extract_pump_swaps, fixture_wallet, json_tx_config, parse_address,
 };
-/// Screening failures: config, keys, and RPC transport.
+/// Screening failures: config, keys, transport.
 #[derive(Error, Debug)]
 pub enum ScreenError {
     /// RPC endpoint URL is invalid.
@@ -74,7 +65,7 @@ pub enum ScreenError {
     /// RPC transport failure.
     #[error("rpc error: {0}")]
     Rpc(#[from] ClientError),
-    /// RPC read exceeded its deadline (fail-closed upstream).
+    /// RPC read exceeded its deadline.
     #[error("rpc read timed out: {0}")]
     Timeout(&'static str),
 }
@@ -114,8 +105,7 @@ mod tests {
         }
     }
 
-    /// Fabricated Json transaction: account 0 = pump program, account 6
-    /// of each swap ix = trader wallet.
+    /// Fabricated Json transaction: account 0 = pump program, account 6 = trader.
     fn swap_tx(
         instructions: Vec<UiCompiledInstruction>,
     ) -> EncodedConfirmedTransactionWithStatusMeta {
@@ -182,9 +172,7 @@ mod tests {
 
     #[test]
     fn classifies_v3_shapes_with_trader_at_index_8() {
-        // v3 layout (official TRADE_V3.md 17-account table): trader
-        // (`user`, row 9) at account position 8 for all three v3 sides.
-        // `buy_v3`/`sell_v3` attribute the first u64; exact-quote
+        // v3 layout (17-account table): trader at position 8; exact-quote
         // attributes `min_tokens_out` (second u64, conservative bound).
         let cases = [
             (PUMP_BUY_V3_DISCRIMINATOR.to_vec(), [7u8; 16], SwapSide::Buy),
@@ -227,10 +215,8 @@ mod tests {
 
     #[test]
     fn replay_mainnet_buy_v2_swap() {
-        // Same frozen mainnet tx as the create_v2 replay: its second
-        // top-level instruction is a real `buy_v2` (27 accounts). The
-        // trader must resolve to the fee payer with the exact on-chain
-        // amount (3_485_709_524_202 base units).
+        // Frozen mainnet `buy_v2`: trader resolves to the fee payer with
+        // the exact on-chain amount (3_485_709_524_202 base units).
         let raw: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/create_v2_mainnet.json"))
                 .expect("fixture");
@@ -248,9 +234,7 @@ mod tests {
 
     #[test]
     fn replay_mainnet_buy_v2_amount_matches_balance_delta() {
-        // Independent on-chain proof of the amount semantic (not just
-        // "the first u64 looks right"): in the same frozen tx, the
-        // buyer's token-balance delta for exactly one mint equals the
+        // Independent proof: the buyer's token-balance delta equals the
         // classified amount to the unit.
         let raw: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/create_v2_mainnet.json"))
@@ -281,11 +265,8 @@ mod tests {
 
     #[test]
     fn replay_mainnet_buy_v2_second_sample() {
-        // Second independent `buy_v2` tx (27 accounts, 24-byte payload):
-        // trader resolves to the fee payer and the amount matches the
-        // buyer's token-balance delta to the unit (8_671_591_758_466).
-        // The trailing u64 is `u64::MAX` (open slippage guard) — amount
-        // semantics need no further samples.
+        // Second independent `buy_v2`: same attribution, amount matches
+        // the balance delta to the unit (8_671_591_758_466).
         let raw: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/buy_v2_second_mainnet.json"))
                 .expect("fixture");
@@ -303,12 +284,8 @@ mod tests {
 
     #[test]
     fn replay_mainnet_sell_v2_swap() {
-        // Frozen mainnet `sell_v2` (26 accounts): the trader must resolve
-        // to the fee payer with the exact on-chain amount. Cross-checked
-        // off-test: the fee payer's token balance decreased by exactly
-        // 3_060_466_246_688 units of the sold mint, and the ix's account
-        // 13 is the fee-payer key — so index-13 attribution and the
-        // first-u64 amount are chain-proven, not inferred.
+        // Frozen mainnet `sell_v2`: trader resolves to the fee payer with
+        // the exact on-chain amount (balance-delta cross-checked off-test).
         let raw: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/sell_v2_mainnet.json"))
                 .expect("fixture");
@@ -330,12 +307,8 @@ mod tests {
 
     #[test]
     fn replay_mainnet_sell_v2_second_sample() {
-        // Second independent `sell_v2` (26 accounts, SOL-quoted this
-        // time — no quote-token legs): trader resolves to the fee payer
-        // and the amount matches the seller's token-balance delta to the
-        // unit (1_679_259_586_074). The second u64 (65_131_943) sits
-        // below the ~94.3M-lamport proceeds — min-SOL-output semantics,
-        // consistent with the first sample (107M ≥ 30,205).
+        // Second independent `sell_v2` (SOL-quoted): amount matches the
+        // seller's token-balance delta to the unit (1_679_259_586_074).
         let raw: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/sell_v2_second_mainnet.json"))
                 .expect("fixture");
@@ -423,8 +396,7 @@ mod tests {
     #[test]
     fn unknown_pump_ix_is_recorded_but_never_counts() {
         // Unmapped discriminators surface as `Unknown` against the ix's
-        // first listed account — never dropped silently, never
-        // quorum-counted, amount always 0.
+        // first listed account — never quorum-counted, amount always 0.
         let mut unknown = buy_ix(0, 6);
         unknown.data = bs58::encode([0u8; 24]).into_string();
         let tx = swap_tx(vec![unknown]);
@@ -438,9 +410,8 @@ mod tests {
 
     #[test]
     fn count_dev_creates_uses_versioned_author_index() {
-        // Regression: v2 `user` sits at index 5, v1 at 7. A single index
-        // for both silently undercounts v2 serial launchers (missed
-        // rejects) and misattributes v1-adjacent wallets (false counts).
+        // v2 `user` sits at index 5, v1 at 7: one shared index
+        // undercounts v2 serial launchers and misattributes v1-adjacent ones.
         let mk = |disc: &[u8; 8]| {
             let mut data = disc.to_vec();
             data.extend_from_slice(&[9u8; 16]);
@@ -466,8 +437,7 @@ mod tests {
 
     #[test]
     fn create_and_migrate_ixs_stay_ignored() {
-        // Benign lifecycle ixs must not become `Unknown` records (a dev
-        // migration touching the curve must never abort the gate).
+        // Benign lifecycle ixs must never abort the gate.
         let mk = |disc: &[u8; 8]| {
             let mut ix = buy_ix(0, 6);
             let mut data = disc.to_vec();
@@ -935,8 +905,7 @@ mod tests {
 
     #[test]
     fn funding_source_short_payload_never_panics() {
-        // Regression: `raw[..4]` on a <4-byte system ix must return None,
-        // not panic (the function promises never to panic).
+        // `raw[..4]` on a <4-byte system ix must return None, not panic.
         for short in [vec![], vec![2u8], vec![2u8, 0, 0]] {
             let ix = UiCompiledInstruction {
                 program_id_index: 0,
@@ -1009,8 +978,8 @@ mod tests {
         assert_eq!(cache.get("new", 5000), Some("v".to_string()));
     }
 
-    /// Build a fabricated transaction from explicit account keys,
-    /// top-level instructions, and an optional meta (for inner-ix cases).
+    /// Build a fabricated transaction from explicit keys, instructions,
+    /// and an optional meta.
     fn funding_tx_with_meta(
         account_keys: &[String],
         instructions: Vec<UiCompiledInstruction>,
@@ -1044,11 +1013,8 @@ mod tests {
 
     #[test]
     fn funding_source_found_via_transfer_with_seed() {
-        // TransferWithSeed (tag 11, [from, base, to]): the seeded
-        // funding path the old detector missed. Layout hand-encoded per
-        // the SDK constructor source (`system-interface/.../instruction.rs`
-        // `transfer_with_seed`: bincode tag 11 ++ lamports ++ seed-string
-        // ++ owner; accounts [from, base-signer, to]).
+        // TransferWithSeed (tag 11, [from, base, to]), hand-encoded per
+        // the SDK constructor source.
         let mut data = 11u32.to_le_bytes().to_vec();
         data.extend_from_slice(&1_000u64.to_le_bytes());
         data.extend_from_slice(&4u64.to_le_bytes());
@@ -1075,8 +1041,7 @@ mod tests {
 
     #[test]
     fn funding_source_found_via_create_with_seed() {
-        // CreateAccountWithSeed (tag 3, [from, new, base]): bincode tag 3
-        // ++ base ++ seed-string ++ lamports ++ space ++ owner.
+        // CreateAccountWithSeed (tag 3, [from, new, base]).
         let mut data = 3u32.to_le_bytes().to_vec();
         data.extend_from_slice(&Pubkey::new_from_array([2; 32]).to_bytes());
         data.extend_from_slice(&4u64.to_le_bytes());
@@ -1104,8 +1069,7 @@ mod tests {
 
     #[test]
     fn funding_source_found_via_ata_creation() {
-        // SPL onboarding: the funder pays rent to create the buyer's ATA
-        // ([payer, ata, owner, mint, system, token-program], data [1]).
+        // SPL onboarding: the funder pays rent to create the buyer's ATA.
         let payer = Pubkey::new_from_array([1; 32]);
         let ata = Pubkey::new_from_array([2; 32]);
         let owner = Pubkey::new_from_array([3; 32]);
@@ -1153,9 +1117,7 @@ mod tests {
 
     #[test]
     fn funding_source_found_in_inner_instruction() {
-        // Multisig/CPI-routed funding executes the system transfer as an
-        // INNER instruction (outer ix belongs to another program): the
-        // traversal must still attribute it.
+        // CPI-routed funding runs the system transfer as an INNER ix.
         let mut data = 2u32.to_le_bytes().to_vec();
         data.extend_from_slice(&500u64.to_le_bytes());
         let inner = UiCompiledInstruction {
@@ -1203,11 +1165,8 @@ mod tests {
         );
     }
 
-    /// Frozen-mainnet v3 replay: pins the v3 layout the whole sniper
-    /// runs on (trader at index 8, amount = first u64 — second u64
-    /// `min_tokens_out` for exact-quote) against real chain fills, so a
-    /// one-byte drift in the TRADE_V3.md table breaks the build instead
-    /// of silently mis-scoring quorum, dev dumps, and monopoly math.
+    /// Frozen-mainnet v3 replay helper: pins the v3 layout (trader at
+    /// index 8, amount = first u64) against real chain fills.
     fn v3_records(raw: &str) -> Vec<SwapRecord> {
         use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
         let fetched: EncodedConfirmedTransactionWithStatusMeta =
@@ -1218,8 +1177,7 @@ mod tests {
     #[test]
     fn replay_buy_v3_mainnet() {
         let records = v3_records(include_str!("../../tests/fixtures/buy_v3_mainnet.json"));
-        // Exactly one real swap; the rest are non-swap pump ixs
-        // (Unknown — never quorum-counted, dev-dump attribution only).
+        // Exactly one real swap; the rest are non-swap pump ixs.
         let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
         assert_eq!(buys.len(), 1, "exactly one v3 buy");
         assert!(records.iter().all(|r| r.side == SwapSide::Buy

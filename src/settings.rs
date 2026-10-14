@@ -1,120 +1,82 @@
-//! Runtime knobs for the paper pipeline, all overridable via env.
-//!
-//! [`Settings::from_env`] reads the process environment;
-//! [`Settings::from_map`] takes an explicit map so unit tests never touch
-//! global env state.
+//! Runtime knobs, all overridable via env.
 
 use risk_engine::StrategyMode;
 use std::collections::HashMap;
 
 /// Runtime knobs, all overridable via env.
-///
-/// Custom [`std::fmt::Debug`] redacts `inference_api_key`: a bearer token
-/// must never appear in logs, even if a future debug-print of the whole
-/// struct slips into an operational log line.
 #[derive(Clone)]
 pub struct Settings {
-    /// WebSocket RPC URL for `logsSubscribe`.
     pub ws_url: String,
-    /// HTTP RPC URL for `getTransaction` and reserve reads.
     pub http_url: String,
-    /// Commitment: `processed` | `confirmed` | `finalized`.
+    /// `processed` | `confirmed` | `finalized`.
     pub commitment: String,
-    /// Virtual starting balance in USD.
+    /// Virtual balance in USD.
     pub start_balance: f64,
-    /// Extra commission per side in basis points (default 0: keep 0
-    /// unless charging on top — the 125bps Pump.fun venue fee already
-    /// lives in the [`FillModel::BondingCurve`] fill price, so any
-    /// `fee_bps > 0` here is commission-only and stacks on the venue fee).
+    /// Extra commission per side in bps (stacks on the venue fee).
     pub fee_bps: f64,
     /// Paper notional per trade in USD.
     pub notional_usd: f64,
-    /// Trailing-stop giveback in percent.
+    /// Trailing giveback in percent.
     pub trail_percent: f64,
-    /// Runner trailing-stop giveback in percent (default 20): moonbag
-    /// runners shake out on normal 5% pullbacks, so the runner trail is
-    /// wide enough to survive volatility on the way to 5x–10x. Used only
-    /// in `runner` mode; must be > 0 to ever fire.
+    /// Runner trail in percent (wide, for 5x–10x runs).
     pub runner_trail_percent: f64,
-    /// Liquidity fallback in USD (used only when the reserve read fails).
+    /// Liquidity fallback in USD (reserve read fails only).
     pub liquidity_usd: f64,
-    /// Entry-gate window in seconds: buyer quorum must arrive in time.
+    /// Entry-gate window in seconds.
     pub gate_window_secs: u64,
-    /// Distinct non-dev buyers required to confirm an entry.
+    /// Buyers needed to confirm.
     pub gate_min_buyers: u32,
-    /// Gate poll interval in milliseconds.
+    /// Gate poll interval in ms.
     pub gate_poll_ms: u64,
-    /// Maximum concurrent paper positions (portfolio heat cap).
+    /// Max paper positions.
     pub max_open_positions: usize,
-    /// Maximum realized day-loss in USD before new entries halt (`0` =
-    /// disabled). UTC-day bucket; exits always keep working. Paper and
-    /// live entries share the gate (live only mirrors paper opens).
+    /// Day-loss cap in USD (`0` = off). Exits always work.
     pub max_daily_loss_usd: f64,
-    /// Per-mint cooldown in seconds after a close (`0` disables).
+    /// Per-mint cooldown after close (`0` = off).
     pub mint_cooldown_secs: u64,
-    /// Minimum dev-wallet age in seconds for the history screen.
+    /// Min dev-wallet age in seconds.
     pub dev_min_age_secs: u64,
-    /// Maximum tolerated prior Pump.fun launches by the dev.
+    /// Max tolerated dev prior launches.
     pub dev_max_prior_launches: usize,
-    /// Recent dev transactions sampled for the launch count.
+    /// Dev txs sampled for the launch count.
     pub dev_screen_sample_txs: usize,
-    /// Manual entry-quote override for tests.
+    /// Manual entry quote (tests).
     pub quote_usd: Option<f64>,
-    /// SOL→USD conversion for curve pricing (retired: feed is dynamic).
-    /// Kept parsed so stale `SOL_USD=...` env lines warn instead of
-    /// silently doing nothing; value is unused.
+    /// Retired `SOL_USD`: parsed to warn, unused.
     pub _sol_usd_retired: f64,
-    /// Bonding-curve poll interval in milliseconds.
+    /// Curve poll interval in ms.
     pub tick_interval_ms: u64,
-    /// Post-migration pool poll interval in milliseconds (separate from
-    /// the curve ticker: pool ticks only feed spike alerts, so they can
-    /// run slower and save RPC budget).
+    /// Pool poll interval in ms.
     pub vault_tick_interval_ms: u64,
-    /// OpenAI-compatible chat-completions endpoint.
+    /// Chat-completions endpoint.
     pub inference_endpoint: String,
-    /// Model identifier for inference requests.
+    /// Model id for inference.
     pub inference_model: String,
-    /// Inference deadline in milliseconds before heuristic fallback.
+    /// Inference deadline in ms.
     pub inference_timeout_ms: u64,
-    /// Optional bearer token for providers that require auth.
+    /// Bearer token, if the provider needs one.
     pub inference_api_key: Option<String>,
-    /// Buy/sell slippage guard in basis points.
+    /// Slippage guard in bps.
     pub slippage_bps: u64,
-    /// Execution strategy: `adaptive` (follow the risk profile), `scalp`
-    /// (TP +25–35%, full exits), or `runner` (TP sells most, rides a
-    /// trailing moonbag). Unknown values fall back to `adaptive` with a
-    /// startup warning.
+    /// `adaptive` | `scalp` | `runner`. Unknown falls back.
     pub strategy_mode: String,
-    /// Runner share kept riding after TP, 0–100 (default 20 = sell 80%).
-    /// Used only in `runner` mode; clamped into range at resolve time.
+    /// Runner share kept after TP, 0–100.
     pub runner_moonbag_percent: f64,
-    /// Compute-unit price in micro-lamports for live transactions (`0` =
-    /// no priority fee; standard `SetComputeUnitPrice` instruction when
-    /// set). Raises landing odds under congestion at a per-tx cost.
+    /// Priority fee price in micro-lamports.
     pub priority_fee_micro_lamports: u64,
-    /// Compute-unit limit for live transactions (`0` = no limit
-    /// instruction; the runtime default applies). Set below the default
-    /// 1.4M only with a simulated margin — too low fails the tx.
+    /// Compute-unit limit (`0` = default).
     pub compute_unit_limit: u32,
-    /// Jito tip budget per bundle in lamports.
+    /// Jito tip per bundle in lamports.
     pub tip_lamports: u64,
-    /// Jito block-engine base URL (global; override per region).
+    /// Jito block-engine URL.
     pub jito_endpoint: String,
-    /// Discord trade alerts via Hermes CLI (needs `hermes` on PATH).
+    /// Discord alerts via Hermes CLI.
     pub discord_alerts: bool,
-    /// Optional Hermes Discord channel ID (numeric snowflake). Empty /
-    /// unset preserves the skill's exact `send --to discord` argv, leaving
-    /// channel routing to the host Hermes configuration. Set to address
-    /// `--to discord:<channel-id>` for a specific channel.
+    /// Hermes channel id. Empty uses host config.
     pub discord_channel: Option<String>,
-    /// Strict preflight for live dispatch (`SIM_STRICT=true`): simulation
-    /// transport/timeout failures reject the bundle instead of proceeding
-    /// unproven. Default off (unknown sim results preserve today's
-    /// warn-and-proceed); enable for live funds.
+    /// Strict preflight: sim failures reject. Use for live.
     pub sim_strict: bool,
-    /// Parse failures seen by [`Settings::from_map`] (raw value → default
-    /// used). Surfaced first by [`Settings::warnings`] so env typos never
-    /// hide silently behind defaults.
+    /// Parse failures seen by `from_map`. Surfaced in `warnings`.
     pub parse_notes: Vec<String>,
 }
 
@@ -166,12 +128,12 @@ impl std::fmt::Debug for Settings {
 }
 
 impl Settings {
-    /// Read knobs from the process environment.
+    /// Read from the process environment.
     pub fn from_env() -> Self {
         Self::from_map(&std::env::vars().collect())
     }
 
-    /// Build knobs from an explicit map (test-friendly, no global state).
+    /// Build from a map (tests avoid global env).
     pub fn from_map(vars: &HashMap<String, String>) -> Self {
         let mut notes = Vec::new();
         Self {
@@ -226,11 +188,7 @@ impl Settings {
         }
     }
 
-    /// Human-readable warnings for suspicious values. Parse failures are
-    /// recorded by `from_map` (see `parse_notes`) and surface first, so
-    /// typos never hide silently behind defaults; `main` prints these at
-    /// startup and refuses zero poll intervals outright. Empty when
-    /// everything looks sane.
+    /// Warnings for bad values. Empty when sane.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.parse_notes.clone();
         if self.slippage_bps > 10_000 {
@@ -357,8 +315,7 @@ fn get_float(
     match vars.get(key) {
         None => default,
         Some(v) => match v.parse::<f64>() {
-            // `nan`/`inf` parse as Ok — a NaN cash ledger or infinite
-            // notional must never boot silently; fall back loudly.
+            // `nan`/`inf` parse Ok — never boot them.
             Ok(x) if x.is_finite() => x,
             _ => {
                 notes.push(format!(
@@ -407,8 +364,7 @@ fn get_bool(
     }
 }
 
-/// Retired static price: returns a positive finite sentinel or 0 when
-/// unset, with a note when a stale env line is ignored.
+/// Retired static price: positive finite or 0 when unset.
 fn parse_retired_sol_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> f64 {
     match vars.get("SOL_USD") {
         None => 0.0,
@@ -431,10 +387,7 @@ fn parse_retired_sol_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>
     }
 }
 
-/// Canonical WebSocket RPC URL: `MAINNET_WSS_RPC_URL` is the only
-/// configured name. A legacy `WS_URL` is still honored once with a loud
-/// retirement note (same grace as `HTTP_URL` → `MAINNET_RPC_URL`).
-/// Unset = public mainnet.
+/// Canonical WebSocket URL. Legacy `WS_URL` honored once with a note.
 fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
     const DEFAULT: &str = "wss://api.mainnet-beta.solana.com";
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
@@ -459,17 +412,11 @@ fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
     }
 }
 
-/// Canonical HTTP RPC URL: `MAINNET_RPC_URL` is the only configured
-/// name. A legacy `HTTP_URL` is still honored once with a loud
-/// retirement note (so a running deployment is never silently dropped
-/// to the rate-limited public endpoint); backslash escapes are stripped
-/// from either (Helius lines arrive escaped through some shells).
-/// Unset = public mainnet.
+/// Canonical HTTP RPC URL. Legacy `HTTP_URL` honored once with a note.
 fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
     const DEFAULT: &str = "https://api.mainnet-beta.solana.com";
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
-    // A present-but-blank value is a typo, not an unset var: say so
-    // instead of silently dropping to the rate-limited public endpoint.
+    // Blank set var is a typo, not unset.
     if vars.contains_key("MAINNET_RPC_URL")
         && vars.get("MAINNET_RPC_URL").is_some_and(|v| clean(v).is_empty())
     {
@@ -491,9 +438,7 @@ fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
     }
 }
 
-/// Manual entry-quote override: only a positive finite price is honored.
-/// Anything else is ignored with a note (a NaN/negative override would
-/// otherwise price paper opens — and live mirrors — at garbage).
+/// Manual entry quote: only positive finite is honored.
 fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Option<f64> {
     let raw = vars.get("QUOTE_USD")?;
     match raw.parse::<f64>() {
@@ -513,12 +458,7 @@ fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> O
     }
 }
 
-/// Local unix seconds; `0` when the clock is unavailable (never panics).
-/// A broken clock corrupts day buckets, gate deadlines, and cooldowns —
-/// warn once (loud on first use, silent after, so a wedged clock cannot
-/// spam every tick). `saturating_sub` everywhere keeps clock-0 (and any
-/// backward step) fail-open, never panicking or underflowing — at worst
-/// timeouts fire immediately and cooldowns look expired.
+/// Unix seconds; `0` when the clock fails (never panics).
 pub fn now_secs() -> u64 {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -648,7 +588,8 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_values_warn() {        let s = Settings::from_map(&vars(&[
+    fn degenerate_values_warn() {
+        let s = Settings::from_map(&vars(&[
             ("GATE_POLL_MS", "0"),
             ("TICK_INTERVAL_MS", "0"),
             ("TRAIL_PERCENT", "0"),

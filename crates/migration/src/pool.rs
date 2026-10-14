@@ -1,21 +1,10 @@
-//! Fresh Raydium AMM V4 pool account parser.
+//! Fresh Raydium AMM V4 pool parser.
 //!
-//! Reads the `LiquidityStateV4` fields a swap needs straight from the
-//! 752-byte account: base/quote mints plus both LP vaults. Offsets below
-//! follow the canonical contiguous 32-byte slots anchored by the
-//! independently verified `quoteMint` memcmp offset 432
-//! (datasize 752, market-program 560, swapQuoteIn 664).
+//! Reads swap fields from the 752-byte account.
+//! Offsets use 32-byte slots from offset 432.
 //!
-//! ORIENTATION (chain-verified 2026-10-11, NOT assumed): Pump.fun
-//! migration pools are WSOL-**based** — slot 400 holds WSOL and slot 432
-//! holds the migrated token. Proven on two independent frozen pools
-//! (`raydium_pool_fartcoin`: the canonical Oct-2024 Fartcoin migration
-//! pool, $8M liquidity; `raydium_pool_mainnet`: a fresh pump-token pool):
-//! in both, the base vault holds WSOL and the quote vault holds the
-//! token (vault mints match the mint slots; Fartcoin vault balances
-//! 37,282 SOL vs 24.9M FART reproduce the market's $8.15M liquidity).
-//! Every trust gate and price formula in this crate follows that
-//! orientation — a WSOL-quoted pool is NOT a Pump migration pool.
+//! Chain-verified: migration pools are WSOL-based.
+//! Slot 400 holds WSOL, slot 432 the token.
 
 use solana_pubkey::Pubkey;
 
@@ -23,57 +12,46 @@ pub use ids::WSOL_MINT;
 
 use crate::detector::MigrationError;
 
-/// Full `LiquidityStateV4` account size in bytes.
+/// Full account size in bytes.
 pub const RAYDIUM_V4_ACCOUNT_SIZE: usize = 752;
-/// Minimum prefix holding every field we read (through `lpMintAddress`).
+/// Min prefix holding every field we read.
 pub const RAYDIUM_V4_MIN_PREFIX: usize = 496;
 
-/// Byte offset of the base-vault address slot.
+/// Base-vault slot.
 pub const OFF_BASE_VAULT: usize = 336;
-/// Byte offset of the quote-vault address slot.
+/// Quote-vault slot.
 pub const OFF_QUOTE_VAULT: usize = 368;
-/// Byte offset of the base-mint address slot (WSOL on migrations).
+/// Base-mint slot (WSOL on migrations).
 pub const OFF_BASE_MINT: usize = 400;
-/// Byte offset of the quote-mint address slot (migrated token).
+/// Quote-mint slot (migrated token).
 pub const OFF_QUOTE_MINT: usize = 432;
-/// Byte offset of the LP-mint address slot.
+/// LP-mint slot.
 pub const OFF_LP_MINT: usize = 464;
 
-/// Compile-time guard: the slot table must fit the account. A
-/// transposed offset constant breaks the build here instead of parsing
-/// garbage on mainnet.
+/// Slot table must fit the account.
 const _: () = assert!(OFF_LP_MINT + 32 <= RAYDIUM_V4_ACCOUNT_SIZE);
 
-/// Fresh Raydium AMM V4 pool, ready for instant swap routing.
-///
-/// Orientation follows the on-chain struct: on Pump.fun migration pools
-/// the BASE side is WSOL and the QUOTE side is the migrated token
-/// (chain-verified, see module docs) — the reverse of the pre-freeze
-/// assumption, which silently rejected every real migration pool.
+/// Fresh Raydium pool, ready for routing.
+/// On migrations BASE is WSOL, QUOTE the token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaydiumV4Pool {
-    /// Pool account address (the AMM ID; caller-supplied, not parsed).
+    /// Pool address (caller-supplied).
     pub amm_id: Pubkey,
-    /// Base (coin) mint — WSOL on Pump.fun migrations.
+    /// Base mint (WSOL on migrations).
     pub base_mint: Pubkey,
-    /// Quote (pc) mint — the migrated token.
+    /// Quote mint (migrated token).
     pub quote_mint: Pubkey,
-    /// Coin-side LP vault (WSOL inventory on migrations).
+    /// Base vault (WSOL inventory).
     pub base_vault: Pubkey,
-    /// Pc-side LP vault (token inventory on migrations).
+    /// Quote vault (token inventory).
     pub quote_vault: Pubkey,
-    /// LP mint for pool-share accounting.
+    /// LP mint.
     pub lp_mint: Pubkey,
 }
 
 impl RaydiumV4Pool {
-    /// Parse the address slots from raw account data. Bounds-checked;
-    /// never panics. Accepts any buffer holding at least the 496-byte
-    /// prefix so forward-compatible account growth still parses.
-    ///
-    /// UNTRUSTED: the returned addresses are just slot reads — they say
-    /// nothing about ownership or mints. Never route at this output
-    /// without [`Self::validate`] (or use [`Self::parse_validated`).
+    /// Parse address slots. Never panics.
+    /// Slot reads only. Call [`Self::validate`] before routing.
     pub fn parse(amm_id: &Pubkey, data: &[u8]) -> Result<Self, MigrationError> {
         if data.len() < RAYDIUM_V4_MIN_PREFIX {
             return Err(MigrationError::DataTooShort(data.len()));
@@ -93,15 +71,12 @@ impl RaydiumV4Pool {
         })
     }
 
-    /// True when the base side is WSOL (standard Pump.fun migration).
+    /// True when base is WSOL.
     pub fn is_wsol_based(&self) -> bool {
         self.base_mint == WSOL_MINT
     }
 
-    /// Trust gate for freshly resolved pools: the account must be owned
-    /// by the Raydium program (kills garbage/misparsed addresses), the
-    /// base side must be WSOL, and the quote must be the expected
-    /// migrated mint. Pure; call before routing anything at a parsed pool.
+    /// Trust gate: owner, WSOL base, expected quote.
     pub fn validate(pool: &RaydiumV4Pool, owner: &Pubkey, expected_token_mint: &Pubkey) -> bool {
         use crate::detector::RAYDIUM_V4_PROGRAM_ID;
         *owner == RAYDIUM_V4_PROGRAM_ID
@@ -109,10 +84,7 @@ impl RaydiumV4Pool {
             && pool.quote_mint == *expected_token_mint
     }
 
-    /// Parse plus trust gate in one step: `None` when the buffer is
-    /// short, the owner is not the Raydium program, the base is not
-    /// WSOL, or the quote mint is unexpected. Prefer this over
-    /// `parse` + manual `validate` at every new call site.
+    /// Parse plus trust gate (`None` on failure).
     pub fn parse_validated(
         amm_id: &Pubkey,
         data: &[u8],
@@ -139,7 +111,7 @@ mod tests {
         fill(&mut data, OFF_QUOTE_VAULT, 12);
         fill(&mut data, OFF_BASE_MINT, 13);
         fill(&mut data, OFF_QUOTE_MINT, 14);
-        // Leave lp mint distinct from fixtures above.
+        // Leave lp mint distinct.
         fill(&mut data, OFF_LP_MINT, 15);
         data
     }
@@ -158,10 +130,8 @@ mod tests {
 
     #[test]
     fn slots_match_documented_table() {
-        // The five 32-byte slots are contiguous in documented order: a
-        // transposed offset constant breaks this before it breaks parsing.
-        // Chain-pinned by `parses_frozen_mainnet_pools` below (two real
-        // 752-byte accounts), not just by this self-consistency check.
+        // Contiguous 32-byte slots in documented order; chain-pinned by
+        // `parses_frozen_mainnet_pools` below, not just this check.
         assert_eq!(OFF_BASE_VAULT + 32, OFF_QUOTE_VAULT);
         assert_eq!(OFF_QUOTE_VAULT + 32, OFF_BASE_MINT);
         assert_eq!(OFF_BASE_MINT + 32, OFF_QUOTE_MINT);
@@ -211,7 +181,7 @@ mod tests {
             &RAYDIUM_V4_PROGRAM_ID,
             &token
         ));
-        // Wrong owner (spoofed/garbage account).
+        // Wrong owner.
         assert!(!RaydiumV4Pool::validate(&pool, &token, &token));
         // Wrong token mint.
         assert!(!RaydiumV4Pool::validate(
@@ -229,8 +199,7 @@ mod tests {
     }
 
     /// Frozen pool fixture shape: `{amm, owner, data: [u8; 752]}`.
-    /// Unknown names panic: silently mapping a typo to the wrong pool
-    /// would green-light a test against unintended bytes.
+    /// Unknown names panic (never map a typo to the wrong pool).
     fn frozen_pool(name: &str) -> (Pubkey, Pubkey, Vec<u8>) {
         let raw = match name {
             "fartcoin" => include_str!("../tests/fixtures/raydium_pool_fartcoin.json"),
@@ -253,11 +222,8 @@ mod tests {
 
     #[test]
     fn parses_frozen_fartcoin_migration_pool() {
-        // Canonical Oct-2024 Fartcoin migration pool ($8M liquidity):
-        // 752 bytes, Raydium-owned, WSOL at BASE, Fartcoin at QUOTE.
-        // Off-test cross-checks: both vaults' mints match the mint slots,
-        // and the vault balances (37,282 SOL vs 24.9M FART) reproduce the
-        // market's quoted liquidity.
+        // Frozen Oct-2024 Fartcoin migration pool: 752 bytes,
+        // Raydium-owned, WSOL at BASE, Fartcoin at QUOTE.
         use crate::detector::RAYDIUM_V4_PROGRAM_ID;
         use std::str::FromStr;
         let (amm, owner, data) = frozen_pool("fartcoin");
@@ -295,8 +261,7 @@ mod tests {
 
     #[test]
     fn parses_frozen_pump_token_pool() {
-        // Second independent pool (fresh pump token): same WSOL-based
-        // orientation — the orientation is systematic, not a one-off.
+        // Second frozen pool: same WSOL-based orientation.
         use crate::detector::RAYDIUM_V4_PROGRAM_ID;
         use std::str::FromStr;
         let (amm, owner, data) = frozen_pool("mainnet");

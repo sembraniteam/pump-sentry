@@ -1,8 +1,5 @@
-//! Adaptive TP/SL risk engine (see skill `adaptive-risk-prompting`).
-//!
-//! [`RiskEngine::evaluate`] tries LLM inference first and drops to the
-//! deterministic [`evaluate_heuristic_fallback`] when inference exceeds
-//! 300ms, errors, or returns out-of-schema JSON.
+//! Adaptive TP/SL risk engine: LLM inference first, heuristic fallback
+//! when inference exceeds 300ms, errors, or returns out-of-schema JSON.
 
 pub mod engine;
 pub mod fallback;

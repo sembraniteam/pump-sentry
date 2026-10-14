@@ -1,14 +1,14 @@
 use super::*;
 
-/// Gate outcome for one observation round.
+/// Gate outcome for one round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateOutcome {
-    /// Quorum reached: open with this distinct-buyer count as velocity.
+    /// Quorum reached. Count is distinct buyers.
     Confirm {
         /// Distinct non-dev buyers observed.
         buyers: u32,
     },
-    /// Never open: dev dump, timeout, or (via sweep) stale entry.
+    /// Never open: dev dump, timeout, or stale entry.
     Abort {
         /// Human-readable cause for logs.
         reason: String,
@@ -20,25 +20,16 @@ pub enum GateOutcome {
 /// Pending watchlist entry.
 #[derive(Debug)]
 struct PendingGate {
-    /// Watched insider wallets: the launcher plus, on v2 launches, the
-    /// distinct creator (see [`EntryGate::add_cohort`]). Buys from any of
-    /// these never count toward quorum; sells/unknowns from any abort.
-    /// Bounded ([`MAX_COHORT_WALLETS`]) so entries stay small.
+    /// Watched insiders (launcher plus v2 creator). Bounded.
+    /// Their buys never count. Their sells or unknowns abort.
     devs: Vec<Pubkey>,
     deadline_secs: u64,
     buyers: HashSet<Pubkey>,
-    /// First-submit time: caps relaunch refreshes so spam cannot extend
-    /// the window forever (see [`EntryGate::submit`]).
+    /// First-submit time. Caps relaunch refresh.
     created_secs: u64,
 }
 
-/// Time-windowed buyer-quorum state machine. Pure except for the clock
-/// the caller passes in — fully unit-testable.
-///
-/// Deadlines are caller wall-clock (`unix_now` at the call sites): an NTP
-/// backward jump can only expire entries early (fail-closed abort, never
-/// a false confirm); forward jumps stretch the window, capped at
-/// `created + 3×window` per entry plus the map cap below.
+/// Buyer-quorum state machine. Pure except for the caller clock.
 #[derive(Debug, Default)]
 pub struct EntryGate {
     window_secs: u64,
@@ -46,18 +37,14 @@ pub struct EntryGate {
     pending: HashMap<String, PendingGate>,
 }
 
-/// Watchlist cap: mint spam must not grow memory without bound when
-/// timeout sweeps stall. The entry with the nearest deadline is evicted
-/// (loudly) to make room.
+/// Watchlist cap. Evicts nearest deadline when full.
 pub const MAX_PENDING_ENTRIES: usize = 10_000;
 
-/// Cohort cap per watchlist entry: launcher + creator fit with margin;
-/// more wallets cannot join one entry (each is a distinct insider to
-/// watch, not a quorum voter).
+/// Cohort cap per entry.
 pub const MAX_COHORT_WALLETS: usize = 4;
 
 impl EntryGate {
-    /// New gate: entries get `window_secs` to gather `min_buyers`.
+    /// New gate. Entries get `window_secs` to gather buyers.
     pub fn new(window_secs: u64, min_buyers: u32) -> Self {
         Self {
             window_secs,
@@ -76,14 +63,10 @@ impl EntryGate {
         self.pending.contains_key(mint)
     }
 
-    /// Submit a fresh signal (idempotent per mint). Returns false when
-    /// the dev address is unparsable (fail-closed: caller must skip).
+    /// Submit a signal (idempotent per mint). False on bad dev address.
     ///
-    /// Relaunch refreshes the window but buyers carry over (demand already
-    /// observed stays valid). The refresh is capped at `created + 3×window`
-    /// so a spammed relaunch cannot extend the watchlist entry forever.
-    /// A relaunch resets the insider cohort to the new dev alone — use
-    /// [`EntryGate::add_cohort`] after each submit for v2 creators.
+    /// Relaunch refreshes the window but keeps buyers.
+    /// Refresh caps at `created + 3xwindow`.
     pub fn submit(&mut self, mint: &str, dev: &str, now_secs: u64) -> bool {
         let Ok(dev) = Pubkey::from_str(dev) else {
             return false;
@@ -120,11 +103,7 @@ impl EntryGate {
         true
     }
 
-    /// Watch one more insider wallet on an existing entry (v2 creator
-    /// cohort). Returns false when the wallet is unparsable, the entry
-    /// is missing, already listed, or the cohort is full — fail-closed:
-    /// the caller must drop the signal rather than watch half the
-    /// insiders. Never resets deadlines or buyers.
+    /// Watch one more insider (v2 creator). False when bad or full.
     pub fn add_cohort(&mut self, mint: &str, wallet: &str) -> bool {
         let Ok(wallet) = Pubkey::from_str(wallet) else {
             return false;
@@ -139,21 +118,13 @@ impl EntryGate {
         true
     }
 
-    /// Abandon a watchlist entry without an outcome (fail-closed unwind
-    /// when post-submit setup cannot complete). True when an entry was
-    /// removed.
+    /// Drop an entry. True when removed.
     pub fn remove(&mut self, mint: &str) -> bool {
         self.pending.remove(mint).is_some()
     }
 
-    /// Fold one observation round into the entry. Removes the entry on
-    /// terminal outcomes. Unknown mints report [`GateOutcome::Wait`].
-    ///
-    /// Best-effort dev-dump detection: a `Sell` (any `SwapSide::Sell` —
-    /// legacy/v2/v3, all layout-verified) authored by any watched
-    /// insider wallet (launcher cohort) aborts here. Dumps routed through
-    /// transfers or funded sybils do not abort on their own — cluster
-    /// forensics in [`BundleDetector`] covers coordinated funding instead.
+    /// Fold one round into the entry. Removes entry when terminal.
+    /// Unknown mints report Wait.
     pub fn observe(&mut self, mint: &str, swaps: &[SwapRecord], now_secs: u64) -> GateOutcome {
         let Some(entry) = self.pending.get_mut(mint) else {
             return GateOutcome::Wait;
@@ -173,10 +144,8 @@ impl EntryGate {
                     }
                 }
                 SwapSide::Unknown => {
-                    // Fail closed on the residual blindness: an unmapped
-                    // pump ix naming a watched insider smells like a dump
-                    // through a layout we cannot parse yet. Stranger
-                    // unknowns never count toward quorum and never abort.
+                    // Unmapped ix from a watched wallet may be a dump.
+                    // Strangers never abort.
                     if entry.devs.contains(&swap.wallet) {
                         let reason = format!(
                             "possible dev dump via unknown pump ix by {} in {}",
@@ -203,7 +172,7 @@ impl EntryGate {
         GateOutcome::Wait
     }
 
-    /// Abort every entry past its deadline. Returns `(mint, outcome)` pairs.
+    /// Abort every entry past deadline.
     pub fn sweep_timeouts(&mut self, now_secs: u64) -> Vec<(String, GateOutcome)> {
         let stale: Vec<String> = self
             .pending
@@ -230,24 +199,17 @@ impl EntryGate {
     }
 }
 
-/// Developer history policy.
-///
-/// Coverage limitation (by design, RPC-bounded): wallet age is measured
-/// over the full `sig_limit` signature window, but the prior-launch
-/// count is sampled from only the newest `sample_txs` transactions.
-/// A serial launcher whose launches sit deeper than `sample_txs` in an
-/// otherwise old wallet passes the count — the age gate, audit score,
-/// quorum, and bundle forensics downstream still apply. Raising
-/// `sample_txs` widens coverage at direct RPC cost.
+/// Dev history policy.
+/// Age covers the full window. Launches sample the newest `sample_txs`.
 #[derive(Debug, Clone)]
 pub struct DevScreenConfig {
-    /// Minimum wallet age in seconds (default 3600: reject fresh wallets).
+    /// Min wallet age in seconds.
     pub min_age_secs: u64,
-    /// Maximum tolerated prior Pump.fun launches (default 1).
+    /// Max past launches allowed.
     pub max_prior_launches: usize,
-    /// Recent transactions sampled for the launch count (default 20).
+    /// Txs sampled for the launch count.
     pub sample_txs: usize,
-    /// Signature window fetched per wallet (default 100).
+    /// Signature window fetched per wallet.
     pub sig_limit: usize,
 }
 
@@ -265,18 +227,17 @@ impl Default for DevScreenConfig {
 /// Screening verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevVerdict {
-    /// True when the wallet may be trusted with a position.
+    /// True when the wallet can hold a position.
     pub pass: bool,
-    /// Wallet age in seconds (`None` = no history at all).
+    /// Wallet age (`None` means no history).
     pub age_secs: Option<u64>,
-    /// Pump.fun launches authored in the sampled window.
+    /// Launches seen in the sampled window.
     pub prior_launches: usize,
     /// Human-readable cause for logs.
     pub reason: String,
 }
 
-/// Pure policy over measured history. `age_secs=None` always fails
-/// (fail-closed: no history, no trust).
+/// Policy over measured history. No history fails.
 pub fn judge_developer(
     age_secs: Option<u64>,
     prior_launches: usize,
@@ -317,5 +278,5 @@ pub fn judge_developer(
     }
 }
 
-/// Poll interval floor for gate rounds (not a tight loop: RPC budget).
+/// Gate poll floor (saves RPC budget).
 pub const GATE_POLL_INTERVAL: Duration = Duration::from_millis(2000);

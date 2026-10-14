@@ -1,14 +1,7 @@
-//! WebSocket event stream: `logsSubscribe` → `getTransaction` → parse → channel.
+//! WebSocket stream: logs to parse to channel.
 //!
-//! Design notes (async hygiene):
-//! - The socket read loop never awaits a full RPC round-trip inline. Each
-//!   candidate signature is handed to a bounded-concurrency `tokio::spawn`
-//!   worker that performs `getTransaction`, parsing, and `try_send`.
-//! - The downstream queue is `tokio::sync::mpsc::channel(10_000)`.
-//!   `TrySendError::Full` drops the event and bumps `dropped_full` — the
-//!   read loop never blocks.
-//! - Reconnects use exponential backoff (100ms base, 5s cap) with jitter.
-//! - No `.unwrap()` / `.expect()` / unchecked indexing anywhere.
+//! Socket loop never waits on RPC. Workers are bounded.
+//! Queue is drop-on-full. Reconnects use capped backoff.
 
 use crate::parser::{
     PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR, decode_ix_data, is_pump_create_ix,
@@ -38,38 +31,27 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-/// Upper bound on concurrent `getTransaction` workers.
+/// Max parallel `getTransaction` workers.
 const MAX_CONCURRENT_FETCHES: usize = 32;
 
-/// Backfill page: signatures pulled per reconnect to cover the socket
-/// gap (newest-first from RPC, replayed oldest-first).
+/// Backfill page per reconnect (newest-first, replayed oldest-first).
 const BACKFILL_SIG_LIMIT: usize = 100;
 
-/// Seen-signature memory cap. Past it an arbitrary half is evicted (a
-/// duplicate across the eviction re-emits: the gate re-submits, capped
-/// at `created + 3×window`, and confirm guards absorb it).
+/// Seen-signature cap. Past it, half is evicted.
 const SEEN_SIG_CAP: usize = 4_000;
 
-/// Deadline for the WebSocket handshake (`connect` + `logs_subscribe`):
-/// a hung handshake must trip the reconnect loop (with backoff) instead
-/// of stalling it forever with no metric and no retry.
+/// Handshake deadline. A hung handshake must reconnect, not stall.
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Anchor log markers emitted for launch instructions (matched
-/// case-insensitively at the call site). Both versions are listed
-/// explicitly: v2 matching used to ride on the v1 prefix
-/// (`"instruction: createv2".contains("instruction: create")`), which is
-/// correct but implicit — a program-side log rename would silently drop
-/// one version.
+/// Launch log markers (matched case-insensitively).
 const CREATE_LOG_MARKERS: [&str; 2] = ["instruction: create", "instruction: createv2"];
 
-/// True when any program log line announces a launch (v1 or v2).
-/// Pure; the read loop lowercases once per line before calling.
+/// True when a log line announces a launch (v1 or v2).
 fn is_launch_log(line: &str) -> bool {
     CREATE_LOG_MARKERS.iter().any(|m| line.contains(m))
 }
 
-/// Typed listener errors — everything maps here, never panics.
+/// Listener errors. Everything maps here.
 #[derive(Error, Debug)]
 pub enum ListenerError {
     /// Listener configuration is invalid.
@@ -105,12 +87,7 @@ pub enum ListenerError {
     Terminated(String),
 }
 
-/// Exponential backoff with jitter.
-///
-/// Base 100ms, doubles per attempt, capped at 5s. The jitter mixes a
-/// per-process counter into the time-derived nanos: pure `subsec_nanos`
-/// correlates across rapid successive calls (same nanosecond bucket),
-/// stacking retries from one burst back onto the same instant.
+/// Backoff with jitter: 100ms base, doubles, caps at 5s.
 pub fn backoff_duration(attempt: u32) -> Duration {
     let exp_ms = 100u64.saturating_mul(1u64 << attempt.min(6)).min(5_000);
     let total = exp_ms.saturating_add(jitter_ms(100)).min(5_000);
@@ -129,8 +106,7 @@ fn jitter_ms(max: u64) -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()))
         .unwrap_or(0);
-    // Golden-ratio stride spreads consecutive calls across the window
-    // even when the clock hasn't advanced between them.
+    // Spread calls across the window when the clock is stuck.
     nanos
         .wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15))
         % max
@@ -140,12 +116,12 @@ fn jitter_ms(max: u64) -> u64 {
 pub struct PumpFunListener {
     config: ListenerConfig,
     stats: Arc<ListenerStats>,
-    /// Recently seen signatures (dedup for gap backfill; bounded).
+    /// Recently seen signatures (bounded dedup).
     seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl PumpFunListener {
-    /// Build a listener from config (validates URLs + commitment eagerly).
+    /// Build from config (checks URLs and commitment).
     pub fn new(config: ListenerConfig) -> Result<Self, ListenerError> {
         config
             .validate()
@@ -162,10 +138,7 @@ impl PumpFunListener {
         Arc::clone(&self.stats)
     }
 
-    /// Record a signature as seen (bounded dedup memory). Past the cap,
-    /// evict an arbitrary half instead of clearing wholesale: a full
-    /// clear re-emits every in-flight signature at once (refreshing gate
-    /// deadlines), while a half keeps most of the dedup working.
+    /// Mark a signature seen (bounded memory).
     fn mark_seen(&self, sig: &str) {
         match self.seen.lock() {
             Ok(mut guard) => {
@@ -183,12 +156,8 @@ impl PumpFunListener {
         }
     }
 
-    /// Gap backfill after a reconnect: pull the latest program
-    /// signatures and replay any the socket never delivered, oldest
-    /// first through the same bounded workers. Best-effort and
-    /// deadline-bound — a failed backfill warns and the live loop
-    /// continues (a gap is a miss, never a stall). Skipped on first
-    /// boot (live-only start preserves current boot semantics).
+    /// Gap backfill after reconnect. Best-effort and bounded.
+    /// Skipped on first boot.
     async fn backfill_gap(
         &self,
         tx: &mpsc::Sender<ListenerEvent>,
@@ -227,7 +196,7 @@ impl PumpFunListener {
                 return;
             }
         };
-        // Oldest first: quorum order should follow chain order.
+        // Oldest first: quorum follows chain order.
         let mut missed = 0u32;
         for info in sigs.iter().rev() {
             if info.err.is_some() {
@@ -267,16 +236,12 @@ impl PumpFunListener {
         }
     }
 
-    /// Run the reconnect loop forever, emitting events into `tx`.
-    ///
-    /// Uses a bounded `mpsc::Sender` (capacity 10_000 expected). Drops on
-    /// full with metric accounting; never blocks the socket loop.
+    /// Run the reconnect loop. Drop-on-full channel.
     pub async fn run(self, tx: mpsc::Sender<ListenerEvent>) -> Result<(), ListenerError> {
         let rpc = Arc::new(RpcClient::new(self.config.http_url.clone()));
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
         let mut attempt: u32 = 0;
-        // First session starts live-only (current boot semantics); every
-        // later session backfills the gap the dead socket missed.
+        // First session starts live-only; later sessions backfill the gap.
         let mut first_session = true;
 
         loop {
@@ -295,9 +260,7 @@ impl PumpFunListener {
             let seen_before = self.stats.logs_seen();
             let session_start = std::time::Instant::now();
             let outcome = self.run_once(&tx, &rpc, &semaphore).await;
-            // A long healthy session resets the backoff: without this, one
-            // old outage keeps every later blip sleeping at the ~5s cap and
-            // the listener bleeds launches it should catch instantly.
+            // Long healthy sessions reset backoff.
             let healthy = self.stats.logs_seen().saturating_sub(seen_before) > 1000
                 || session_start.elapsed() > std::time::Duration::from_secs(30);
             match outcome {
@@ -316,7 +279,7 @@ impl PumpFunListener {
         }
     }
 
-    /// Single subscription session; returns when the socket stream ends.
+    /// One subscription session. Returns when the stream ends.
     async fn run_once(
         &self,
         tx: &mpsc::Sender<ListenerEvent>,
@@ -367,8 +330,7 @@ impl PumpFunListener {
         );
 
         while let Some(response) = sub.next().await {
-            // Downstream may drop mid-session: stop spawning workers for
-            // a dead channel instead of fetching until the socket ends.
+            // Stop spawning workers for a dead channel.
             if tx.is_closed() {
                 info!("downstream closed mid-session; ending subscription");
                 break;
@@ -378,11 +340,10 @@ impl PumpFunListener {
             let slot_hint = response.context.slot;
             self.mark_seen(&sig_str);
 
-            // Only successful transactions are interesting.
             if response.value.err.is_some() {
                 continue;
             }
-            // Anchor emits `Instruction: Create` in program logs for `create`.
+            // Anchor logs `Instruction: Create` for launches.
             let has_create = response
                 .value
                 .logs
@@ -393,18 +354,14 @@ impl PumpFunListener {
             }
             self.stats.inc_candidates();
 
-            // Hand the RPC round-trip to a worker; never block the read loop.
-            // Concurrency is bounded INSIDE the worker (per-attempt fetch
-            // permits): workers that find no permit exit immediately, and
-            // backoff sleeps never pin a permit.
+            // Workers do the RPC. Never block the read loop.
             let tx_clone = tx.clone();
             let rpc_clone = Arc::clone(rpc);
             let stats_clone = Arc::clone(&self.stats);
             let sem_clone = Arc::clone(semaphore);
             let seen_clone = Arc::clone(&self.seen);
             let Some(commitment) = self.config.commitment_config() else {
-                // Validated at subscribe(); unreachable in practice, but
-                // never coerce silently.
+                // Validated at subscribe(); never coerce silently.
                 debug!(signature = %sig_str, "unknown commitment; dropping candidate");
                 continue;
             };
@@ -425,11 +382,7 @@ impl PumpFunListener {
         Ok(())
     }
 
-    /// Spawn a listener and return the bounded receiver + stats + task handle.
-    ///
-    /// Channel capacity is [`EVENT_CHANNEL_CAPACITY`] (10_000) with
-    /// drop-on-full semantics. (A capacity parameter would be YAGNI:
-    /// the single production caller always uses the constant.)
+    /// Spawn a listener. Returns receiver, stats, and task handle.
     pub async fn subscribe(
         config: ListenerConfig,
     ) -> Result<
@@ -453,15 +406,8 @@ impl PumpFunListener {
     }
 }
 
-/// Fetch one transaction with retries for transient failures.
-/// Permits are held only across live RPCs, never across the backoff
-/// sleeps: each attempt runs under a fresh permit (giving up with a
-/// metric when saturated). Tiers: 250ms retry for any transient error,
-/// plus a 1s third attempt for `429` alone (the fast retry usually lands
-/// inside the same limit window).
-/// Returns `None` on any terminal outcome (metrics recorded inside).
-/// Deterministic errors (unknown transaction, bad params, rejected
-/// encoding) return immediately without burning an extra RPC.
+/// Fetch one tx with retries. Permits cover live RPCs only.
+/// Third attempt (1s) is for `429` alone. `None` when terminal.
 async fn fetch_tx_permit_bound(
     rpc: &RpcClient,
     signature: &Signature,
@@ -475,9 +421,7 @@ async fn fetch_tx_permit_bound(
             Ok(permit) => Some(permit),
             Err(_) => {
                 stats.inc_dropped_throttled();
-                // Warn, not debug: sustained throttling is a systemic
-                // miss-trade signal during Pump.fun bursts (fail-closed
-                // for funds, but the sniper is blind while this fires).
+                // Sustained throttling blinds the sniper during bursts.
                 warn!(signature = %sig_str, why, "fetch saturated; dropping candidate");
                 None
             }
@@ -493,12 +437,7 @@ async fn fetch_tx_permit_bound(
             let _permit = acquire("retry")?;
             match rpc.get_transaction_with_config(signature, tx_config).await {
                 Ok(v) => Some(v),
-                // Rate limits get one last, longer tier: the 250ms retry
-                // usually lands inside the same window, while a ~1s pause
-                // often clears it. Jittered (RPC hides Retry-After, so a
-                // fixed delay would re-collide with other clients'
-                // retries). Other transients stop here (two RPCs per
-                // candidate is the quota budget).
+                // `429` gets one longer retry: 250ms often lands in-window.
                 Err(e) if is_rate_limited(&e) => {
                     let jitter = jitter_ms(500);
                     tokio::time::sleep(std::time::Duration::from_millis(1000 + jitter)).await;
@@ -527,14 +466,7 @@ async fn fetch_tx_permit_bound(
     }
 }
 
-/// True for rate-limit rejections specifically (`429`): worth a longer
-/// second backoff tier, since the first 250ms retry usually lands inside
-/// the same limit window.
-///
-/// Covers both surfaces: JSON-RPC `429` (`RpcError::RpcResponseError`)
-/// and HTTP-level `429` from provider proxies (Helius/QuickNode), which
-/// `HttpSender` surfaces as `ClientErrorKind::Reqwest` with
-/// `status() == 429` after its own 5 internal retries are exhausted.
+/// True for rate limits (`429`). Worth a longer backoff.
 fn is_rate_limited(e: &ClientError) -> bool {    use solana_client::client_error::ClientErrorKind;
     match e.kind() {
         ClientErrorKind::RpcError(solana_client::rpc_request::RpcError::RpcResponseError {
@@ -546,14 +478,8 @@ fn is_rate_limited(e: &ClientError) -> bool {    use solana_client::client_error
     }
 }
 
-/// True for failures worth one retry: transport-level trouble plus
-/// node-overload/availability RPC codes — NOT deterministic rejections.
-/// Retried: I/O errors, reqwest timeouts/connects, and JSON-RPC
-/// `-32005` (node behind/unhealthy), `-32007`/`-32009` (skipped or
-/// missing slots), `429` (rate-limited). Returned at once: unknown
-/// transaction, bad params (`-32602`), unsupported tx version
-/// (`-32015`), decode/body failures, signing/transaction errors.
-/// Mirrors the auditor's transient classification.
+/// True for failures worth one retry.
+/// Retried: I/O, timeouts, connects, `-32005`, `-32007`, `-32009`, `429`.
 fn is_transient_fetch_error(e: &ClientError) -> bool {
     use solana_client::client_error::ClientErrorKind;
     match e.kind() {
@@ -574,17 +500,9 @@ fn is_transient_fetch_error(e: &ClientError) -> bool {
     }
 }
 
-/// Fetch one transaction and emit every `create` event found in it.
-///
-/// Runs inside a spawned worker (not the socket read loop). Never panics;
-/// all failures are counted and logged. Fetch permits are acquired per
-/// attempt and released across the backoff sleep: a sleeping worker must
-/// not pin one of the 32 fetch slots.
-///
-/// `seen` is the dedup set: fetch failures (transient RPC trouble, and
-/// drop-on-full downstream) UNMARK the signature so a later gap-backfill
-/// can retry it. Deterministic failures (bad signature, undecodable
-/// transaction) stay marked — retrying identical bytes is pointless.
+/// Fetch one tx and emit every `create` found. Runs in a worker.
+/// Fetch failures and full-channel drops unmark the sig for backfill.
+/// Bad bytes stay marked: retrying them is useless.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_and_emit(
     sig_str: &str,
@@ -613,16 +531,10 @@ async fn fetch_and_emit(
         }
     };
 
-    // Shared JSON fetch shape (`screen::json_tx_config`): structured
-    // `accountKeys` / compiled-instruction form the parser expects.
-    // Binary payloads are rejected below (`UnsupportedEncoding`) — a
-    // node forcing binary drops launches. See the version-envelope
-    // notes on `json_tx_config` (v1 required; v2 fails loud).
+    // Shared JSON fetch shape. Binary payloads rejected below.
     let tx_config = crate::screen::json_tx_config(commitment);
 
-    // Whole fetch is deadline-bound (one throttled/overloaded retry, then
-    // give up: a missed launch beats a wedged worker) so hung RPCs cannot
-    // hold semaphore permits forever.
+    // Hung RPCs can't hold permits forever.
     let fetched = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         fetch_tx_permit_bound(rpc, &signature, tx_config, sem, stats, sig_str),
@@ -662,10 +574,8 @@ async fn fetch_and_emit(
     }
 }
 
-/// Extract all Pump.fun `create` events from a fetched transaction.
-///
-/// Handles both structured-JSON transactions and raw binary (`Base64`)
-/// payloads when present. Never panics; index access is bounds-checked.
+/// Extract all `create` events from a fetched tx.
+/// Covers top-level and inner ixs.
 fn extract_events(
     fetched: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
     sig_str: &str,
@@ -673,8 +583,7 @@ fn extract_events(
     stats: &Arc<ListenerStats>,
 ) -> Vec<crate::parser::PumpTokenLaunchEvent> {
     let mut out = Vec::new();
-    // Prefer the on-chain slot; fall back to the log-context slot when the
-    // fetch reports slot 0 (downstream bundle rules key on slots).
+    // Chain slot wins. Falls back to log slot on 0.
     let slot = if fetched.slot == 0 { slot_hint } else { fetched.slot };
 
     let (_account_keys, top_ixs, inner_ixs) = match build_ix_lists(fetched) {
@@ -688,9 +597,7 @@ fn extract_events(
         }
     };
 
-    // Top-level and inner instructions share one create-classification
-    // path (a `sell_v2` fix in one place must not be forgotten in the
-    // other): decode, then parse v2-or-v1, counting outcomes identically.
+    // Top and inner ixs share one path.
     for (program_id, accounts, data_b58) in top_ixs {
         if program_id != PUMP_PROGRAM_ID {
             continue;
@@ -715,8 +622,7 @@ fn extract_events(
         }
     }
 
-    // Inner instructions: `data` may be base58 or base64 — decoded
-    // through the same shared helper as top-level.
+    // Inner instructions decode through the same shared helper.
     for (program_id, accounts, data_str) in inner_ixs {
         if program_id != PUMP_PROGRAM_ID {
             continue;
@@ -741,16 +647,12 @@ fn extract_events(
         }
     }
 
-    // Slot observability for the fallback above.
+    // Slot observability for the fallback.
     debug!(signature = %sig_str, slot, slot_hint, "extracted events");
-
     out
 }
 
-/// Classify one decoded Pump.fun instruction as a launch event:
-/// `Some` on `create`/`create_v2`, `None` on other discriminators,
-/// `Err` on malformed create payloads. Single home for the v2→v1
-/// branching used by top-level and inner loops alike.
+/// Classify one decoded ix: `Some` on launch, `None` on other ixs.
 fn parse_create_event(
     raw: &[u8],
     accounts: &[Pubkey],
@@ -766,10 +668,10 @@ fn parse_create_event(
     }
 }
 
-/// Decoded instruction view: (program_id, resolved accounts, raw data string).
+/// Decoded ix: (program, accounts, raw data).
 type DecodedIx = (Pubkey, Vec<Pubkey>, String);
 
-/// Build (account_keys, top-level ixs, inner ixs) from a fetched transaction.
+/// Build (keys, top ixs, inner ixs) from a fetched tx.
 #[allow(clippy::type_complexity)]
 fn build_ix_lists(
     fetched: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
@@ -808,8 +710,6 @@ fn build_ix_lists(
             }
             Ok((account_keys, top, inner))
         }
-        // Binary payloads (Base58/Base64/legacy): decode the versioned
-        // transaction in place and resolve program ids the same way.
         EncodedTransaction::LegacyBinary(_) | EncodedTransaction::Binary(_, _) => {
             Err(ListenerError::UnsupportedEncoding)
         }
@@ -817,8 +717,7 @@ fn build_ix_lists(
     }
 }
 
-/// Resolve the full account-key list: static keys + loaded addresses
-/// (writable first, then readonly), all bounds-checked.
+/// Resolve full key list: static keys plus loaded addresses.
 fn resolve_account_keys(
     ui_tx: &solana_transaction_status::UiTransaction,
     meta: &Option<solana_transaction_status::UiTransactionStatusMeta>,
@@ -866,10 +765,7 @@ fn append_loaded(keys: &mut Vec<Pubkey>, extra: &[String]) -> Result<(), Listene
     Ok(())
 }
 
-/// Resolve one compiled instruction to (program_id, accounts, data string).
-/// Out-of-bounds indexes (malformed RPC payloads) log at debug and skip —
-/// callers must never mistake a truncated instruction for an absent one
-/// in silence.
+/// Resolve one compiled ix. Bad indexes skip at debug.
 fn decode_compiled_ix(cix: &UiCompiledInstruction, account_keys: &[Pubkey]) -> Option<DecodedIx> {
     let program_id = match account_keys.get(usize::from(cix.program_id_index)) {
         Some(p) => *p,
@@ -891,8 +787,7 @@ fn decode_compiled_ix(cix: &UiCompiledInstruction, account_keys: &[Pubkey]) -> O
     Some((program_id, accounts, cix.data.clone()))
 }
 
-/// Resolve one `UiInstruction` (inner) — only compiled form carries raw data.
-/// Parsed-form instructions are skipped with a trace (no data to decode).
+/// Resolve one inner ix. Only compiled form has raw data.
 fn decode_ui_ix(cix: &UiInstruction, account_keys: &[Pubkey]) -> Option<DecodedIx> {
     match cix {
         UiInstruction::Compiled(c) => decode_compiled_ix(c, account_keys),
@@ -933,9 +828,7 @@ mod tests {
 
     #[test]
     fn launch_log_marker_covers_both_versions() {
-        // Anchor PascalCases the log (`Create`, `CreateV2`); the read
-        // loop lowercases before matching. Both versions must hit, and an
-        // unrelated swap log must not.
+        // Anchor PascalCases the log; the read loop lowercases first.
         for line in [
             "program log: instruction: create",
             "program log: instruction: createv2",
@@ -977,9 +870,7 @@ mod tests {
 
     #[test]
     fn replay_real_create_v2_fixture() {
-        // Real mainnet create_v2 (Pump.fun program 6EF8..., slot 455573900,
-        // fetched live): proves the v2 wire shape — 16-account instruction,
-        // Borsh (name/symbol/uri) + trailing versioned args — decodes and
+        // Real mainnet create_v2: proves the v2 wire shape decodes and
         // emits exactly one launch event with the IDL account mapping.
         let raw: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/create_v2_mainnet.json"))
@@ -1003,11 +894,8 @@ mod tests {
 
     #[tokio::test]
     async fn http_429_maps_to_rate_limited_transient() {
-        // Provider-proxy 429 (Helius/QuickNode) surfaces as
-        // `ClientErrorKind::Reqwest` with HTTP status 429 after
-        // `HttpSender`'s own 5 internal retries — both classifiers must
-        // still see it as rate-limited/transient, or the fetch worker
-        // drops the launch without its tier-2 backoff.
+        // Provider-proxy 429 surfaces as `Reqwest` with HTTP status 429;
+        // both classifiers must still see it as rate-limited/transient.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1021,8 +909,7 @@ mod tests {
                 };
                 let mut buf = vec![0u8; 4096];
                 let _ = socket.read(&mut buf).await;
-                // `Retry-After: 0` keeps the sender's internal 429
-                // retries instant so the test stays fast.
+                // `Retry-After: 0` keeps the sender's internal 429 retries instant.
                 let head = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 0\r\nRetry-After: 0\r\nConnection: close\r\n\r\n";
                 let _ = socket.write_all(head.as_bytes()).await;
                 let _ = socket.shutdown().await;

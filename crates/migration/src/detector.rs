@@ -1,5 +1,4 @@
-//! Graduation detection and migration classification (skill
-//! `solana-raydium-migration`).
+//! Graduation check and migration classifier.
 
 use curve::{BONDING_CURVE_MIN_LEN, COMPLETE_FLAG_OFFSET};
 use solana_pubkey::Pubkey;
@@ -9,18 +8,12 @@ pub use ids::{
     PUMP_MIGRATE_DISCRIMINATOR, PUMP_MIGRATION_AUTHORITY, PUMP_PROGRAM_ID, RAYDIUM_V4_PROGRAM_ID,
 };
 
-/// PumpSwap migration marker in program logs (current canonical flow;
-/// verified live: `Instruction: MigrateV2` with no authority account).
-/// Matched case-insensitively: log capitalisation varies across RPC
-/// nodes and program versions, and an exact-case miss would drop a real
-/// migration. Note this is a *weak* signal on its own (any program can
-/// print the word); it only counts together with the pump program or
-/// migration authority among account keys (see `classify_migration`).
+/// PumpSwap log marker (matched case-insensitively).
+/// Weak alone. Counts only with pump program or authority in keys.
 pub const PUMP_MIGRATE_V2_LOG: &str = "migratev2";
-/// Raydium pool-init marker in program logs (matched case-insensitively
-/// for the same reason; likewise gated on the Raydium program key).
+/// Raydium pool-init marker (same case-insensitive match).
 pub const RAYDIUM_INITIALIZE2_LOG: &str = "initialize2";
-/// Real SOL collected at graduation (~84 SOL, skill constant).
+/// Real SOL collected at graduation (~84 SOL).
 pub const GRADUATION_REAL_SOL_LAMPORTS: u64 = 84_000_000_000;
 
 /// Migration failures.
@@ -67,11 +60,7 @@ impl MigrationMonitor {
         }
     }
 
-    /// True when the bonding-curve `complete` flag (byte 48) is set.
-    /// The discriminator is checked first: byte 48 on a non-curve
-    /// account (pool, token) must never read as graduation. Any nonzero
-    /// byte counts (matches the curve parser); short buffers safely
-    /// report `false`. Never panics.
+    /// True when curve `complete` flag is set. Never panics.
     pub fn is_curve_graduated(account_data: &[u8]) -> bool {
         if account_data.len() < BONDING_CURVE_MIN_LEN {
             return false;
@@ -82,8 +71,7 @@ impl MigrationMonitor {
         account_data[COMPLETE_FLAG_OFFSET] != 0
     }
 
-    /// Graduation progress in percent from real SOL reserves,
-    /// clamped to `0.0..=100.0`. Non-finite inputs map to `0.0`.
+    /// Graduation progress in percent, clamped. Non-finite maps to `0.0`.
     pub fn calculate_progress(real_sol_lamports: u64) -> f64 {
         let progress = real_sol_lamports as f64 / GRADUATION_REAL_SOL_LAMPORTS as f64 * 100.0;
         if progress.is_finite() {
@@ -93,19 +81,11 @@ impl MigrationMonitor {
         }
     }
 
-    /// Classify a migration transaction.
+    /// Classify a migration tx.
     ///
-    /// Live-data correction (verified against 25 real authority
-    /// transactions): modern migrations omit the migration authority, so
-    /// it is a supporting signal, not a gate. Rules, in order:
-    /// 1. Raydium V4: Raydium program + `initialize2` log, with the pump
-    ///    program or the migration authority also present, AND the watched
-    ///    curve or expected token mint among the keys (a shared tx carrying
-    ///    an unrelated Raydium init must not false-positive).
-    /// 2. PumpSwap: `migrate` discriminator or `MigrateV2` log, with the
-    ///    pump program or the migration authority also present, AND the
-    ///    same key linkage.
-    ///    `None` otherwise (ordinary pump swaps never match).
+    /// Needs pump program or authority in keys plus the watched
+    /// curve or mint. Then Raydium (program + log) or
+    /// PumpSwap (discriminator or log).
     pub fn classify_migration(
         &self,
         account_keys: &[Pubkey],
@@ -121,7 +101,7 @@ impl MigrationMonitor {
         if !mentions_authority && !mentions_pump {
             return None;
         }
-        // Linkage: the migration must touch what we watch.
+        // Linked: tx must touch what we watch.
         let linked = account_keys
             .iter()
             .any(|k| k == curve || k == expected_token_mint);
@@ -129,7 +109,7 @@ impl MigrationMonitor {
             return None;
         }
 
-        // 1. Raydium AMM V4 initialization check.
+        // 1. Raydium init.
         let mentions_raydium = account_keys.iter().any(|k| k == &self.raydium_v4);
         let has_raydium_log = log_messages
             .iter()
@@ -138,7 +118,7 @@ impl MigrationMonitor {
             return Some(MigrationDestination::RaydiumV4);
         }
 
-        // 2. PumpSwap migration: legacy instruction or current log marker.
+        // 2. PumpSwap: ix or log.
         let has_pump_migrate_ix = instructions_data
             .iter()
             .any(|ix| ix.len() >= 8 && ix[..8] == PUMP_MIGRATE_DISCRIMINATOR);
@@ -152,7 +132,7 @@ impl MigrationMonitor {
         None
     }
 
-    /// Pump.fun Program ID under observation.
+    /// Observed Pump.fun program ID.
     pub fn pump_program(&self) -> Pubkey {
         self.pump_program
     }
@@ -253,9 +233,7 @@ mod tests {
 
     #[test]
     fn unlinked_markers_do_not_match() {
-        // All signals present but neither the watched curve nor the base
-        // mint is among the keys (shared tx with an unrelated init):
-        // no classification, so the hunt keeps scanning.
+        // Signals present but neither watched key among them: no match.
         let monitor = MigrationMonitor::new();
         let raydium_keys = vec![PUMP_MIGRATION_AUTHORITY, RAYDIUM_V4_PROGRAM_ID];
         let logs = vec!["Program log: initialize2: InitializeInstruction2".to_string()];
@@ -273,8 +251,6 @@ mod tests {
 
     #[test]
     fn log_markers_match_case_insensitively() {
-        // RPC nodes/program versions vary capitalisation; a real migration
-        // must not be dropped over case.
         let monitor = MigrationMonitor::new();
         let raydium_keys = vec![PUMP_MIGRATION_AUTHORITY, RAYDIUM_V4_PROGRAM_ID, curve_key()];
         for log in ["INITIALIZE2", "Initialize2", "initialize2"] {
@@ -292,8 +268,7 @@ mod tests {
                 "log={log}"
             );
         }
-        // Substring alone is not enough: the program/authority key must
-        // also be present (weak-signal gating).
+        // The program/authority key must also be present.
         assert_eq!(
             monitor.classify_migration(&[], &[], &["initialize2".to_string()], &curve_key(), &base_key()),
             None
@@ -302,7 +277,6 @@ mod tests {
 
     #[test]
     fn ordinary_swaps_never_match() {
-        // Plain buy: pump program + buy discriminator, no markers.
         let monitor = MigrationMonitor::new();
         let keys = vec![PUMP_PROGRAM_ID, PUMP_MIGRATION_AUTHORITY, curve_key()];
         let mut ix = vec![102u8, 6, 61, 18, 1, 218, 235, 234];
@@ -311,7 +285,6 @@ mod tests {
             monitor.classify_migration(&keys, &[ix], &[], &curve_key(), &base_key()),
             None
         );
-        // Unrelated program entirely.
         assert_eq!(
             monitor.classify_migration(&[], &[], &[], &curve_key(), &base_key()),
             None

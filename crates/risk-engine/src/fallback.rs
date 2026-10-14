@@ -1,43 +1,21 @@
-//! Deterministic heuristic fallback (see skill `adaptive-risk-prompting`).
-//!
-//! Runs in nanoseconds with no I/O. Mirrors the skill's decision table so
-//! the pipeline keeps identical behavior when the model path is skipped.
+//! Deterministic heuristic fallback.
 
 use crate::schema::{Action, RiskProfile, TokenMetrics};
 
-/// Skill thresholds, named for readability and testability.
+/// Dev reputation floor.
 pub const DEV_REPUTATION_FLOOR: f64 = 0.40;
-/// Skill thresholds, named for readability and testability.
-///
-/// `RUGCHECK_SCORE_CAP` (350) vs the auditor's hard gate (400 in
-/// `auditor/src/policy.rs::AuditPolicy::default`): this is the softer
-/// pre-LLM triage — and since the model prompt also passes above 350,
-/// scores 351–400 are a deliberate dead zone (observed, never bought on
-/// any path). Fail-closed by construction; narrowing the dead zone
-/// means changing the prompt AND this cap together.
-/// Keep `RUGCHECK_SCORE_CAP <= AuditPolicy::max_score`.
+/// Pre-LLM score cap. Keep `<= AuditPolicy::max_score` (400).
 pub const RUGCHECK_SCORE_CAP: u32 = 350;
-/// Skill thresholds, named for readability and testability.
+/// High-momentum buy velocity.
 pub const HIGH_MOMENTUM_VELOCITY: u32 = 25;
-/// Skill thresholds, named for readability and testability.
+/// High-momentum liquidity in USD.
 pub const HIGH_MOMENTUM_LIQUIDITY_USD: f64 = 20_000.0;
-/// Skill thresholds, named for readability and testability.
+/// Moderate-momentum buy velocity.
 pub const MODERATE_MOMENTUM_VELOCITY: u32 = 5;
-/// Skill thresholds, named for readability and testability.
+/// Moderate-momentum liquidity in USD.
 pub const MODERATE_MOMENTUM_LIQUIDITY_USD: f64 = 10_000.0;
 
-/// Instant heuristic evaluation, exactly per the skill's decision table
-/// (hardened 2026-10-11: never buy dead tokens):
-///
-/// - `dev_reputation < 0.40`, `rugcheck_score > 350`, or
-///   `velocity < 5` → PASS.
-/// - High momentum (`velocity > 25`, `liq > $20k`) → TP 60, SL −10,
-///   trailing, 180s.
-/// - Moderate (`velocity >= 5`, `liq >= $10k`) → TP 35, SL −8, no trail, 90s.
-/// - Otherwise (unproven liquidity/velocity) → PASS.
-///
-/// PASS shape (zeroed targets, disarmed trailing/moonbag) is shared so
-/// the three call sites cannot drift apart.
+/// Heuristic decision. Mirrors the model table.
 const fn pass_profile() -> RiskProfile {
     RiskProfile {
         action: Action::Pass,
@@ -54,9 +32,7 @@ pub fn evaluate_heuristic_fallback(
     dev_rep: f64,
     rugcheck_score: u32,
 ) -> RiskProfile {
-    // NaN comparisons are all false (`NaN < x == false`), which would
-    // sail a non-reputation straight into the momentum branches.
-    // Fail closed on any non-finite input.
+    // NaN never compares true. Fail closed.
     if !liq_usd.is_finite() || !dev_rep.is_finite() {
         return pass_profile();
     }
@@ -91,7 +67,7 @@ pub fn evaluate_heuristic_fallback(
     }
 }
 
-/// [`TokenMetrics`] convenience wrapper over [`evaluate_heuristic_fallback`].
+/// [`TokenMetrics`] wrapper.
 pub fn evaluate_metrics_fallback(metrics: &TokenMetrics) -> RiskProfile {
     evaluate_heuristic_fallback(
         metrics.liquidity_usd,
@@ -128,10 +104,7 @@ mod tests {
 
     #[test]
     fn prompt_bands_match_heuristic_constants() {
-        // SYSTEM_PROMPT duplicates the decision bands as prose; a
-        // constant change without a prompt change silently forks the
-        // model policy from the heuristic. This test forces them to
-        // move together.
+        // SYSTEM_PROMPT duplicates the bands; constants and prompt move together.
         let prompt = crate::schema::SYSTEM_PROMPT;
         assert!(prompt.contains(&DEV_REPUTATION_FLOOR.to_string()), "dev floor");
         assert!(prompt.contains(&RUGCHECK_SCORE_CAP.to_string()), "score cap");
@@ -176,7 +149,6 @@ mod tests {
 
     #[test]
     fn thin_liquidity_is_pass() {
-        // Proven velocity but unproven liquidity: never buy.
         let p = evaluate_heuristic_fallback(9_999.0, 20, 0.9, 100);
         assert_eq!(p.action, Action::Pass);
         assert_eq!(p.timeout_seconds, 0);
@@ -184,7 +156,6 @@ mod tests {
 
     #[test]
     fn no_demand_is_pass() {
-        // The 0%-win-rate killer: stubbed/zero velocity must never buy.
         for v in [0, 1, 4] {
             let p = evaluate_heuristic_fallback(50_000.0, v, 0.9, 100);
             assert_eq!(p.action, Action::Pass, "velocity={v}");

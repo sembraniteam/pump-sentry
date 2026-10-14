@@ -1,8 +1,4 @@
-//! Entry gate service: watchlist signals, buyer-quorum polling, and
-//! confirmed opens (paper + live dispatch kickoff).
-//!
-//! Moved verbatim from `pipeline.rs` (same `impl Pipeline` block, new
-//! home). Behavior unchanged.
+//! Entry gate: watchlist, quorum polling, confirmed opens.
 
 use std::collections::HashMap;
 
@@ -22,35 +18,22 @@ use tracing::{debug, info, warn};
 use crate::pipeline::{AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener};
 use crate::settings::now_secs;
 
-/// One curve observation: `(mint, signal, swaps+watermark+truncated or error)`.
+/// One curve read: `(mint, signal, swaps+watermark+truncated or error)`.
 type Observation = (
     String,
     PendingSignal,
     Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError>,
 );
 
-/// Concurrent RPC fanout ceiling per gate phase: a full `join_all` over a
-/// thousand-entry watchlist opens a thousand concurrent RPCs (rate-limit
-/// mass timeouts); 16 at a time keeps rounds moving without hammering.
-/// The live width adapts per round (see `GateState::fanout`): slow rounds
-/// halve it toward [`GATE_FANOUT_MIN`], fast rounds recover toward this
-/// ceiling one step at a time.
+/// Max concurrent RPC per gate phase (slow rounds halve it).
 const GATE_FANOUT: usize = 16;
-/// Floor for adaptive gate fanout: serial progress beats a wedged node.
+/// Fanout floor.
 const GATE_FANOUT_MIN: usize = 1;
-/// Round slower than this (seconds, phases 1+3 wall time) halves the
-/// gate fanout for the next round (rate-limit/backoff signal).
+/// Slow round in secs halves fanout.
 const SLOW_GATE_ROUND_SECS: u64 = 10;
 
 
-/// Map screened dev history to a 0.4–1.0 trust score for the risk
-/// input. Screening already rejected young/prolific wallets; survivors
-/// ramp from 0.7 at exactly `min_age` to 1.0 at 4× `min_age`, minus 0.05
-/// per prior launch. The 0.4 floor equals the heuristic PASS cutoff, so
-/// screening and scoring cannot disagree on the worst devs. A disabled
-/// age gate (`min_age_secs == 0`) scores full trust (nothing to ramp on).
-/// Unknown age scores 0.6 (below any screened survivor — unreachable in
-/// production since screening rejects ageless wallets outright).
+/// Dev history to 0.4–1.0 trust. Floor 0.4 is the PASS cutoff.
 pub fn dev_reputation_score(
     age_secs: Option<u64>,
     prior_launches: usize,
@@ -64,14 +47,8 @@ pub fn dev_reputation_score(
     (0.6 + 0.4 * age_factor - 0.05 * prior_launches as f64).clamp(0.4, 1.0)
 }
 
-/// Resolve an entry price and sizing liquidity from a reserve read, plus
-/// the paper-only flag (true when the price came from the manual
-/// `QUOTE_USD` override — the live mirror must stay out).
-///
-/// Live tick wins; on failure the manual override applies; `None` means
-/// "cannot price — skip the signal". Single source: callers must take
-/// the flag from here, never re-derive it from `tick_result.is_err()`
-/// (a future caller doing that would let a static price leak live).
+/// Entry price and sizing liquidity from a reserve read, plus paper-only flag.
+/// `None` means skip the signal.
 pub fn resolve_entry_with_flag(
     tick: Result<PriceTick, CurveError>,
     quote_override: Option<f64>,
@@ -87,8 +64,7 @@ pub fn resolve_entry_with_flag(
             Some((tick.price_usd, tick.liquidity_usd, false))
         }
         Ok(bad) => {
-            // A feed print of NaN/zero/negative is worse than none: it
-            // would open paper (and mirror live) at a garbage price.
+            // Bad print: drop signal, never price garbage.
             warn!(mint = %bad.mint, price = bad.price_usd, liq = bad.liquidity_usd,
                 "ignoring degenerate curve tick; dropping signal");
             None
@@ -111,18 +87,12 @@ pub fn resolve_entry_with_flag(
     }
 }
 
-/// Stop-loss floor for a venue tier: twice the per-side fee (round
-/// trip) plus a 4-point impact margin, negated. A tighter stop on a
-/// custom tier loses to venue costs before price action matters:
-/// 125 bps → −6.5% (never binds: profiles stop at −8 or wider),
-/// 345 bps → −10.9% (widens a −8 stop). Pure and unit-tested.
+/// Stop-loss floor for a tier: 2x fee + 4pt margin, negated.
 fn fee_aware_sl_floor(sl_percent: f64, venue_fee_bps: f64) -> f64 {
     sl_percent.min(-(2.0 * venue_fee_bps / 100.0 + 4.0))
 }
 
-/// Confirm-open request: one gate-confirmed signal plus its quorum.
-/// Bundles the four `confirm_open` inputs so new context cannot grow the
-/// arity again.
+/// Confirm-open request: gate signal plus quorum.
 #[derive(Debug, Clone, Copy)]
 struct OpenRequest<'a> {
     mint: &'a str,
@@ -131,8 +101,7 @@ struct OpenRequest<'a> {
     allow_live: bool,
 }
 
-/// Tracked-open request: priced confirm ready for paper + live dispatch.
-/// Bundles the seven `open_tracked` inputs for the same reason.
+/// Priced confirm ready for paper plus live.
 #[derive(Debug, Clone, Copy)]
 struct TrackedOpen<'a> {
     mint: &'a str,
@@ -143,83 +112,50 @@ struct TrackedOpen<'a> {
     profile: &'a risk_engine::RiskProfile,
     allow_live: bool,
     creator: Option<&'a str>,
-    /// Venue tier read with the pricing tick (same chain state, one
-    /// fewer RPC than a separate fee call). `None` keeps the standard
-    /// tier — and is forced `None` for synthetic (override-priced)
-    /// opens, whose paper never feeds the breaker anyway.
+    /// Venue tier with the tick. `None` is standard; synthetic forces `None`.
     venue_fee_bps: Option<f64>,
-    /// SOL/USD stamped at confirm time (shared by paper + live sizing).
-    /// Captured here — not re-read at dispatch — so the amount and the
-    /// guard price one market, not two reads seconds apart. Freshness
-    /// is re-checked at USE time (`age_ok`); a reading aged past the
-    /// feed window by dispatch fails closed like a stale feed.
+    /// SOL/USD stamped at confirm. Rechecked at use; stale fails closed.
     sol: Option<(f64, u64)>,
-    /// Trailing giveback resolved per strategy (runner uses its own wide
-    /// trail; everything else uses the shared setting).
     trail_percent: f64,
 }
 
-/// Watchlist entry context alongside [`EntryGate`] decisions.
+/// Watchlist entry context.
 #[derive(Debug, Clone)]
 pub struct PendingSignal {
-    /// Bonding-curve address (base58) for swap observation.
     pub curve: String,
-    /// Token creator (base58), when the launch carried one: required
-    /// for v3 live dispatch (cross-checked against curve state).
-    /// `None` (legacy v1 launch) fails live closed — paper only.
+    /// Creator, if the launch had one. `None` is paper-only (fails live).
     pub creator: Option<String>,
-    /// Curve ATA address (base58) for live exits.
     pub assoc_curve: String,
-    /// RugCheck score captured at signal time (`None` while the audit
-    /// is still pending retry — RugCheck 400s fresh mints during
-    /// indexing; see `AUDIT_RETRY_SECS`). Quorum can never confirm
-    /// without a score (fail-closed at confirm, deadline aborts).
+    /// Score at signal time. Quorum needs one (fail-closed).
     pub audit_score: Option<u32>,
-    /// Last audit attempt (`now_secs`): throttles re-polls.
+    /// Last audit try (throttles re-polls).
     pub last_audit_secs: u64,
-    /// Creation slot for the bundle rule.
     pub creation_slot: u64,
-    /// Signature watermark for incremental curve reads.
+    /// Watermark for incremental reads.
     pub last_sig: Option<String>,
-    /// Continuous dev-trust score (0.4–1.0) from the launch-time screen,
-    /// carried to confirm time for the risk input. On v2 launches with a
-    /// distinct creator this is the WORST of both insider screens.
+    /// Dev trust (0.4–1.0); worst wins on v2.
     pub dev_trust: f64,
 }
 
-/// Entry gate plus signal context under one lock (no lock ordering).
+/// Gate plus signal context under one lock.
 pub struct GateState {
-    /// Buyer-quorum state machine.
     pub gate: EntryGate,
-    /// Per-mint context for pending entries.
     pub meta: HashMap<String, PendingSignal>,
-    /// Gate-poll mutual exclusion across overlapping rounds. Set while a
-    /// round runs, with the claim timestamp: a claim older than
-    /// [`STALE_POLL_SECS`] is treated as leaked (owning task cancelled
-    /// before [`Pipeline::end_poll`]) and may be taken over, so the gate
-    /// self-heals instead of stalling forever.
+    /// Poll exclusion: stale claims may be taken over.
     pub poll_busy: bool,
-    /// `now_secs` of the current `poll_busy` claim (0 when free).
+    /// Claim time (0 when free).
     pub poll_started_secs: u64,
-    /// Live fanout width for this round's phase 1+3 (adaptive between
-    /// [`GATE_FANOUT_MIN`] and [`GATE_FANOUT`]; see `poll_gates`).
+    /// Fanout width this round.
     pub fanout: usize,
 }
 
-/// Age after which a gate-poll claim is considered leaked and eligible
-/// for takeover. Normal rounds finish in seconds (phase budgets top out
-/// near 15s); 30s of silence means the owning task died mid-round, so
-/// the gate self-heals instead of stalling confirms for two minutes.
+/// Stale claim age.
 pub const STALE_POLL_SECS: u64 = 30;
 
-/// Minimum spacing between audit retries for one watchlisted mint.
-/// RugCheck 400s on seconds-old mints (indexing latency) resolve in
-/// seconds — faster polling would spam a struggling third party.
+/// Min spacing between audit retries per mint.
 pub const AUDIT_RETRY_SECS: u64 = 3;
 
-/// Day-loss circuit breaker: halts *new entries* once the UTC-day
-/// realized net passes the configured loss cap. Exits always keep
-/// working (a breaker must never trap open risk). Pure time math.
+/// Day-loss breaker: halts entries past the cap. Exits still work.
 #[derive(Debug, Clone, Copy)]
 pub struct DailyBreaker {
     /// UTC day bucket (`unix_secs / 86400`) of the accumulated loss.
@@ -234,7 +170,7 @@ impl DailyBreaker {
         Self { day: now_secs / 86_400, day_net: 0.0 }
     }
 
-    /// Fold one closed trade into the day bucket (rolls the day first).
+    /// Fold one closed trade in (rolls the day first).
     pub fn record(&mut self, net_pnl: f64, now_secs: u64) {
         let day = now_secs / 86_400;
         if day != self.day {
@@ -246,9 +182,7 @@ impl DailyBreaker {
         }
     }
 
-    /// True when new entries must halt: positive cap configured and the
-    /// day net is at or beyond it. A stale bucket never trips (rolls on
-    /// read, same as on record).
+    /// True when entries must halt. Rolls stale buckets on read.
     pub fn tripped(&mut self, cap_usd: f64, now_secs: u64) -> bool {
         let day = now_secs / 86_400;
         if day != self.day {
@@ -260,7 +194,7 @@ impl DailyBreaker {
 }
 
 impl GateState {
-    /// Empty watchlist with the poll slot free.
+    /// Empty watchlist, poll slot free.
     pub fn new(gate: EntryGate) -> Self {
         Self {
             gate,
@@ -274,15 +208,12 @@ impl GateState {
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
 
-    /// Watchlisted mint count (for metrics/tests).
+    /// Watchlisted mint count.
     pub async fn pending_count(&self) -> usize {
         self.gate_state.lock().await.gate.pending_count()
     }
 
-    /// Claim the gate-poll slot; false when a round is already running.
-    /// A claim older than [`STALE_POLL_SECS`] is treated as leaked (the
-    /// owning task was cancelled before [`Pipeline::end_poll`]) and taken
-    /// over with a loud log.
+    /// Claim the poll slot; false when running. Stale claims are taken over.
     pub async fn try_begin_poll(&self) -> bool {
         let mut state = self.gate_state.lock().await;
         let now = now_secs();
@@ -300,16 +231,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         true
     }
 
-    /// Release the gate-poll slot after a round.
+    /// Release the poll slot.
     pub async fn end_poll(&self) {
         let mut state = self.gate_state.lock().await;
         state.poll_busy = false;
         state.poll_started_secs = 0;
     }
 
-    /// Audit → dev screen → watchlist. Never opens here: real demand must
-    /// show up in [`Pipeline::poll_gates`] first. Skips (with a log) on
-    /// any fail-closed condition.
+    /// Audit, screen, watchlist. Never opens here; skips fail closed.
     pub async fn on_launch(
         &self,
         mint: &str,
@@ -319,17 +248,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         creator: Option<&str>,
         slot: u64,
     ) {
-        // Invariant: every address here arrives as a stringified, already
-        // parsed `Pubkey` (production callers forward parser output, which
-        // is typed). Stubs pass placeholders like "MINT" — downstream
-        // screening parses defensively (`parse_address` at each RPC
-        // boundary), so a bad string degrades to per-round warnings until
-        // the gate sweep, never to a mispriced open.
-        // 1. Audit — fail closed, with indexing-latency retry. A fresh
-        // mint's 400 ("not indexed yet") must not burn the launch at
-        // second 0: retryable failures watchlist with no score and
-        // re-poll on the gate cadence until the deadline aborts.
-        // Policy rejections and misconfiguration still drop at once.
+        // 1. Audit, fail closed. Retryable watchlists scoreless for retry.
         let now = now_secs();
         let (audit_score, last_audit_secs) = match self.auditor.evaluate_token(mint).await {
             Ok(report) => (Some(report.score), now),
@@ -347,20 +266,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         };
 
-        // 2. Developer history — fail closed. Survivors fold into a
-        // continuous trust score (see `dev_reputation_score`) rather than
-        // a flat 1.0, so barely-old-enough wallets price worse than
-        // long-aged ones.
+        // 2. Dev history, fail closed.
         let dev_trust = match self.screen_wallet(mint, dev, "dev").await {
             Some(trust) => trust,
             None => return,
         };
 
-        // 2b. v2 creator history — fail closed AND. `create_v2` launches
-        // carry a creator distinct from the payer/launcher, with its own
-        // rug history: screening only the payer lets serial creators
-        // through. The signal carries the worst of both trusts, and the
-        // gate watches both wallets for dumps.
+        // 2b. v2 creator: worst trust wins.
         let mut trust = dev_trust;
         let distinct_creator = creator.filter(|c| *c != dev);
         if let Some(creator) = distinct_creator {
@@ -370,7 +282,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         }
 
-        // 3. Watchlist — demand confirmation happens in poll_gates.
+        // 3. Watchlist; confirms happen in poll_gates.
         let mut state = self.gate_state.lock().await;
         if !state.gate.submit(mint, dev, now_secs()) {
             warn!(%mint, "bad dev address; skipping");
@@ -379,8 +291,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if let Some(creator) = distinct_creator
             && !state.gate.add_cohort(mint, creator)
         {
-            // Half-watched insiders are worse than none: unwind instead
-            // of tracking a launch whose creator dumps unseen.
+            // Half-watched is worse than none: unwind.
             state.gate.remove(mint);
             warn!(%mint, "creator cohort untrackable; skipping (fail-closed)");
             return;
@@ -404,9 +315,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
-    /// Screen one insider wallet (launcher or creator): audit-logged
-    /// verdict mapped to a trust score. `None` means skip-the-signal
-    /// (reject or transport error — both fail closed).
+    /// Screen one insider to a trust score. `None` skips (fail-closed).
     async fn screen_wallet(&self, mint: &str, wallet: &str, role: &str) -> Option<f64> {
         match self.screener.screen_dev(wallet).await {
             Ok(verdict) if verdict.pass => {
@@ -428,13 +337,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
-    /// Drive every watchlisted mint one observation round: confirm opens
-    /// (with live-measured velocity), aborts drop, timeouts sweep.
-    ///
-    /// Three phases: (1) concurrent curve reads (no head-of-line block on
-    /// slow RPC), (2) sequential gate state machine (deterministic, single
-    /// critical section per mint), (3) concurrent bundle forensics +
-    /// confirms (the slowest RPC path, never serial).
+    /// Drive every watchlisted mint one round: confirms open, aborts drop.
     pub async fn poll_gates(&self) {
         let round_start = std::time::Instant::now();
         let (mints, fanout): (Vec<(String, PendingSignal)>, usize) = {
@@ -446,9 +349,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .collect();
             (mints, state.fanout.clamp(GATE_FANOUT_MIN, GATE_FANOUT))
         };
-        // Phase 1: concurrent observations, bounded so a large
-        // watchlist cannot open one RPC per mint at once. Width is the
-        // adaptive live value, not the ceiling.
+        // Phase 1: concurrent reads.
         use futures_util::stream::{self, StreamExt};
         let observations: Vec<Observation> =
             stream::iter(mints.into_iter().map(|(mint, signal)| async move {
@@ -461,7 +362,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .buffered(fanout.max(1))
             .collect()
             .await;
-        // Phase 2: gate state machine (fast, sequential for determinism).
+        // Phase 2: gate machine.
         enum GateStep {
             Confirmed(u32, PendingSignal),
             Aborted(String),
@@ -478,23 +379,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 }
             };
             if truncated {
-                // Partial view: never confirm on it and never advance the
-                // watermark — the next round re-reads the same window once
-                // velocity cools. Sustained truncation hits the deadline
-                // (abort), the fail-closed answer to a gap.
+                // Partial view: never confirm.
                 debug!(%mint, "curve observation truncated; holding watch without quorum");
                 continue;
             }
-            // Audit retry (P1.2): a `None` score means RugCheck was still
-            // indexing at launch. Re-poll throttled to `AUDIT_RETRY_SECS`;
-            // the gate deadline aborts unresolvable mints (fail-closed
-            // after the window, never at second 0). The watermark below
-            // is deliberately NOT advanced while the score is missing:
-            // post-resolve quorum must observe the whole window,
-            // including insider dumps during the wait.
-            // Snapshot the score BEFORE retrying: the staleness check
-            // below must compare meta against the pre-retry snapshot, or
-            // our own retry would read as a concurrent relaunch.
+            // `None` score is still indexing. Throttled retry; deadline aborts.
             let audit_at_snapshot = signal.audit_score;
             let mut audit_changed = false;
             if signal.audit_score.is_none() {
@@ -522,19 +411,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                 }
             }
-            // Single critical section: skip the round when a concurrent
-            // relaunch replaced the snapshot (never clobber fresh signal
-            // context), then observe and remove atomically on terminal
-            // outcomes so newborn entries cannot be deleted.
+            // One lock: skip relaunches; terminal removes keep newborns.
             let step = {
                 let mut state = self.gate_state.lock().await;
                 let fresh = state.meta.get(&mint);
-                // Any identity drift (curve, ATA, creator, score, slot)
-                // means a concurrent relaunch replaced the snapshot: never
-                // clobber fresh signal context or confirm on stale reads.
-                // The score compares against its SNAPSHOT value (a retry
-                // above may have filled it in — that is progress, and
-                // must not read as a relaunch).
+                // Drift means relaunch: never clobber or confirm.
                 let stale = fresh.is_some_and(|current| {
                     current.curve != signal.curve
                         || current.assoc_curve != signal.assoc_curve
@@ -552,13 +433,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         signal.last_sig = Some(sig);
                     }
                     if audit_changed || has_new {
-                        // Never regress a concurrently-advanced watermark:
-                        // overlapping rounds snapshot the same entry, and
-                        // the older round must not overwrite the newer
-                        // round's `last_sig` (it would re-read the window
-                        // and stall quorum; buyer counts stay safe via set
-                        // semantics either way). Audit progress merges
-                        // onto whichever watermark is current.
+                        // Keep a concurrently-advanced watermark.
                         if has_new
                             && let Some(current) = state.meta.get(&mint)
                             && current.last_sig != snap_sig
@@ -593,13 +468,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 GateStep::Waiting | GateStep::Stale => {}
             }
         }
-        // Phase 3: bundle forensics + opens, bounded like phase 1 (the
-        // slowest RPC path must never fan out without limit either).
+        // Phase 3: forensics plus opens.
         if !confirmed.is_empty() {
             use futures_util::stream::{self, StreamExt};
             stream::iter(confirmed.into_iter().map(|(mint, signal, buyers)| async move {
-                // Bundle forensics before money moves: reject drops,
-                // suspect trades paper-only, safe runs the full flow.
+                // Reject drops; suspect is paper-only.
                 match self
                     .screener
                     .screen_bundle(&signal.curve, signal.creation_slot)
@@ -626,11 +499,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .collect::<Vec<()>>()
             .await;
         }
-        // Adapt the fanout for the next round: a slow round (phases 1+3
-        // wall time past the threshold) means the node is throttling us,
-        // so halve toward serial; a fast round recovers one step toward
-        // the ceiling. Additive-increase / multiplicative-decrease keeps
-        // throughput high on healthy nodes without hammering sick ones.
+        // AIMD fanout: slow halves, fast recovers one.
         {
             let mut state = self.gate_state.lock().await;
             if round_start.elapsed().as_secs() >= SLOW_GATE_ROUND_SECS {
@@ -644,12 +513,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         }
         let now = now_secs();
-        // Collect under one short critical section: iterating while
-        // re-locking per mint depends on temporary-guard drops and would
-        // self-deadlock the moment a refactor holds the guard across.
+        // Sweep timeouts under one short lock.
         let timeouts = { self.gate_state.lock().await.gate.sweep_timeouts(now) };
         for (mint, outcome) in timeouts {
-            // Only drop meta when no fresh entry replaced it mid-sweep.
+            // Drop meta only when no fresh entry replaced it.
             let mut state = self.gate_state.lock().await;
             if !state.gate.contains(&mint) {
                 state.meta.remove(&mint);
@@ -661,15 +528,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
-    /// Open a confirmed signal: fresh pricing, risk with measured buyer
-    /// velocity and screened developer trust, then paper + live dispatch.
+    /// Open a confirmed signal: price, check risk, open paper plus live.
     async fn confirm_open(&self, req: &OpenRequest<'_>) {
         let mint = req.mint;
         let signal = req.signal;
         let buyers = req.buyers;
-        // Pricing + venue tier from one chain state (single account read
-        // for both — a tick and a tier from two different slots could
-        // price one market and fee another).
+        // Price and tier from one chain state.
         let (tick_result, venue_fee) = match self
             .reserves
             .fetch_tick_with_fee(mint, &signal.curve)
@@ -678,10 +542,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Ok((tick, fee)) => (Ok(tick), fee),
             Err(e) => (Err(e), None),
         };
-        // A manual QUOTE_USD fallback is for paper/tests only: never let
-        // real funds ride on an operator-set price when the feed is down.
-        // The flag comes from the resolver itself (single source), so a
-        // future caller cannot misderive it from `tick_result.is_err()`.
+        // Fallback is paper-only; the flag is the source.
         let Some((entry_quote, liquidity_usd, priced_via_override)) = resolve_entry_with_flag(
             tick_result,
             self.settings.quote_usd,
@@ -691,12 +552,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         };
 
-        // Mint-decimals gate: every sizing path below scales by 10^6
-        // (Pump.fun standard). A non-6 mint would misprice entries and
-        // live orders by 10^Δ — drop it loudly instead of guessing.
-        // Unreadable decimals fail closed for the same reason.
-        // Locked to the live sizing scale at compile time: changing one
-        // without the other diverges paper from dispatch silently.
+        // Sizing needs 6 decimals; else drop.
         const _: () = assert!(crate::live::TOKEN_DECIMALS == 6);
         match self.reserves.token_decimals(mint).await {
             Ok(6) => {}
@@ -710,11 +566,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         }
 
-        // Developer passed a real on-chain history screen (trust carried
-        // on the signal from launch time).
         let Some(score) = signal.audit_score else {
-            // Unreachable via poll_gates (quorum never confirms without
-            // a score) — fail closed rather than price risk on nothing.
+            // Fail closed (unreachable via poll_gates).
             warn!(%mint, "confirm reached without an audit score; dropping (fail-closed)");
             return;
         };
@@ -737,9 +590,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             info!(%mint, buyers, score, "risk PASS at confirm");
             return;
         }
-        // Multi-strategy execution: rewrite the BUY profile per the
-        // startup-parsed `self.strategy` (adaptive = verbatim, scalp = TP
-        // band + full exits, runner = forced moonbag + trailing).
+        // Rewrite BUY per strategy.
         let strategy = StrategyConfig {
             mode: self.strategy,
             runner_moonbag_percent: self.settings.runner_moonbag_percent,
@@ -748,22 +599,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         info!(%mint, mode = ?strategy.mode, tp = profile.tp_percent,
             moonbag = profile.moonbag_percent, trailing = profile.trailing_stop,
             "strategy resolved");
-        // Scalp never widens a below-band TP silently: the model wanted
-        // out early, and forcing it to wait turns winners into losers.
+        // Low scalp TP is honored, never widened.
         if strategy.mode == StrategyMode::ScalpQuick && profile.tp_percent < SCALP_TP_MIN {
             warn!(%mint, tp = profile.tp_percent,
                 "scalp TP below +25% band; honoring the model's early exit");
         }
-        // Runners trail wide (survive pullbacks toward 5x–10x); the scalp
-        // and adaptive paths share the standard trail setting.
+        // Runners use the wide trail; others use the shared setting.
         let trail_percent = match strategy.mode {
             StrategyMode::Runner => self.settings.runner_trail_percent,
             _ => self.settings.trail_percent,
         };
-        // Single SOL reading for both legs (see `TrackedOpen::sol`).
+        // One SOL reading for both legs.
         let sol = self.sol_feed.stamped_price();
-        // Override-priced opens are synthetic paper (no market behind
-        // the quote): mark the mint so its PnL never feeds the breaker.
+        // Override opens are synthetic paper.
         if priced_via_override {
             self.exec.mark_synthetic(mint).await;
         }
@@ -776,8 +624,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             profile: &profile,
             allow_live: req.allow_live && !priced_via_override,
             creator: signal.creator.as_deref(),
-            // Synthetic paper has no market behind its quote: no tier
-            // to register (its PnL never feeds the breaker anyway).
+            // Synthetic registers no tier.
             venue_fee_bps: if priced_via_override { None } else { venue_fee },
             sol,
             trail_percent,
@@ -785,9 +632,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         .await;
     }
 
-    /// Open a paper position at a confirmed price, watch for exits, and
-    /// mirror to live dispatch when enabled (and allowed: bundle
-    /// suspects stay paper-only).
+    /// Open paper at confirm price, watch exits, mirror live if allowed.
     async fn open_tracked(&self, req: &TrackedOpen<'_>) {
         let mint = req.mint;
         let curve = req.curve;
@@ -799,15 +644,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let trail_percent = req.trail_percent;
         let creator = req.creator;
         let sol = req.sol;
-        // Circuit breaker first: past the day-loss cap, no new risk —
-        // paper or live. Exits are unaffected (handled on ticks).
+        // Breaker first: past cap, no new risk.
         if self.daily.lock().await.tripped(self.settings.max_daily_loss_usd, now_secs()) {
             warn!(%mint, cap = self.settings.max_daily_loss_usd, "daily loss breaker tripped; skipping open");
             return;
         }
         let mut portfolio = self.portfolio.lock().await;
-        // Portfolio heat: cap concurrent exposure and enforce per-mint
-        // cooldown so correlated launches cannot stack the book.
+        // Heat + per-mint cooldown.
         if portfolio.position_ids().len() >= self.settings.max_open_positions {
             info!(%mint, max = self.settings.max_open_positions, "heat limit: skipping");
             return;
@@ -829,21 +672,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             info!(%mint, "mint in cooldown; skipping");
             return;
         }
-        // Per-mint venue fee (custom creator tiers), read with the pricing
-        // tick upstream — no second fetch here. `None` keeps the standard
-        // 125 bps tier; a custom tier re-prices this mint's paper fills
-        // to match the live dispatch exactly.
+        // Tier read with the tick. Custom tiers reprice paper like live.
         if let Some(bps) = req.venue_fee_bps {
             portfolio.set_venue_fee_for_mint(mint, bps);
             if (bps - crate::live::VENUE_FEE_BPS as f64).abs() > f64::EPSILON {
                 info!(%mint, bps, "custom venue fee tier registered for paper ledger");
             }
         }
-        // Fee-aware stop: a stop tighter than round-trip venue costs plus
-        // margin gets eaten by fees, not alpha. Standard tiers never bind
-        // (floor −6.5% sits inside −8/−10); custom tiers widen the stop
-        // instead of booking structural losers. TP is untouched (far
-        // above costs on every tier).
+        // Widen stops past round-trip costs on custom tiers.
         let mut profile = *profile;
         if let Some(bps) = req.venue_fee_bps {
             let widened = fee_aware_sl_floor(profile.sl_percent, bps);
@@ -872,8 +708,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 info!(%mint, id, entry = format!("{entry_quote:.10}"),
                     tp = profile.tp_percent, sl = profile.sl_percent,
                     equity = format!("{:.2}", snap.equity), "paper position opened");
-                // Emit after the guard drops (below): alert dispatch must
-                // never run while the portfolio lock is held.
+                // Emit after unlock: never alert under lock.
                 let card = Alerter::format_entry(
                     mint,
                     entry_quote,
@@ -883,9 +718,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 );
                 drop(portfolio);
                 self.emit(card);
-                // No feed, no live leg: without the exit ticker a real bag
-                // would have no TP/SL automation, so the live mirror stays
-                // out (paper still opens for manual review).
+                // No feed means no live leg: exits would be manual.
                 if let Err(e) = self.reserves.watch(mint, curve).await {
                     warn!(%mint, error = %e, "ticker watch failed; paper-only, live mirror skipped");
                     if allow_live {
@@ -918,16 +751,13 @@ mod tests {
 
     #[test]
     fn fee_aware_sl_floor_leaves_standard_stops() {
-        // 125 bps → floor −6.5%: profiles stop at −8 or wider already.
         assert_eq!(fee_aware_sl_floor(-8.0, 125.0), -8.0);
         assert_eq!(fee_aware_sl_floor(-10.0, 125.0), -10.0);
     }
 
     #[test]
     fn fee_aware_sl_floor_widens_custom_tiers() {
-        // 345 bps → floor −10.9%: a −8 stop would lose to venue costs.
         assert_eq!(fee_aware_sl_floor(-8.0, 345.0), -10.9);
-        // Already-wide stops are untouched (never tightened).
         assert_eq!(fee_aware_sl_floor(-15.0, 345.0), -15.0);
     }
 }

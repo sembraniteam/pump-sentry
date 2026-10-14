@@ -1,12 +1,9 @@
-//! RugCheck report types (see skill `solana-rugcheck-api`).
-//!
-//! Shapes follow the skill contract. `#[serde(default)]` keeps parsing
-//! tolerant when the API omits fields; unknown fields are ignored.
+//! RugCheck report types.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Token audit failures — transport errors vs policy rejections.
+/// Audit failures: transport vs policy.
 #[derive(Error, Debug)]
 pub enum RugCheckError {
     /// HTTP request failed (timeout, connect, TLS, retry budget spent).
@@ -18,10 +15,7 @@ pub enum RugCheckError {
     /// Failed to parse JSON response: {0}
     #[error("Failed to parse JSON response: {0}")]
     Deserialization(#[from] serde_json::Error),
-    /// Response body exceeded [`MAX_BODY_BYTES`]: a rogue server must not
-    /// turn the audit path into a retry loop. Never retryable (unlike
-    /// [`RugCheckError::Deserialization`], which covers genuinely
-    /// unparseable-but-small bodies during indexing latency).
+    /// Response body exceeded [`MAX_BODY_BYTES`]. Never retryable.
     #[error("RugCheck response body exceeds size cap")]
     ResponseTooLarge,
     /// Token rejected: {0}
@@ -33,12 +27,8 @@ pub enum RugCheckError {
 }
 
 impl RugCheckError {
-    /// Retryable at the pipeline watchlist: transport trouble, rate
-    /// limits, server errors, unparseable bodies, and HTTP 400. A 400
-    /// on a seconds-old mint almost always means "not indexed yet"
-    /// (our requests are fixed-format, so a malformed-request 400 is
-    /// not a live case) — dropping it instantly burns real launches.
-    /// Only policy rejections and client misconfiguration drop at once.
+    /// Retryable at the watchlist. HTTP 400 on a new
+    /// mint means "not indexed yet".
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::SecurityRejection(_) | Self::BadUrl(_) | Self::ResponseTooLarge => false,
@@ -53,20 +43,18 @@ impl RugCheckError {
     }
 }
 
-/// Risk report for one mint, as returned by
-/// `GET /tokens/{mint}/report`.
+/// Risk report for one mint.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RugCheckReport {
     /// Token mint address (base58).
     pub mint: String,
-    /// Aggregate risk score; higher is riskier. Required: a missing
-    /// score must fail the fetch (fail-closed), never parse as 0 and
-    /// sail through the score gate.
+    /// Aggregate risk score. Higher is riskier.
+    /// Required: missing score fails the fetch.
     pub score: u32,
     /// Individual risk findings.
     #[serde(default)]
     pub risks: Vec<RiskItem>,
-    /// On-chain token metadata, when available.
+    /// On-chain token metadata, when present.
     #[serde(default)]
     pub token: Option<TokenInfo>,
 }
@@ -85,9 +73,7 @@ pub struct RiskItem {
     /// Risk contribution in points.
     #[serde(default)]
     pub score: u32,
-    /// Severity: `warn` or `danger`. Required in spirit but tolerant in
-    /// parsing: an unknown level parses fine and is rejected by policy
-    /// (fail-closed there, where the allowlist lives).
+    /// Severity (`warn` or `danger`). Unknown levels fail at policy.
     #[serde(default)]
     pub level: String,
 }
@@ -153,8 +139,6 @@ mod tests {
     #[test]
     fn retryable_covers_indexing_latency_not_policy() {
         use reqwest::StatusCode;
-        // Fresh-mint 400s, rate limits, server errors, transport and
-        // unparseable bodies: retry at the watchlist, never drop at 0s.
         assert!(RugCheckError::HttpStatus(StatusCode::BAD_REQUEST).is_retryable());
         assert!(RugCheckError::HttpStatus(StatusCode::TOO_MANY_REQUESTS).is_retryable());
         assert!(RugCheckError::HttpStatus(StatusCode::REQUEST_TIMEOUT).is_retryable());
@@ -163,7 +147,7 @@ mod tests {
             serde_json::from_str::<u32>("bogus").expect_err("must fail")
         )
         .is_retryable());
-        // Policy, config, and oversize bodies: drop at once, never queue.
+        // Policy, config, and oversize bodies: drop at once.
         assert!(!RugCheckError::SecurityRejection("rug".to_string()).is_retryable());
         assert!(!RugCheckError::BadUrl(":::".to_string()).is_retryable());
         assert!(!RugCheckError::ResponseTooLarge.is_retryable());

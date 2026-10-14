@@ -1,53 +1,31 @@
-//! Multi-strategy execution framework: how a BUY profile turns into exits.
-//!
-//! [`StrategyMode`] selects the execution shape; [`resolve_strategy`]
-//! rewrites a [`RiskProfile`] accordingly (pure, unit-tested):
-//!
-//! - [`StrategyMode::Adaptive`] (default): profile passes through
-//!   untouched — model/heuristic decides everything, exactly as before.
-//! - [`StrategyMode::ScalpQuick`]: TP clamped DOWN into
-//!   [`SCALP_TP_MIN`]..=[`SCALP_TP_MAX`] — targets above +35% are cut to
-//!   the band, but targets already below +25% pass through untouched:
-//!   forcing a later exit than the model wanted turns winners into
-//!   losers, so the pipeline logs a loud warning instead of silently
-//!   widening. Moonbag forced to zero (full exit, no runners).
-//! - [`StrategyMode::Runner`]: TP as profiled, moonbag forced to the
-//!   configured share (default [`RUNNER_MOONBAG_DEFAULT`] = 20%), trailing
-//!   armed. At TP the pipeline sells `(100 - moonbag)%` and the runner
-//!   rides with its stop ratcheted to breakeven; the time-stop is lifted
-//!   on scale-out so runners chase 5x–10x instead of expiring.
-//!
-//! PASS profiles are never rewritten by any mode (no trade, no exits).
+//! Execution strategies: how a BUY turns into exits.
 
 use crate::schema::{Action, RiskProfile};
 use std::str::FromStr;
 
-/// Scalp TP floor in percent: exits never trigger below +25%.
+/// Scalp TP floor in percent.
 pub const SCALP_TP_MIN: f64 = 25.0;
-/// Scalp TP cap in percent: exits never wait past +35%.
+/// Scalp TP cap in percent.
 pub const SCALP_TP_MAX: f64 = 35.0;
-/// Runner default: sell 80% at TP, ride 20% with a trailing stop.
+/// Runner default: sell 80% at TP, ride 20%.
 pub const RUNNER_MOONBAG_DEFAULT: f64 = 20.0;
 
 /// Execution strategy selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StrategyMode {
-    /// Follow the risk profile verbatim (model/heuristic decides).
+    /// Follow the profile as-is.
     #[default]
     Adaptive,
-    /// Quick scalp: TP clamped down to +35% (below-band targets
-    /// honored as-is, never widened), full exit, no runners.
+    /// Quick scalp: clamp TP down, full exit, no runner.
     ScalpQuick,
-    /// Moonbag runner: TP sells most, rides the rest on trailing.
+    /// Moonbag runner: sell most at TP, ride the rest.
     Runner,
 }
 
 impl FromStr for StrategyMode {
     type Err = String;
 
-    /// Parses `adaptive` | `scalp` | `runner` (case-insensitive);
-    /// anything else is an error (fail-closed: the caller falls back
-    /// to [`StrategyMode::Adaptive`]).
+    /// Parses `adaptive` | `scalp` | `runner` (case-insensitive).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "adaptive" => Ok(StrategyMode::Adaptive),
@@ -58,13 +36,12 @@ impl FromStr for StrategyMode {
     }
 }
 
-/// Strategy knobs (built from settings; see `STRATEGY_MODE`).
+/// Strategy knobs (built from settings).
 #[derive(Debug, Clone, Copy)]
 pub struct StrategyConfig {
     /// Execution shape selector.
     pub mode: StrategyMode,
-    /// Runner share kept riding after TP, 0–100 (default 20). Values
-    /// >= 100 coerce to a full exit (a TP selling nothing never exits).
+    /// Runner share kept riding after TP.
     pub runner_moonbag_percent: f64,
 }
 
@@ -77,18 +54,8 @@ impl Default for StrategyConfig {
     }
 }
 
-/// Rewrite `profile` per `cfg`. Pure: PASS profiles return unchanged;
-/// BUY profiles keep SL/timeout and gain the mode's TP/moonbag/trailing
-/// shape. Outputs always satisfy [`RiskProfile::is_valid`] when inputs do.
-///
-/// Invalid profiles pass through untouched for the caller to reject
-/// explicitly: clamping garbage (e.g. `tp.min(35)` on `-5`) would launder
-/// it into a still-invalid profile that merely looks processed.
-///
-/// Scalp clamps DOWN only: `tp` above the band is cut to
-/// [`SCALP_TP_MAX`]; `tp` below [`SCALP_TP_MIN`] passes through (callers
-/// must warn — silently widening a model's early exit is how winners
-/// become losers).
+/// Rewrite `profile` per `cfg`. Pure.
+/// PASS and invalid profiles return unchanged.
 pub fn resolve_strategy(profile: &RiskProfile, cfg: &StrategyConfig) -> RiskProfile {
     if profile.action != Action::Buy || !profile.is_valid() {
         return *profile;
@@ -109,29 +76,23 @@ pub fn resolve_strategy(profile: &RiskProfile, cfg: &StrategyConfig) -> RiskProf
             sl_percent: profile.sl_percent,
             trailing_stop: true,
             timeout_seconds: profile.timeout_seconds,
-            // `f64::clamp` on NaN yields NaN (never the range): normalize
-            // non-finite config to the default first.
+            // `clamp` on NaN stays NaN. Clean first.
             moonbag_percent: {
                 let moonbag = finite_or(cfg.runner_moonbag_percent, RUNNER_MOONBAG_DEFAULT)
                     .clamp(0.0, 100.0);
-                // 100% moonbag sells NOTHING at TP (`close_partial`
-                // rejects fraction 0), so the position could never exit
-                // on its profit trigger — coerce to a full exit.
+                // 100% moonbag sells nothing. Use full exit.
                 if moonbag >= 100.0 { 0.0 } else { moonbag }
             },
         },
     };
-    // A moonbag runner without a trailing stop never exits sideways:
-    // settle lifts the timeout and disarms the moonbag, leaving only
-    // SL/TP — force the trail on (the trail percent itself resolves
-    // downstream per mode). Applies to every mode, not just runner.
+    // Moonbag without trail never exits sideways. Force it on.
     if resolved.moonbag_percent > 0.0 {
         resolved.trailing_stop = true;
     }
     resolved
 }
 
-/// Finite `v`, else `default` (for pre-clamp normalization).
+/// Finite `v`, else `default`.
 fn finite_or(v: f64, default: f64) -> f64 {
     if v.is_finite() { v } else { default }
 }
@@ -170,9 +131,6 @@ mod tests {
 
     #[test]
     fn moonbag_without_trailing_gets_a_trail() {
-        // An LLM moonbag on adaptive/scalp passthrough would otherwise
-        // ride sideways forever (settle lifts the timeout): coerce the
-        // trail on in every mode.
         let cfg = StrategyConfig::default();
         let p = resolve_strategy(&buy(60.0, 20.0, false), &cfg);
         assert!(p.trailing_stop);
@@ -211,8 +169,7 @@ mod tests {
         let high = resolve_strategy(&buy(90.0, 20.0, true), &cfg);
         assert_eq!((high.tp_percent, high.moonbag_percent), (35.0, 0.0));
         assert!(high.trailing_stop);
-        // Below the band passes through untouched (caller must warn):
-        // silently widening a model's early exit turns winners to losers.
+        // Below the band passes through untouched (caller must warn).
         let low = resolve_strategy(&buy(10.0, 0.0, false), &cfg);
         assert_eq!((low.tp_percent, low.moonbag_percent), (10.0, 0.0));
         let mid = resolve_strategy(&buy(30.0, 0.0, false), &cfg);
@@ -222,8 +179,6 @@ mod tests {
 
     #[test]
     fn invalid_profiles_pass_through_untouched() {
-        // Clamping garbage would launder it into a still-invalid profile
-        // that looks processed; the caller must reject it explicitly.
         let invalid = RiskProfile {
             action: Action::Buy,
             tp_percent: -5.0,
@@ -267,8 +222,7 @@ mod tests {
         assert_eq!((p.tp_percent, p.moonbag_percent), (60.0, 20.0));
         assert!(p.trailing_stop);
         assert!(p.is_valid());
-        // Custom moonbag share honored, clamped, and never 100% (a
-        // TP that sells nothing could never exit — coerced to full).
+        // Custom moonbag share honored, clamped, never 100%.
         let custom = StrategyConfig {
             mode: StrategyMode::Runner,
             runner_moonbag_percent: 150.0,
