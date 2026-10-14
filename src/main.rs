@@ -168,6 +168,34 @@ async fn run_pipeline(live_arg: bool) {
         )
         .init();
 
+    // SIGHUP log reopen (unix): external logrotate renames `bot.log`
+    // then `kill -HUP`s the daemon for a lossless reopen — no
+    // `copytruncate` line loss, no restart. Independent task, no locks:
+    // a failed reopen only warns (writes keep going to the old file).
+    #[cfg(unix)]
+    {
+        tokio::spawn(async {
+            let mut hup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            loop {
+                hup.recv().await;
+                let (_, log_file) = cli::resolve_paths();
+                match cli::reopen_log_file(&log_file) {
+                    Ok(file) => {
+                        if let Err(e) = cli::redirect_stdout_stderr_to(&file) {
+                            eprintln!("log reopen failed: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("log reopen failed: {e}"),
+                }
+            }
+        });
+    }
+
     let settings = Settings::from_env();
 
     // Fail closed on unknown commitment (no silent coercion to confirmed).

@@ -93,6 +93,13 @@ A heartbeat card (logs/candidates/cash/equity) fires at boot and every
 6h so quiet markets still prove liveness; `sell <mint>` exits one mint
 now without stopping the daemon.
 
+Long-run log rotation: the supervisor rotates a ≥50 MB log at
+(start/restart) time only, so a bot left running for weeks needs
+`ops/logrotate/solana-snipe-bot` installed (rename + SIGHUP reopen —
+lossless, no restart, no `copytruncate`). The daemon reopens its log
+on SIGHUP by itself; without logrotate the file just keeps growing
+(`logs -n` still stays cheap: tail seeks from the end).
+
 With knobs:
 
 ```sh

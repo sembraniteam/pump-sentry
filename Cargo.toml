@@ -31,6 +31,7 @@ executor = { path = "crates/executor" }
 migration = { path = "crates/migration" }
 alert = { path = "crates/alert" }
 serde_json = "1"
+libc = "0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"

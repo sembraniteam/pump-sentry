@@ -364,6 +364,60 @@ pub fn tail_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
     Ok(lines)
 }
 
+/// Open (or create) the daemon log for appending, owner-only on unix.
+/// Split out for testability; the SIGHUP-reopen path
+/// ([`redirect_stdout_stderr_to`]) and logrotate rely on it. Never
+/// truncates: post-rename writes must append to the fresh file, not
+/// wipe it.
+pub fn reopen_log_file(log: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = log.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(log)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(log, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
+}
+
+/// Point this process's stdout/stderr at an already-open log file
+/// (unix `dup2` onto fds 1/2). The tracing subscriber and `eprintln!`
+/// resolve fds 1/2 per write, so after this call every subsequent log
+/// line lands in the new file — no restart, no lost lines. External
+/// logrotate renames `bot.log` then `kill -HUP`s the daemon (pid from
+/// the pid file); `copytruncate` is unnecessary and must NOT be used
+/// (its copy-then-truncate window drops lines).
+#[cfg(unix)]
+pub fn redirect_stdout_stderr_to(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    for target in [1, 2] {
+        loop {
+            // SAFETY: `fd` is a live open file; `dup2` onto 1/2 only
+            // redirects this process's own stdio. Retried on EINTR.
+            if unsafe { libc::dup2(fd, target) } == target {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Future that resolves on the first shutdown request: SIGINT (Ctrl-C)
 /// or, on unix, SIGTERM (what `stop`, systemd, and docker send). The
 /// pipeline used to watch Ctrl-C only, so `stop` killed it mid-commit —
@@ -1043,6 +1097,37 @@ mod tests {
         assert_eq!(sh_quote("abc"), "'abc'");
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
         assert_eq!(sh_quote(""), "''");
+    }
+
+    #[test]
+    fn reopen_log_file_creates_and_appends() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "cli-reopen-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let log = dir.join("bot.log");
+        // Creates parents + file, then appends without truncating.
+        let mut f = reopen_log_file(&log).expect("create");
+        writeln!(f, "first").expect("write");
+        drop(f);
+        let mut f = reopen_log_file(&log).expect("reopen");
+        writeln!(f, "second").expect("write");
+        drop(f);
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("read"),
+            "first\nsecond\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&log).expect("meta").permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
