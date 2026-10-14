@@ -1,6 +1,6 @@
 [package]
 name = "pump-sentry"
-description = "Solana memecoin snipe pipeline: Pump.fun event listener, RugCheck auditor, adaptive TP/SL risk engine, and paper-trading simulator"
+description = "Paper-trading Solana memecoin sniper: Pump.fun launch screening, fail-closed risk gates, and Jito-routed live execution"
 version = "0.1.0"
 edition = "2024"
 readme = "README.md"
