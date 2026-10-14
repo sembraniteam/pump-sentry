@@ -2,7 +2,7 @@
 
 use crate::settings::now_secs;
 use crate::wal;
-use executor::{BuyOrder, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, parse_pubkey};
+use executor::{BuyOrder, BundleStatus, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, parse_pubkey};
 use ids::{ATA_RENT_LAMPORTS, BASE_TX_FEE_LAMPORTS};
 use simulator::{FillModel, Side};
 use std::path::PathBuf;
@@ -264,6 +264,9 @@ pub struct LiveTrader {
     wal_path: Option<PathBuf>,
     /// Unconfirmed buys, re-polled until settled or out of tries.
     pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+    /// Last sell bundle per mint (resend guard: never compete with
+    /// an inflight-pending prior bundle for the same bag).
+    last_sell_bundle: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// One recheck round at a time.
     recheck_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -316,6 +319,9 @@ impl LiveTrader {
             pending: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            last_sell_bundle: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             recheck_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -362,8 +368,7 @@ impl LiveTrader {
     }
 
     /// Run `f` under the pending lock (one poison policy).
-    fn with_pending<R>(
-        &self,
+    fn with_pending<R>(        &self,
         op: &'static str,
         fallback: R,
         f: impl FnOnce(&mut std::collections::HashMap<String, PendingBuy>) -> R,
@@ -375,6 +380,35 @@ impl LiveTrader {
                 fallback
             }
         }
+    }
+
+    /// Remember a sell bundle for the resend guard.
+    fn note_sell_bundle(&self, mint: &str, bundle_id: &str) {
+        if let Ok(mut guard) = self.last_sell_bundle.lock() {
+            guard.insert(mint.to_string(), bundle_id.to_string());
+        }
+    }
+
+    /// Forget a sell bundle after confirm.
+    fn clear_sell_bundle(&self, mint: &str) {
+        if let Ok(mut guard) = self.last_sell_bundle.lock() {
+            guard.remove(mint);
+        }
+    }
+
+    /// True when the last sell bundle for `mint` is still
+    /// engine-pending: resends must wait, never compete with it.
+    /// `Unknown` proceeds (exits must not stall on a status outage).
+    pub(crate) async fn prior_sell_pending(&self, mint: &str) -> bool {
+        let id = match self.last_sell_bundle.lock() {
+            Ok(guard) => guard.get(mint).cloned(),
+            Err(_) => None,
+        };
+        let Some(id) = id else { return false };
+        matches!(
+            self.executor.bundle_status(&id).await,
+            BundleStatus::Pending
+        )
     }
 
     /// True when a buy awaits confirmation.
@@ -426,7 +460,18 @@ impl LiveTrader {
                 Ok(ConfirmOutcome::Timeout) | Err(_) => {
                     let attempts = entry.attempts.saturating_add(1);
                     if attempts >= PENDING_MAX_ATTEMPTS {
-                        RecheckOutcome::GiveUp
+                        // Last word from the engine before giving up:
+                        // terminal states retire now instead of parking
+                        // a dead bundle for manual review.
+                        match self.executor.bundle_status(&entry.bundle_id).await {
+                            BundleStatus::Failed | BundleStatus::Invalid => {
+                                RecheckOutcome::FailedOnChain
+                            }
+                            BundleStatus::Landed => RecheckOutcome::Confirmed,
+                            BundleStatus::Pending | BundleStatus::Unknown => {
+                                RecheckOutcome::GiveUp
+                            }
+                        }
                     } else {
                         let mint = entry.position.mint.clone();
                         self.with_pending("recheck-bump", (), |guard| {
@@ -579,23 +624,50 @@ impl LiveTrader {
                 )))
             }
             Ok(ConfirmOutcome::Timeout) => {
-                // May land late: keep for recheck.
-                Self::track_pending(
-                    &self.pending,
-                    mint,
-                    Self::pending_position(
-                        mint,
-                        curve,
-                        assoc_curve,
-                        plan.amount_tokens,
-                        creator.map(|c| c.to_string()),
-                    ),
-                    &receipt,
-                );
-                Err(LiveError::Unconfirmed(format!(
-                    "buy bundle {} unconfirmed after {:?}; tracked as pending, rechecking",
-                    receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
-                )))
+                // Engine verdict beats the silent signature: Failed /
+                // Invalid is terminal (no fill), Landed confirms.
+                match self.executor.bundle_status(&receipt.bundle_id).await {
+                    BundleStatus::Failed | BundleStatus::Invalid => {
+                        Self::untrack_pending(&self.pending, mint);
+                        self.write_wal_settled(&receipt.bundle_id);
+                        Err(LiveError::Unconfirmed(format!(
+                            "buy bundle {} Confirmed failure: engine reports bundle failed/invalid; no fill",
+                            receipt.bundle_id
+                        )))
+                    }
+                    BundleStatus::Landed => {
+                        Self::untrack_pending(&self.pending, mint);
+                        Ok((
+                            Self::pending_position(
+                                mint,
+                                curve,
+                                assoc_curve,
+                                plan.amount_tokens,
+                                creator.map(|c| c.to_string()),
+                            ),
+                            receipt.bundle_id,
+                        ))
+                    }
+                    BundleStatus::Pending | BundleStatus::Unknown => {
+                        // May land late: keep for recheck.
+                        Self::track_pending(
+                            &self.pending,
+                            mint,
+                            Self::pending_position(
+                                mint,
+                                curve,
+                                assoc_curve,
+                                plan.amount_tokens,
+                                creator.map(|c| c.to_string()),
+                            ),
+                            &receipt,
+                        );
+                        Err(LiveError::Unconfirmed(format!(
+                            "buy bundle {} unconfirmed after {:?}; tracked as pending, rechecking",
+                            receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
+                        )))
+                    }
+                }
             }
             Err(e) => {
                 // Transport failure: same as timeout.
@@ -834,6 +906,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE sell dispatched");
+        self.note_sell_bundle(&position.mint, &receipt.bundle_id);
         match self
             .executor
             .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
@@ -844,16 +917,33 @@ impl LiveTrader {
                 // write-ahead of its custody subtract (single write
                 // point — a duplicate line would double-subtract a
                 // partial exit on boot replay).
+                self.clear_sell_bundle(&position.mint);
                 Ok(receipt.bundle_id)
             }
             Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
                 "sell bundle {} errored on-chain; still holding",
                 receipt.bundle_id
             ))),
-            Ok(ConfirmOutcome::Timeout) => Err(LiveError::Unconfirmed(format!(
-                "sell bundle {} unconfirmed after {:?}; still holding",
-                receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
-            ))),
+            Ok(ConfirmOutcome::Timeout) => {
+                match self.executor.bundle_status(&receipt.bundle_id).await {
+                    BundleStatus::Failed | BundleStatus::Invalid => {
+                        Err(LiveError::Unconfirmed(format!(
+                            "sell bundle {} engine reports bundle failed/invalid; still holding",
+                            receipt.bundle_id
+                        )))
+                    }
+                    BundleStatus::Landed => {
+                        self.clear_sell_bundle(&position.mint);
+                        Ok(receipt.bundle_id)
+                    }
+                    BundleStatus::Pending | BundleStatus::Unknown => {
+                        Err(LiveError::Unconfirmed(format!(
+                            "sell bundle {} unconfirmed after {:?}; still holding",
+                            receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
+                        )))
+                    }
+                }
+            }
             // Transport failure: same as timeout.
             Err(e) => Err(LiveError::Unconfirmed(format!(
                 "sell bundle {} confirm RPC failed ({e}); still holding",
@@ -893,6 +983,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE raydium sell dispatched");
+        self.note_sell_bundle(&position.mint, &receipt.bundle_id);
         match self
             .executor
             .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
@@ -900,16 +991,33 @@ impl LiveTrader {
         {
             Ok(ConfirmOutcome::Confirmed) => {
                 // No WAL write here (see curve-leg sell above).
+                self.clear_sell_bundle(&position.mint);
                 Ok(receipt.bundle_id)
             }
             Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
                 "raydium sell bundle {} errored on-chain; still holding",
                 receipt.bundle_id
             ))),
-            Ok(ConfirmOutcome::Timeout) => Err(LiveError::Unconfirmed(format!(
-                "raydium sell bundle {} unconfirmed after {:?}; still holding",
-                receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
-            ))),
+            Ok(ConfirmOutcome::Timeout) => {
+                match self.executor.bundle_status(&receipt.bundle_id).await {
+                    BundleStatus::Failed | BundleStatus::Invalid => {
+                        Err(LiveError::Unconfirmed(format!(
+                            "raydium sell bundle {} engine reports bundle failed/invalid; still holding",
+                            receipt.bundle_id
+                        )))
+                    }
+                    BundleStatus::Landed => {
+                        self.clear_sell_bundle(&position.mint);
+                        Ok(receipt.bundle_id)
+                    }
+                    BundleStatus::Pending | BundleStatus::Unknown => {
+                        Err(LiveError::Unconfirmed(format!(
+                            "raydium sell bundle {} unconfirmed after {:?}; still holding",
+                            receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
+                        )))
+                    }
+                }
+            }
             // Transport failure: same as timeout.
             Err(e) => Err(LiveError::Unconfirmed(format!(
                 "raydium sell bundle {} confirm RPC failed ({e}); still holding",

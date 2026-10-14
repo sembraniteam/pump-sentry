@@ -122,10 +122,12 @@ impl JitoClient {
     }
 }
 
-/// Tip accounts refresh hourly from `getTipAccounts` (2s budget, silent
-/// fallback to the compiled rotation). Post to the SAME bundles endpoint —
-/// Jito routes by the `method` field, not the path (posting to the bare base
-/// URL returns nothing and silently pins the fallback forever).
+/// Tip accounts refresh on a 15min TTL from `getTipAccounts` (2s budget,
+/// failures keep the cached list with a `warn!`). Each method posts to its
+/// OWN documented path off the base URL (`/api/v1/bundles`,
+/// `/api/v1/getTipAccounts`, `/api/v1/getInflightBundleStatuses`) —
+/// posting every method to the bundles path silently pins the fallback
+/// list forever when the engine ignores the unknown path.
 /// Deviation from the old trust-but-verify note, deliberate and logged:
 /// a fetched set with zero overlap against the compiled rotation is ADOPTED
 /// with a `warn!` (availability over hijack-guard — `crates/executor/src/jito.rs:187-191`);

@@ -115,6 +115,13 @@ pub trait LiveSink {
         Vec::new()
     }
 
+    /// True when the last sell bundle for `mint` is still
+    /// engine-pending: resends must wait, never compete with it.
+    /// Default proceeds (stubs have no bundle client).
+    async fn prior_sell_pending(&self, _mint: &str) -> bool {
+        false
+    }
+
     /// Per-dispatch overhead in lamports.
     fn dispatch_cost_lamports(&self) -> u64 {
         0
@@ -168,6 +175,10 @@ impl LiveSink for LiveTrader {
 
     fn pending_mints(&self) -> Vec<String> {
         self.pending_mints()
+    }
+
+    async fn prior_sell_pending(&self, mint: &str) -> bool {
+        self.prior_sell_pending(mint).await
     }
 
     fn dispatch_cost_lamports(&self) -> u64 {

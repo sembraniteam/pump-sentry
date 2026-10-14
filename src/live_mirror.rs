@@ -519,6 +519,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // response; floors never widen instead). Read before the probe:
         // short lock, never held across awaits.
         let tip = escalated_tip(trader.base_tip_lamports(), self.exec.retry_attempts(mint).await);
+        // Never compete with our own inflight bundle: a resend while
+        // the prior sell is still engine-pending risks two live
+        // bundles for one bag. Unknown status proceeds (exits must
+        // not stall on a status outage).
+        if self.exec.retry_attempts(mint).await > 0 && trader.prior_sell_pending(mint).await {
+            warn!(%mint, "prior sell bundle still inflight-pending; holding resend");
+            return false;
+        }
         let sell_result = match &pool {
             Some(leg) => {
                 warn!(%mint, amm = %leg.amm, leg_mint = %leg.mint, "routing post-migration exit via Raydium");

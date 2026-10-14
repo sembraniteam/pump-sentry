@@ -11,7 +11,8 @@ use tracing::{info, warn};
 
 use crate::instructions::{PumpSwapBuilder, user_ata_with_program};
 use crate::jito::{
-    JitoClient, JitoError, encode_bundle, nanos_seed, select_tip_account, tip_instruction,
+    BundleStatus, JitoClient, JitoError, encode_bundle, nanos_seed, select_tip_account,
+    tip_instruction,
 };
 use crate::wallet::{WalletGuard, WalletGuardError};
 
@@ -503,8 +504,7 @@ impl SwapExecutor {
     }
 
     /// Poll a signature until it lands or `timeout` ends.
-    pub async fn confirm_signature(
-        &self,
+    pub async fn confirm_signature(        &self,
         signature_str: &str,
         timeout: Duration,
     ) -> Result<ConfirmOutcome, ExecutorError> {
@@ -541,6 +541,15 @@ impl SwapExecutor {
             // lockstep every second.
             let round = (start.elapsed().as_secs() % 4) * 125;
             tokio::time::sleep(Duration::from_millis(1000 + round)).await;
+        }
+    }
+
+    /// Engine-side bundle state. `Unknown` without a bundle client or
+    /// on any status trouble: callers keep their existing behavior.
+    pub async fn bundle_status(&self, bundle_id: &str) -> BundleStatus {
+        match &self.jito {
+            Some(jito) => jito.inflight_status(bundle_id).await,
+            None => BundleStatus::Unknown,
         }
     }
 
@@ -1134,7 +1143,9 @@ impl SwapExecutor {
                 )))
             }
             Err(e) => {
-                warn!(%label, error = %e, "bundle rejected");
+                // Transport failure is not a refusal: a timed-out POST
+                // may still land, so callers park instead of resending.
+                warn!(%label, error = %e, "bundle send failed (no resend: a timeout may still land)");
                 Err(ExecutorError::Jito(e))
             }
         }
