@@ -1,5 +1,6 @@
 //! Reserve polling ticker over HTTP RPC.
 
+use crate::backoff::{RoundBackoff, warn_throttled};
 use crate::layout::{BondingCurveReserves, CurveParseError};
 use crate::sol_feed::SolUsdFeed;
 use solana_client::client_error::ClientError;
@@ -9,10 +10,15 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, warn};
+
+// Warn slots: persistent fee/read trouble pages ops, not every round.
+static FEE_WARN_AT: AtomicU64 = AtomicU64::new(0);
+static TICK_WARN_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Ticker failures.
 #[derive(Error, Debug)]
@@ -71,6 +77,10 @@ pub struct CurveTicker {
     decimals: Arc<Mutex<HashMap<String, u8>>>,
     /// FeeConfig/Global cache.
     fee_inputs: crate::fee::FeeInputsCache,
+    /// Mint supply cache (immutable on curves; evicted past cap).
+    supply: crate::fee::SupplyCache,
+    /// Consecutive-failure backoff (sick node, not sick data).
+    backoff: Arc<RoundBackoff>,
 }
 
 /// Decimals cache cap.
@@ -109,10 +119,14 @@ impl CurveTicker {
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decimals: Arc::new(Mutex::new(HashMap::new())),
             fee_inputs: Arc::new(Mutex::new(None)),
+            supply: Arc::new(Mutex::new(HashMap::new())),
+            backoff: Arc::new(RoundBackoff::new()),
         })
     }
 
-    /// Ticks dropped on a full queue.
+    /// Ticks dropped on a full queue. Test-only: production surfaces
+    /// drops via tracing, never by polling this counter.
+    #[cfg(test)]
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -197,9 +211,11 @@ impl CurveTicker {
         let key = Pubkey::from_str(curve)
             .map_err(|_| CurveError::BadCurveKey(curve.to_string()))
             .ok()?;
-        let fee = crate::fee::venue_fee_bps(&self.rpc, &self.fee_inputs, &mint_key, &key).await;
-        if fee.is_none() {
-            debug!(%curve, "venue fee unreadable; paper keeps the standard tier");
+        let fee =
+            crate::fee::venue_fee_bps(&self.rpc, &self.fee_inputs, &self.supply, &mint_key, &key)
+                .await;
+        if fee.is_none() && warn_throttled(&FEE_WARN_AT) {
+            warn!(%curve, "venue fee unreadable; paper keeps the standard tier");
         }
         fee
     }
@@ -222,13 +238,14 @@ impl CurveTicker {
         let fee = crate::fee::venue_fee_for_data(
             &self.rpc,
             &self.fee_inputs,
+            &self.supply,
             &mint_key,
             &account.owner,
             &account.data,
         )
         .await;
-        if fee.is_none() {
-            debug!(%curve, "venue fee unreadable; paper keeps the standard tier");
+        if fee.is_none() && warn_throttled(&FEE_WARN_AT) {
+            warn!(%curve, "venue fee unreadable; paper keeps the standard tier");
         }
         Ok((tick, fee))
     }
@@ -249,7 +266,11 @@ impl CurveTicker {
                 continue;
             }
             let Some(sol_usd) = self.sol_feed.price() else {
-                debug!("sol_usd stale; skipping round");
+                if warn_throttled(&TICK_WARN_AT) {
+                    warn!("sol_usd stale; skipping pool rounds until the feed recovers");
+                } else {
+                    debug!("sol_usd stale; skipping round");
+                }
                 continue;
             };
             let keys: Vec<Pubkey> = watched.iter().map(|w| w.curve).collect();
@@ -257,16 +278,25 @@ impl CurveTicker {
                 match tokio::time::timeout(ROUND_OVERALL_TIMEOUT, poll_round(&self.rpc, &keys))
                     .await
                 {
-                Ok(Ok(accounts)) => accounts,
-                Ok(Err(e)) => {
-                    warn!(error = %e, n = keys.len(), "round failed; backing off");
-                    continue;
-                }
-                Err(_) => {
-                    warn!(n = keys.len(), "round timed out; backing off");
-                    continue;
-                }
-            };
+                    Ok(Ok(accounts)) => {
+                        self.backoff.success();
+                        accounts
+                    }
+                    Ok(Err(e)) => {
+                        if warn_throttled(&TICK_WARN_AT) {
+                            warn!(error = %e, n = keys.len(), "round failed; backing off");
+                        }
+                        tokio::time::sleep(self.backoff.fail_sleep()).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        if warn_throttled(&TICK_WARN_AT) {
+                            warn!(n = keys.len(), "round timed out; backing off");
+                        }
+                        tokio::time::sleep(self.backoff.fail_sleep()).await;
+                        continue;
+                    }
+                };
             if accounts.len() != watched.len() {
                 warn!(
                     expected = watched.len(),
@@ -277,14 +307,18 @@ impl CurveTicker {
             }
             for (entry, maybe_account) in watched.iter().zip(accounts.iter()) {
                 let Some(account) = maybe_account else {
-                    debug!(mint = %entry.mint, "curve account missing (not yet indexed?)");
+                    if warn_throttled(&TICK_WARN_AT) {
+                        warn!(mint = %entry.mint, "curve account missing for rounds; still unindexed?");
+                    }
                     continue;
                 };
                 // Wrong-scale prints are worse than skips.
                 let decimals = match self.token_decimals(&entry.mint).await {
                     Ok(d) => d,
                     Err(e) => {
-                        debug!(mint = %entry.mint, error = %e, "mint decimals unreadable; skipping tick");
+                        if warn_throttled(&TICK_WARN_AT) {
+                            warn!(mint = %entry.mint, error = %e, "mint decimals unreadable for rounds; skipping ticks");
+                        }
                         continue;
                     }
                 };
@@ -308,7 +342,9 @@ impl CurveTicker {
                         }
                     },
                     Err(e) => {
-                        debug!(mint = %entry.mint, error = %e, "tick parse failed");
+                        if warn_throttled(&TICK_WARN_AT) {
+                            warn!(mint = %entry.mint, error = %e, "tick parse failing for rounds; layout changed?");
+                        }
                     }
                 }
             }

@@ -9,9 +9,10 @@ use listener::{
     BundleVerdict, EntryGate, GateOutcome, ScreenError, SwapRecord,
 };
 use risk_engine::{
-    Action, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics, evaluate_heuristic_fallback,
-    resolve_strategy,
+    Action, RiskProfile, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
+    evaluate_heuristic_fallback, resolve_strategy,
 };
+use risk_engine::fallback::RUGCHECK_SCORE_CAP;
 use simulator::Side;
 use tracing::{debug, info, warn};
 
@@ -87,10 +88,34 @@ pub fn resolve_entry_with_flag(
     }
 }
 
-/// Stop-loss floor for a tier: 2x fee + 4pt margin, negated.
+/// Stop-loss floor for a tier: 2x fee + 4pt margin, negated,
+/// clamped to [-100, 0) so absurd tiers can't print an invalid SL.
 fn fee_aware_sl_floor(sl_percent: f64, venue_fee_bps: f64) -> f64 {
-    sl_percent.min(-(2.0 * venue_fee_bps / 100.0 + 4.0))
+    sl_percent
+        .min(-(2.0 * venue_fee_bps / 100.0 + 4.0))
+        .clamp(-100.0, 0.0)
 }
+
+/// Re-gate a BUY against the audit score: the prompt advises PASS above
+/// 350, but advice isn't enforcement and `is_valid` never sees the
+/// score. Scores the heuristic rejects never buy on any path. Pure.
+fn apply_score_gate(profile: RiskProfile, rugcheck_score: u32) -> RiskProfile {
+    if profile.action == Action::Buy && rugcheck_score > RUGCHECK_SCORE_CAP {
+        return RiskProfile {
+            action: Action::Pass,
+            tp_percent: 0.0,
+            sl_percent: 0.0,
+            trailing_stop: false,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+        };
+    }
+    profile
+}
+
+/// Watchlist size that pages ops (no cap: entries die by deadline, and
+/// dropping signals under load would miss the exact trades we want).
+const WATCHLIST_WARN_SIZE: usize = 64;
 
 /// Confirm-open request: gate signal plus quorum.
 #[derive(Debug, Clone, Copy)]
@@ -99,6 +124,8 @@ struct OpenRequest<'a> {
     signal: &'a PendingSignal,
     buyers: u32,
     allow_live: bool,
+    creation_slot_buys: Option<u32>,
+    cluster_pct: Option<f64>,
 }
 
 /// Priced confirm ready for paper plus live.
@@ -349,6 +376,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .collect();
             (mints, state.fanout.clamp(GATE_FANOUT_MIN, GATE_FANOUT))
         };
+        // Watermark only (never a cap): a flood means peak opportunity,
+        // and each entry dies by deadline. Ops tunes RPC headroom here.
+        if mints.len() > WATCHLIST_WARN_SIZE {
+            warn!(watchlist = mints.len(), "watchlist above watermark; RPC burn follows launch rate");
+        }
         // Phase 1: concurrent reads.
         use futures_util::stream::{self, StreamExt};
         let observations: Vec<Observation> =
@@ -485,10 +517,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                     Ok(analysis) if analysis.verdict == BundleVerdict::SuspectLowVolume => {
                         info!(%mint, "bundle suspect: paper-only, live dispatch skipped");
-                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, allow_live: false }).await;
+                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, allow_live: false, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
                     }
-                    Ok(_) => {
-                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, allow_live: true }).await;
+                    Ok(analysis) => {
+                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, allow_live: true, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
                     }
                     Err(e) => {
                         warn!(%mint, error = %e, "bundle screen error; dropping (fail-closed)");
@@ -526,6 +558,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 info!(%mint, %reason, "gate abort");
             }
         }
+        // Timer-driven idle-follow sweep: runs even when no pool ticks
+        // arrive, so dead follows can't leak to restart.
+        let stale = self.sweep_idle().await;
+        if !stale.is_empty() {
+            info!(count = stale.len(), "swept idle post-migration follows");
+        }
     }
 
     /// Open a confirmed signal: price, check risk, open paper plus live.
@@ -552,7 +590,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         };
 
-        // Sizing needs 6 decimals; else drop.
+        // Live ticks must carry positive liquidity: zero liquidity
+        // prices fee-only (synthetic-grade). Fail closed.
+        // Note: `venue_fee=None` keeps the standard 125bps tier
+        // (see `CurveTicker::venue_fee_bps`); custom-tier mints whose
+        // fee read fails therefore book slightly cheap — accepted
+        // residual (widened only when the tier is known below).
+        if !priced_via_override
+            && (!liquidity_usd.is_finite() || liquidity_usd <= 0.0)
+        {
+            warn!(%mint, liq = liquidity_usd, "non-positive curve liquidity; dropping signal (fail-closed)");
+            return;
+        }
         const _: () = assert!(crate::live::TOKEN_DECIMALS == 6);
         match self.reserves.token_decimals(mint).await {
             Ok(6) => {}
@@ -576,6 +625,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             buy_velocity_5s: buyers,
             dev_reputation: signal.dev_trust,
             rugcheck_score: score,
+            creation_slot_buys: req.creation_slot_buys,
+            cluster_pct: req.cluster_pct,
+            curve_progress: None,
         };
         let profile = match &self.engine {
             Some(engine) => engine.evaluate(&metrics).await.profile,
@@ -588,6 +640,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         if profile.action != Action::Buy {
             info!(%mint, buyers, score, "risk PASS at confirm");
+            return;
+        }
+        // Re-gate LLM BUYs against the audit score: the prompt advises
+        // PASS above 350, but advice isn't enforcement and `is_valid`
+        // never sees the score. Scores the heuristic rejects never buy
+        // on any path.
+        let profile = apply_score_gate(profile, score);
+        if profile.action != Action::Buy {
+            info!(%mint, buyers, score, "audit score re-gated model BUY to PASS");
             return;
         }
         // Rewrite BUY per strategy.
@@ -679,10 +740,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 info!(%mint, bps, "custom venue fee tier registered for paper ledger");
             }
         }
-        // Widen stops past round-trip costs on custom tiers.
+        // Widen stops past round-trip costs on custom tiers (venue +
+        // commission): a stop inside total costs is a guaranteed loss.
         let mut profile = *profile;
         if let Some(bps) = req.venue_fee_bps {
-            let widened = fee_aware_sl_floor(profile.sl_percent, bps);
+            let total_bps = bps + self.settings.fee_bps;
+            let widened = fee_aware_sl_floor(profile.sl_percent, total_bps);
             if widened < profile.sl_percent {
                 info!(%mint, sl = profile.sl_percent, widened, bps,
                     "custom-tier stop widened past round-trip costs");
@@ -759,5 +822,43 @@ mod tests {
     fn fee_aware_sl_floor_widens_custom_tiers() {
         assert_eq!(fee_aware_sl_floor(-8.0, 345.0), -10.9);
         assert_eq!(fee_aware_sl_floor(-15.0, 345.0), -15.0);
+    }
+
+    #[test]
+    fn fee_aware_sl_floor_clamps_to_full_loss() {
+        assert_eq!(fee_aware_sl_floor(-8.0, 10_000.0), -100.0);
+        assert_eq!(fee_aware_sl_floor(-8.0, 100_000.0), -100.0);
+    }
+
+    fn buy_profile() -> RiskProfile {
+        RiskProfile {
+            action: Action::Buy,
+            tp_percent: 60.0,
+            sl_percent: -10.0,
+            trailing_stop: true,
+            timeout_seconds: 180,
+            moonbag_percent: 20.0,
+        }
+    }
+
+    #[test]
+    fn score_gate_passes_model_buy_at_or_below_cap() {
+        assert_eq!(apply_score_gate(buy_profile(), 100).action, Action::Buy);
+        assert_eq!(apply_score_gate(buy_profile(), 350).action, Action::Buy);
+    }
+
+    #[test]
+    fn score_gate_rejects_model_buy_above_cap() {
+        let gated = apply_score_gate(buy_profile(), 380);
+        assert_eq!(gated.action, Action::Pass);
+        assert_eq!(gated.tp_percent, 0.0);
+        assert_eq!(gated.sl_percent, 0.0);
+        assert_eq!(gated.timeout_seconds, 0);
+    }
+
+    #[test]
+    fn score_gate_leaves_pass_alone() {
+        let pass = RiskProfile { action: Action::Pass, ..buy_profile() };
+        assert_eq!(apply_score_gate(pass, 999).action, Action::Pass);
     }
 }

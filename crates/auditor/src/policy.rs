@@ -4,6 +4,11 @@ use crate::types::{RugCheckError, RugCheckReport};
 
 /// Acceptance thresholds.
 /// Keep `heuristic cap (350) <= policy cap`.
+/// Production must use [`AuditPolicy::default`]: the per-check toggles
+/// exist for tests only — disabling any check can allow a 10000-score,
+/// danger-level, authority-retained token (see
+/// `policy_toggles_disable_checks`). No prod constructor takes a custom
+/// policy.
 #[derive(Debug, Clone)]
 pub struct AuditPolicy {
     /// Reports with `score > max_score` are rejected.

@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::live::{
-    LiveBuyParams, LiveError, LivePosition, LiveTrader, RecheckOutcome,
-    SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN,
+    LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, RaydiumSellParams,
+    RecheckOutcome, SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN, escalated_tip,
 };
 use crate::pipeline::{
     AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener, CURVE_TICK_STALE_SECS,
@@ -95,6 +95,9 @@ impl<L> LiveExecution<L> {
     }
 
     /// Subtract a confirmed sell; true when the bag emptied.
+    /// A missing bag is custody drift (dispatch confirmed what we no
+    /// longer track): loud, then treated as settled so the breaker
+    /// still resolves instead of deferring forever.
     pub async fn subtract_fill(&self, mint: &str, amount: u64) -> bool {
         let mut guard = self.live_positions.lock().await;
         match guard.get_mut(mint) {
@@ -107,7 +110,10 @@ impl<L> LiveExecution<L> {
                     false
                 }
             }
-            None => true,
+            None => {
+                warn!(%mint, amount, "sell confirmed for an untracked bag; custody drifted, treating as settled");
+                true
+            }
         }
     }
 
@@ -181,16 +187,6 @@ impl<L> LiveExecution<L> {
         entry.0
     }
 
-    /// Stamp cooldown without spending budget (dust re-probes).
-    pub async fn stamp_cooldown(&self, mint: &str, now: u64) {
-        self.live_retry
-            .lock()
-            .await
-            .entry(mint.to_string())
-            .or_insert((0u32, 0u64))
-            .1 = now;
-    }
-
     /// Drop retry state (success, empty, or parked).
     pub async fn reset_retry(&self, mint: &str) {
         self.live_retry.lock().await.remove(mint);
@@ -201,6 +197,11 @@ impl<L> LiveExecution<L> {
         self.live_retry.lock().await.get(mint).is_some_and(
             |(_, last)| now.saturating_sub(*last) < cooldown_secs,
         )
+    }
+
+    /// Prior sell failures (tip escalation input; 0 when clean).
+    pub async fn retry_attempts(&self, mint: &str) -> u32 {
+        self.live_retry.lock().await.get(mint).map(|(n, _)| *n).unwrap_or(0)
     }
 
     /// Mark a mint synthetic (override paper).
@@ -490,10 +491,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 warn!(mint = %mint, sell_amount, held, "live sell sizing overflow; refusing");
                 return false;
             }
-            // Floor only (never ceiling). Dust holds; cooldown stamps.
+            // Floor only (never ceiling). Dust counts toward the retry
+            // budget like any failed probe (note_failure stamps the
+            // cooldown too), so an unsellable remainder parks to manual
+            // after the budget instead of re-probing forever.
             if sell_amount == 0 {
-                warn!(mint = %mint, fraction_closed, held, "live sell sizes to zero dust; holding, will re-probe");
-                self.exec.stamp_cooldown(mint, now).await;
+                let attempts = self.exec.note_failure(mint, now).await;
+                warn!(mint = %mint, fraction_closed, held, attempts, "live sell sizes to zero dust; holding, will re-probe until budget, then manual");
                 return false;
             }
             LivePosition {
@@ -511,14 +515,29 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .await
             .get(mint)
             .and_then(|state| state.pool.clone());
+        // Tip escalates with prior failures (bounded congestion
+        // response; floors never widen instead). Read before the probe:
+        // short lock, never held across awaits.
+        let tip = escalated_tip(trader.base_tip_lamports(), self.exec.retry_attempts(mint).await);
         let sell_result = match &pool {
             Some(leg) => {
                 warn!(%mint, amm = %leg.amm, leg_mint = %leg.mint, "routing post-migration exit via Raydium");
-                trader.sell_raydium(&probe, leg).await
+                trader.sell_raydium(&RaydiumSellParams {
+                    position: &probe,
+                    pool: leg,
+                    tip_lamports: tip,
+                }).await
             }
             None => {
                 trader
-                    .sell(&probe, price_usd, sol_usd, liquidity_usd, Some(venue_fee_bps))
+                    .sell(&LiveSellParams {
+                        position: &probe,
+                        price_usd,
+                        sol_usd,
+                        liquidity_usd,
+                        venue_fee_bps: Some(venue_fee_bps),
+                        tip_lamports: tip,
+                    })
                     .await
             }
         };
@@ -531,8 +550,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.exec.reset_retry(mint).await;
                 self.flush_deferred_pnl(mint).await;
                 self.maybe_release_follow(mint).await;
-                // Dispatch cost feeds the day-loss gate.
-                let tip_usd = trader.dispatch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
+                // Dispatch cost at the ACTUAL tip: the day-loss gate
+                // sees live bleed, not paper-only profit.
+                let tip_usd = trader.dispatch_cost_for_tip(tip) as f64 / 1_000_000_000.0 * sol_usd;
                 if tip_usd.is_finite() && tip_usd > 0.0 {
                     self.daily.lock().await.record(-tip_usd, now_secs());
                     self.portfolio.lock().await.debit_dispatch_cost(tip_usd);
@@ -605,12 +625,29 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             self.portfolio.lock().await.clear_venue_fee_for_mint(mint);
             return true;
         };
-        // Resurrect parked bags so `live_sell` can probe them.
+        // Resurrect parked bags so `live_sell` can probe them. Only the
+        // exact key resurrects (one tracked bag per mint); suffixed
+        // duplicates stay parked and are reported loudly instead of
+        // rotting silently — exit each explicitly.
         if !self.exec.is_tracked(mint).await
             && let Some(held) = self.exec.take_manual_exact(mint).await
         {
             warn!(%mint, amount = held.amount_tokens, "manual sell resurrects a parked bag for explicit exit");
             self.exec.insert_tracked(held).await;
+        }
+        let parked_dups: Vec<String> = self
+            .exec
+            .manual_keys()
+            .await
+            .into_iter()
+            .filter(|k| k != mint && live_base_mint(k) == mint)
+            .collect();
+        if !parked_dups.is_empty() {
+            warn!(%mint, dups = ?parked_dups, "other parked bags for this mint stay parked; exit each explicitly");
+            self.emit(format!(
+                "manual sell on {mint} leaves parked duplicates ({}) standing by; exit each explicitly",
+                parked_dups.join(", ")
+            ));
         }
         let tick = match self.reserves.fetch_tick(mint, &curve).await {
             Ok(tick) => tick,
@@ -764,16 +801,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_budget_counts_failures_not_cooldowns() {
+    async fn retry_budget_counts_failures() {
         let exec = exec();
+        assert_eq!(exec.retry_attempts("MINT").await, 0);
         assert_eq!(exec.note_failure("MINT", 1_000).await, 1);
+        assert_eq!(exec.retry_attempts("MINT").await, 1);
         assert_eq!(exec.note_failure("MINT", 1_001).await, 2);
         assert!(exec.cooling("MINT", 1_002, 30).await);
         assert!(!exec.cooling("MINT", 9_999, 30).await);
-        exec.stamp_cooldown("MINT", 2_000).await;
-        assert_eq!(exec.note_failure("MINT", 2_001).await, 3);
         exec.reset_retry("MINT").await;
         assert!(!exec.cooling("MINT", 2_002, 30).await);
+        assert_eq!(exec.retry_attempts("MINT").await, 0);
         assert_eq!(exec.note_failure("MINT", 2_002).await, 1);
     }
 

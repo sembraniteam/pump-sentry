@@ -119,7 +119,9 @@ impl BondingCurveReserves {
         }
     }
 
-    /// Fully-diluted market cap in USD.
+    /// Fully-diluted market cap in USD. Test-only: no production caller
+    /// uses it (pricing flows through `price_usd` + supply math inline).
+    #[cfg(test)]
     pub fn market_cap_usd(&self, decimals: u8, sol_usd: f64) -> Option<f64> {
         self.price_usd(decimals, sol_usd).and_then(|p| {
             let scale = 10f64.powi(i32::from(decimals));

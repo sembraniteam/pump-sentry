@@ -65,10 +65,14 @@ fn position_from(line: &str) -> Option<LivePosition> {
 
 /// Fold lines in order into boot state.
 pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     let mut pending: HashMap<String, WalPending> = HashMap::new();
     let mut positions: HashMap<String, LivePosition> = HashMap::new();
     let mut manual: HashMap<String, WalManual> = HashMap::new();
+    // Fills already subtracted (by bundle id). Old files may carry the
+    // same sell twice (two writers pre-fix); without this a partial
+    // exit replays twice and the held runner vanishes from tracking.
+    let mut seen_sells: HashSet<String> = HashSet::new();
     let mut skipped = 0usize;
     let add = |map: &mut HashMap<String, LivePosition>, p: LivePosition| {
         map.entry(p.mint.clone())
@@ -121,11 +125,17 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 add(&mut positions, pos);
             }
             "sell" => {
-                let (Some(mint), Some(amount)) = (field(line, "mint"), num(line, "amount"))
-                else {
+                let (Some(mint), Some(amount)) = (field(line, "mint"), num(line, "amount")) else {
                     skipped += 1;
                     continue;
                 };
+                // Exactly-once per fill: a repeated bundle id means the
+                // same dispatch was recorded twice, not two fills.
+                if let Some(bundle) = field(line, "bundle")
+                    && !seen_sells.insert(bundle)
+                {
+                    continue;
+                }
                 if let Some(p) = positions.get_mut(&mint) {
                     p.amount_tokens = p.amount_tokens.saturating_sub(amount);
                     if p.amount_tokens == 0 {
@@ -230,5 +240,74 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
     }
     if let Err(e) = crate::cli::write_private_file(path, out.as_bytes()) {
         tracing::warn!(file = %path.display(), error = %e, "live WAL compaction failed; file keeps growing (non-fatal)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn position_line(mint: &str, amount: u64, bundle: &str) -> String {
+        format!(
+            "{{\"t\":\"position\",\"mint\":\"{mint}\",\"curve\":\"C\",\"assoc\":\"A\",\"amount\":{amount},\"creator\":null,\"bundle\":\"{bundle}\",\"ts\":1}}"
+        )
+    }
+
+    fn sell_line(mint: &str, amount: u64, bundle: &str) -> String {
+        format!(
+            "{{\"t\":\"sell\",\"mint\":\"{mint}\",\"amount\":{amount},\"bundle\":\"{bundle}\",\"ts\":2}}"
+        )
+    }
+
+    #[test]
+    fn duplicate_sell_lines_subtract_once() {
+        // The same fill recorded twice (two writers pre-fix, or a
+        // retried append): replay must not double-subtract.
+        let lines = [
+            position_line("MINT", 1000, "B1"),
+            sell_line("MINT", 1000, "B1"),
+            sell_line("MINT", 1000, "B1"),
+        ];
+        let replay = replay_lines(lines.iter().map(String::as_str));
+        assert!(replay.positions.is_empty());
+        assert_eq!(replay.skipped, 0);
+    }
+
+    #[test]
+    fn duplicate_partial_sell_keeps_runner() {
+        // Partial exit recorded twice: the held remainder survives
+        // replay with exit automation intact.
+        let lines = [
+            position_line("MINT", 1000, "B1"),
+            sell_line("MINT", 600, "B2"),
+            sell_line("MINT", 600, "B2"),
+        ];
+        let replay = replay_lines(lines.iter().map(String::as_str));
+        assert_eq!(replay.positions.len(), 1);
+        assert_eq!(replay.positions[0].amount_tokens, 400);
+    }
+
+    #[test]
+    fn distinct_bundles_each_settle() {
+        // Different bundle ids are different fills: both subtract.
+        let lines = [
+            position_line("MINT", 1000, "B1"),
+            sell_line("MINT", 600, "B2"),
+            sell_line("MINT", 400, "B3"),
+        ];
+        let replay = replay_lines(lines.iter().map(String::as_str));
+        assert!(replay.positions.is_empty());
+    }
+
+    #[test]
+    fn sell_without_bundle_still_settles() {
+        // Legacy lines may lack the id: fall back to plain subtract
+        // rather than dropping the fill.
+        let lines = [
+            position_line("MINT", 1000, "B1"),
+            "{\"t\":\"sell\",\"mint\":\"MINT\",\"amount\":1000,\"ts\":2}".to_string(),
+        ];
+        let replay = replay_lines(lines.iter().map(String::as_str));
+        assert!(replay.positions.is_empty());
     }
 }

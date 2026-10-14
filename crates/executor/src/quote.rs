@@ -95,7 +95,8 @@ pub enum QuoteKind {
 }
 
 /// Max decoded tiers per table (DoS bound; live uses 1+1).
-pub const MAX_FEE_TIERS: usize = 1024;
+/// Single source is [`ids::MAX_FEE_TIERS`]; re-exported here.
+pub use ids::MAX_FEE_TIERS;
 
 /// Decode [`FeeSchedule`]. Layout: disc(8) + bump(1) + admin(32) + flat(24)
 /// + fee vec + stable vec + exotic(24, zeros when predating the extension).
@@ -178,9 +179,10 @@ fn u128le(data: &[u8], off: usize) -> Result<u128, QuoteError> {
         .ok_or(QuoteError::BadAccount)
 }
 
-/// `ceil(a / b)` for non-zero `b`.
+/// `ceil(a / b)` for non-zero `b`. Crate-private: only the quote
+/// builders below use it.
 #[inline]
-pub fn ceil_div(a: u128, b: u128) -> Result<u128, QuoteError> {
+fn ceil_div(a: u128, b: u128) -> Result<u128, QuoteError> {
     if b == 0 {
         return Err(QuoteError::MathOverflow);
     }
@@ -189,18 +191,21 @@ pub fn ceil_div(a: u128, b: u128) -> Result<u128, QuoteError> {
         .ok_or(QuoteError::MathOverflow)
 }
 
+/// Basis-point denominator shared by fee and slippage math.
+pub const BPS_DENOMINATOR: u128 = 10_000;
+
 /// `ceil(amount * bps / 10_000)`. Fees round up (flooring dust-underfunds: 6002).
 #[inline]
-pub fn fee_amount(amount: u128, bps: u64) -> Result<u128, QuoteError> {
+fn fee_amount(amount: u128, bps: u64) -> Result<u128, QuoteError> {
     let prod = amount
         .checked_mul(u128::from(bps))
         .ok_or(QuoteError::MathOverflow)?;
-    ceil_div(prod, 10_000)
+    ceil_div(prod, BPS_DENOMINATOR)
 }
 
 /// `a * b / c` floored. Overflow is `Err`.
 #[inline]
-pub fn mul_div(a: u128, b: u128, c: u128) -> Result<u128, QuoteError> {
+fn mul_div(a: u128, b: u128, c: u128) -> Result<u128, QuoteError> {
     a.checked_mul(b)
         .ok_or(QuoteError::MathOverflow)?
         .checked_div(c)
@@ -209,23 +214,27 @@ pub fn mul_div(a: u128, b: u128, c: u128) -> Result<u128, QuoteError> {
 
 /// Constant-product exact-in swap.
 #[inline]
-pub fn swap_exact_input(amount: u128, in_reserve: u128, out_reserve: u128) -> Result<u128, QuoteError> {
+fn swap_exact_input(amount: u128, in_reserve: u128, out_reserve: u128) -> Result<u128, QuoteError> {
     let denom = in_reserve
         .checked_add(amount)
         .ok_or(QuoteError::MathOverflow)?;
     mul_div(amount, out_reserve, denom)
 }
 
-/// Guard ceiling for every spend guard. Zero/overflow -> `None`.
+/// Guard ceiling for every spend guard. Zero, overflow, or slippage >= 100%
+/// (unguarded 2x) -> `None` (fail-closed, mirrors the sell floor policy).
 pub fn slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option<u64> {
     if quoted_cost_incl_fees == 0 {
         return None;
     }
-    let bps = u128::from(slippage_bps.min(10_000));
+    if u128::from(slippage_bps) >= BPS_DENOMINATOR {
+        return None;
+    }
+    let bps = u128::from(slippage_bps);
     let guard = u128::from(quoted_cost_incl_fees)
-        .checked_mul(10_000 + bps)
+        .checked_mul(BPS_DENOMINATOR + bps)
         .and_then(|v| v.checked_add(9_999))
-        .and_then(|v| v.checked_div(10_000))?;
+        .and_then(|v| v.checked_div(BPS_DENOMINATOR))?;
     u64::try_from(guard).ok().filter(|g| *g > 0)
 }
 
@@ -364,7 +373,7 @@ pub fn buy_tokens_for_exact_in(
     }
     let (proto, creator) = curve_fee_bps(schedule, gate_on, view, mint_supply)?;
     let total_bps = u128::from(proto) + u128::from(creator);
-    let mut net = u128::from(sol_amount) * 10_000 / (10_000 + total_bps);
+    let mut net = u128::from(sol_amount) * BPS_DENOMINATOR / (BPS_DENOMINATOR + total_bps);
     if net == 0 {
         return Ok(0);
     }
@@ -540,7 +549,9 @@ mod tests {
         assert_eq!(slippage_ceiling(1_668_970, 100), Some(1_685_660));
         assert_eq!(slippage_ceiling(10_000, 1), Some(10_001));
         assert_eq!(slippage_ceiling(0, 200), None);
-        assert_eq!(slippage_ceiling(1_000, 99_999), Some(2_000));
+        assert_eq!(slippage_ceiling(1_000, 9_999), Some(2_000));
+        assert_eq!(slippage_ceiling(1_000, 10_000), None);
+        assert_eq!(slippage_ceiling(1_000, 99_999), None);
         assert_eq!(slippage_ceiling(u64::MAX, 10_000), None);
         assert_eq!(slippage_ceiling(u64::MAX, 0), Some(u64::MAX));
     }

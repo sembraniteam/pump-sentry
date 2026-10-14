@@ -60,4 +60,9 @@ pub struct ClosedTrade {
     pub opened_at: u64,
     pub closed_at: u64,
     pub hold_seconds: u64,
+    /// Dispatch bleed (tip/base/rent in USD) attributed to this close.
+    /// Zero for pure-paper closes; live legs attribute actual tips here
+    /// so headline PnL never hides the round-trip drag.
+    #[serde(default)]
+    pub dispatch_usd: f64,
 }

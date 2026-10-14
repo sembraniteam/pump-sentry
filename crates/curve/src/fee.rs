@@ -3,17 +3,25 @@
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// Deadline for fee-input reads.
 pub const FEE_TIMEOUT: Duration = Duration::from_secs(10);
-/// FeeConfig/Global cache TTL.
-pub const FEE_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// FeeConfig/Global cache TTL. Short on purpose: a schedule change
+/// must reach paper within minutes, and a cold read is only 2 RPCs on
+/// the rare confirm path.
+pub const FEE_CACHE_TTL: Duration = Duration::from_secs(900);
 
 /// Cached globals: FeeConfig bytes, gate byte, fetch time.
 pub type FeeInputsCache = Arc<Mutex<Option<(Vec<u8>, u8, Instant)>>>;
+
+/// Mint supply cache. Supplies never change on bonding curves (fixed at
+/// creation; gated mints have no live mint authority), so entries never
+/// expire — same bound discipline as the decimals cache.
+pub type SupplyCache = Arc<Mutex<HashMap<String, u64>>>;
 
 /// Quote-mint class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +35,7 @@ enum QuoteKind {
 pub async fn venue_fee_bps(
     rpc: &RpcClient,
     cache: &FeeInputsCache,
+    supply_cache: &SupplyCache,
     mint: &Pubkey,
     curve: &Pubkey,
 ) -> Option<f64> {
@@ -34,13 +43,22 @@ pub async fn venue_fee_bps(
         .await
         .ok()?
         .ok()?;
-    venue_fee_for_data(rpc, cache, mint, &curve_data.owner, &curve_data.data).await
+    venue_fee_for_data(
+        rpc,
+        cache,
+        supply_cache,
+        mint,
+        &curve_data.owner,
+        &curve_data.data,
+    )
+    .await
 }
 
 /// Total venue fee from curve bytes (owner must be Pump).
 pub async fn venue_fee_for_data(
     rpc: &RpcClient,
     cache: &FeeInputsCache,
+    supply_cache: &SupplyCache,
     mint: &Pubkey,
     owner: &Pubkey,
     data: &[u8],
@@ -52,7 +70,7 @@ pub async fn venue_fee_for_data(
     let supply = if view.is_mayhem {
         view.stored_supply
     } else {
-        mint_supply(rpc, mint).await?
+        mint_supply(rpc, supply_cache, mint).await?
     };
     let (fee_bytes, gate_byte) = cached_fee_inputs(rpc, cache).await?;
     let gate_on = match gate_byte {
@@ -71,10 +89,13 @@ pub async fn venue_fee_for_data(
     Some(effective_total(proto, coin)? as f64)
 }
 
+/// Basis-point denominator (mirrors executor math; u64 domain here).
+const BPS_DENOMINATOR: u64 = 10_000;
+
 /// Venue total; `None` past 100%.
 fn effective_total(proto: u64, creator: u64) -> Option<u64> {
     let total = proto.checked_add(creator)?;
-    if total > 10_000 {
+    if total > BPS_DENOMINATOR {
         return None;
     }
     Some(total)
@@ -147,13 +168,25 @@ fn curve_fee_inputs(data: &[u8]) -> Option<CurveFeeView> {
     })
 }
 
-/// Mint supply for fee-tier market caps.
-async fn mint_supply(rpc: &RpcClient, mint: &Pubkey) -> Option<u64> {
+/// Mint supply for fee-tier market caps (cached: immutable on curves).
+async fn mint_supply(rpc: &RpcClient, cache: &SupplyCache, mint: &Pubkey) -> Option<u64> {
+    let key = mint.to_string();
+    if let Some(hit) = cache.lock().await.get(&key) {
+        return Some(*hit);
+    }
     let supply = tokio::time::timeout(FEE_TIMEOUT, rpc.get_token_supply(mint))
         .await
         .ok()?
         .ok()?;
-    supply.amount.parse::<u64>().ok()
+    let supply = supply.amount.parse::<u64>().ok()?;
+    let mut guard = cache.lock().await;
+    if guard.len() >= crate::ticker::DECIMALS_CACHE_CAP
+        && let Some(oldest) = guard.keys().next().cloned()
+    {
+        guard.remove(&oldest);
+    }
+    guard.insert(key, supply);
+    Some(supply)
 }
 
 /// Market cap, lamports: `vq * supply / vt`.
@@ -178,8 +211,9 @@ struct FeeSchedule {
     exotic: (u64, u64),
 }
 
-/// Tier-table bound (DoS cap on hostile lengths).
-pub const MAX_FEE_TIERS: usize = 1024;
+/// Tier-table bound (DoS cap on hostile lengths; single source is
+/// `ids::MAX_FEE_TIERS`).
+use ids::MAX_FEE_TIERS;
 
 /// Highest tier at or below mcap, else the first.
 fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<(u64, u64)> {
@@ -232,7 +266,8 @@ fn parse_schedule(data: &[u8]) -> Option<FeeSchedule> {
     })
 }
 
-/// One tier table at `off` plus the next offset.
+/// One tier table at `off` plus the next offset. Thresholds must
+/// ascend (tier selection assumes it); anything else fails closed.
 fn parse_tier_vec(data: &[u8], off: usize) -> Option<(Vec<FeeTierRow>, usize)> {
     let n = u32le(data, off)? as usize;
     if n > MAX_FEE_TIERS {
@@ -240,11 +275,16 @@ fn parse_tier_vec(data: &[u8], off: usize) -> Option<(Vec<FeeTierRow>, usize)> {
     }
     let mut out = Vec::with_capacity(n.min(16));
     let mut at = off + 4;
+    let mut prev = 0u128;
     for _ in 0..n {
         let threshold = data
             .get(at..at + 16)
             .and_then(|b| <[u8; 16]>::try_from(b).ok())
             .map(u128::from_le_bytes)?;
+        if threshold < prev {
+            return None;
+        }
+        prev = threshold;
         let proto = u64le(data, at + 24)?;
         let creator = u64le(data, at + 32)?;
         out.push((threshold, (proto, creator)));
@@ -327,6 +367,22 @@ mod tests {
         };
         assert_eq!(select_tier(&empty, QuoteKind::SolLike, 0), None);
         assert_eq!(parse_schedule(&two_tier_bytes()[..72]), None);
+    }
+
+    #[test]
+    fn descending_tiers_fail_closed() {
+        // Thresholds must ascend; anything else refuses (tier
+        // selection would mis-pick silently). Row 2 lives at 109..125.
+        let mut bytes = two_tier_bytes();
+        bytes[109..125].copy_from_slice(&0u128.to_le_bytes());
+        let sched = parse_schedule(&bytes).expect("shape still decodes");
+        // Equal thresholds resolve to the last row (documented
+        // tie-break: highest threshold <= mcap, later wins ties).
+        assert_eq!(select_tier(&sched, QuoteKind::SolLike, 0), Some((80, 20)));
+        let mut bad = two_tier_bytes();
+        bad[69..85].copy_from_slice(&5u128.to_le_bytes());
+        bad[109..125].copy_from_slice(&0u128.to_le_bytes());
+        assert_eq!(parse_schedule(&bad), None);
     }
 
     #[test]

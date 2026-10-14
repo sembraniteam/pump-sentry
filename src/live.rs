@@ -10,11 +10,15 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// Mint decimals. Confirm verifies 6; else drop.
-pub const TOKEN_DECIMALS: u32 = 6;
-/// Lamports per SOL.
-pub const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+/// Single source is `curve::PUMP_TOKEN_DECIMALS`.
+pub const TOKEN_DECIMALS: u32 = curve::PUMP_TOKEN_DECIMALS as u32;
+/// Lamports per SOL. Single source is `curve::layout::LAMPORTS_PER_SOL`.
+pub const LAMPORTS_PER_SOL: f64 = curve::layout::LAMPORTS_PER_SOL;
 /// Standard fee tier (bps/side). Matches the simulator default.
 pub const VENUE_FEE_BPS: u64 = 125;
+/// Basis-point denominator shared by fee and slippage math.
+/// Single source is `executor::quote::BPS_DENOMINATOR` (u128 domain there).
+pub const BPS_DENOMINATOR: u64 = executor::quote::BPS_DENOMINATOR as u64;
 
 /// Live-trade failures.
 #[derive(Error, Debug)]
@@ -98,6 +102,42 @@ pub struct LiveBuyPlan {
     pub max_sol_cost: u64,
 }
 
+/// Curve-leg sell request. Bundled like buys (arity never grows).
+#[derive(Debug, Clone, Copy)]
+pub struct LiveSellParams<'a> {
+    pub position: &'a LivePosition,
+    pub price_usd: f64,
+    pub sol_usd: f64,
+    pub liquidity_usd: f64,
+    /// Fee tier. `None` is standard.
+    pub venue_fee_bps: Option<f64>,
+    /// Jito tip (escalated on retry; caller computes via `escalated_tip`).
+    pub tip_lamports: u64,
+}
+
+/// Raydium-leg sell request. Floor prices from vault reserves, so no
+/// USD inputs cross here (the curve print is gone on this path).
+#[derive(Debug, Clone, Copy)]
+pub struct RaydiumSellParams<'a> {
+    pub position: &'a LivePosition,
+    pub pool: &'a RaydiumPoolLeg,
+    /// Jito tip (escalated on retry).
+    pub tip_lamports: u64,
+}
+
+/// Max tip multiplier on sell retries. Congestion response is bounded:
+/// a stuck bag must not burn the wallet, and floors never widen
+/// instead (price protection is the policy; landing odds are the knob).
+pub const TIP_ESCALATION_MAX_MULT: u64 = 4;
+
+/// Tip for a sell attempt: base x (1 + prior failures), capped. Pure.
+pub fn escalated_tip(base_tip_lamports: u64, failed_attempts: u32) -> u64 {
+    let mult = failed_attempts
+        .saturating_add(1)
+        .min(TIP_ESCALATION_MAX_MULT as u32);
+    base_tip_lamports.saturating_mul(mult as u64)
+}
+
 /// Guard over a fee-inclusive quote: quote plus `slippage_bps`, up.
 /// `None` on zero or overflow (fail-closed).
 pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option<u64> {
@@ -147,8 +187,9 @@ pub fn plan_buy(
     let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
     // Fee first at sizing tier, then slippage ceiling.
     let with_fee = u64::try_from(
-        (u64_from_f64_floor(lamports)? as u128 * (10_000 + fee_bps_per_side.ceil() as u128))
-            .div_ceil(10_000),
+        (u64_from_f64_floor(lamports)? as u128
+            * (BPS_DENOMINATOR as u128 + fee_bps_per_side.ceil() as u128))
+            .div_ceil(BPS_DENOMINATOR as u128),
     )
     .ok()?;
     // One guard everywhere.
@@ -175,7 +216,7 @@ pub fn plan_sell_floor(
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
         return None;
     }
-    if slippage_bps >= 10_000 {
+    if slippage_bps >= BPS_DENOMINATOR {
         return None;
     }
     if !fee_bps_per_side.is_finite() || fee_bps_per_side < 0.0 {
@@ -192,12 +233,17 @@ pub fn plan_sell_floor(
     if !lamports.is_finite() || lamports <= 0.0 || lamports >= u64::MAX as f64 {
         return None;
     }
-    // Exact mul-div floor in u128.
+    // Exact mul-div floor in u128. The `as u64` below is exact, not
+    // saturating-by-accident: the guard above already rejected NaN,
+    // non-positive, and everything >= 2^64 (unrepresentable in f64
+    // anyway), so every surviving value converts losslessly.
     let base = lamports.floor() as u64;
+    debug_assert!((base as f64) <= lamports);
     if base == 0 {
         return None;
     }
-    let floor = (base as u128 * (10_000 - slippage_bps as u128) / 10_000) as u64;
+    let floor = (base as u128 * (BPS_DENOMINATOR as u128 - slippage_bps as u128)
+        / BPS_DENOMINATOR as u128) as u64;
     if floor == 0 {
         return None;
     }
@@ -293,12 +339,18 @@ impl LiveTrader {
 
     /// Per-dispatch overhead: tip plus fees. Excludes first-buy ATA rent.
     pub fn dispatch_cost_lamports(&self) -> u64 {
+        self.dispatch_cost_for_tip(self.tip_lamports)
+    }
+
+    /// Overhead at an explicit tip (escalated retries debit actuals, not
+    /// the base rate).
+    pub fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64 {
         let prio = (self.compute_unit_limit as u128)
             .saturating_mul(self.priority_fee_micro_lamports as u128)
             .saturating_add(999_999)
             / 1_000_000;
         let prio = u64::try_from(prio).unwrap_or(u64::MAX);
-        self.tip_lamports
+        tip_lamports
             .saturating_add(prio)
             .saturating_add(BASE_TX_FEE_LAMPORTS)
     }
@@ -713,39 +765,41 @@ impl LiveTrader {
         ));
     }
 
+    /// Base Jito tip (live_sell escalates it by attempts).
+    pub fn base_tip(&self) -> u64 {
+        self.tip_lamports
+    }
+
     /// Import boot-replayed pendings into recheck.
     pub fn import_pending(&self, items: Vec<wal::WalPending>) -> usize {
         self.with_pending("wal-import", 0, |guard| {
             let mut n = 0usize;
             for item in items {
-                guard.entry(item.position.mint.clone()).or_insert(PendingBuy {
-                    position: item.position,
-                    signature: item.signature,
-                    bundle_id: item.bundle_id,
-                    attempts: 1,
+                let mint = item.position.mint.clone();
+                guard.entry(mint).or_insert_with(|| {
+                    n += 1;
+                    PendingBuy {
+                        position: item.position,
+                        signature: item.signature,
+                        bundle_id: item.bundle_id,
+                        attempts: 1,
+                    }
                 });
-                n += 1;
             }
             n
         })
     }
 
     /// Sell the full tracked amount via Jito.
-    pub async fn sell(
-        &self,
-        position: &LivePosition,
-        price_usd: f64,
-        sol_usd: f64,
-        liquidity_usd: f64,
-        venue_fee_bps: Option<f64>,
-    ) -> Result<String, LiveError> {
+    pub async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
+        let position = req.position;
         let floor = plan_sell_floor(
             position.amount_tokens,
-            price_usd,
-            sol_usd,
+            req.price_usd,
+            req.sol_usd,
             self.slippage_bps,
-            liquidity_usd,
-            venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
+            req.liquidity_usd,
+            req.venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
         )
         .ok_or_else(|| LiveError::BadOrder(format!("cannot floor sell of {}", position.mint)))?;
         let receipt = match tokio::time::timeout(
@@ -759,7 +813,7 @@ impl LiveTrader {
                     .map_err(|e| LiveError::BadOrder(format!("bad assoc_curve '{}': {e}", position.assoc_curve)))?,
                 amount_tokens: position.amount_tokens,
                 min_sol_output: floor,
-                tip_lamports: self.tip_lamports,
+                tip_lamports: req.tip_lamports,
                 creator: match &position.creator {
                     Some(c) => Some(
                         parse_pubkey(c)
@@ -786,8 +840,10 @@ impl LiveTrader {
             .await
         {
             Ok(ConfirmOutcome::Confirmed) => {
-                // Write-ahead of subtract: crash replays subtracted.
-                self.record_sell(&position.mint, position.amount_tokens, &receipt.bundle_id);
+                // No WAL write here: the caller records the sell
+                // write-ahead of its custody subtract (single write
+                // point — a duplicate line would double-subtract a
+                // partial exit on boot replay).
                 Ok(receipt.bundle_id)
             }
             Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
@@ -807,11 +863,9 @@ impl LiveTrader {
     }
 
     /// Raydium sell at `pool` via Jito. Floor prices from vault reserves.
-    pub async fn sell_raydium(
-        &self,
-        position: &LivePosition,
-        pool: &RaydiumPoolLeg,
-    ) -> Result<String, LiveError> {
+    pub async fn sell_raydium(&self, req: &RaydiumSellParams<'_>) -> Result<String, LiveError> {
+        let position = req.position;
+        let pool = req.pool;
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.sell_raydium_jito(&executor::SellRaydiumOrder {
@@ -825,7 +879,7 @@ impl LiveTrader {
                     .map_err(|e| LiveError::BadOrder(format!("bad quote_vault '{e}")))?,
                 amount_tokens: position.amount_tokens,
                 slippage_bps: self.slippage_bps,
-                tip_lamports: self.tip_lamports,
+                tip_lamports: req.tip_lamports,
             }),
         )
         .await
@@ -845,8 +899,7 @@ impl LiveTrader {
             .await
         {
             Ok(ConfirmOutcome::Confirmed) => {
-                // Write-ahead of subtract: crash replays subtracted.
-                self.record_sell(&position.mint, position.amount_tokens, &receipt.bundle_id);
+                // No WAL write here (see curve-leg sell above).
                 Ok(receipt.bundle_id)
             }
             Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
@@ -876,8 +929,9 @@ mod tests {
         assert_eq!(apply_slippage_ceiling(10_001, 0), Some(10_001));
         assert_eq!(apply_slippage_ceiling(10_000, 1), Some(10_001));
         assert_eq!(apply_slippage_ceiling(0, 200), None);
-        assert_eq!(apply_slippage_ceiling(1_000, 10_000), Some(2_000));
-        assert_eq!(apply_slippage_ceiling(1_000, 99_999), Some(2_000));
+        assert_eq!(apply_slippage_ceiling(1_000, 9_999), Some(2_000));
+        assert_eq!(apply_slippage_ceiling(1_000, 10_000), None);
+        assert_eq!(apply_slippage_ceiling(1_000, 99_999), None);
         assert_eq!(apply_slippage_ceiling(u64::MAX, 10_000), None);
         assert_eq!(apply_slippage_ceiling(u64::MAX, 0), Some(u64::MAX));
     }
@@ -885,6 +939,20 @@ mod tests {
     #[test]
     fn standard_tier_matches_simulator_default() {
         assert_eq!(VENUE_FEE_BPS as f64, FillModel::default().venue_fee_bps());
+    }
+
+    #[test]
+    fn tip_escalates_bounded_by_attempts() {
+        assert_eq!(escalated_tip(100_000, 0), 100_000);
+        assert_eq!(escalated_tip(100_000, 1), 200_000);
+        assert_eq!(escalated_tip(100_000, 2), 300_000);
+        assert_eq!(escalated_tip(100_000, 3), 400_000);
+        // Capped: a stuck bag cannot burn the wallet.
+        assert_eq!(escalated_tip(100_000, 4), 400_000);
+        assert_eq!(escalated_tip(100_000, u32::MAX), 400_000);
+        // Zero base stays zero; saturates instead of wrapping.
+        assert_eq!(escalated_tip(0, 9), 0);
+        assert_eq!(escalated_tip(u64::MAX, 9), u64::MAX);
     }
 
     #[test]
@@ -1045,7 +1113,7 @@ mod tests {
             WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
                 .expect("wallet");
         let exec = SwapExecutor::new(
-            "https://api.mainnet-beta.solana.com",
+            crate::settings::DEFAULT_HTTP_RPC_URL,
             CommitmentConfig::confirmed(),
             wallet,
         )

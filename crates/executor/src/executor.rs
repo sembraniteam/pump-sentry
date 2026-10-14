@@ -279,7 +279,8 @@ pub struct LiveFundingReport {
     pub payer: Pubkey,
     /// Native SOL in lamports (`None` = unreadable).
     pub native_balance: Option<u64>,
-    /// Native lamports required (tip + 0.05 SOL reserve).
+    /// Native lamports required (tip + priority + base fee + one ATA
+    /// rent + 0.05 SOL reserve).
     pub native_required: u64,
     /// Wallet WSOL ATA.
     pub wsol_ata: Pubkey,
@@ -345,18 +346,37 @@ impl SwapExecutor {
         }
     }
 
-    /// Read-only funding snapshot. Moves no funds.
+    /// Priority fee per dispatch, ceiled (`limit * price / 1e6`).
+    fn priority_fee_lamports(&self) -> u64 {
+        let prio = (self.compute_unit_limit as u128)
+            .saturating_mul(self.compute_unit_price as u128)
+            .saturating_add(999_999)
+            / 1_000_000;
+        u64::try_from(prio).unwrap_or(u64::MAX)
+    }
+
+    /// Read-only funding snapshot. Moves no funds. Matches a real
+    /// first-touch dispatch cost (tip + priority + base fee + one ATA
+    /// rent + reserve), so a green report means the wallet can actually
+    /// open — not just cover the tip.
     pub async fn live_funding_report(&self, tip_lamports: u64) -> LiveFundingReport {
         use crate::instructions::{WSOL_MINT, user_ata_with_program};
         let required = self
             .effective_tip(tip_lamports, true)
+            .saturating_add(self.priority_fee_lamports())
+            .saturating_add(ids::BASE_TX_FEE_LAMPORTS)
+            .saturating_add(ids::ATA_RENT_LAMPORTS)
             .saturating_add(crate::wallet::MIN_SOL_RESERVE_LAMPORTS);
         let native_balance = rpc_timeout(
             Duration::from_secs(15),
             self.rpc.get_balance(&self.wallet.pubkey()),
         )
         .await;
-        // Same program resolution as every dispatch path.
+        // Same program resolution as every dispatch path. Report-only
+        // fallback: dispatch paths fail closed when the mint is unreadable
+        // (`token_program` -> `BadOrder`), while this snapshot still reports
+        // a classic-ATA address so funding stays visible. Never use this
+        // fallback to build a swap ix.
         let wsol_ata = match self.token_program(&WSOL_MINT).await {
             Some(program) => {
                 user_ata_with_program(&self.wallet.pubkey(), &WSOL_MINT, &program)
@@ -516,7 +536,11 @@ impl SwapExecutor {
             if start.elapsed() >= timeout {
                 return Ok(ConfirmOutcome::Timeout);
             }
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            // Deterministic stagger (no rand dep): concurrent confirms
+            // for different mints desync instead of bursting the RPC in
+            // lockstep every second.
+            let round = (start.elapsed().as_secs() % 4) * 125;
+            tokio::time::sleep(Duration::from_millis(1000 + round)).await;
         }
     }
 
@@ -575,14 +599,22 @@ impl SwapExecutor {
         }
         let balance = self
             .wallet
-            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled))
+            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "raydium sell pre-flight ok");
         let payer = self.wallet.pubkey();
-        // Source ATA must be the account the swap spends from.
+        // Source ATA must be the account the swap spends from. Classic
+        // only: upstream requires `[0] == spl_token::id()`, so a
+        // Token-2022 mint fails here (not after burning sim budget).
         let Some(token_program) = self.token_program(&order.mint).await else {
             return Err(ExecutorError::BadOrder("mint account unreadable; token program unknown".to_string()));
         };
+        if token_program != crate::instructions::TOKEN_PROGRAM_ID {
+            warn!(mint = %order.mint, "Token-2022 mint on a Raydium V4 pool: unroutable by program construction; refusing (fail-closed, manual exit)");
+            return Err(ExecutorError::BadOrder(
+                "Token-2022 mint unroutable via Raydium V4; refusing (fail-closed)".to_string(),
+            ));
+        }
         let source_ata = crate::instructions::user_ata_with_program(&payer, &order.mint, &token_program);
         match tokio::time::timeout(
             Duration::from_secs(10),
@@ -706,6 +738,11 @@ impl SwapExecutor {
         if order.max_sol_cost == 0 {
             return Err(ExecutorError::BadOrder("buy max_sol_cost is 0".to_string()));
         }
+        if order.slippage_bps >= 10_000 {
+            return Err(ExecutorError::BadOrder(
+                "buy slippage >= 100%: refusing unguarded ceiling".to_string(),
+            ));
+        }
         // SOL-paired pays native; token-paired debits the quote ATA.
         let payer = self.wallet.pubkey();
         // Independent RPCs: load together.
@@ -767,7 +804,7 @@ impl SwapExecutor {
         let trade_lamports = if is_sol_quote { final_max } else { 0 };
         let balance = self
             .wallet
-            .assert_solvency(&self.rpc, trade_lamports, self.effective_tip(order.tip_lamports, bundled))
+            .assert_solvency(&self.rpc, trade_lamports, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
             .await?;
         info!(mint = %order.mint, balance, max_cost = final_max, "buy pre-flight ok");
         let Some(state) = curve_state.as_ref() else {
@@ -848,9 +885,14 @@ impl SwapExecutor {
         if order.amount_tokens == 0 {
             return Err(ExecutorError::BadOrder("sell amount_tokens is 0".to_string()));
         }
+        // Zero floor authorizes any fill price (sandwich drain): fail closed,
+        // mirroring the buy-side max_sol_cost == 0 refusal above.
+        if order.min_sol_output == 0 {
+            return Err(ExecutorError::BadOrder("sell min_sol_output is 0".to_string()));
+        }
         let balance = self
             .wallet
-            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled))
+            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "sell pre-flight ok");
         let payer = self.wallet.pubkey();
@@ -992,6 +1034,9 @@ impl SwapExecutor {
             Some(_) => Vec::new(),
             None => {
                 use crate::instructions::build_create_ata_ix;
+                // Unreadable counts as missing (idempotent create decides
+                // at sim): transport trouble, not proof of absence.
+                tracing::debug!(%ata, "ATA unreadable; prefixing idempotent create");
                 vec![build_create_ata_ix(payer, owner, mint, ata, token_program)]
             }
         }

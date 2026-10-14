@@ -27,12 +27,22 @@ pub enum RugCheckError {
 }
 
 impl RugCheckError {
+    /// Retryable throttle (429): indexing latency, not policy.
+    /// Helper for pipeline stubs; production surfaces this from HTTP.
+    pub fn transient_throttle() -> Self {
+        Self::HttpStatus(reqwest::StatusCode::TOO_MANY_REQUESTS)
+    }
+
     /// Retryable at the watchlist. HTTP 400 on a new
-    /// mint means "not indexed yet".
+    /// mint means "not indexed yet". Deserialization is terminal:
+    /// a schema break is permanent, not a transient to re-poll every 3s.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::SecurityRejection(_) | Self::BadUrl(_) | Self::ResponseTooLarge => false,
-            Self::Network(_) | Self::Deserialization(_) => true,
+            Self::SecurityRejection(_)
+            | Self::BadUrl(_)
+            | Self::ResponseTooLarge
+            | Self::Deserialization(_) => false,
+            Self::Network(_) => true,
             Self::HttpStatus(s) => {
                 s.is_server_error()
                     || *s == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -87,10 +97,11 @@ pub struct TokenInfo {
     /// Freeze authority address, if still enabled.
     #[serde(default)]
     pub freeze_authority: Option<String>,
-    /// Total supply in base units.
+    /// Total supply in base units (informational only: policy and
+    /// sizing never read it; decimals come from RPC `token_decimals`).
     #[serde(default)]
     pub supply: u64,
-    /// Mint decimals.
+    /// Mint decimals (informational only, see `supply`).
     #[serde(default)]
     pub decimals: u8,
 }
@@ -143,7 +154,8 @@ mod tests {
         assert!(RugCheckError::HttpStatus(StatusCode::TOO_MANY_REQUESTS).is_retryable());
         assert!(RugCheckError::HttpStatus(StatusCode::REQUEST_TIMEOUT).is_retryable());
         assert!(RugCheckError::HttpStatus(StatusCode::INTERNAL_SERVER_ERROR).is_retryable());
-        assert!(RugCheckError::Deserialization(
+        // Schema breaks are permanent: terminal, never re-polled.
+        assert!(!RugCheckError::Deserialization(
             serde_json::from_str::<u32>("bogus").expect_err("must fail")
         )
         .is_retryable());

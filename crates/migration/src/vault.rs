@@ -4,14 +4,21 @@
 //!
 //! SPL layout (bytes 64..72 read): `mint(32) owner(32) amount(u64)`.
 
-use curve::SolUsdFeed;
+use curve::{RoundBackoff, SolUsdFeed, warn_throttled};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
+
+// Warn slot: persistent price trouble pages ops, not every round.
+static PRICE_WARN_AT: AtomicU64 = AtomicU64::new(0);
 
 /// SPL amount offset/length.
 const TOKEN_AMOUNT_OFFSET: usize = 64;
@@ -74,6 +81,8 @@ pub struct VaultTicker {
     sol_feed: Arc<SolUsdFeed>,
     /// Ticks dropped on a full queue.
     dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Consecutive-failure backoff (sick node, not sick data).
+    backoff: Arc<RoundBackoff>,
 }
 
 impl VaultTicker {
@@ -97,10 +106,13 @@ impl VaultTicker {
             interval,
             sol_feed,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            backoff: Arc::new(RoundBackoff::new()),
         })
     }
 
-    /// Ticks dropped on a full queue.
+    /// Ticks dropped on a full queue. Test-only: production surfaces
+    /// drops via tracing, never by polling this counter.
+    #[cfg(test)]
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -191,6 +203,9 @@ impl VaultTicker {
             }
             let Some(sol_usd) = self.sol_feed.price() else {
                 debug!("sol_usd stale; skipping pool round");
+                // Extra interval is deliberate backoff (on top of loop
+                // pacing): a dead feed heals on its own cadence, and
+                // hammering vault RPCs meanwhile only burns budget.
                 tokio::time::sleep(self.interval).await;
                 continue;
             };
@@ -201,10 +216,13 @@ impl VaultTicker {
             )
             .await
             {
-                Ok(accounts) => accounts,
+                Ok(accounts) => {
+                    self.backoff.success();
+                    accounts
+                }
                 Err(_) => {
                     warn!(pools = watched.len(), "pool round timed out; backing off");
-                    tokio::time::sleep(self.interval).await;
+                    tokio::time::sleep(self.interval + self.backoff.fail_sleep()).await;
                     continue;
                 }
             };
@@ -214,6 +232,7 @@ impl VaultTicker {
                     got = accounts.len(),
                     "vault batch length mismatch; skipping round"
                 );
+                tokio::time::sleep(self.backoff.fail_sleep()).await;
                 continue;
             }
             for (pool, pair) in watched.iter().zip(accounts.as_chunks::<2>().0) {
@@ -229,7 +248,9 @@ impl VaultTicker {
                     &quote.owner,
                     sol_usd,
                 ) else {
-                    debug!(mint = %pool.mint, "pool price uncomputable");
+                    if warn_throttled(&PRICE_WARN_AT) {
+                        warn!(mint = %pool.mint, "pool price uncomputable for rounds; vault layout changed?");
+                    }
                     continue;
                 };
                 match tx.try_send(tick) {

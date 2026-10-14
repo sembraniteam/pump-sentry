@@ -43,9 +43,6 @@ pub const PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR: [u8; 8] =
 pub const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 /// `migrate` instruction discriminator (skill solana-raydium-migration).
 pub const PUMP_MIGRATE_DISCRIMINATOR: [u8; 8] = [155, 234, 231, 146, 236, 158, 162, 30];
-/// Global volume accumulator: every swap's volume tracking roots here.
-pub const GLOBAL_VOLUME_ACCUMULATOR: Pubkey =
-    Pubkey::from_str_const("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y");
 /// Fee config account: swap fee schedule (position 14).
 pub const FEE_CONFIG_ACCOUNT: Pubkey =
     Pubkey::from_str_const("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt");
@@ -69,10 +66,6 @@ pub const DEFAULT_BUYBACK_FEE_RECIPIENT: Pubkey = BUYBACK_FEE_RECIPIENTS[0];
 /// USDC mint: `stable_fee_tiers`; SOL-like: `fee_tiers`; else exotic/flat.
 pub const USDC_MINT: Pubkey =
     Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-/// Seed for creator-vault PDAs: `["creator-vault", creator]`.
-pub const CREATOR_VAULT_SEED: &[u8] = b"creator-vault";
-/// Seed for sharing-config PDAs: `["sharing-config", base_mint]`.
-pub const SHARING_CONFIG_SEED: &[u8] = b"sharing-config";
 /// Curve offsets (after the 8-byte Anchor disc):
 /// complete @48, creator @49..81, mayhem @81, cashback @82,
 /// quote @83..115 (zero = SOL-paired -> WSOL).
@@ -97,6 +90,9 @@ pub const CURVE_COIN_CREATOR_FEE_OFFSET: usize = 115;
 pub const CURVE_COIN_CREATOR_FEE_END: usize = 123;
 /// `creator_fee_configurable` byte in Global (1088 bytes).
 pub const GLOBAL_FEE_GATE_OFFSET: usize = 1045;
+/// Max decoded fee tiers per FeeConfig table (DoS bound; live uses 1+1).
+/// Single source for the executor quote decoder and the paper fee reader.
+pub const MAX_FEE_TIERS: usize = 1024;
 /// Seed for user volume PDAs: `["user_volume_accumulator", user]`.
 pub const USER_VOLUME_ACCUMULATOR_SEED: &[u8] = b"user_volume_accumulator";
 

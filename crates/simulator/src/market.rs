@@ -3,6 +3,17 @@
 use crate::types::{ExitReason, Position, Side};
 
 /// Execution price for paper fills.
+///
+/// Two fee layers, never confused: `fee_bps` commission on entry/exit
+/// notionals (see `PaperPortfolio::new`) PLUS the venue fee already
+/// embedded in fill prices. Setting `fee_bps = 125` on the default model
+/// double-counts the venue leg.
+///
+/// The infallible helpers (`slip_fraction*`, `fill_price`) are capped
+/// estimators for sizing guards (live slippage ceilings/floors are
+/// protection, not fills). Execution paths must use the `try_*`
+/// variants, which return `None` instead of printing a fictitious
+/// capped fill when the curve cannot absorb the size.
 #[derive(Debug, Clone, Copy)]
 pub enum FillModel {
     /// Fill at quote (tests only).
@@ -51,8 +62,64 @@ impl FillModel {
     }
 
     /// One-side cost, capped.
+    ///
+    /// Capped estimator for sizing guards, NOT an execution fill: a buy
+    /// past the curve (`notional >= liquidity`) clamps at `max_slip_frac`
+    /// instead of failing. Use `try_slip_fraction_for_side` to price.
     pub fn slip_fraction(&self, side: Side, notional_usd: f64, liquidity_usd: f64) -> f64 {
         self.slip_fraction_for_side(side, notional_usd, liquidity_usd)
+    }
+
+    /// Fallible one-side cost. `None` when the price is unknowable:
+    /// bad notional, non-finite/negative liquidity, or a buy whose size
+    /// exhausts the curve (`notional >= liquidity`, where the
+    /// constant-product impact `s/(1-s)` is unbounded). Zero liquidity
+    /// prices fee-only (synthetic-grade: the caller decides whether that
+    /// book is headline-eligible). Sells always absorb (bounded impact).
+    /// Otherwise identical to `slip_fraction_for_side`, cap included.
+    pub fn try_slip_fraction_for_side(
+        &self,
+        side: Side,
+        notional_usd: f64,
+        liquidity_usd: f64,
+    ) -> Option<f64> {
+        let cap = match *self {
+            FillModel::Exact => 0.0,
+            FillModel::BondingCurve { max_slip_frac, .. } => max_slip_frac.max(0.0),
+        };
+        if matches!(*self, FillModel::Exact) {
+            return Some(0.0);
+        }
+        if !notional_usd.is_finite() || notional_usd <= 0.0 {
+            return None;
+        }
+        if !liquidity_usd.is_finite() || liquidity_usd < 0.0 {
+            return None;
+        }
+        let fee = match *self {
+            FillModel::Exact => 0.0,
+            FillModel::BondingCurve { fee_bps_per_side, .. } => fee_bps_per_side.max(0.0) / 10_000.0,
+        };
+        if liquidity_usd == 0.0 {
+            return Some(fee.clamp(0.0, cap));
+        }
+        let size = (notional_usd / liquidity_usd).max(0.0);
+        let impact = match side {
+            Side::Long if size >= 1.0 => return None,
+            Side::Long => size / (1.0 - size),
+            Side::Short => size / (1.0 + size),
+        };
+        Some((impact + fee).clamp(0.0, cap))
+    }
+
+    /// `try_slip_fraction_for_side` with the position side implied by `side`.
+    pub fn try_slip_fraction(
+        &self,
+        side: Side,
+        notional_usd: f64,
+        liquidity_usd: f64,
+    ) -> Option<f64> {
+        self.try_slip_fraction_for_side(side, notional_usd, liquidity_usd)
     }
 
     pub fn slip_fraction_for_side(&self, side: Side, notional_usd: f64, liquidity_usd: f64) -> f64 {
@@ -99,6 +166,9 @@ impl FillModel {
         (impact + fee).clamp(0.0, cap)
     }
     /// Quote to execution price.
+    ///
+    /// Capped estimator (see `slip_fraction`): never fails, even past the
+    /// curve. Execution paths must use `try_fill_price`.
     pub fn fill_price(&self, side: Side, quote: f64, notional_usd: f64, liquidity_usd: f64) -> f64 {
         if !quote.is_finite() || quote <= 0.0 || !notional_usd.is_finite() || notional_usd <= 0.0 {
             return quote;
@@ -108,6 +178,26 @@ impl FillModel {
             Side::Long => quote * (1.0 + slip),
             Side::Short => quote * (1.0 - slip).max(0.0),
         }
+    }
+
+    /// Fallible quote to execution price. `None` exactly when
+    /// `try_slip_fraction_for_side` is `None` (bad inputs, unknown
+    /// liquidity, or curve exhaustion on buys).
+    pub fn try_fill_price(
+        &self,
+        side: Side,
+        quote: f64,
+        notional_usd: f64,
+        liquidity_usd: f64,
+    ) -> Option<f64> {
+        if !quote.is_finite() || quote <= 0.0 {
+            return None;
+        }
+        let slip = self.try_slip_fraction_for_side(side, notional_usd, liquidity_usd)?;
+        Some(match side {
+            Side::Long => quote * (1.0 + slip),
+            Side::Short => quote * (1.0 - slip).max(0.0),
+        })
     }
 }
 

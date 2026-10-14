@@ -47,7 +47,7 @@ RULES:
 - Otherwise (low liquidity or stagnant volume) -> "action": "PASS" (Never buy dead tokens).
 
 ADMISSION BOUNDS (model output must satisfy `is_valid`, else fallback):
-- BUY: TP in (0, 1000%], SL in [-100%, 0), timeout <= 3600s. Unbounded magnitudes would never TP/expire.
+- BUY: TP in [10%, 1000%], SL in [-100%, -1%], timeout <= 3600s. Sub-fee targets are guaranteed losers, so they fail closed. Unbounded magnitudes would never TP/expire.
 - Strategy shaping downstream: `adaptive` verbatim; `scalp` clamps TP DOWN to +35% (below-band honored, never
   widened); `runner` forces moonbag + trailing. Invalid profiles pass through untouched for the caller to reject.
 - Inference budget default 300ms (hard ceiling 2s at build); endpoint must parse as http/https.

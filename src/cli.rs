@@ -144,7 +144,8 @@ pub fn parse_cli(args: &[String]) -> CliAction {
     }
 }
 
-/// `-n` / `--lines` value; default when missing or bad.
+/// `-n` / `--lines` value; default when missing or bad. A present but
+/// unparsable value warns on stderr (formerly a silent fallback).
 fn log_lines(args: &[String]) -> usize {
     let glued = args.iter().find_map(|a| {
         a.strip_prefix("--lines=")
@@ -154,13 +155,23 @@ fn log_lines(args: &[String]) -> usize {
     if let Some(n) = glued {
         return n;
     }
-    args.windows(2)
-        .find_map(|w| {
-            (w[0] == "-n" || w[0] == "--lines")
-                .then(|| w[1].parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(DEFAULT_LOG_LINES)
+    let spaced = args.windows(2).find_map(|w| {
+        (w[0] == "-n" || w[0] == "--lines")
+            .then(|| w[1].parse::<usize>().ok())
+            .flatten()
+    });
+    if let Some(n) = spaced {
+        return n;
+    }
+    if args.iter().any(|a| {
+        a == "-n"
+            || a == "--lines"
+            || a.starts_with("--lines=")
+            || (a.starts_with("-n") && a.len() > 2)
+    }) {
+        eprintln!("warning: bad log line count in {args:?}; using default {DEFAULT_LOG_LINES}");
+    }
+    DEFAULT_LOG_LINES
 }
 
 /// `(pid_file, log_file)` from env, `~/` expanded.
@@ -328,12 +339,10 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Unix seconds (0 on broken clock).
+/// Unix seconds (0 on broken clock). Single source: warn-once semantics
+/// live in `crate::settings::now_secs`; this alias keeps call sites stable.
 pub fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::settings::now_secs()
 }
 
 /// Append one log line (best-effort).
@@ -886,11 +895,13 @@ pub fn cmd_sell(mint: &str) {
     println!("manual sell queued for {mint} (daemon drains it on its next round)");
 }
 
-/// Mint in a sell-request body. `None` on mismatch.
+/// Mint in a sell-request body. `None` on mismatch — including a `mint`
+/// that is not a base58 pubkey (same check as `cmd_sell`, so a queued
+/// `"ABC"` can never match a file name the daemon would honor).
 pub fn sell_request_body_mint(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let mint = value.get("mint")?.as_str()?;
-    if mint.is_empty() {
+    if mint.is_empty() || executor::parse_pubkey(mint).is_err() {
         return None;
     }
     Some(mint.to_string())
@@ -1233,22 +1244,26 @@ mod tests {
 
     #[test]
     fn sell_request_body_mint_parses() {
+        // A real 32-byte base58 pubkey (WSOL mint). Short strings like
+        // "ABC" decode as bytes but are not pubkeys — must reject.
+        let mint = "So11111111111111111111111111111111111111112";
         assert_eq!(
-            sell_request_body_mint(r#"{"mint":"ABC","ts":1}"#),
-            Some("ABC".to_string())
+            sell_request_body_mint(&format!(r#"{{"mint":"{mint}","ts":1}}"#)),
+            Some(mint.to_string())
         );
         assert_eq!(
-            sell_request_body_mint(r#"{"mint": "ABC", "ts": 1}"#),
-            Some("ABC".to_string())
+            sell_request_body_mint(&format!(r#"{{"mint": "{mint}", "ts": 1}}"#)),
+            Some(mint.to_string())
         );
         assert_eq!(
-            sell_request_body_mint("{\n  \"mint\" : \"ABC\",\n  \"ts\" : 1\n}"),
-            Some("ABC".to_string())
+            sell_request_body_mint(&format!("{{\n  \"mint\" : \"{mint}\",\n  \"ts\" : 1\n}}")),
+            Some(mint.to_string())
         );
         assert_eq!(
-            sell_request_body_mint(r#"{"ts":1,"mint":"ABC"}"#),
-            Some("ABC".to_string())
+            sell_request_body_mint(&format!(r#"{{"ts":1,"mint":"{mint}"}}"#)),
+            Some(mint.to_string())
         );
+        assert_eq!(sell_request_body_mint(r#"{"mint":"ABC","ts":1}"#), None);
         assert_eq!(sell_request_body_mint(""), None);
         assert_eq!(sell_request_body_mint("not json"), None);
         assert_eq!(sell_request_body_mint(r#"{"mint":"","ts":1}"#), None);

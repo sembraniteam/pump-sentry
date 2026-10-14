@@ -32,6 +32,8 @@ pub enum PortfolioError {
     InvalidMint(String),
     #[error("position id space exhausted")]
     IdExhausted,
+    #[error("curve cannot absorb size (notional {notional:.2} vs liquidity {liquidity:.2})")]
+    CurveExhausted { notional: f64, liquidity: f64 },
 }
 
 /// Position slice being settled.
@@ -148,6 +150,10 @@ pub struct PaperPortfolio {
     realized_sum: f64,
     win_count: usize,
     closed_total: usize,
+    /// Cumulative dispatch bleed (tips/base/rent) debited via
+    /// [`Self::debit_dispatch_cost`]. Kept parallel to `realized_sum`
+    /// so `cash`/`equity` and headline PnL can't diverge silently.
+    total_dispatch_usd: f64,
 }
 
 /// Detail history cap.
@@ -168,6 +174,7 @@ impl PaperPortfolio {
             realized_sum: 0.0,
             win_count: 0,
             closed_total: 0,
+            total_dispatch_usd: 0.0,
         }
     }
 
@@ -209,11 +216,25 @@ impl PaperPortfolio {
         self.cash
     }
 
-    /// Debit dispatch cost.
+    /// Debit dispatch cost. Bleeds `cash` (floored at zero) and records
+    /// the cumulative bleed so headline PnL can net it (see
+    /// [`Self::realized_net_pnl`]). Non-finite/non-positive costs ignored.
     pub fn debit_dispatch_cost(&mut self, cost_usd: f64) {
         if cost_usd.is_finite() && cost_usd > 0.0 {
+            self.total_dispatch_usd += cost_usd;
             self.cash = (self.cash - cost_usd).max(0.0);
         }
+    }
+
+    /// Cumulative dispatch bleed debited so far.
+    pub fn total_dispatch_usd(&self) -> f64 {
+        self.total_dispatch_usd
+    }
+
+    /// Dispatch-adjusted realized PnL: trade edge minus live bleed.
+    /// Use this for headlines/breaker, not [`Self::realized_pnl`].
+    pub fn realized_net_pnl(&self) -> f64 {
+        self.realized_sum - self.total_dispatch_usd
     }
 
     pub fn starting_balance(&self) -> f64 {
@@ -295,16 +316,21 @@ impl PaperPortfolio {
         if !tp_percent.is_finite() || tp_percent <= 0.0 {
             return Err(PortfolioError::InvalidTakeProfit(tp_percent));
         }
-        if !sl_percent.is_finite() || sl_percent >= 0.0 {
+        if !sl_percent.is_finite() || sl_percent >= 0.0 || sl_percent < -100.0 {
             return Err(PortfolioError::InvalidStopLoss(sl_percent));
         }
         if p.mint.is_empty() {
             return Err(PortfolioError::InvalidMint(p.mint.to_string()));
         }
-
-        let entry_price =
-            self.fill_for_mint(p.mint)
-                .fill_price(p.side, quote, notional_usd, p.liquidity_usd);
+        // Execution pricing: reject when the curve cannot absorb the
+        // size instead of printing a fictitious capped fill.
+        let entry_price = self
+            .fill_for_mint(p.mint)
+            .try_fill_price(p.side, quote, notional_usd, p.liquidity_usd)
+            .ok_or(PortfolioError::CurveExhausted {
+                notional: notional_usd,
+                liquidity: p.liquidity_usd,
+            })?;
         let entry_fee = self.fee_for(notional_usd);
 
         let quantity = match p.side {
@@ -400,6 +426,27 @@ impl PaperPortfolio {
     ) -> Result<ClosedTrade, PortfolioError> {
         if !quote.is_finite() || quote <= 0.0 {
             return Err(PortfolioError::InvalidPrice(quote));
+        }
+        // Execution pricing guard: long exits past the curve have no
+        // price (unbounded impact). Peek before mutating.
+        {
+            let position = self
+                .positions
+                .get(&id)
+                .ok_or(PortfolioError::PositionNotFound(id))?;
+            let exit_size = (position.quantity.abs() * fraction).abs() * quote;
+            let probe = self.fill_for_mint(&position.mint).try_fill_price(
+                flip_side(position.side),
+                quote,
+                exit_size,
+                liquidity_usd,
+            );
+            if probe.is_none() {
+                return Err(PortfolioError::CurveExhausted {
+                    notional: exit_size,
+                    liquidity: liquidity_usd,
+                });
+            }
         }
         if fraction >= 1.0 {
             let position = self
@@ -501,6 +548,7 @@ impl PaperPortfolio {
             opened_at: slice.opened_at,
             closed_at: now_secs,
             hold_seconds: now_secs.saturating_sub(slice.opened_at),
+            dispatch_usd: 0.0,
         }
     }
 
@@ -1215,12 +1263,88 @@ mod tests {
         let mut pf = PaperPortfolio::new(10.0, 0.0);
         pf.debit_dispatch_cost(2.5);
         assert!((pf.cash() - 7.5).abs() < 1e-9);
+        assert!((pf.total_dispatch_usd() - 2.5).abs() < 1e-9);
+        assert!((pf.realized_net_pnl() + 2.5).abs() < 1e-9);
         pf.debit_dispatch_cost(100.0);
         assert_eq!(pf.cash(), 0.0);
+        assert!((pf.total_dispatch_usd() - 102.5).abs() < 1e-9);
         let mut pf2 = PaperPortfolio::new(10.0, 0.0);
         for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
             pf2.debit_dispatch_cost(bad);
             assert_eq!(pf2.cash(), 10.0, "bad={bad}");
+        }
+        assert_eq!(pf2.total_dispatch_usd(), 0.0);
+    }
+
+    #[test]
+    fn dispatch_net_turns_thin_win_into_loss() {
+        let mut pf = PaperPortfolio::new(100.0, 0.0).with_fill_model(FillModel::Exact);
+        let id = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 100.0,
+                sl_percent: -50.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
+            .expect("open");
+        let trade = pf
+            .close_position(id, 1.02, 1e9, ExitReason::Manual, 1)
+            .expect("close");
+        assert!(trade.net_pnl > 0.0);
+        pf.debit_dispatch_cost(0.34);
+        assert!(pf.realized_net_pnl() < trade.net_pnl);
+        assert!((pf.realized_net_pnl() - (trade.net_pnl - 0.34)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_curve_exhaustion_and_absurd_stops() {
+        let mut pf = PaperPortfolio::new(1_000_000.0, 0.0);
+        assert!(matches!(
+            pf.open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 10_000_000.0,
+                liquidity_usd: 10_000.0,
+                tp_percent: 100.0,
+                sl_percent: -50.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            }),
+            Err(PortfolioError::CurveExhausted { .. })
+        ));
+        for bad_sl in [-204.0, -101.0, 0.0, 5.0, f64::NAN] {
+            assert!(
+                matches!(
+                    pf.open_position_params(&OpenPositionParams {
+                        mint: "MINT",
+                        side: Side::Long,
+                        quote: 1.0,
+                        notional_usd: 10.0,
+                        liquidity_usd: 1e9,
+                        tp_percent: 100.0,
+                        sl_percent: bad_sl,
+                        trailing: false,
+                        trail_percent: 0.0,
+                        timeout_seconds: 0,
+                        moonbag_percent: 0.0,
+                        now_secs: 0,
+                    }),
+                    Err(PortfolioError::InvalidStopLoss(_))
+                ),
+                "sl={bad_sl}"
+            );
         }
     }
 

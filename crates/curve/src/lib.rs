@@ -1,11 +1,13 @@
 //! Bonding-curve reader and price ticker.
 
+pub mod backoff;
 pub mod fee;
 pub mod layout;
 pub mod sol_feed;
 pub mod ticker;
 
-pub use fee::{FEE_CACHE_TTL, FEE_TIMEOUT, FeeInputsCache};
+pub use backoff::{RoundBackoff, warn_throttled};
+pub use fee::{FEE_CACHE_TTL, FEE_TIMEOUT, FeeInputsCache, SupplyCache};
 
 pub use layout::{
     BONDING_CURVE_DISCRIMINATOR, BONDING_CURVE_MIN_LEN, BondingCurveReserves, COMPLETE_FLAG_OFFSET,

@@ -271,7 +271,9 @@ pub fn build_create_ata_ix(
     }
 }
 
-/// SPL address cross-check (drift detector).
+/// SPL address cross-check (drift detector). Test-only: no production
+/// caller gates on it.
+#[cfg(test)]
 pub fn spl_ids_match() -> bool {
     TOKEN_PROGRAM_ID.to_bytes() == spl_token::ID.to_bytes()
         && ASSOCIATED_TOKEN_PROGRAM_ID.to_bytes() == spl_associated_token_account::ID.to_bytes()

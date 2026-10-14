@@ -71,7 +71,9 @@ impl JitoClient {
         })
     }
 
-    /// Bundle endpoint in use (for logs).
+    /// Bundle endpoint in use (for logs). Test-only: production code
+    /// logs `self.endpoint` via the `send_bundle` debug line instead.
+    #[cfg(test)]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }

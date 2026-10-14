@@ -22,6 +22,10 @@ pub async fn screen_developer(
     if sigs.is_empty() {
         return Ok(judge_developer(None, 0, cfg));
     }
+    // Window full: older history hides beyond `sig_limit`. The launch
+    // count below is a lower bound; a zero count on a full window proves
+    // nothing and must fail closed.
+    let history_truncated = sigs.len() >= cfg.sig_limit;
     // Newest first. Last entry is oldest activity.
     let age_secs = sigs
         .last()
@@ -43,11 +47,24 @@ pub async fn screen_developer(
                 .map(|sig| (sig, s.err.is_some()))
         })
         .collect();
+    let total = candidates.len();
+    let err_skipped = candidates.iter().filter(|(_, e)| *e).count();
+    if total > 0 && err_skipped * 2 >= total {
+        // Majority failed on-chain: the sample proves no successful
+        // history, not a clean one. Fail closed without burning fetches.
+        return Ok(DevVerdict {
+            pass: false,
+            age_secs,
+            prior_launches: 0,
+            reason: format!(
+                "dev history mostly failed txs ({err_skipped} of {total} errored); failing closed",
+            ),
+        });
+    }
     use futures_util::stream::{self, StreamExt};
     let mut prior_launches: usize = 0;
     let mut fetch_failed: usize = 0;
     // Owned items for `.buffered()`: borrowed items trip E0631.
-    let total = candidates.len();
     let fetched: Vec<(usize, bool)> = stream::iter(candidates)
         .map(|(sig, failed)| async move {
             if failed {
@@ -71,7 +88,11 @@ pub async fn screen_developer(
             if failed_tx {
                 return (0usize, false);
             }
-            (count_dev_creates(&fetched, dev), false)
+            // Undecodable keys prove nothing: count unreadable, never zero.
+            match count_dev_creates(&fetched, dev) {
+                Some(count) => (count, false),
+                None => (0usize, true),
+            }
         })
         .buffered(DEV_SCREEN_FANOUT)
         .collect()
@@ -88,6 +109,19 @@ pub async fn screen_developer(
             prior_launches,
             reason: format!(
                 "dev history unreadable ({fetch_failed} of {total} fetches failed); failing closed",
+            ),
+        });
+    }
+    if history_truncated && prior_launches == 0 {
+        // Full window with zero hits: older launches may hide beyond
+        // `sig_limit`. A zero count here is a lower bound, not proof.
+        return Ok(DevVerdict {
+            pass: false,
+            age_secs,
+            prior_launches,
+            reason: format!(
+                "dev history window full ({total} sampled of {} sigs); zero launches unproven, failing closed",
+                cfg.sig_limit,
             ),
         });
     }
@@ -264,6 +298,10 @@ impl DetectedMigration {
 pub const INITIALIZE2_AMM_INDEX: usize = 4;
 
 /// Resolve the new AMM id: accounts[4] of the first Raydium ix.
+/// Callers already gate the tx on Raydium program + `initialize2` log +
+/// curve/mint linkage (see `MigrationMonitor::classify_migration`), so a
+/// co-bundled unrelated Raydium ix can't promote a wrong AMM past the
+/// pool trust gate (`parse_validated` still must pass owner/mints).
 pub fn initialize2_amm_id(instructions: &[(Pubkey, Vec<Pubkey>)]) -> Option<Pubkey> {
     instructions
         .iter()
@@ -435,10 +473,14 @@ impl RpcScreener {
     ) -> Result<Option<DetectedMigration>, ClientError> {
         let monitor = MigrationMonitor::new();
         let tx_config = json_tx_config(self.commitment);
-        // First bad Raydium hit is fallback. Returned after full scan.
-        let mut fallback: Option<(String, Option<Pubkey>)> = None;
+        // No unvalidated fallback: a Raydium hit that fails the trust
+        // gate/fetch/AMM resolve returns None (retry next tick). Promoting
+        // it to RaydiumV4 pool:None would mark an unproven pool as migrated.
         let mut before: Option<Signature> = None;
         let mut fetches: usize = 0;
+        let mut failed_fetches: usize = 0;
+        const MAX_FAILED_FETCHES: usize = 4;
+        let mut budget_hit = false;
         for _ in 0..HUNT_MAX_PAGES {
             let sigs = self
                 .rpc
@@ -457,8 +499,9 @@ impl RpcScreener {
             }
             let page_full = sigs.len() >= HUNT_PAGE_LIMIT;
             for status in &sigs {
-                if fetches >= HUNT_MAX_FETCHES {
+                if fetches >= HUNT_MAX_FETCHES || failed_fetches >= MAX_FAILED_FETCHES {
                     debug!("migration hunt hit fetch budget; stopping");
+                    budget_hit = true;
                     break;
                 }
                 if status.err.is_some() {
@@ -467,15 +510,21 @@ impl RpcScreener {
                 let Ok(signature) = Signature::from_str(&status.signature) else {
                     continue;
                 };
-                fetches += 1;
                 let fetched = match tokio::time::timeout(
                     TX_FETCH_TIMEOUT,
                     self.rpc.get_transaction_with_config(&signature, tx_config),
                 )
                 .await
                 {
-                    Ok(Ok(fetched)) => fetched,
-                    _ => continue,
+                    Ok(Ok(fetched)) => {
+                        fetches += 1;
+                        fetched
+                    }
+                    _ => {
+                        // Transport blips don't burn the progress budget.
+                        failed_fetches += 1;
+                        continue;
+                    }
                 };
                 let Some((keys, decoded, logs)) = decode_migration_tx(&fetched) else {
                     continue;
@@ -505,10 +554,7 @@ impl RpcScreener {
                                 {
                                     Ok(Ok(account)) => account,
                                     _ => {
-                                        debug!(%amm, "pool account fetch failed; keeping as fallback, continuing hunt");
-                                        if fallback.is_none() {
-                                            fallback = Some((status.signature.clone(), amm_id));
-                                        }
+                                        debug!(%amm, "pool account fetch failed; skipping unproven hit, continuing hunt");
                                         continue;
                                     }
                                 };
@@ -520,19 +566,13 @@ impl RpcScreener {
                                 ) {
                                     Some(pool) => Some(pool),
                                     None => {
-                                        debug!(%amm, "pool failed trust gate; keeping as fallback, continuing hunt");
-                                        if fallback.is_none() {
-                                            fallback = Some((status.signature.clone(), amm_id));
-                                        }
+                                        debug!(%amm, "pool failed trust gate; skipping unproven hit, continuing hunt");
                                         continue;
                                     }
                                 }
                             }
                             None => {
-                                debug!("raydium migration without resolvable AMM; continuing hunt");
-                                if fallback.is_none() {
-                                    fallback = Some((status.signature.clone(), None));
-                                }
+                                debug!("raydium migration without resolvable AMM; skipping unproven hit, continuing hunt");
                                 continue;
                             }
                         };
@@ -554,7 +594,7 @@ impl RpcScreener {
                     None => continue,
                 }
             }
-            if fetches >= HUNT_MAX_FETCHES {
+            if budget_hit || fetches >= HUNT_MAX_FETCHES {
                 break;
             }
             if !page_full {
@@ -566,15 +606,6 @@ impl RpcScreener {
             if before.is_none() {
                 break;
             }
-        }
-        if let Some((signature, amm_id)) = fallback {
-            warn!("raydium migration detected but pool unresolvable; reporting without pool");
-            return Ok(Some(DetectedMigration {
-                signature,
-                destination: MigrationDestination::RaydiumV4,
-                amm_id,
-                pool: None,
-            }));
         }
         Ok(None)
     }
@@ -619,10 +650,18 @@ impl RpcScreener {
         // Bad supply can't zero the monopoly math. Propagate.
         let total_supply = self.curve_total_supply(curve).await?;
 
-        // Distinct buyers, first-seen order, bounded. Only Buys count.
+        // Distinct buyers, earliest-first, bounded. Only Buys count.
+        // Records arrive newest-first: iterate oldest-first so the 8
+        // traced wallets are the earliest (creation-slot) buyers, not
+        // the 8 most recent. Otherwise early bundle buyers fall out of
+        // the window and the monopoly math undercounts (fail-open).
         let mut seen: HashSet<Pubkey> = HashSet::new();
         let mut buyers: Vec<Pubkey> = Vec::new();
-        for record in records.iter().filter(|r| r.side == SwapSide::Buy) {
+        for record in records
+            .iter()
+            .filter(|r| r.side == SwapSide::Buy)
+            .rev()
+        {
             if seen.insert(record.wallet) {
                 buyers.push(record.wallet);
             }
@@ -630,6 +669,19 @@ impl RpcScreener {
                 break;
             }
         }
+
+        // Supply share covers ALL creation-slot buys (not just traced
+        // buyers): the monopoly denominator must not shrink with the
+        // trace cap.
+        let total_creation_amount: u64 = records
+            .iter()
+            .filter(|r| r.side == SwapSide::Buy && r.slot == creation_slot)
+            .fold(0u64, |acc, r| acc.saturating_add(r.amount_base_units));
+        let total_cluster_all_pct = if total_supply > 0 {
+            total_creation_amount as f64 / total_supply as f64 * 100.0
+        } else {
+            0.0
+        };
 
         let mut swaps: Vec<(u64, Pubkey, f64)> = Vec::new();
         for buyer in &buyers {
@@ -669,6 +721,15 @@ impl RpcScreener {
 
         let mut analysis =
             BundleDetector::evaluate_launch_slot(creation_slot, &swaps, &funding_parents);
+        // Trace cap must not shrink the monopoly: raise the cluster
+        // share to the all-buyer total when the 8-wallet window hides volume.
+        if total_cluster_all_pct > analysis.total_cluster_supply_pct {
+            analysis.total_cluster_supply_pct = total_cluster_all_pct;
+            if total_cluster_all_pct > 15.0 {
+                analysis.is_bundled = true;
+                analysis.verdict = BundleVerdict::RejectBundledMonopoly;
+            }
+        }
         // Few traces resolved: Safe becomes Suspect.
         if walked && analysis.verdict == BundleVerdict::SafeOrganic {
             let traced: HashSet<Pubkey> =

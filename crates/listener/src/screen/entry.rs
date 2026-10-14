@@ -74,7 +74,12 @@ impl EntryGate {
         let deadline_secs = now_secs.saturating_add(self.window_secs);
         match self.pending.get_mut(mint) {
             Some(entry) => {
-                entry.devs = vec![dev];
+                // Preserve the cohort (v2 creator): relaunch refreshes the
+                // window, never drops a watched insider.
+                if !entry.devs.contains(&dev) {
+                    entry.devs.insert(0, dev);
+                    entry.devs.truncate(MAX_COHORT_WALLETS);
+                }
                 let cap = entry.created_secs.saturating_add(self.window_secs.saturating_mul(3));
                 entry.deadline_secs = deadline_secs.min(cap);
             }

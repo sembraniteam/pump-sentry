@@ -95,7 +95,9 @@ impl Alerter {
         }
     }
 
-    /// Messages dropped for lack of a permit.
+    /// Messages dropped for lack of a permit. Test-only: production
+    /// surfaces drops via tracing, never by polling this counter.
+    #[cfg(test)]
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }

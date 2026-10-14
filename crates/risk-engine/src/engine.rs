@@ -142,6 +142,11 @@ pub struct RiskEngine {
     max_tokens: u32,
     /// Heuristic-fallback count.
     fallback_count: Arc<AtomicU64>,
+    /// Timeouts only (subset of fallbacks; operator can tell
+    /// whether the model is slow vs non-compliant).
+    timeout_count: Arc<AtomicU64>,
+    /// Invalid/unusable model outputs (subset of fallbacks).
+    invalid_count: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for RiskEngine {
@@ -192,12 +197,34 @@ impl RiskEngine {
             temperature: b.temperature.clamp(0.0, 1.0),
             max_tokens,
             fallback_count: Arc::new(AtomicU64::new(0)),
+            timeout_count: Arc::new(AtomicU64::new(0)),
+            invalid_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
     /// Heuristic-fallback count since construction.
     pub fn fallback_count(&self) -> u64 {
         self.fallback_count.load(Ordering::Relaxed)
+    }
+
+    /// Timeout fallbacks since construction (subset of [`Self::fallback_count`]).
+    pub fn timeout_count(&self) -> u64 {
+        self.timeout_count.load(Ordering::Relaxed)
+    }
+
+    /// Invalid-output fallbacks since construction (subset of [`Self::fallback_count`]).
+    pub fn invalid_count(&self) -> u64 {
+        self.invalid_count.load(Ordering::Relaxed)
+    }
+
+    fn note_invalid(&self) {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.invalid_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_timeout(&self) {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.timeout_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Model inference within budget, else heuristic.
@@ -228,7 +255,7 @@ impl RiskEngine {
                 source: DecisionSource::Model,
             },
             Ok(None) => {
-                self.fallback_count.fetch_add(1, Ordering::Relaxed);
+                self.note_invalid();
                 // `infer` already warned the cause; stay at debug here.
                 debug!(
                     endpoint = %self.endpoint, model = %self.model,
@@ -241,7 +268,7 @@ impl RiskEngine {
                 }
             }
             Err(_) => {
-                self.fallback_count.fetch_add(1, Ordering::Relaxed);
+                self.note_timeout();
                 warn!(
                     endpoint = %self.endpoint, model = %self.model,
                     timeout = ?self.timeout,
@@ -256,9 +283,10 @@ impl RiskEngine {
         }
     }
 
-    /// Heuristic-only evaluation (no I/O).
+    /// Heuristic-only evaluation (no I/O). Does not touch the
+    /// model-trouble counters: this path is deliberate, not a failure.
     pub fn evaluate_fallback(&self, metrics: &TokenMetrics) -> RiskDecision {
-        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(?metrics, "explicit heuristic fallback (no model call)");
         RiskDecision {
             profile: evaluate_metrics_fallback(metrics),
             source: DecisionSource::Fallback,
@@ -295,11 +323,23 @@ impl RiskEngine {
         let profile: RiskProfile = match serde_json::from_str(json) {
             Ok(profile) => profile,
             Err(e) => {
+                // Unparseable but clearly PASS-intended: never flip a safe
+                // intent into a heuristic BUY. Fail closed to PASS.
+                if pass_intended(json) {
+                    warn!(endpoint = %self.endpoint, model = %self.model, content = %truncate200(json), "inference unparseable but PASS-intended; holding PASS");
+                    return Some(RiskProfile::pass());
+                }
                 warn!(endpoint = %self.endpoint, model = %self.model, error = %e, content = %truncate200(json), "inference output not in schema; using heuristic fallback");
                 return None;
             }
         };
         if !profile.is_valid() {
+            // Malformed PASS (e.g. non-zeroed timeout) is still a safe
+            // intent: hold PASS instead of re-evaluating to a BUY.
+            if profile.action == crate::schema::Action::Pass {
+                warn!(endpoint = %self.endpoint, model = %self.model, ?profile, "inference PASS malformed; holding PASS");
+                return Some(RiskProfile::pass());
+            }
             warn!(endpoint = %self.endpoint, model = %self.model, ?profile, "inference profile failed validation; using heuristic fallback");
             return None;
         }
@@ -361,14 +401,31 @@ fn truncate200(s: &str) -> String {
     format!("{}…", &s[..end])
 }
 
-/// Strip one layer of markdown fencing.
+/// Strip one layer of markdown fencing plus any chatty preamble:
+/// finds the outer `{...}` object so `"Here is JSON:\n```json\n{...}\n```"`
+/// still parses instead of falling back.
 fn strip_code_fence(s: &str) -> &str {
     let s = s.trim();
     let inner = s
         .strip_prefix("```json")
         .or_else(|| s.strip_prefix("```"))
         .unwrap_or(s);
-    inner.strip_suffix("```").unwrap_or(inner).trim()
+    let inner = inner.strip_suffix("```").unwrap_or(inner).trim();
+    // Preamble-tolerant: slice to the outer JSON object when present.
+    if let (Some(start), Some(end)) = (inner.find('{'), inner.rfind('}'))
+        && end > start
+    {
+        return inner[start..=end].trim();
+    }
+    inner
+}
+
+/// True when raw model output declares a PASS decision, even if the
+/// full profile is malformed (non-zeroed timeout, trailing text, ...).
+/// String-level check only: never infers BUY from garbage.
+fn pass_intended(json: &str) -> bool {
+    json.contains("\"action\"")
+        && (json.contains("\"PASS\"") || json.contains("\"Pass\"") || json.contains("\"pass\""))
 }
 
 #[cfg(test)]
@@ -384,6 +441,9 @@ mod tests {
             buy_velocity_5s: 40,
             dev_reputation: 0.8,
             rugcheck_score: 100,
+            creation_slot_buys: None,
+            cluster_pct: None,
+            curve_progress: None,
         }
     }
 
@@ -490,6 +550,28 @@ mod tests {
         assert_eq!(engine.temperature, 1.0);
     }
 
+    #[test]
+    fn preamble_stripped_to_object() {
+        let raw = "Here is JSON:\n```json\n{\"action\":\"PASS\",\"tp_percent\":0.0,\"sl_percent\":0.0,\"trailing_stop\":false,\"timeout_seconds\":0}\n```";
+        let stripped = strip_code_fence(raw);
+        let profile: RiskProfile = serde_json::from_str(stripped).expect("parses");
+        assert!(profile.is_valid());
+        assert_eq!(profile.action, Action::Pass);
+    }
+
+    #[test]
+    fn malformed_pass_intent_detected() {
+        // Non-zeroed timeout: invalid profile but clearly PASS-intended.
+        assert!(pass_intended(r#"{"action":"PASS","timeout_seconds":90}"#));
+        assert!(!pass_intended(r#"{"action":"BUY","tp_percent":60.0}"#));
+        assert!(!pass_intended("total garbage"));
+    }
+
+    #[test]
+    fn pass_constructor_is_valid() {
+        assert!(RiskProfile::pass().is_valid());
+    }
+
     #[tokio::test]
     async fn uses_model_when_fast_and_valid() {
         let inner = r#"{"action":"BUY","tp_percent":90.0,"sl_percent":-8.0,"trailing_stop":true,"timeout_seconds":180}"#;
@@ -530,6 +612,19 @@ mod tests {
             let decision = fast_engine(&base).evaluate(&metrics()).await;
             assert_eq!(decision.source, DecisionSource::Fallback, "input: {bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_pass_holds_pass_instead_of_fallback_buy() {
+        // Malformed PASS (non-zeroed timeout): safe intent must hold,
+        // never re-evaluate to a heuristic BUY on these hot metrics.
+        let inner = r#"{"action":"PASS","tp_percent":0.0,"sl_percent":0.0,"trailing_stop":false,"timeout_seconds":90}"#;
+        let leaked: &'static str = Box::leak(chat_body(inner).into_boxed_str());
+        let base = serve_scripted(vec![(0, 200, leaked)]).await;
+        let decision = fast_engine(&base).evaluate(&metrics()).await;
+        assert_eq!(decision.source, DecisionSource::Model);
+        assert_eq!(decision.profile.action, Action::Pass);
+        assert_eq!(decision.profile.timeout_seconds, 0);
     }
 
     #[tokio::test]

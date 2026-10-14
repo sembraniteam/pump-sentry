@@ -5,7 +5,7 @@
 //! cargo run -p listener --example watch
 //! ```
 
-use listener::{ListenerConfig, PumpFunListener};
+use listener::{DEFAULT_HTTP_RPC_URL, DEFAULT_WS_RPC_URL, ListenerConfig, PumpFunListener};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -18,8 +18,8 @@ async fn main() {
         .init();
 
     let config = ListenerConfig {
-        ws_url: "wss://api.mainnet-beta.solana.com".to_string(),
-        http_url: "https://api.mainnet-beta.solana.com".to_string(),
+        ws_url: DEFAULT_WS_RPC_URL.to_string(),
+        http_url: DEFAULT_HTTP_RPC_URL.to_string(),
         commitment: "confirmed".to_string(),
     };
 

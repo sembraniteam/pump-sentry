@@ -15,7 +15,7 @@ use simulator::{ExitReason, Mark, PaperPortfolio, check_exit};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveTrader, PendingRecheck, RaydiumPoolLeg};
+use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, RaydiumSellParams};
 use crate::live_mirror::{LiveExecution, live_base_mint};
 use crate::follow::FollowState;
 pub use crate::gate::{DailyBreaker, GateState};
@@ -97,21 +97,13 @@ pub trait LiveSink {
     async fn buy(&self, req: &LiveBuyParams<'_>) -> Result<(LivePosition, String), LiveError>;
 
     /// Sell a tracked position. `None` fee is standard.
-    async fn sell(
-        &self,
-        position: &LivePosition,
-        price_usd: f64,
-        sol_usd: f64,
-        liquidity_usd: f64,
-        venue_fee_bps: Option<f64>,
-    ) -> Result<String, LiveError>;
+    async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError>;
 
     /// Raydium sell at a pool leg. Same contract as `sell`.
-    async fn sell_raydium(
-        &self,
-        position: &LivePosition,
-        pool: &RaydiumPoolLeg,
-    ) -> Result<String, LiveError>;
+    async fn sell_raydium(&self, req: &RaydiumSellParams<'_>) -> Result<String, LiveError>;
+
+    /// Base Jito tip (live_sell escalates it by attempts).
+    fn base_tip_lamports(&self) -> u64;
 
     /// True when a buy awaits confirmation.
     fn has_pending(&self) -> bool {
@@ -126,6 +118,11 @@ pub trait LiveSink {
     /// Per-dispatch overhead in lamports.
     fn dispatch_cost_lamports(&self) -> u64 {
         0
+    }
+
+    /// Overhead at an explicit tip (escalated retries debit actuals).
+    fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64 {
+        tip_lamports
     }
 
     /// First-buy cost (dispatch plus rent). Debit on buys only.
@@ -153,23 +150,16 @@ impl LiveSink for LiveTrader {
         self.buy(req).await
     }
 
-    async fn sell(
-        &self,
-        position: &LivePosition,
-        price_usd: f64,
-        sol_usd: f64,
-        liquidity_usd: f64,
-        venue_fee_bps: Option<f64>,
-    ) -> Result<String, LiveError> {
-        self.sell(position, price_usd, sol_usd, liquidity_usd, venue_fee_bps).await
+    async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
+        self.sell(req).await
     }
 
-    async fn sell_raydium(
-        &self,
-        position: &LivePosition,
-        pool: &RaydiumPoolLeg,
-    ) -> Result<String, LiveError> {
-        self.sell_raydium(position, pool).await
+    async fn sell_raydium(&self, req: &RaydiumSellParams<'_>) -> Result<String, LiveError> {
+        self.sell_raydium(req).await
+    }
+
+    fn base_tip_lamports(&self) -> u64 {
+        self.base_tip()
     }
 
     fn has_pending(&self) -> bool {
@@ -182,6 +172,10 @@ impl LiveSink for LiveTrader {
 
     fn dispatch_cost_lamports(&self) -> u64 {
         self.dispatch_cost_lamports()
+    }
+
+    fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64 {
+        self.dispatch_cost_for_tip(tip_lamports)
     }
 
     fn first_touch_cost_lamports(&self) -> u64 {
@@ -657,6 +651,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::RaydiumPoolLeg;
     use migration::PoolTick;
     use simulator::Side;
     use simulator::FillModel;
@@ -692,9 +687,9 @@ mod tests {
                     let mut fails = fails_left.lock().expect("lock");
                     if *fails > 0 {
                         *fails -= 1;
-                        Err(RugCheckError::Deserialization(
-                            serde_json::from_str::<u32>("bogus").expect_err("must fail"),
-                        ))
+                        // Transient indexing latency (retryable 429), not a
+                        // schema break (terminal). See `is_retryable`.
+                        Err(RugCheckError::transient_throttle())
                     } else {
                         Ok(RugCheckReport {
                             mint: mint.to_string(),
@@ -722,6 +717,10 @@ mod tests {
         sells: StdMutex<Vec<(String, u64)>>,
         /// Raydium-leg sells `(mint, amm, amount)`.
         raydium_sells: StdMutex<Vec<(String, String, u64)>>,
+        /// Tips passed per sell (escalation wiring proof).
+        sell_tips: StdMutex<Vec<u64>>,
+        /// Base tip the stub reports (mirrors prod default).
+        tip_lamports: u64,
         fail_buys: std::sync::atomic::AtomicBool,
         fail_sells: std::sync::atomic::AtomicBool,
         /// Transient sell failures (consume retry budget, unlike `BadOrder`).
@@ -739,6 +738,8 @@ mod tests {
                     buys: StdMutex::new(vec![]),
                     sells: StdMutex::new(vec![]),
                     raydium_sells: StdMutex::new(vec![]),
+                    sell_tips: StdMutex::new(vec![]),
+                    tip_lamports: 100_000,
                     fail_buys: std::sync::atomic::AtomicBool::new(false),
                     fail_sells: std::sync::atomic::AtomicBool::new(false),
                     fail_sells_transient: std::sync::atomic::AtomicBool::new(false),
@@ -759,6 +760,10 @@ mod tests {
 
         fn raydium_sells(&self) -> Vec<(String, String, u64)> {
             self.inner.raydium_sells.lock().expect("lock").clone()
+        }
+
+        fn sell_tips(&self) -> Vec<u64> {
+            self.inner.sell_tips.lock().expect("lock").clone()
         }
     }
 
@@ -793,14 +798,8 @@ mod tests {
             ))
         }
 
-        async fn sell(
-            &self,
-            position: &LivePosition,
-            _price_usd: f64,
-            _sol_usd: f64,
-            _liquidity_usd: f64,
-            _venue_fee_bps: Option<f64>,
-        ) -> Result<String, LiveError> {
+        async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
+            let position = req.position;
             if self
                 .inner
                 .fail_sells
@@ -830,14 +829,17 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push((position.mint.clone(), position.amount_tokens));
+            self.inner
+                .sell_tips
+                .lock()
+                .expect("lock")
+                .push(req.tip_lamports);
             Ok("bundle-stub".to_string())
         }
 
-        async fn sell_raydium(
-            &self,
-            position: &LivePosition,
-            pool: &RaydiumPoolLeg,
-        ) -> Result<String, LiveError> {
+        async fn sell_raydium(&self, req: &RaydiumSellParams<'_>) -> Result<String, LiveError> {
+            let position = req.position;
+            let pool = req.pool;
             // Same failure hooks as the curve leg.
             if self
                 .inner
@@ -860,7 +862,16 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push((position.mint.clone(), pool.amm.clone(), position.amount_tokens));
+            self.inner
+                .sell_tips
+                .lock()
+                .expect("lock")
+                .push(req.tip_lamports);
             Ok("bundle-stub-raydium".to_string())
+        }
+
+        fn base_tip_lamports(&self) -> u64 {
+            self.inner.tip_lamports
         }
     }
 
@@ -1181,7 +1192,7 @@ mod tests {
         alerts: Option<StubAlerts>,
     ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
         let vaults = VaultTicker::new(
-            "https://api.mainnet-beta.solana.com",
+            crate::settings::DEFAULT_HTTP_RPC_URL,
             CurveTicker::parse_commitment("confirmed").expect("known commitment"),
             std::time::Duration::from_millis(500),
             SolUsdFeed::new_for_test(150.0),
@@ -1622,6 +1633,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn follow_pool_stores_leg_and_sweep_keeps_held_bags() {
+        // Full leg lifecycle: hunt stores the leg over a tick-seeded
+        // entry; the idle sweep keeps it while live custody holds and
+        // releases it once the book clears.
+        use listener::MigrationDestination;
+        let live = StubLive::working();
+        let screener = StubScreener::passing();
+        *screener.inner.migration.lock().expect("lock") = Some(MigrationReport {
+            signature: "migsig".to_string(),
+            destination: MigrationDestination::RaydiumV4,
+            amm_id: Some(fixture_wallet(20)),
+            base_mint: Some("WSOL".to_string()),
+            quote_mint: Some("MINT".to_string()),
+            base_vault: Some(fixture_wallet(21)),
+            quote_vault: Some(fixture_wallet(22)),
+        });
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::failing(),
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        // Valid base58 throughout: the pool watch parses every address.
+        let mint = fixture_wallet(30);
+        let tick = PoolTick {
+            mint: mint.clone(),
+            amm_id: "AMM".to_string(),
+            price_usd: 1.0,
+            liquidity_usd: 50_000.0,
+            observed_at: now_secs(),
+        };
+        // Tick seeds the entry with no leg...
+        pipe.on_pool_tick(&tick).await;
+        assert!(pipe.followed.lock().await[&mint].pool.is_none());
+        // ...the hunt overwrites it (never `or_insert` past it).
+        pipe.report_migration_once(&mint, "CURVE").await;
+        {
+            let followed = pipe.followed.lock().await;
+            let leg = followed[&mint].pool.clone().expect("leg stored");
+            assert_eq!(leg.amm, fixture_wallet(20));
+        }
+        // Age the entry past TTL with a live bag held: sweep keeps it.
+        pipe.exec.live_positions.lock().await.insert(
+            mint.clone(),
+            LivePosition {
+                mint: mint.clone(),
+                curve: "CURVE".to_string(),
+                assoc_curve: "ASSOC".to_string(),
+                amount_tokens: 1_000,
+                creator: None,
+            },
+        );
+        {
+            let mut followed = pipe.followed.lock().await;
+            followed.get_mut(&mint).expect("entry").last_seen_secs = 0;
+        }
+        let other = PoolTick { mint: "OTHER".to_string(), ..tick.clone() };
+        pipe.on_pool_tick(&other).await;
+        assert!(pipe.followed.lock().await.contains_key(&mint));
+        // Book clears: next sweep releases the leg.
+        pipe.exec.live_positions.lock().await.remove(&mint);
+        pipe.on_pool_tick(&other).await;
+        assert!(!pipe.followed.lock().await.contains_key(&mint));
+    }
+
+    #[tokio::test]
     async fn truncated_round_never_confirms() {
         // Quorum swaps on a truncated round: no confirm, no watermark
         // advance — the entry stays watchlisted for the next round.
@@ -2035,8 +2114,29 @@ mod tests {
 
     #[tokio::test]
     async fn launch_watchlists_on_audit_transport_error() {
-        // Transport-level audit failure (Broken body) is retryable, not
-        // a reject: watchlist with no score, open nothing yet.
+        // Retryable transport failure (429) watchlists, not rejects:
+        // watchlist with no score, open nothing yet. Schema breaks
+        // (Broken body) are terminal instead — see
+        // `audit_schema_break_drops_immediately`.
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Flaky { fails_left: std::sync::Mutex::new(9999), score: 100 },
+            reserves,
+            funded(),
+            StubScreener::passing(),
+            None,
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+        assert_eq!(pipe.pending_count().await, 1);
+        assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_schema_break_drops_immediately() {
+        // Schema break is permanent: drop at once, never watchlist-retry.
         let reserves = StubReserves::with_tick(tick("MINT", 2.0));
         let pipe = pipeline_screened(
             Settings::from_map(&HashMap::new()),
@@ -2049,7 +2149,7 @@ mod tests {
         pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
             .await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
-        assert_eq!(pipe.pending_count().await, 1);
+        assert_eq!(pipe.pending_count().await, 0);
         assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
     }
 
@@ -2941,6 +3041,32 @@ mod tests {
         assert_eq!(live.sells(), vec![("MINT".to_string(), 1_000)]);
         assert!(!pipe.exec.deferred_pnl.lock().await.contains_key("MINT"));
         assert!(pipe.daily.lock().await.day_net > 0.0);
+    }
+
+    #[tokio::test]
+    async fn live_sell_escalates_tip_with_attempts() {
+        // Two prior failures: the next dispatch carries 3x base tip
+        // (bounded congestion response), recorded per sell.
+        let live = StubLive::working();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick("MINT", 2.0)),
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        {
+            let mut retry = pipe.exec.live_retry.lock().await;
+            retry.insert("MINT".to_string(), (2u32, 0u64));
+        }
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+        assert_eq!(live.sell_tips(), vec![300_000]);
+        assert_eq!(live.sells(), vec![("MINT".to_string(), 1_000)]);
     }
 
     #[tokio::test]

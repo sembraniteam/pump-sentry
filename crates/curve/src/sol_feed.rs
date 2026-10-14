@@ -80,17 +80,6 @@ impl SolUsdFeed {
         feed
     }
 
-    /// Test helper: override URL.
-    pub fn with_url(self: &Arc<Self>, url: &str) -> Arc<Self> {
-        Arc::new(Self {
-            inner: Arc::clone(&self.inner),
-            client: self.client.clone(),
-            url: url.to_string(),
-            stale_secs: self.stale_secs,
-            refresh: self.refresh,
-        })
-    }
-
     /// Current price if fresh.
     pub fn price(&self) -> Option<f64> {
         self.stamped_price().map(|(price, _)| price)

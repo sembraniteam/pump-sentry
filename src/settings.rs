@@ -3,6 +3,15 @@
 use risk_engine::StrategyMode;
 use std::collections::HashMap;
 
+/// Default public HTTP RPC endpoint (override via `MAINNET_RPC_URL`).
+pub const DEFAULT_HTTP_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+/// Default public WebSocket RPC endpoint (override via `MAINNET_WSS_RPC_URL`).
+pub const DEFAULT_WS_RPC_URL: &str = "wss://api.mainnet-beta.solana.com";
+/// Default Jito block-engine base URL (override via `JITO_ENDPOINT`).
+pub const DEFAULT_JITO_ENDPOINT: &str = "https://mainnet.block-engine.jito.wtf";
+/// Default local chat-completions endpoint (override via `INFERENCE_ENDPOINT`).
+pub const DEFAULT_INFERENCE_ENDPOINT: &str = "http://127.0.0.1:11434/v1/chat/completions";
+
 /// Runtime knobs, all overridable via env.
 #[derive(Clone)]
 pub struct Settings {
@@ -40,6 +49,8 @@ pub struct Settings {
     pub dev_max_prior_launches: usize,
     /// Dev txs sampled for the launch count.
     pub dev_screen_sample_txs: usize,
+    /// Dev signature window fetched per wallet.
+    pub dev_sig_limit: usize,
     /// Manual entry quote (tests).
     pub quote_usd: Option<f64>,
     /// Retired `SOL_USD`: parsed to warn, unused.
@@ -101,8 +112,9 @@ impl std::fmt::Debug for Settings {
             .field("dev_min_age_secs", &self.dev_min_age_secs)
             .field("dev_max_prior_launches", &self.dev_max_prior_launches)
             .field("dev_screen_sample_txs", &self.dev_screen_sample_txs)
+            .field("dev_sig_limit", &self.dev_sig_limit)
             .field("quote_usd", &self.quote_usd)
-            .field("sol_usd", &self._sol_usd_retired)
+            .field("_sol_usd_retired", &self._sol_usd_retired)
             .field("tick_interval_ms", &self.tick_interval_ms)
             .field("vault_tick_interval_ms", &self.vault_tick_interval_ms)
             .field("inference_endpoint", &self.inference_endpoint)
@@ -155,15 +167,12 @@ impl Settings {
             dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600, &mut notes),
             dev_max_prior_launches: get_int(vars, "DEV_MAX_PRIOR_LAUNCHES", 1, &mut notes),
             dev_screen_sample_txs: get_int(vars, "DEV_SCREEN_SAMPLE_TXS", 20, &mut notes),
+            dev_sig_limit: get_int(vars, "DEV_SIG_LIMIT", 100, &mut notes),
             quote_usd: parse_quote_usd(vars, &mut notes),
             _sol_usd_retired: parse_retired_sol_usd(vars, &mut notes),
             tick_interval_ms: get_int(vars, "TICK_INTERVAL_MS", 1000, &mut notes),
             vault_tick_interval_ms: get_int(vars, "VAULT_TICK_INTERVAL_MS", 5000, &mut notes),
-            inference_endpoint: get_string(
-                vars,
-                "INFERENCE_ENDPOINT",
-                "http://127.0.0.1:11434/v1/chat/completions",
-            ),
+            inference_endpoint: get_string(vars, "INFERENCE_ENDPOINT", DEFAULT_INFERENCE_ENDPOINT),
             inference_model: get_string(vars, "INFERENCE_MODEL", "llama3.2:1b"),
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300, &mut notes),
             inference_api_key: vars.get("INFERENCE_API_KEY").cloned(),
@@ -173,11 +182,7 @@ impl Settings {
             priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0, &mut notes),
             compute_unit_limit: get_int(vars, "COMPUTE_UNIT_LIMIT", 0, &mut notes),
             tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000, &mut notes),
-            jito_endpoint: get_string(
-                vars,
-                "JITO_ENDPOINT",
-                "https://mainnet.block-engine.jito.wtf",
-            ),
+            jito_endpoint: get_string(vars, "JITO_ENDPOINT", DEFAULT_JITO_ENDPOINT),
             discord_alerts: get_bool(vars, "DISCORD_ALERTS", true, &mut notes),
             discord_channel: vars
                 .get("DISCORD_CHANNEL")
@@ -193,7 +198,7 @@ impl Settings {
         let mut out = self.parse_notes.clone();
         if self.slippage_bps > 10_000 {
             out.push(format!(
-                "SLIPPAGE_BPS={} exceeds 100%; clamped to 100% at sizing (check the value — likely a typo)",
+                "SLIPPAGE_BPS={} exceeds 100%; quotes fail closed (no guard can cover it — check the value, likely a typo)",
                 self.slippage_bps
             ));
         }
@@ -255,6 +260,11 @@ impl Settings {
                 "COMMITMENT=processed is optimistic (reorgable prints): prefer confirmed for exits"
                     .to_string(),
             );
+        } else if !matches!(self.commitment.as_str(), "confirmed" | "finalized") {
+            out.push(format!(
+                "COMMITMENT='{}' unknown; startup refuses it (expected processed|confirmed|finalized)",
+                self.commitment
+            ));
         }
         if self.start_balance <= 0.0 || !self.start_balance.is_finite() {
             out.push(format!(
@@ -285,7 +295,7 @@ impl Settings {
         }
         if self.inference_timeout_ms == 0 {
             out.push(
-                "INFERENCE_TIMEOUT_MS=0; every inference falls back to the heuristic".to_string(),
+                "INFERENCE_TIMEOUT_MS=0 is clamped to the 50ms floor at build; expect near-total fallback (set 300 for the default budget)".to_string(),
             );
         }
         if self.tip_lamports == 0 {
@@ -389,7 +399,6 @@ fn parse_retired_sol_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>
 
 /// Canonical WebSocket URL. Legacy `WS_URL` honored once with a note.
 fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
-    const DEFAULT: &str = "wss://api.mainnet-beta.solana.com";
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
     if vars.contains_key("MAINNET_WSS_RPC_URL")
         && vars.get("MAINNET_WSS_RPC_URL").is_some_and(|v| clean(v).is_empty())
@@ -407,14 +416,13 @@ fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
                 );
                 legacy
             }
-            None => DEFAULT.to_string(),
+            None => DEFAULT_WS_RPC_URL.to_string(),
         },
     }
 }
 
 /// Canonical HTTP RPC URL. Legacy `HTTP_URL` honored once with a note.
 fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
-    const DEFAULT: &str = "https://api.mainnet-beta.solana.com";
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
     // Blank set var is a typo, not unset.
     if vars.contains_key("MAINNET_RPC_URL")
@@ -433,7 +441,7 @@ fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
                 );
                 legacy
             }
-            None => DEFAULT.to_string(),
+            None => DEFAULT_HTTP_RPC_URL.to_string(),
         },
     }
 }
@@ -524,8 +532,8 @@ mod tests {
         assert!(s.warnings().iter().any(|w| w.contains("HTTP_URL is retired")), "{:?}", s.warnings());
         // Unset = public default.
         let s = Settings::from_map(&HashMap::new());
-        assert_eq!(s.http_url, "https://api.mainnet-beta.solana.com");
-        assert_eq!(s.ws_url, "wss://api.mainnet-beta.solana.com");
+        assert_eq!(s.http_url, DEFAULT_HTTP_RPC_URL);
+        assert_eq!(s.ws_url, DEFAULT_WS_RPC_URL);
         // WSS mirrors the HTTP rule: canonical wins, legacy warns.
         let s = Settings::from_map(&vars(&[
             ("MAINNET_WSS_RPC_URL", "wss://helius/abc"),
@@ -606,6 +614,26 @@ mod tests {
         assert!(w.contains("JITO_TIP_LAMPORTS=0"), "{w}");
         assert!(w.contains("SLIPPAGE_BPS=20000"), "{w}");
         assert!(w.contains("QUOTE_USD override is set"), "{w}");
+    }
+
+    #[test]
+    fn bogus_commitment_warns_early() {
+        // `main` refuses unknown commitments at boot; the warning must
+        // already fire here so paper runs notice it in `warnings()`.
+        let s = Settings::from_map(&vars(&[("COMMITMENT", "bogus")]));
+        let w = s.warnings().join("\n");
+        assert!(w.contains("COMMITMENT='bogus' unknown"), "{w}");
+        let s = Settings::from_map(&HashMap::new());
+        assert!(!s.warnings().iter().any(|x| x.contains("unknown; startup refuses")));
+    }
+
+    #[test]
+    fn rpc_defaults_match_listener_crate() {
+        // The listener crate cannot depend on the binary, so it keeps its
+        // own copies (`listener::types::DEFAULT_*_RPC_URL`). This pins
+        // them together; a drift breaks loudly here, not in prod.
+        assert_eq!(DEFAULT_HTTP_RPC_URL, listener::types::DEFAULT_HTTP_RPC_URL);
+        assert_eq!(DEFAULT_WS_RPC_URL, listener::types::DEFAULT_WS_RPC_URL);
     }
 
     #[test]

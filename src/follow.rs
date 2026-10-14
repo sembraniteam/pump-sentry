@@ -102,6 +102,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         }
         // Seed now: pools that never tick still expire. Keeps raced baseline.
+        // A tick-first entry carries pool None: overwrite the leg when
+        // the hunt resolves it, or routing stays blind until eviction.
         let pool = Some(crate::live::RaydiumPoolLeg {
             mint: mint.to_string(),
             amm: amm.clone(),
@@ -112,6 +114,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .lock()
             .await
             .entry(mint.to_string())
+            .and_modify(|state| {
+                state.pool = pool.clone();
+                state.last_seen_secs = now_secs();
+            })
             .or_insert(FollowState {
                 entry_price: f64::NAN,
                 alerted_spike: false,
@@ -119,6 +125,41 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 pool,
             });
         info!(%mint, amm = %amm, "following migrated pool");
+    }
+
+    /// Sweep idle follows even when no pool ticks arrive (call from the
+    /// poll loop on a timer). `on_pool_tick` also sweeps, but a fully
+    /// idle ticker would otherwise leak `followed` + vault subs to restart.
+    pub async fn sweep_idle(&self) -> Vec<String> {
+        let now = now_secs();
+        let candidates: Vec<String> = {
+            let followed = self.followed.lock().await;
+            followed
+                .iter()
+                .filter(|(_, state)| now.saturating_sub(state.last_seen_secs) > FOLLOW_TTL_SECS)
+                .map(|(mint, _)| mint.clone())
+                .collect()
+        };
+        let mut stale = Vec::new();
+        for mint in candidates {
+            let held = match &self.exec.live {
+                Some(trader) => self.is_live_tracked(trader, &mint).await,
+                None => false,
+            };
+            if !held {
+                stale.push(mint);
+            }
+        }
+        for mint in &stale {
+            self.vaults.unwatch(mint).await;
+        }
+        if !stale.is_empty() {
+            let mut followed = self.followed.lock().await;
+            for mint in &stale {
+                followed.remove(mint);
+            }
+        }
+        stale
     }
 
     /// One pool tick: seed baseline, alert once on 2x.
@@ -133,8 +174,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         }
         let now = now_secs();
-        // Evict idle follows first, outside the guard.
-        let stale: Vec<String> = {
+        // Evict idle follows first. Candidates collected under a short
+        // guard; custody checks await after it drops (never hold a lock
+        // across await). Skips mints with live custody: evicting a held
+        // bag's leg strands its Raydium exit to manual.
+        let candidates: Vec<String> = {
             let followed = self.followed.lock().await;
             followed
                 .iter()
@@ -142,6 +186,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .map(|(mint, _)| mint.clone())
                 .collect()
         };
+        let mut stale = Vec::new();
+        for mint in candidates {
+            // Same custody rule as the spike path: any tracked, parked,
+            // or pending bag keeps its leg.
+            let held = match &self.exec.live {
+                Some(trader) => self.is_live_tracked(trader, &mint).await,
+                None => false,
+            };
+            if !held {
+                stale.push(mint);
+            }
+        }
         for mint in &stale {
             self.vaults.unwatch(mint).await;
         }
@@ -150,7 +206,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             for mint in &stale {
                 followed.remove(mint);
             }
-        }        let mut followed = self.followed.lock().await;
+        }
+        let mut followed = self.followed.lock().await;
         let state = followed.entry(tick.mint.clone()).or_insert(FollowState {
             entry_price: tick.price_usd,
             alerted_spike: false,

@@ -23,6 +23,9 @@ Fund native for everything, no WSOL float needed for SOL pairs:
 ```
 required_native = MAX_OPEN_POSITIONS × (NOTIONAL_USD/SOL_USD × (1+SLIPPAGE_BPS/10000) + fees)
                 + JITO_TIP_LAMPORTS × MAX_OPEN_POSITIONS × 2   // buy + sell legs
+                + priority fees (COMPUTE_UNIT_LIMIT × PRIORITY_FEE_MICRO_LAMPORTS / 1e6 per dispatch)
+                + 5_000 lamports base fee per dispatch
+                + ~2_039_280 lamports (one ATA rent per new mint)
                 + 0.05 SOL reserve (hard floor, never spent)
 ```
 

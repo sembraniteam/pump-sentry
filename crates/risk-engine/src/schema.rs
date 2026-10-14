@@ -24,6 +24,15 @@ pub struct TokenMetrics {
     pub dev_reputation: f64,
     /// RugCheck risk score.
     pub rugcheck_score: u32,
+    /// Bundle buys in the creation slot (`None` = unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_slot_buys: Option<u32>,
+    /// Largest insider-cluster supply share in percent (`None` = unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_pct: Option<f64>,
+    /// Bonding-curve progress in percent (`None` = unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curve_progress: Option<f64>,
 }
 
 /// Model output: TP/SL plus exit policy.
@@ -45,7 +54,21 @@ pub struct RiskProfile {
 }
 
 impl RiskProfile {
-    /// Admission check for model profiles.
+    /// Zeroed PASS profile (the only valid PASS shape).
+    pub fn pass() -> Self {
+        Self {
+            action: Action::Pass,
+            tp_percent: 0.0,
+            sl_percent: 0.0,
+            trailing_stop: false,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+        }
+    }
+
+    /// Admission check for model profiles. Bounds are economic, not
+    /// just syntactic: sub-fee TP/SL values are guaranteed losers after
+    /// venue costs, so they fail closed to the heuristic instead.
     pub fn is_valid(&self) -> bool {
         if !self.tp_percent.is_finite() || !self.sl_percent.is_finite() {
             return false;
@@ -58,9 +81,9 @@ impl RiskProfile {
         }
         match self.action {
             Action::Buy => {
-                self.tp_percent > 0.0
+                self.tp_percent >= MIN_TP_PERCENT
                     && self.tp_percent <= MAX_TP_PERCENT
-                    && self.sl_percent < 0.0
+                    && self.sl_percent <= -MIN_STOP_MAGNITUDE_PCT
                     && self.sl_percent >= MIN_SL_PERCENT
                     && self.timeout_seconds <= MAX_TIMEOUT_SECS
             }
@@ -77,13 +100,22 @@ impl RiskProfile {
 
 /// Max take-profit in percent (10x).
 pub const MAX_TP_PERCENT: f64 = 1000.0;
+/// Min take-profit in percent: below venue round-trip cost + margin,
+/// so a first-uptick exit can't book a guaranteed loss after fees.
+/// Well under the prompt's lowest band (TP 30), well above dust.
+pub const MIN_TP_PERCENT: f64 = 10.0;
 /// Min stop-loss in percent (-100% = full loss).
 pub const MIN_SL_PERCENT: f64 = -100.0;
+/// Min stop magnitude in percent: tighter stops drown in memecoin
+/// noise. Matches the prompt's `-8` floor (2–4% spread/impact plus
+/// round-trip venue costs); `fee_aware_sl_floor` widens further on
+/// custom tiers, never tighter.
+pub const MIN_STOP_MAGNITUDE_PCT: f64 = 8.0;
 /// Max exit timeout in seconds (one hour).
 pub const MAX_TIMEOUT_SECS: u64 = 3600;
 
 /// System instruction sent to the model.
-pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8.";
+pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. On high-fee tiers, widen SL past round-trip costs instead.";
 
 impl TokenMetrics {
     /// Render the skill's `INPUT PAYLOAD` as a compact JSON string.
@@ -93,6 +125,9 @@ impl TokenMetrics {
             "buy_velocity_5s": self.buy_velocity_5s,
             "dev_reputation": self.dev_reputation,
             "rugcheck_score": self.rugcheck_score,
+            "creation_slot_buys": self.creation_slot_buys,
+            "cluster_pct": self.cluster_pct,
+            "curve_progress": self.curve_progress,
         })
         .to_string()
     }
@@ -114,6 +149,9 @@ mod tests {
             buy_velocity_5s: 40,
             dev_reputation: 0.8,
             rugcheck_score: 120,
+            creation_slot_buys: None,
+            cluster_pct: None,
+            curve_progress: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&metrics.to_input_payload()).expect("valid JSON");
@@ -191,6 +229,29 @@ mod tests {
             moonbag_percent: 0.0,
         };
         assert!(!zero_buy.is_valid());
+
+        // Sub-fee targets are guaranteed losers after venue costs.
+        for (tp, sl) in [(5.0, -8.0), (60.0, -0.5), (9.9, -0.99)] {
+            let dust = RiskProfile {
+                action: Action::Buy,
+                tp_percent: tp,
+                sl_percent: sl,
+                trailing_stop: false,
+                timeout_seconds: 90,
+                moonbag_percent: 0.0,
+            };
+            assert!(!dust.is_valid(), "tp={tp} sl={sl}");
+        }
+        // Floors themselves are admitted.
+        let floored = RiskProfile {
+            action: Action::Buy,
+            tp_percent: MIN_TP_PERCENT,
+            sl_percent: -MIN_STOP_MAGNITUDE_PCT,
+            trailing_stop: false,
+            timeout_seconds: 90,
+            moonbag_percent: 0.0,
+        };
+        assert!(floored.is_valid());
 
         // Unbounded magnitudes would never TP or never expire.
         let huge_tp = RiskProfile {

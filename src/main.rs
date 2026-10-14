@@ -404,7 +404,7 @@ async fn run_pipeline(live_arg: bool) {
             min_age_secs: settings.dev_min_age_secs,
             max_prior_launches: settings.dev_max_prior_launches,
             sample_txs: settings.dev_screen_sample_txs,
-            sig_limit: 100,
+            sig_limit: settings.dev_sig_limit.max(settings.dev_screen_sample_txs).clamp(1, 1000),
         },
     ) {
         Ok(screener) => screener,

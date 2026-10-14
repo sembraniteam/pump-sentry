@@ -845,7 +845,7 @@ mod tests {
     fn bad_config_rejected() {
         let cfg = ListenerConfig {
             ws_url: "http://x".to_string(),
-            http_url: "https://api.mainnet-beta.solana.com".to_string(),
+            http_url: crate::types::DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
         };
         assert!(PumpFunListener::new(cfg).is_err());
@@ -854,8 +854,8 @@ mod tests {
     #[test]
     fn seen_set_dedups_and_bounds_memory() {
         let cfg = ListenerConfig {
-            ws_url: "wss://api.mainnet-beta.solana.com".to_string(),
-            http_url: "https://api.mainnet-beta.solana.com".to_string(),
+            ws_url: crate::types::DEFAULT_WS_RPC_URL.to_string(),
+            http_url: crate::types::DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
         };
         let listener = PumpFunListener::new(cfg).expect("config");

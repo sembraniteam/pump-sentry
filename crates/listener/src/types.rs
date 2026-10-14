@@ -9,6 +9,14 @@ use thiserror::Error;
 /// Bounded event queue capacity.
 pub const EVENT_CHANNEL_CAPACITY: usize = 10_000;
 
+/// Default public HTTP RPC endpoint.
+/// Mirrors the main binary default (`settings::DEFAULT_HTTP_RPC_URL`;
+/// the listener cannot depend on the binary, so the pair is pinned by
+/// a test there). Change both together.
+pub const DEFAULT_HTTP_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+/// Default public WebSocket RPC endpoint. Same mirroring note as above.
+pub const DEFAULT_WS_RPC_URL: &str = "wss://api.mainnet-beta.solana.com";
+
 /// Listener config.
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
@@ -23,8 +31,8 @@ pub struct ListenerConfig {
 impl Default for ListenerConfig {
     fn default() -> Self {
         Self {
-            ws_url: "wss://api.mainnet-beta.solana.com".to_string(),
-            http_url: "https://api.mainnet-beta.solana.com".to_string(),
+            ws_url: DEFAULT_WS_RPC_URL.to_string(),
+            http_url: DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
         }
     }
@@ -218,21 +226,21 @@ mod tests {
     fn bad_urls_rejected() {
         let cfg = ListenerConfig {
             ws_url: "http://nope".to_string(),
-            http_url: "https://api.mainnet-beta.solana.com".to_string(),
+            http_url: DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
         };
         assert!(cfg.validate().is_err());
 
         let cfg2 = ListenerConfig {
-            ws_url: "wss://api.mainnet-beta.solana.com".to_string(),
+            ws_url: DEFAULT_WS_RPC_URL.to_string(),
             http_url: "notaurl".to_string(),
             commitment: "confirmed".to_string(),
         };
         assert!(cfg2.validate().is_err());
 
         let cfg3 = ListenerConfig {
-            ws_url: "wss://api.mainnet-beta.solana.com".to_string(),
-            http_url: "https://api.mainnet-beta.solana.com".to_string(),
+            ws_url: DEFAULT_WS_RPC_URL.to_string(),
+            http_url: DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "bogus".to_string(),
         };
         assert!(cfg3.validate().is_err());

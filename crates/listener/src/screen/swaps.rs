@@ -4,8 +4,6 @@ use super::*;
 pub const IDX_SWAP_USER: usize = 6;
 /// Trader slot in v2 ixs: fee payer at 13.
 pub const IDX_SWAP_V2_USER: usize = 13;
-/// Old name of [`IDX_SWAP_V2_USER`]. Kept.
-pub const IDX_BUY_V2_USER: usize = IDX_SWAP_V2_USER;
 /// Trader slot in v3 ixs: position 8.
 pub const IDX_SWAP_V3_USER: usize = 8;
 /// Creator slot in create ixs.
@@ -151,20 +149,20 @@ pub fn extract_pump_swaps(
 }
 
 /// Count `create` ixs by `dev`. Powers the prior-launch check.
+/// `None` when keys don't resolve: callers must count it unreadable
+/// (fail-closed), never as zero launches.
 pub fn count_dev_creates(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
     dev: &Pubkey,
-) -> usize {
+) -> Option<usize> {
     let tx_with_meta = &fetched.transaction;
     let EncodedTransaction::Json(ui_tx) = &tx_with_meta.transaction else {
-        return 0;
+        return Some(0);
     };
     let UiMessage::Raw(raw) = &ui_tx.message else {
-        return 0;
+        return Some(0);
     };
-    let Some(keys) = resolve_keys(raw, &tx_with_meta.meta) else {
-        return 0;
-    };
+    let keys = resolve_keys(raw, &tx_with_meta.meta)?;
 
     let mut count = 0;
     let mut check = |program_id_index: u8, accounts: &[u8], data_b58: &str| {
@@ -195,7 +193,7 @@ pub fn count_dev_creates(
         }
     };
     for_each_compiled_ix(raw, &tx_with_meta.meta, &mut check);
-    count
+    Some(count)
 }
 
 /// Parse a base58 address.

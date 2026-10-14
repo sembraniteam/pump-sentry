@@ -1,7 +1,7 @@
 //! Fresh Raydium AMM V4 pool parser.
 //!
 //! Reads swap fields from the 752-byte account.
-//! Offsets use 32-byte slots from offset 432.
+//! Offsets use 32-byte slots from offset 336 (base vault) through 464 (LP mint).
 //!
 //! Chain-verified: migration pools are WSOL-based.
 //! Slot 400 holds WSOL, slot 432 the token.

@@ -1,4 +1,4 @@
-//! Raydium authority + bundle acceptance (pre-wiring gate, dormant path).
+//! Raydium authority + bundle acceptance (post-migration exit gate).
 //!
 //! Two gates, $0 by construction (read-only RPC + simulation with a
 //! funded *sampled* payer, sig_verify off — nothing is ever sent):

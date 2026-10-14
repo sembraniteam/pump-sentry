@@ -60,7 +60,16 @@ impl RugCheckClientBuilder {
     }
 
     /// Override the policy used by `evaluate_token`.
+    /// Weakening the defaults bypasses fail-closed checks: debug builds
+    /// assert every check stays on, so non-default policies are tests-only.
     pub fn policy(mut self, policy: AuditPolicy) -> Self {
+        debug_assert!(
+            policy.max_score <= AuditPolicy::default().max_score
+                && policy.reject_danger
+                && policy.reject_mint_authority
+                && policy.reject_freeze_authority,
+            "non-default audit policy disables fail-closed checks; tests only"
+        );
         self.policy = policy;
         self
     }
@@ -124,13 +133,14 @@ impl RugCheckClient {
         Ok(self.report_url(mint))
     }
 
-    /// Fetch the raw report without policy checks.
-    pub async fn fetch_report(&self, mint: &str) -> Result<RugCheckReport, RugCheckError> {
+    /// Fetch the raw report. Private: callers must go through
+    /// [`evaluate_token`](Self::evaluate_token) so the policy always runs.
+    async fn fetch_report(&self, mint: &str) -> Result<RugCheckReport, RugCheckError> {
         let url = self.report_url_checked(mint)?;
         let mut attempt: u32 = 0;
 
-        loop {
-            let response = match self.client.get(&url).send().await {
+        'retry: loop {
+            let mut response = match self.client.get(&url).send().await {
                 Ok(response) => response,
                 Err(e) if is_transient_network_error(&e) && attempt < self.max_retries => {
                     warn!(mint, attempt, error = %e, "rugcheck request failed; retrying");
@@ -149,23 +159,32 @@ impl RugCheckClient {
                 {
                     return Err(oversized_body());
                 }
-                // Slow body reads are transient. Retry in budget.
-                let bytes = match response.bytes().await {
-                    Ok(bytes) => bytes,
-                    Err(e)
-                        if is_transient_network_error(&e) && attempt < self.max_retries =>
-                    {
-                        warn!(mint, attempt, error = %e, "rugcheck body stalled; retrying");
-                        sleep_backoff(attempt).await;
-                        attempt += 1;
-                        continue;
+                // Incremental cap: reject mid-stream past MAX_BODY_BYTES.
+                // `bytes()` would buffer an unbounded body before the length
+                // check below, so a lying/missing Content-Length could OOM.
+                let mut buf = Vec::new();
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => {
+                            buf.extend_from_slice(&chunk);
+                            if buf.len() as u64 > MAX_BODY_BYTES {
+                                return Err(oversized_body());
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e)
+                            if is_transient_network_error(&e)
+                                && attempt < self.max_retries =>
+                        {
+                            warn!(mint, attempt, error = %e, "rugcheck body stalled; retrying");
+                            sleep_backoff(attempt).await;
+                            attempt += 1;
+                            continue 'retry;
+                        }
+                        Err(e) => return Err(RugCheckError::Network(e)),
                     }
-                    Err(e) => return Err(RugCheckError::Network(e)),
-                };
-                if bytes.len() as u64 > MAX_BODY_BYTES {
-                    return Err(oversized_body());
                 }
-                return serde_json::from_slice::<RugCheckReport>(&bytes)
+                return serde_json::from_slice::<RugCheckReport>(&buf)
                     .map_err(RugCheckError::Deserialization);
             }
 
@@ -210,9 +229,9 @@ fn oversized_body() -> RugCheckError {
 }
 
 /// Network errors worth retrying.
-/// Decode failures return at once.
+/// Body stalls mid-stream retry like timeouts; decode failures return at once.
 fn is_transient_network_error(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect()
+    e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode()
 }
 
 /// Retry server errors, rate limits, and timeouts.

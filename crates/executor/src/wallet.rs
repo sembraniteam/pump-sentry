@@ -80,12 +80,16 @@ impl WalletGuard {
         &self.keypair
     }
 
-    /// Assert `balance >= trade + tip + reserve`. Deadline-bound.
+    /// Assert `balance >= trade + tip + priority + reserve`. Deadline-bound.
+    /// Priority is explicit (not folded into tip) so shortfalls name the
+    /// right knob. Simulation still gates every dispatch; this only
+    /// fails fast before burning sim budget.
     pub async fn assert_solvency(
         &self,
         rpc: &RpcClient,
         trade_lamports: u64,
         tip_lamports: u64,
+        priority_lamports: u64,
     ) -> Result<u64, WalletGuardError> {
         let balance = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -96,6 +100,7 @@ impl WalletGuard {
         .map_err(WalletGuardError::Rpc)?;
         let required = trade_lamports
             .saturating_add(tip_lamports)
+            .saturating_add(priority_lamports)
             .saturating_add(MIN_SOL_RESERVE_LAMPORTS);
         if balance < required {
             return Err(WalletGuardError::InsufficientFunds {

@@ -50,7 +50,7 @@ pub use rpc::{
     find_funding_source, initialize2_amm_id, read_curve_swaps, screen_developer,
 };
 pub use swaps::{
-    IDX_BUY_V2_USER, IDX_CREATE_USER, IDX_SWAP_USER, IDX_SWAP_V2_USER, IDX_SWAP_V3_USER, SwapRecord,
+    IDX_CREATE_USER, IDX_SWAP_USER, IDX_SWAP_V2_USER, IDX_SWAP_V3_USER, SwapRecord,
     SwapSide, count_dev_creates, extract_pump_swaps, fixture_wallet, json_tx_config, parse_address,
 };
 /// Screening failures: config, keys, transport.
@@ -429,10 +429,22 @@ mod tests {
         let tx_v1 = swap_tx(vec![v1]);
         let tx_v2 = swap_tx(vec![v2]);
         // Position 5 → key(5) (v2 author); position 7 → key(7) (v1 author).
-        assert_eq!(count_dev_creates(&tx_v1, &Pubkey::new_from_array([7; 32])), 1);
-        assert_eq!(count_dev_creates(&tx_v1, &Pubkey::new_from_array([5; 32])), 0);
-        assert_eq!(count_dev_creates(&tx_v2, &Pubkey::new_from_array([5; 32])), 1);
-        assert_eq!(count_dev_creates(&tx_v2, &Pubkey::new_from_array([7; 32])), 0);
+        assert_eq!(
+            count_dev_creates(&tx_v1, &Pubkey::new_from_array([7; 32])),
+            Some(1)
+        );
+        assert_eq!(
+            count_dev_creates(&tx_v1, &Pubkey::new_from_array([5; 32])),
+            Some(0)
+        );
+        assert_eq!(
+            count_dev_creates(&tx_v2, &Pubkey::new_from_array([5; 32])),
+            Some(1)
+        );
+        assert_eq!(
+            count_dev_creates(&tx_v2, &Pubkey::new_from_array([7; 32])),
+            Some(0)
+        );
     }
 
     #[test]
@@ -950,8 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_relaunch_refresh_is_capped() {
-        // Regression: spammed relaunches must not extend the window forever.
+    fn gate_relaunch_refresh_is_capped() {        // Regression: spammed relaunches must not extend the window forever.
         let mut gate = EntryGate::new(60, 3);
         let dev = Pubkey::new_from_array([7; 32]);
         assert!(gate.submit("MINT", &dev.to_string(), 1000));
@@ -966,6 +977,29 @@ mod tests {
             GateOutcome::Abort { .. }
         ));
         assert_eq!(gate.pending_count(), 0);
+    }
+
+    #[test]
+    fn relaunch_preserves_cohort_wallets() {
+        // Regression: relaunch refresh must not drop the v2 creator cohort.
+        let mut gate = EntryGate::new(60, 3);
+        let dev = Pubkey::new_from_array([7; 32]);
+        let creator = Pubkey::new_from_array([9; 32]);
+        assert!(gate.submit("MINT", &dev.to_string(), 1000));
+        assert!(gate.add_cohort("MINT", &creator.to_string()));
+        assert!(gate.submit("MINT", &dev.to_string(), 1010));
+        // Creator sell still aborts after the relaunch.
+        let dump = SwapRecord {
+            wallet: creator,
+            side: SwapSide::Sell,
+            signature: "sig".to_string(),
+            slot: 1,
+            amount_base_units: 1,
+        };
+        assert!(matches!(
+            gate.observe("MINT", &[dump], 1011),
+            GateOutcome::Abort { .. }
+        ));
     }
 
     #[test]
