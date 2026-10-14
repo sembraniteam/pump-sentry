@@ -9,10 +9,9 @@ use listener::{
     BundleVerdict, EntryGate, GateOutcome, ScreenError, SwapRecord,
 };
 use risk_engine::{
-    Action, RiskProfile, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
+    Action, DecisionSource, RiskDecision, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
     evaluate_heuristic_fallback, resolve_strategy,
 };
-use risk_engine::fallback::RUGCHECK_SCORE_CAP;
 use simulator::Side;
 use tracing::{debug, info, warn};
 
@@ -97,23 +96,6 @@ pub(crate) fn fee_aware_sl_floor(sl_percent: f64, venue_fee_bps: f64) -> f64 {
         warn!(sl = sl_percent, bps = venue_fee_bps, "absurd fee tier clamped the stop; check the schedule");
     }
     clamped
-}
-
-/// Re-gate a BUY against the audit score: the prompt advises PASS above
-/// 350, but advice isn't enforcement and `is_valid` never sees the
-/// score. Scores the heuristic rejects never buy on any path. Pure.
-fn apply_score_gate(profile: RiskProfile, rugcheck_score: u32) -> RiskProfile {
-    if profile.action == Action::Buy && rugcheck_score > RUGCHECK_SCORE_CAP {
-        return RiskProfile {
-            action: Action::Pass,
-            tp_percent: 0.0,
-            sl_percent: 0.0,
-            trailing_stop: false,
-            timeout_seconds: 0,
-            moonbag_percent: 0.0,
-        };
-    }
-    profile
 }
 
 /// Watchlist size that pages ops (no cap: entries die by deadline, and
@@ -648,26 +630,29 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             cluster_pct: req.cluster_pct,
             curve_progress: None,
         };
-        let profile = match &self.engine {
-            Some(engine) => engine.evaluate(&metrics).await.profile,
-            None => evaluate_heuristic_fallback(
-                metrics.liquidity_usd,
-                metrics.buy_velocity_5s,
-                metrics.dev_reputation,
-                metrics.rugcheck_score,
-            ),
+        // Model call timed: entry latency is sniper budget (raise
+        // INFERENCE_TIMEOUT_MS only knowing it costs entry price).
+        let started = std::time::Instant::now();
+        let decision = match &self.engine {
+            Some(engine) => engine.evaluate(&metrics).await,
+            None => RiskDecision {
+                profile: evaluate_heuristic_fallback(
+                    metrics.liquidity_usd,
+                    metrics.buy_velocity_5s,
+                    metrics.dev_reputation,
+                    metrics.rugcheck_score,
+                ),
+                source: DecisionSource::Fallback,
+            },
         };
+        let profile = decision.profile;
+        if let Some(engine) = &self.engine {
+            info!(%mint, source = ?decision.source, latency_ms = started.elapsed().as_millis(),
+                fallbacks = engine.fallback_count(), timeouts = engine.timeout_count(),
+                invalid = engine.invalid_count(), "risk decided at confirm");
+        }
         if profile.action != Action::Buy {
             info!(%mint, buyers, score, "risk PASS at confirm");
-            return;
-        }
-        // Re-gate LLM BUYs against the audit score: the prompt advises
-        // PASS above 350, but advice isn't enforcement and `is_valid`
-        // never sees the score. Scores the heuristic rejects never buy
-        // on any path.
-        let profile = apply_score_gate(profile, score);
-        if profile.action != Action::Buy {
-            info!(%mint, buyers, score, "audit score re-gated model BUY to PASS");
             return;
         }
         // Rewrite BUY per strategy.
@@ -857,37 +842,5 @@ mod tests {
     fn fee_aware_sl_floor_clamps_to_full_loss() {
         assert_eq!(fee_aware_sl_floor(-8.0, 10_000.0), -100.0);
         assert_eq!(fee_aware_sl_floor(-8.0, 100_000.0), -100.0);
-    }
-
-    fn buy_profile() -> RiskProfile {
-        RiskProfile {
-            action: Action::Buy,
-            tp_percent: 60.0,
-            sl_percent: -10.0,
-            trailing_stop: true,
-            timeout_seconds: 180,
-            moonbag_percent: 20.0,
-        }
-    }
-
-    #[test]
-    fn score_gate_passes_model_buy_at_or_below_cap() {
-        assert_eq!(apply_score_gate(buy_profile(), 100).action, Action::Buy);
-        assert_eq!(apply_score_gate(buy_profile(), 350).action, Action::Buy);
-    }
-
-    #[test]
-    fn score_gate_rejects_model_buy_above_cap() {
-        let gated = apply_score_gate(buy_profile(), 380);
-        assert_eq!(gated.action, Action::Pass);
-        assert_eq!(gated.tp_percent, 0.0);
-        assert_eq!(gated.sl_percent, 0.0);
-        assert_eq!(gated.timeout_seconds, 0);
-    }
-
-    #[test]
-    fn score_gate_leaves_pass_alone() {
-        let pass = RiskProfile { action: Action::Pass, ..buy_profile() };
-        assert_eq!(apply_score_gate(pass, 999).action, Action::Pass);
     }
 }

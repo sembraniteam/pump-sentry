@@ -1,6 +1,6 @@
 //! LLM-first risk engine with heuristic fallback.
 
-use crate::fallback::evaluate_metrics_fallback;
+use crate::fallback::{RUGCHECK_SCORE_CAP, evaluate_metrics_fallback};
 use crate::schema::{RiskProfile, TokenMetrics, build_prompt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -261,10 +261,27 @@ impl RiskEngine {
         };
 
         match tokio::time::timeout(self.timeout, self.infer(request)).await {
-            Ok(Some(profile)) => RiskDecision {
-                profile,
-                source: DecisionSource::Model,
-            },
+            Ok(Some(profile)) => {
+                // In-crate score gate (not prompt advice): high-risk
+                // mints never buy on any path, even on a model BUY.
+                // The heuristic already PASSes above the cap itself.
+                let profile = if profile.action == crate::schema::Action::Buy
+                    && metrics.rugcheck_score > RUGCHECK_SCORE_CAP
+                {
+                    warn!(
+                        endpoint = %self.endpoint, model = %self.model,
+                        score = metrics.rugcheck_score,
+                        "model BUY re-gated to PASS on audit score"
+                    );
+                    RiskProfile::pass()
+                } else {
+                    profile
+                };
+                RiskDecision {
+                    profile,
+                    source: DecisionSource::Model,
+                }
+            }
             Ok(None) => {
                 self.note_fallback();
                 // `infer` already warned the cause; stay at debug here.
@@ -624,6 +641,21 @@ mod tests {
         let leaked: &'static str = Box::leak(chat_body(inner).into_boxed_str());
         let base = serve_scripted(vec![(0, 200, leaked)]).await;
         let decision = fast_engine(&base).evaluate(&metrics()).await;
+        assert_eq!(decision.source, DecisionSource::Model);
+        assert_eq!(decision.profile.action, Action::Pass);
+        assert_eq!(decision.profile.timeout_seconds, 0);
+    }
+
+    #[tokio::test]
+    async fn model_buy_above_score_cap_regates_to_pass() {
+        // In-crate score gate: a valid model BUY on a high-risk mint
+        // holds PASS (source stays Model: the model was consulted).
+        let inner = r#"{"action":"BUY","tp_percent":90.0,"sl_percent":-8.0,"trailing_stop":true,"timeout_seconds":180}"#;
+        let leaked: &'static str = Box::leak(chat_body(inner).into_boxed_str());
+        let base = serve_scripted(vec![(0, 200, leaked)]).await;
+        let mut risky = metrics();
+        risky.rugcheck_score = 380;
+        let decision = fast_engine(&base).evaluate(&risky).await;
         assert_eq!(decision.source, DecisionSource::Model);
         assert_eq!(decision.profile.action, Action::Pass);
         assert_eq!(decision.profile.timeout_seconds, 0);

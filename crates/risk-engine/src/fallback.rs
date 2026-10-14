@@ -123,6 +123,9 @@ mod tests {
             prompt.contains(&MODERATE_MOMENTUM_LIQUIDITY_USD.to_string()),
             "moderate liquidity"
         );
+        // Bundle-forensics and hard-bounds sentences pin with them.
+        assert!(prompt.contains("wash momentum"), "wash guidance");
+        assert!(prompt.contains("all-zero"), "pass shape");
     }
 
     #[test]

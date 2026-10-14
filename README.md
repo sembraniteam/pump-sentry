@@ -39,7 +39,7 @@ Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fe
 | `GATE_WINDOW_SECS` / `GATE_MIN_BUYERS` / `GATE_POLL_MS`                 | `10` / `5` / `2000`           | Watchlist window, quorum, poll cadence                                                       |
 | `DEV_MIN_AGE_SECS` / `DEV_MAX_PRIOR_LAUNCHES` / `DEV_SCREEN_SAMPLE_TXS` | `3600` / `1` / `20`           | Min wallet age, tolerated prior launches, sample size                                        |
 | `TICK_INTERVAL_MS` / `VAULT_TICK_INTERVAL_MS`                           | `1000` / `5000`               | Curve / pool poll intervals                                                                  |
-| `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine LLM (OpenAI-compatible)                                                          |
+| `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine LLM (OpenAI-compatible); raising the timeout past 300ms costs entry price |
 | `STRATEGY_MODE` / `RUNNER_MOONBAG_PERCENT` / `RUNNER_TRAIL_PERCENT`     | `adaptive` / `20` / `20`      | `adaptive`/`scalp`/`runner` + runner shape                                                   |
 | `MAX_DAILY_LOSS_USD`                                                    | `0` (off)                     | Halts new entries past the cap; exits always work                                            |
 | `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`                  | `200` / `100000` / global     | Buy guard, per-bundle tip, block-engine (global)                                             |
