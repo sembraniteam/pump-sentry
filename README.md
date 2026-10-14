@@ -176,7 +176,7 @@ the risk profile runs verbatim):
 ## Testing
 
 ```sh
-cargo test --workspace                    # 334 tests across all crates, live probes ignored by default
+cargo test --workspace                    # 339 tests across all crates, live probes ignored by default
 cargo clippy --all-targets                # must be zero warnings
 cargo fmt --all -- --check
 ```
