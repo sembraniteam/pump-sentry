@@ -42,7 +42,7 @@ pub enum RiskEngineError {
 pub enum DecisionSource {
     /// Model inference within budget with a valid profile.
     Model,
-    /// Heuristic (timeout, error, or bad model output).
+    /// Heuristic: model unreachable or over budget.
     Fallback,
 }
 
@@ -145,7 +145,8 @@ pub struct RiskEngine {
     /// Timeouts only (subset of fallbacks; operator can tell
     /// whether the model is slow vs non-compliant).
     timeout_count: Arc<AtomicU64>,
-    /// Invalid/unusable model outputs (subset of fallbacks).
+    /// Non-compliant model outputs (undecodable or invalid;
+    /// fail-closed to PASS, not heuristic fallback).
     invalid_count: Arc<AtomicU64>,
 }
 
@@ -212,13 +213,17 @@ impl RiskEngine {
         self.timeout_count.load(Ordering::Relaxed)
     }
 
-    /// Invalid-output fallbacks since construction (subset of [`Self::fallback_count`]).
+    /// Non-compliant model outputs since construction.
     pub fn invalid_count(&self) -> u64 {
         self.invalid_count.load(Ordering::Relaxed)
     }
 
-    fn note_invalid(&self) {
+    fn note_fallback(&self) {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.invalid_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_noncompliant(&self) {
         self.invalid_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -228,6 +233,12 @@ impl RiskEngine {
     }
 
     /// Model inference within budget, else heuristic.
+    /// Split is deliberate: unreachable/over-budget model falls back
+    /// (entries must not halt when the model is down; single attempt,
+    /// no retry on the entry path), but model output that is
+    /// undecodable or invalid fails closed to PASS — an explicit
+    /// valid BUY is required to buy, never a heuristic re-evaluation
+    /// of garbled output.
     pub async fn evaluate(&self, metrics: &TokenMetrics) -> RiskDecision {
         let (system, user) = build_prompt(metrics);
         let request = ChatRequest {
@@ -255,7 +266,7 @@ impl RiskEngine {
                 source: DecisionSource::Model,
             },
             Ok(None) => {
-                self.note_invalid();
+                self.note_fallback();
                 // `infer` already warned the cause; stay at debug here.
                 debug!(
                     endpoint = %self.endpoint, model = %self.model,
@@ -323,25 +334,26 @@ impl RiskEngine {
         let profile: RiskProfile = match serde_json::from_str(json) {
             Ok(profile) => profile,
             Err(e) => {
-                // Unparseable but clearly PASS-intended: never flip a safe
-                // intent into a heuristic BUY. Fail closed to PASS.
-                if pass_intended(json) {
-                    warn!(endpoint = %self.endpoint, model = %self.model, content = %truncate200(json), "inference unparseable but PASS-intended; holding PASS");
-                    return Some(RiskProfile::pass());
-                }
-                warn!(endpoint = %self.endpoint, model = %self.model, error = %e, content = %truncate200(json), "inference output not in schema; using heuristic fallback");
-                return None;
+                // Undecodable output fails closed to PASS: a garbled
+                // BUY (truncation, wrong fence slice) must never
+                // become a heuristic BUY.
+                self.note_noncompliant();
+                warn!(endpoint = %self.endpoint, model = %self.model, error = %e, content = %truncate200(json), "inference output not in schema; holding PASS");
+                return Some(RiskProfile::pass());
             }
         };
         if !profile.is_valid() {
             // Malformed PASS (e.g. non-zeroed timeout) is still a safe
             // intent: hold PASS instead of re-evaluating to a BUY.
             if profile.action == crate::schema::Action::Pass {
+                self.note_noncompliant();
                 warn!(endpoint = %self.endpoint, model = %self.model, ?profile, "inference PASS malformed; holding PASS");
                 return Some(RiskProfile::pass());
             }
-            warn!(endpoint = %self.endpoint, model = %self.model, ?profile, "inference profile failed validation; using heuristic fallback");
-            return None;
+            // Invalid BUY fails closed like undecodable output.
+            self.note_noncompliant();
+            warn!(endpoint = %self.endpoint, model = %self.model, ?profile, "inference profile failed validation; holding PASS");
+            return Some(RiskProfile::pass());
         }
         Some(profile)
     }
@@ -418,14 +430,6 @@ fn strip_code_fence(s: &str) -> &str {
         return inner[start..=end].trim();
     }
     inner
-}
-
-/// True when raw model output declares a PASS decision, even if the
-/// full profile is malformed (non-zeroed timeout, trailing text, ...).
-/// String-level check only: never infers BUY from garbage.
-fn pass_intended(json: &str) -> bool {
-    json.contains("\"action\"")
-        && (json.contains("\"PASS\"") || json.contains("\"Pass\"") || json.contains("\"pass\""))
 }
 
 #[cfg(test)]
@@ -560,14 +564,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_pass_intent_detected() {
-        // Non-zeroed timeout: invalid profile but clearly PASS-intended.
-        assert!(pass_intended(r#"{"action":"PASS","timeout_seconds":90}"#));
-        assert!(!pass_intended(r#"{"action":"BUY","tp_percent":60.0}"#));
-        assert!(!pass_intended("total garbage"));
-    }
-
-    #[test]
     fn pass_constructor_is_valid() {
         assert!(RiskProfile::pass().is_valid());
     }
@@ -601,16 +597,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_on_invalid_model_output() {
+    async fn undecodable_or_invalid_output_holds_pass() {
+        // Garbled output must never become a heuristic BUY on these
+        // hot metrics: only an explicit valid BUY buys.
         for bad in [
             r#"{"action":"BUY","tp_percent":"lots","sl_percent":-8.0}"#,
             r#"{"action":"BUY","tp_percent":-5.0,"sl_percent":3.0,"trailing_stop":false,"timeout_seconds":90}"#,
+            r#"{"action":"BUY","tp_percent":90.0,"sl_percent":-8.0,"trailing_stop":true"#,
             "not json at all",
         ] {
             let leaked: &'static str = Box::leak(chat_body(bad).into_boxed_str());
             let base = serve_scripted(vec![(0, 200, leaked)]).await;
-            let decision = fast_engine(&base).evaluate(&metrics()).await;
-            assert_eq!(decision.source, DecisionSource::Fallback, "input: {bad}");
+            let engine = fast_engine(&base);
+            let decision = engine.evaluate(&metrics()).await;
+            assert_eq!(decision.source, DecisionSource::Model, "input: {bad}");
+            assert_eq!(decision.profile.action, Action::Pass, "input: {bad}");
+            assert_eq!(engine.invalid_count(), 1);
         }
     }
 
