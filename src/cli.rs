@@ -19,17 +19,36 @@
 //! swaps — but now attaches to a subcommand (`start --live`,
 //! `restart --live`, `run --live`).
 //!
-//! Files default to `logs/bot.log` / `logs/bot.pid` under the current
-//! working directory; override with `LOG_FILE` / `PID_FILE`. Start and
-//! stop must run from the same directory.
+//! Files default to `~/.pump-sentry/bot.log` /
+//! `~/.pump-sentry/bot.pid`; override with `LOG_FILE` / `PID_FILE`
+//! (a leading `~/` in those values expands to the home directory).
+//! With relative overrides, start and stop must run from the same
+//! directory.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Default daemon log file (relative to the working directory).
-pub const DEFAULT_LOG_FILE: &str = "logs/bot.log";
-/// Default daemon pid file (relative to the working directory).
-pub const DEFAULT_PID_FILE: &str = "logs/bot.pid";
+/// Default state directory (`~/.pump-sentry`): log, pid, sell
+/// requests, WAL, and shutdown snapshots all live here unless
+/// overridden. `None` when `HOME` is unset (then relative `logs/`
+/// fallbacks apply so the bot still runs).
+pub fn default_state_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".pump-sentry"))
+}
+
+/// Default daemon log file (`~/.pump-sentry/bot.log`).
+pub fn default_log_file() -> PathBuf {
+    default_state_dir()
+        .map(|d| d.join("bot.log"))
+        .unwrap_or_else(|| PathBuf::from("logs/bot.log"))
+}
+
+/// Default daemon pid file (`~/.pump-sentry/bot.pid`).
+pub fn default_pid_file() -> PathBuf {
+    default_state_dir()
+        .map(|d| d.join("bot.pid"))
+        .unwrap_or_else(|| PathBuf::from("logs/bot.pid"))
+}
 /// Lines shown by `logs` without `-n`.
 pub const DEFAULT_LOG_LINES: usize = 100;
 /// Grace period after SIGTERM before SIGKILL (`stop`, `restart`).
@@ -43,7 +62,7 @@ pub const STOP_POLL_MS: u64 = 200;
 
 /// Usage text printed when no (valid) subcommand is given.
 pub const USAGE: &str = "\
-Usage: solana-snipe-bot <command> [options]
+Usage: pump-sentry <command> [options]
 
 Commands:
   start [--live]          Run the bot in the background (daemon, log to file)
@@ -67,12 +86,12 @@ Env:
   SOLANA_PRIVATE_KEY      Base58 keypair (required for live mode).
 
 Examples:
-  solana-snipe-bot start
-  solana-snipe-bot start --live
-  solana-snipe-bot logs -n 50 --follow
-  solana-snipe-bot restart --live
-  solana-snipe-bot sell <mint>
-  solana-snipe-bot stop
+  pump-sentry start
+  pump-sentry start --live
+  pump-sentry logs -n 50 --follow
+  pump-sentry restart --live
+  pump-sentry sell <mint>
+  pump-sentry stop
 ";
 
 /// Parsed supervisor action (pure; see [`parse_cli`]).
@@ -145,7 +164,7 @@ pub fn parse_cli(args: &[String]) -> CliAction {
         },
         "sell" => match args.get(2).map(String::as_str).unwrap_or("") {
             "" => CliAction::Help {
-                error: Some("`sell` needs a mint: `solana-snipe-bot sell <mint>`.".to_string()),
+                error: Some("`sell` needs a mint: `pump-sentry sell <mint>`.".to_string()),
             },
             mint => CliAction::Sell { mint: mint.to_string() },
         },
@@ -174,11 +193,29 @@ fn log_lines(args: &[String]) -> usize {
         .unwrap_or(DEFAULT_LOG_LINES)
 }
 
-/// Resolved `(pid_file, log_file)` honoring `PID_FILE` / `LOG_FILE`.
+/// Resolved `(pid_file, log_file)` honoring `PID_FILE` / `LOG_FILE`
+/// (a leading `~/` expands to the home directory), else the
+/// `~/.pump-sentry/` defaults.
 pub fn resolve_paths() -> (PathBuf, PathBuf) {
-    let pid = std::env::var("PID_FILE").unwrap_or_else(|_| DEFAULT_PID_FILE.to_string());
-    let log = std::env::var("LOG_FILE").unwrap_or_else(|_| DEFAULT_LOG_FILE.to_string());
-    (PathBuf::from(pid), PathBuf::from(log))
+    let pid = std::env::var("PID_FILE")
+        .ok()
+        .map(|v| expand_tilde(&v))
+        .unwrap_or_else(default_pid_file);
+    let log = std::env::var("LOG_FILE")
+        .ok()
+        .map(|v| expand_tilde(&v))
+        .unwrap_or_else(default_log_file);
+    (pid, log)
+}
+
+/// Expand a leading `~/` (or bare `~`) against `HOME`; anything else
+/// passes through untouched. Unset `HOME` leaves the value as-is.
+fn expand_tilde(s: &str) -> PathBuf {
+    let rest = s.strip_prefix("~/").or_else(|| (s == "~").then_some(""));
+    match (rest, std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(s),
+    }
 }
 
 /// Daemon identity recorded in the pid file.
@@ -446,7 +483,7 @@ pub async fn shutdown_signal() {
 
 /// Shutdown snapshot: what was still open when the signal arrived, so a
 /// drained-or-aborted shutdown never loses track silently. Serialized to
-/// `logs/shutdown-<ts>.json` (best-effort) and echoed to the log.
+/// `shutdown-<ts>.json` next to the log file (best-effort) and echoed to the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownSummary {
     /// Unix seconds of the snapshot.
@@ -1128,6 +1165,39 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_paths_defaults_and_overrides() {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock");
+        let saved = ["HOME", "PID_FILE", "LOG_FILE"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect::<Vec<_>>();
+        let restore = || {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        };
+        // Defaults live under the home state dir.
+        unsafe { std::env::set_var("HOME", "/tmp/fakehome") };
+        unsafe { std::env::remove_var("PID_FILE") };
+        unsafe { std::env::remove_var("LOG_FILE") };
+        let (pid, log) = resolve_paths();
+        assert_eq!(pid, PathBuf::from("/tmp/fakehome/.pump-sentry/bot.pid"));
+        assert_eq!(log, PathBuf::from("/tmp/fakehome/.pump-sentry/bot.log"));
+        // Explicit overrides win; a leading ~/ expands against HOME.
+        unsafe { std::env::set_var("PID_FILE", "/tmp/x.pid") };
+        unsafe { std::env::set_var("LOG_FILE", "~/custom/bot.log") };
+        let (pid, log) = resolve_paths();
+        assert_eq!(pid, PathBuf::from("/tmp/x.pid"));
+        assert_eq!(log, PathBuf::from("/tmp/fakehome/custom/bot.log"));
+        restore();
     }
 
     #[test]

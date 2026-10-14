@@ -1,4 +1,4 @@
-# solana-snipe-bot
+# pump-sentry
 
 Paper-trading pipeline for Solana memecoins: listen for new Pump.fun
 launches → audit risk via RugCheck → read live bonding-curve reserves →
@@ -57,7 +57,7 @@ cargo build --workspace
 
 # The binary only acts through an explicit subcommand (bare `cargo run`
 # prints usage and runs nothing):
-cargo run -- start            # background daemon, logs to logs/bot.log
+cargo run -- start            # background daemon, logs to ~/.pump-sentry/bot.log
 cargo run -- status           # check the daemon (pid, mode, log)
 cargo run -- logs -n 50       # tail the log (add --follow to follow it)
 cargo run -- restart --live   # stop + restart in live mode
@@ -83,19 +83,22 @@ kept in the WSOL ATA) **and** native SOL for fees, Jito tips, and the
 logs say so loudly; wrap with e.g. `spl-token wrap <amount>` first).
 
 Daemon details: `start`/`restart` spawn `<binary> run` detached
-(`nohup`, stdout/stderr appended to `logs/bot.log`), record the pid in
-`logs/bot.pid`, and log a banner with when the bot was first started vs
+(`nohup`, stdout/stderr appended to the log file), record the pid in
+the pid file, and log a banner with when the bot was first started vs
 restarted. `stop` sends SIGTERM (bounded 30s in-flight drain + a
-`logs/shutdown-<ts>.json` snapshot of still-open paper/live positions
-for manual review), then SIGKILL past 45s. `LOG_FILE` / `PID_FILE`
-override the default paths; run every command from the same directory.
+`shutdown-<ts>.json` snapshot of still-open paper/live positions
+for manual review), then SIGKILL past 45s. State defaults to
+`~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL,
+snapshots); `LOG_FILE` / `PID_FILE` override the file paths
+(`~/` expands). With relative overrides, run every command from the
+same directory.
 A heartbeat card (logs/candidates/cash/equity) fires at boot and every
 6h so quiet markets still prove liveness; `sell <mint>` exits one mint
 now without stopping the daemon.
 
 Long-run log rotation: the supervisor rotates a ≥50 MB log at
 (start/restart) time only, so a bot left running for weeks needs
-`ops/logrotate/solana-snipe-bot` installed (rename + SIGHUP reopen —
+`ops/logrotate/pump-sentry` installed (rename + SIGHUP reopen —
 lossless, no restart, no `copytruncate`). The daemon reopens its log
 on SIGHUP by itself; without logrotate the file just keeps growing
 (`logs -n` still stays cheap: tail seeks from the end).
@@ -116,7 +119,7 @@ cargo run
 
 | Env                                                                     | Default                       | Meaning                                                                            |
 |-------------------------------------------------------------------------|-------------------------------|------------------------------------------------------------------------------------|
-| `MAINNET_WSS_RPC_URL` / `MAINNET_RPC_URL`                           | mainnet-beta                  | RPC endpoints (`WS_URL` / `HTTP_URL` retired, still honored once with a warning) |
+| `MAINNET_WSS_RPC_URL` / `MAINNET_RPC_URL`                               | mainnet-beta                  | RPC endpoints (`WS_URL` / `HTTP_URL` retired, still honored once with a warning)   |
 | `COMMITMENT`                                                            | `confirmed`                   | `processed` \| `confirmed` \| `finalized`                                          |
 | `START_BALANCE`                                                         | `100`                         | Virtual USD balance                                                                |
 | `FEE_BPS`                                                               | `30`                          | Commission per side (bps)                                                          |
@@ -128,8 +131,8 @@ cargo run
 | `DEV_MIN_AGE_SECS` / `DEV_MAX_PRIOR_LAUNCHES` / `DEV_SCREEN_SAMPLE_TXS` | `3600` / `1` / `20`           | Dev-wallet minimum age, tolerated prior launches, sampled transactions             |
 | `LIQUIDITY_USD`                                                         | `0`                           | Liquidity fallback when the reserve read fails (normally live from reserves)       |
 | `DISCORD_ALERTS`                                                        | `true`                        | Trade cards via `hermes send --to discord`; `false` silences                       |
-| `TICK_INTERVAL_MS`                                                        | `1000`                        | Curve exit-poll interval                                                           |
-| `VAULT_TICK_INTERVAL_MS`                                                  | `5000`                        | Post-migration pool poll interval (spike alerts only)                              |
+| `TICK_INTERVAL_MS`                                                      | `1000`                        | Curve exit-poll interval                                                           |
+| `VAULT_TICK_INTERVAL_MS`                                                | `5000`                        | Post-migration pool poll interval (spike alerts only)                              |
 | `INFERENCE_ENDPOINT` / `INFERENCE_MODEL` / `INFERENCE_TIMEOUT_MS`       | local / `llama3.2:1b` / `300` | Risk-engine inference (OpenAI-compatible; Hermes Agent ready)                      |
 | `INFERENCE_API_KEY`                                                     | *(unset)*                     | Bearer token for providers that require auth                                       |
 | `IS_LIVE` / `--live`                                                    | *(unset)*                     | Live mode: mirror signals with real Jito-routed swaps (needs `SOLANA_PRIVATE_KEY`) |

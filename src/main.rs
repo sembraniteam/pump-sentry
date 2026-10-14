@@ -163,7 +163,7 @@ async fn run_pipeline(live_arg: bool) {
         .with_ansi(!daemon)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info,solana_snipe_bot=debug")
+                tracing_subscriber::EnvFilter::new("info,pump_sentry=debug")
             }),
         )
         .init();
@@ -701,7 +701,7 @@ async fn run_pipeline(live_arg: bool) {
     let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
 
     // Snapshot BEFORE the drain: paper opens, tracked live fills, and
-    // the watchlist, frozen to `logs/shutdown-<ts>.json` plus loud log
+    // the watchlist, frozen to `shutdown-<ts>.json` next to the log file plus loud log
     // lines. Best-effort file IO (a snapshot failure must not fail the
     // shutdown itself); the log lines always fire.
     let snap_ts = settings::now_secs();

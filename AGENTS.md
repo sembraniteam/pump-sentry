@@ -1,4 +1,4 @@
-# AGENTS.md — solana-snipe-bot
+# AGENTS.md — pump-sentry
 
 Paper-trading Solana memecoin sniper (Pump.fun → Raydium). Rust workspace:
 binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.

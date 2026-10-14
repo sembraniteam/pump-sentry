@@ -1,12 +1,12 @@
 [package]
-name = "solana-snipe-bot"
+name = "pump-sentry"
 description = "Solana memecoin snipe pipeline: Pump.fun event listener, RugCheck auditor, adaptive TP/SL risk engine, and paper-trading simulator"
 version = "0.1.0"
 edition = "2024"
 readme = "README.md"
 rust-version = "1.99.0"
 publish = false
-repository = "https://github.com/sembraniteam/solana-snipe-bot"
+repository = "https://github.com/sembraniteam/pump-sentry"
 authors = ["Ahmad Rifa'i <develop.rifai@gmail.com>"]
 
 [workspace]

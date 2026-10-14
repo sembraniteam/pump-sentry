@@ -1,14 +1,15 @@
-# solana-snipe-bot log rotation — lossless (rename + SIGHUP reopen).
+# pump-sentry log rotation — lossless (rename + SIGHUP reopen).
 #
 # Install:
-#   1. Replace <APP_DIR> below with the bot's working directory
-#      (the directory `start`/`run` is launched from).
-#   2. Copy to /etc/logrotate.d/solana-snipe-bot (needs root).
+#   1. Replace <HOME> below with the bot user's home directory
+#      (state defaults to ~/.pump-sentry/; with a LOG_FILE
+#      override, point at that path instead).
+#   2. Copy to /etc/logrotate.d/pump-sentry (needs root).
 #   3. If logrotate runs as root on another user's files, add:
 #        su <bot-user> <bot-group>
 #
 # How it works: logrotate renames bot.log, then SIGHUPs the daemon pid
-# (parsed from logs/bot.pid, which is {"pid":N,...} JSON). The daemon
+# (parsed from bot.pid, which is {"pid":N,...} JSON). The daemon
 # reopens its stdout/stderr onto the fresh bot.log — no restart, no
 # lost lines. Do NOT add `copytruncate` here: its copy-then-truncate
 # window drops lines the daemon writes mid-rotation.
@@ -16,7 +17,7 @@
 # The start-time size rotation in the supervisor (50 MB, 3 archives)
 # stays as a backstop for hosts without logrotate.
 
-<APP_DIR>/logs/bot.log {
+<HOME>/.pump-sentry/bot.log {
     daily
     rotate 7
     compress
@@ -26,7 +27,7 @@
     dateext
     sharedscripts
     postrotate
-        PID_FILE=<APP_DIR>/logs/bot.pid
+        PID_FILE=<HOME>/.pump-sentry/bot.pid
         if [ -f "$PID_FILE" ]; then
             PID=$(sed 's/.*"pid":\([0-9][0-9]*\).*/\1/' "$PID_FILE")
             if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
