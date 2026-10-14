@@ -196,7 +196,7 @@ impl Settings {
     /// Warnings for bad values. Empty when sane.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.parse_notes.clone();
-        if self.slippage_bps > 10_000 {
+        if self.slippage_bps > crate::live::BPS_DENOMINATOR {
             out.push(format!(
                 "SLIPPAGE_BPS={} exceeds 100%; quotes fail closed (no guard can cover it — check the value, likely a typo)",
                 self.slippage_bps
@@ -307,6 +307,25 @@ impl Settings {
             );
         }
         out
+    }
+
+    /// Fatal misconfig: values that guarantee no-opens or unguarded
+    /// spend. Called at boot in every mode (paper must not run blind
+    /// either); `warnings` keeps the soft advisories.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.notional_usd.is_finite() || self.notional_usd <= 0.0 {
+            return Err(format!(
+                "NOTIONAL_USD={} is not positive; no position can open",
+                self.notional_usd
+            ));
+        }
+        if self.slippage_bps >= crate::live::BPS_DENOMINATOR {
+            return Err(format!(
+                "SLIPPAGE_BPS={} (>=100%): buys would authorize 2x spend while every sell fails closed",
+                self.slippage_bps
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -614,6 +633,22 @@ mod tests {
         assert!(w.contains("JITO_TIP_LAMPORTS=0"), "{w}");
         assert!(w.contains("SLIPPAGE_BPS=20000"), "{w}");
         assert!(w.contains("QUOTE_USD override is set"), "{w}");
+    }
+
+    #[test]
+    fn fatal_misconfig_refuses_at_validate() {
+        let ok = Settings::from_map(&HashMap::new());
+        assert!(ok.validate().is_ok());
+        for (k, v) in [("NOTIONAL_USD", "0"), ("NOTIONAL_USD", "-5")] {
+            let s = Settings::from_map(&vars(&[(k, v)]));
+            assert!(s.validate().is_err(), "{k}={v}");
+        }
+        let s = Settings::from_map(&vars(&[("SLIPPAGE_BPS", "10000")]));
+        assert!(s.validate().is_err());
+        // Warnings still fire alongside (soft copy for logs).
+        let s = Settings::from_map(&vars(&[("SLIPPAGE_BPS", "20000")]));
+        assert!(s.validate().is_err());
+        assert!(s.warnings().iter().any(|w| w.contains("SLIPPAGE_BPS=20000")));
     }
 
     #[test]

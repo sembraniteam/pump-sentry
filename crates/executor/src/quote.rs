@@ -191,8 +191,9 @@ fn ceil_div(a: u128, b: u128) -> Result<u128, QuoteError> {
         .ok_or(QuoteError::MathOverflow)
 }
 
-/// Basis-point denominator shared by fee and slippage math.
-pub const BPS_DENOMINATOR: u128 = 10_000;
+/// Basis-point denominator shared by fee and slippage math (u128
+/// domain here; single source is `ids::BPS_DENOMINATOR`).
+pub const BPS_DENOMINATOR: u128 = ids::BPS_DENOMINATOR as u128;
 
 /// `ceil(amount * bps / 10_000)`. Fees round up (flooring dust-underfunds: 6002).
 #[inline]

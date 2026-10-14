@@ -86,8 +86,6 @@ pub const CURVE_CASHBACK_FLAG_OFFSET: usize = 82;
 pub const CURVE_QUOTE_MINT_OFFSET: usize = 83;
 /// Quote-mint slot end (exclusive).
 pub const CURVE_QUOTE_MINT_END: usize = 115;
-/// Min curve length. 115..122-byte blobs pass, then read `None` on fees.
-pub const CURVE_MIN_LEN: usize = 115;
 /// Complete flag (1 = migrated; curve trades refused).
 pub const CURVE_COMPLETE_OFFSET: usize = 48;
 /// Coin creator rate (u64le bps; 0 = unconfigured). Needs `115..123`.

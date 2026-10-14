@@ -223,6 +223,11 @@ async fn run_pipeline(live_arg: bool) {
     for warning in settings.warnings() {
         warn!("config: {warning}");
     }
+    // Fatal misconfig refuses in every mode (not just live).
+    if let Err(e) = settings.validate() {
+        eprintln!("bad config: {e}");
+        std::process::exit(1);
+    }
     // Live gates: real funds never run on defaults.
     if live_mode {
         if !(settings.max_daily_loss_usd.is_finite() && settings.max_daily_loss_usd > 0.0) {
@@ -231,10 +236,6 @@ async fn run_pipeline(live_arg: bool) {
         }
         if !settings.sim_strict {
             eprintln!("live mode requires SIM_STRICT=true (unproven sims must refuse, not warn-and-proceed)");
-            std::process::exit(1);
-        }
-        if settings.slippage_bps >= 10_000 {
-            eprintln!("live mode refuses SLIPPAGE_BPS={} (>=100%: buys would authorize 2x spend while every sell fails closed)", settings.slippage_bps);
             std::process::exit(1);
         }
         if settings.tip_lamports == 0 {

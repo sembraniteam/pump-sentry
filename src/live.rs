@@ -14,8 +14,9 @@ use thiserror::Error;
 pub const TOKEN_DECIMALS: u32 = curve::PUMP_TOKEN_DECIMALS as u32;
 /// Lamports per SOL. Single source is `curve::layout::LAMPORTS_PER_SOL`.
 pub const LAMPORTS_PER_SOL: f64 = curve::layout::LAMPORTS_PER_SOL;
-/// Standard fee tier (bps/side). Matches the simulator default.
-pub const VENUE_FEE_BPS: u64 = 125;
+/// Standard fee tier (bps/side). Single source is
+/// `simulator::STANDARD_VENUE_FEE_BPS` (f64 domain there).
+pub const VENUE_FEE_BPS: u64 = simulator::STANDARD_VENUE_FEE_BPS as u64;
 /// Basis-point denominator shared by fee and slippage math.
 /// Single source is `executor::quote::BPS_DENOMINATOR` (u128 domain there).
 pub const BPS_DENOMINATOR: u64 = executor::quote::BPS_DENOMINATOR as u64;
@@ -1102,11 +1103,6 @@ mod tests {
         assert_eq!(apply_slippage_ceiling(1_000, 99_999), None);
         assert_eq!(apply_slippage_ceiling(u64::MAX, 10_000), None);
         assert_eq!(apply_slippage_ceiling(u64::MAX, 0), Some(u64::MAX));
-    }
-
-    #[test]
-    fn standard_tier_matches_simulator_default() {
-        assert_eq!(VENUE_FEE_BPS as f64, FillModel::default().venue_fee_bps());
     }
 
     #[test]

@@ -11,8 +11,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::live::{
-    LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PumpSwapSellParams,
-    RaydiumSellParams, RecheckOutcome, SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN,
+    BPS_DENOMINATOR, LAMPORTS_PER_SOL, LiveBuyParams, LiveError, LivePosition, LiveSellParams,
+    LiveTrader, PumpSwapSellParams, RaydiumSellParams, RecheckOutcome, SELL_MAX_ATTEMPTS,
+    SELL_RETRY_COOLDOWN,
 };
 use crate::pipeline::{
     AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener, CURVE_TICK_STALE_SECS,
@@ -345,7 +346,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.exec.clear_diverged(mint).await;
                 // First-touch cost feeds the day-loss gate.
                 let buy_tip_usd =
-                    trader.first_touch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
+                    trader.first_touch_cost_lamports() as f64 / LAMPORTS_PER_SOL * sol_usd;
                 if buy_tip_usd.is_finite() && buy_tip_usd > 0.0 {
                     self.daily.lock().await.record(-buy_tip_usd, now_secs());
                     self.portfolio.lock().await.debit_dispatch_cost(buy_tip_usd);
@@ -412,7 +413,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     // Same first-touch cost; stale feed skips.
                     if let Some(sol_usd) = self.sol_feed.price() {
                         let tip_usd =
-                            trader.first_touch_cost_lamports() as f64 / 1_000_000_000.0 * sol_usd;
+                            trader.first_touch_cost_lamports() as f64 / LAMPORTS_PER_SOL * sol_usd;
                         if tip_usd.is_finite() && tip_usd > 0.0 {
                             self.daily.lock().await.record(-tip_usd, now_secs());
                             self.portfolio.lock().await.debit_dispatch_cost(tip_usd);
@@ -484,9 +485,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return true;
             };
             // Floored math (oversell is unauthorized).
-            let numer = (fraction_closed.clamp(0.0, 1.0) * 10_000.0).floor() as u64;
+            let numer = (fraction_closed.clamp(0.0, 1.0) * BPS_DENOMINATOR as f64).floor() as u64;
             let held = tracked.amount_tokens;
-            let sell_amount = ((held as u128 * numer as u128) / 10_000u128) as u64;
+            let sell_amount = ((held as u128 * numer as u128) / BPS_DENOMINATOR as u128) as u64;
             if sell_amount > held {
                 warn!(mint = %mint, sell_amount, held, "live sell sizing overflow; refusing");
                 return false;
@@ -571,7 +572,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.maybe_release_follow(mint).await;
                 // Dispatch cost at the ACTUAL tip: the day-loss gate
                 // sees live bleed, not paper-only profit.
-                let tip_usd = trader.dispatch_cost_for_tip(tip) as f64 / 1_000_000_000.0 * sol_usd;
+                let tip_usd = trader.dispatch_cost_for_tip(tip) as f64 / LAMPORTS_PER_SOL * sol_usd;
                 if tip_usd.is_finite() && tip_usd > 0.0 {
                     self.daily.lock().await.record(-tip_usd, now_secs());
                     self.portfolio.lock().await.debit_dispatch_cost(tip_usd);

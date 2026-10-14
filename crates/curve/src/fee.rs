@@ -89,13 +89,10 @@ pub async fn venue_fee_for_data(
     Some(effective_total(proto, coin)? as f64)
 }
 
-/// Basis-point denominator (mirrors executor math; u64 domain here).
-const BPS_DENOMINATOR: u64 = 10_000;
-
 /// Venue total; `None` past 100%.
 fn effective_total(proto: u64, creator: u64) -> Option<u64> {
     let total = proto.checked_add(creator)?;
-    if total > BPS_DENOMINATOR {
+    if total > ids::BPS_DENOMINATOR {
         return None;
     }
     Some(total)

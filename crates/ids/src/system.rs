@@ -25,6 +25,8 @@ pub const COMPUTE_BUDGET_PROGRAM_ID: Pubkey =
 pub const BASE_TX_FEE_LAMPORTS: u64 = 5_000;
 /// Rent for one ATA (165 bytes). Change only on rent/ATA change.
 pub const ATA_RENT_LAMPORTS: u64 = 2_039_280;
+/// Basis-point denominator (100%): slippage, fees, pro-rata math.
+pub const BPS_DENOMINATOR: u64 = 10_000;
 
 #[cfg(test)]
 mod tests {
@@ -68,5 +70,6 @@ mod tests {
         // Network/rent changes are deliberate edits here, never silent drift.
         assert_eq!(BASE_TX_FEE_LAMPORTS, 5_000);
         assert_eq!(ATA_RENT_LAMPORTS, 2_039_280);
+        assert_eq!(BPS_DENOMINATOR, 10_000);
     }
 }

@@ -5,7 +5,7 @@ use solana_client::{client_error::ClientError, nonblocking::rpc_client::RpcClien
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -149,11 +149,11 @@ pub struct CurveState {
 /// Decode [`CurveState`]. Pure. `None` on wrong owner or short data.
 pub fn parse_curve_state(owner: &Pubkey, data: &[u8]) -> Option<CurveState> {
     use crate::instructions::{
-        CURVE_CASHBACK_FLAG_OFFSET, CURVE_COMPLETE_OFFSET, CURVE_CREATOR_END,
-        CURVE_CREATOR_OFFSET, CURVE_MAYHEM_FLAG_OFFSET, CURVE_MIN_LEN,
-        CURVE_QUOTE_MINT_END, CURVE_QUOTE_MINT_OFFSET,
+        CURVE_CASHBACK_FLAG_OFFSET, CURVE_COIN_CREATOR_FEE_END, CURVE_COMPLETE_OFFSET,
+        CURVE_CREATOR_END, CURVE_CREATOR_OFFSET, CURVE_MAYHEM_FLAG_OFFSET, CURVE_QUOTE_MINT_END,
+        CURVE_QUOTE_MINT_OFFSET,
     };
-    if *owner != crate::instructions::PUMP_PROGRAM_ID || data.len() < CURVE_MIN_LEN {
+    if *owner != crate::instructions::PUMP_PROGRAM_ID || data.len() < CURVE_COIN_CREATOR_FEE_END {
         return None;
     }
     let creator = Pubkey::new_from_array(
@@ -290,7 +290,16 @@ pub struct SwapExecutor {
     compute_unit_price: u64,
     /// Strict preflight: sim transport failure rejects. Off by default.
     strict_sim: bool,
+    /// Curve fee-input cache: (gate_on, schedule, fetched_at).
+    fee_cache: Arc<tokio::sync::Mutex<Option<(bool, crate::quote::FeeSchedule, std::time::Instant)>>>,
+    /// Mint supply cache: (supply, fetched_at).
+    supply_cache: Arc<tokio::sync::Mutex<HashMap<Pubkey, (u64, std::time::Instant)>>>,
 }
+
+/// Fee-input cache TTL. Same value as the paper reader twin
+/// (`curve::fee::FEE_CACHE_TTL`): a schedule change must reach
+/// dispatch within minutes.
+pub const FEE_INPUTS_TTL: Duration = Duration::from_secs(900);
 
 /// Read-only funding snapshot. `None` = unreadable, never funded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +350,8 @@ impl SwapExecutor {
             compute_unit_limit: 0,
             compute_unit_price: 0,
             strict_sim: false,
+            fee_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            supply_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -444,12 +455,12 @@ impl SwapExecutor {
             ExecutorError::BadOrder(format!("sell re-quote failed ({why}); refusing"))
         };
         let (fees, supply) = tokio::join!(
-            fetch_fee_inputs(&self.rpc),
+            self.fee_inputs(),
             async {
                 if state.is_mayhem {
                     Some(state.token_total_supply)
                 } else {
-                    mint_supply(&self.rpc, mint).await
+                    self.supply_cached(mint).await
                 }
             }
         );
@@ -484,6 +495,34 @@ impl SwapExecutor {
         }
     }
 
+    /// Curve fee inputs behind the TTL cache. `None` on failure.
+    async fn fee_inputs(&self) -> Option<(bool, crate::quote::FeeSchedule)> {
+        if let Some((gate, schedule, at)) = self.fee_cache.lock().await.clone()
+            && at.elapsed() < FEE_INPUTS_TTL
+        {
+            return Some((gate, schedule));
+        }
+        let fresh = fetch_fee_inputs(&self.rpc).await?;
+        *self.fee_cache.lock().await =
+            Some((fresh.0, fresh.1.clone(), std::time::Instant::now()));
+        Some((fresh.0, fresh.1))
+    }
+
+    /// Mint supply behind the TTL cache. `None` on failure.
+    async fn supply_cached(&self, mint: &Pubkey) -> Option<u64> {
+        if let Some((supply, at)) = self.supply_cache.lock().await.get(mint).copied()
+            && at.elapsed() < FEE_INPUTS_TTL
+        {
+            return Some(supply);
+        }
+        let supply = mint_supply(&self.rpc, mint).await?;
+        self.supply_cache
+            .lock()
+            .await
+            .insert(*mint, (supply, std::time::Instant::now()));
+        Some(supply)
+    }
+
     /// Fee-inclusive spend guard. Falls back to the order guard when
     /// unreadable. Never exceeds the order ceiling.
     async fn quote_buy_guard(        &self,
@@ -498,12 +537,12 @@ impl SwapExecutor {
             return (fallback_max, None);
         }
         let (fees, supply) = tokio::join!(
-            fetch_fee_inputs(&self.rpc),
+            self.fee_inputs(),
             async {
                 if state.is_mayhem {
                     Some(state.token_total_supply)
                 } else {
-                    mint_supply(&self.rpc, mint).await
+                    self.supply_cached(mint).await
                 }
             }
         );
@@ -913,7 +952,7 @@ impl SwapExecutor {
             async {
                 tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&PUMP_AMM_FEE_CONFIG)).await
             },
-            async { mint_supply(&self.rpc, &order.mint).await }
+            async { self.supply_cached(&order.mint).await }
         );
         let (Ok(Ok(pool)), Ok(Ok(base_vault)), Ok(Ok(quote_vault))) = (pool, base_vault, quote_vault)
         else {

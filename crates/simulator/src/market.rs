@@ -2,6 +2,10 @@
 
 use crate::types::{ExitReason, Position, Side};
 
+/// Standard venue fee per side, bps. Live-launch schedule total
+/// (95 + 30); custom-tier mints override per mint.
+pub const STANDARD_VENUE_FEE_BPS: f64 = 125.0;
+
 /// Execution price for paper fills.
 ///
 /// Two fee layers, never confused: `fee_bps` commission on entry/exit
@@ -33,7 +37,7 @@ pub enum FillModel {
 impl Default for FillModel {
     fn default() -> Self {
         Self::BondingCurve {
-            fee_bps_per_side: 125.0,
+            fee_bps_per_side: STANDARD_VENUE_FEE_BPS,
             max_slip_frac: 0.25,
         }
     }

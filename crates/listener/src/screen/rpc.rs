@@ -169,31 +169,58 @@ pub async fn read_curve_swaps(
         pages += 1;
         let page_full = sigs.len() >= CURVE_SWAP_PAGE_LIMIT;
 
-        for status in &sigs {
-            if Some(status.signature.as_str()) == since_sig {
-                watermark_found = true;
-                break;
-            }
-            if newest.is_none() {
-                newest = Some(status.signature.clone());
-            }
-            if status.err.is_some() {
-                continue;
-            }
-            let Ok(signature) = Signature::from_str(&status.signature) else {
-                continue;
-            };
-            // One slow fetch can't eat the budget.
-            let fetched = match tokio::time::timeout(
-                TX_FETCH_TIMEOUT,
-                rpc.get_transaction_with_config(&signature, tx_config),
-            )
-            .await
-            {
-                Ok(Ok(fetched)) => fetched,
-                _ => continue,
-            };
-            records.extend(extract_pump_swaps(&fetched, &status.signature));
+        // Watermark cutoff first: sigs at/after it never fetch.
+        if since_sig.is_some()
+            && sigs
+                .iter()
+                .any(|s| Some(s.signature.as_str()) == since_sig)
+        {
+            watermark_found = true;
+        }
+        let end = since_sig
+            .and_then(|w| sigs.iter().position(|s| s.signature.as_str() == w))
+            .unwrap_or(sigs.len());
+        if newest.is_none() {
+            newest = sigs
+                .first()
+                .filter(|s| Some(s.signature.as_str()) != since_sig)
+                .map(|s| s.signature.clone());
+        }
+        // Bounded concurrency: serial page reads stall confirms (75
+        // serial fetches blow the 15s screen budget). Jobs are owned
+        // up front (Send-safe); order restored by index; 429s degrade
+        // to skips (fail-closed), never errors.
+        use futures_util::stream::{self, StreamExt};
+        let jobs: Vec<(usize, Signature, String)> = sigs[..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, status)| {
+                if status.err.is_some() {
+                    return None;
+                }
+                let signature = Signature::from_str(&status.signature).ok()?;
+                Some((i, signature, status.signature.clone()))
+            })
+            .collect();
+        let mut fetched: Vec<(usize, Vec<SwapRecord>)> = stream::iter(jobs)
+            .map(|(i, signature, sig_str)| async move {
+                let records = match tokio::time::timeout(
+                    TX_FETCH_TIMEOUT,
+                    rpc.get_transaction_with_config(&signature, tx_config),
+                )
+                .await
+                {
+                    Ok(Ok(fetched)) => extract_pump_swaps(&fetched, &sig_str),
+                    _ => Vec::new(),
+                };
+                (i, records)
+            })
+            .buffered(CURVE_SWAP_FETCH_FANOUT)
+            .collect()
+            .await;
+        fetched.sort_by_key(|(i, _)| *i);
+        for (_, recs) in fetched {
+            records.extend(recs);
         }
         if watermark_found {
             break;
@@ -978,6 +1005,8 @@ pub const DEV_SCREEN_FANOUT: usize = 5;
 pub const FUNDER_TRACE_FANOUT: usize = 4;
 /// Curve pages: 3 x 25 newest sigs. Past that, watermark is stale.
 pub const CURVE_SWAP_PAGE_LIMIT: usize = 25;
+/// Page-fetch fanout (see `read_curve_swaps`).
+pub const CURVE_SWAP_FETCH_FANOUT: usize = 4;
 pub const CURVE_SWAP_MAX_PAGES: usize = 3;
 /// Genesis walk cap: 10 x 1000 sigs. Past that, untraceable.
 pub const MAX_FUNDER_PAGES: u32 = 10;

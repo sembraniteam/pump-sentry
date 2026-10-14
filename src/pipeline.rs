@@ -694,7 +694,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live::{PoolLeg, PoolVenue};
+    use crate::live::{LAMPORTS_PER_SOL, PoolLeg, PoolVenue};
     use migration::PoolTick;
     use simulator::Side;
     use simulator::FillModel;
@@ -2690,8 +2690,8 @@ mod tests {
         assert!(gross_move > -8.0, "gross must hold: {gross_move}");
         // Paper bleed at sol $150, tip 100k: open (100k+5k+rent),
         // close (100k+5k), modeled on both legs.
-        let open_leg = 2_144_280.0 / 1_000_000_000.0 * 150.0;
-        let close_leg = 105_000.0 / 1_000_000_000.0 * 150.0;
+        let open_leg = 2_144_280.0 / LAMPORTS_PER_SOL * 150.0;
+        let close_leg = 105_000.0 / LAMPORTS_PER_SOL * 150.0;
         assert!((trade.dispatch_usd - close_leg).abs() < 1e-9);
         assert!((portfolio.total_dispatch_usd() - (open_leg + close_leg)).abs() < 1e-6);
         // Breaker and cards see edge net of bleed.
