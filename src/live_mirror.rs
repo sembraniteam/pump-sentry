@@ -655,7 +655,30 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 creator: tracked.creator.clone(),
             }
         };
-        match trader.sell(&probe, price_usd, sol_usd, liquidity_usd, Some(venue_fee_bps)).await {
+        // Post-migration routing: a validated pool leg means the curve
+        // is gone — the curve leg would refuse pre-dispatch (complete)
+        // or fail on a drained curve, so route Raydium directly. No leg
+        // (PumpSwap, unresolvable pool, evicted follow) keeps the curve
+        // leg, which fails closed to manual on its own. Short lock, no
+        // awaits inside.
+        let pool = self
+            .followed
+            .lock()
+            .await
+            .get(mint)
+            .and_then(|state| state.pool.clone());
+        let sell_result = match &pool {
+            Some(leg) => {
+                warn!(%mint, amm = %leg.amm, leg_mint = %leg.mint, "routing post-migration exit via Raydium");
+                trader.sell_raydium(&probe, leg).await
+            }
+            None => {
+                trader
+                    .sell(&probe, price_usd, sol_usd, liquidity_usd, Some(venue_fee_bps))
+                    .await
+            }
+        };
+        match sell_result {
             Ok(bundle) => {
                 // WAL first (write-ahead): a crash between here and the
                 // subtract below replays to a subtracted position, never
@@ -672,6 +695,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // The corresponding paper PnL was deferred while holding;
                 // the fill settles it now.
                 self.flush_deferred_pnl(mint).await;
+                // Post-spike follow reap: a follow kept past its alert
+                // solely for this Raydium exit dies with custody (curve
+                // legs never set one — the check is a cheap map read).
+                self.maybe_release_follow(mint).await;
                 // Real dispatch cost: tip + priority fee + base fee left
                 // the wallet, so the day-loss gate sees live bleed, not
                 // paper-only profit. Sells never touch ATA rent (the

@@ -113,6 +113,28 @@ pub struct SellOrder {
     pub creator: Option<Pubkey>,
 }
 
+/// Post-migration Raydium sell order: token → WSOL on a validated V4
+/// pool (see [`RaydiumPoolLeg`] upstream — legs must come from
+/// `parse_validated` stores, never hand-built). The floor prices from
+/// live vault reserves inside preflight, not from the caller.
+pub struct SellRaydiumOrder {
+    /// Migrated token mint.
+    pub mint: Pubkey,
+    /// Raydium AMM pool account.
+    pub amm: Pubkey,
+    /// Coin-side LP vault (WSOL inventory on migrations).
+    pub base_vault: Pubkey,
+    /// Pc-side LP vault (token inventory on migrations).
+    pub quote_vault: Pubkey,
+    /// Token base units to sell.
+    pub amount_tokens: u64,
+    /// Slippage guard in basis points over the reserve quote
+    /// (`>= 10000` refuses: it would authorize any fill price).
+    pub slippage_bps: u64,
+    /// Jito tip budget in lamports (see [`BuyOrder::tip_lamports`]).
+    pub tip_lamports: u64,
+}
+
 /// Bonding-curve trade state decoded from chain bytes (offsets in
 /// [`ids`], verified live 2026-10-14 against a legacy-18-buy curve and a
 /// `buy_v2` curve): creator @49..81 (vault-PDA cross-checked on both),
@@ -636,6 +658,171 @@ impl SwapExecutor {
         let mut ixs = self.preflight_sell(order, true).await?;
         self.push_tip(&mut ixs, order.tip_lamports).await;
         self.send_bundle(&ixs, "sell-jito").await
+    }
+
+    /// Post-migration Raydium sell via Jito bundle: token → WSOL on a
+    /// validated V4 pool. Requires [`SwapExecutor::with_jito`]. The
+    /// floor prices from live vault reserves inside preflight (never a
+    /// caller-copied value); Token-2022 vaults refuse fail-closed
+    /// (only the proven classic path routes).
+    pub async fn sell_raydium_jito(
+        &self,
+        order: &SellRaydiumOrder,
+    ) -> Result<JitoReceipt, ExecutorError> {
+        let mut ixs = self.preflight_sell_raydium(order, true).await?;
+        self.push_tip(&mut ixs, order.tip_lamports).await;
+        self.send_bundle(&ixs, "sell-raydium-jito").await
+    }
+
+    /// Raydium sell path: balance + reserve + floor checks, then the
+    /// 8-account `SwapBaseInV2` shape with an idempotent WSOL-destination
+    /// prefix (the program never creates accounts). Every failure is a
+    /// pre-dispatch `BadOrder`/timeout — simulation still gates the
+    /// bundle in `send_bundle`, so a stale reserve read dies free, never
+    /// on-chain.
+    async fn preflight_sell_raydium(
+        &self,
+        order: &SellRaydiumOrder,
+        bundled: bool,
+    ) -> Result<Vec<solana_instruction::Instruction>, ExecutorError> {
+        if order.amount_tokens == 0 {
+            return Err(ExecutorError::BadOrder(
+                "raydium sell amount_tokens is 0".to_string(),
+            ));
+        }
+        if order.slippage_bps >= 10_000 {
+            return Err(ExecutorError::BadOrder(
+                "raydium sell slippage >= 100%: refusing unguarded floor".to_string(),
+            ));
+        }
+        let balance = self
+            .wallet
+            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled))
+            .await?;
+        info!(mint = %order.mint, balance, amount = order.amount_tokens, "raydium sell pre-flight ok");
+        let payer = self.wallet.pubkey();
+        // Token program from the mint (classic vs Token-2022): the user
+        // source ATA below must be the account the swap spends from.
+        let Some(token_program) = self.token_program(&order.mint).await else {
+            return Err(ExecutorError::BadOrder("mint account unreadable; token program unknown".to_string()));
+        };
+        let source_ata = crate::instructions::user_ata_with_program(&payer, &order.mint, &token_program);
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.rpc.get_token_account_balance(&source_ata),
+        )
+        .await
+        {
+            Ok(Ok(balance)) => {
+                let held: u64 = balance.amount.parse().map_err(|_| {
+                    ExecutorError::BadOrder(format!(
+                        "raydium sell balance unreadable for {} (RPC shape change?); refusing",
+                        order.mint
+                    ))
+                })?;
+                if held < order.amount_tokens {
+                    return Err(ExecutorError::BadOrder(format!(
+                        "raydium sell amount {} exceeds ATA balance {held}",
+                        order.amount_tokens
+                    )));
+                }
+            }
+            Ok(Err(_)) => {
+                return Err(ExecutorError::BadOrder(
+                    "raydium sell ATA missing or unreadable".to_string(),
+                ));
+            }
+            Err(_) => return Err(ExecutorError::Timeout("raydium sell balance read")),
+        }
+        // Vault reads (owners + balances, joined): both vaults must be
+        // classic Token-program accounts. Upstream `process_swap_base_in_v2`
+        // hard-requires `[0] == spl_token::id()` (`InvalidSplTokenProgram`)
+        // and unpacks every vault/user account with the classic layout —
+        // Token-2022 vaults are unroutable through AMM v4 by program
+        // construction (only other Raydium programs could serve them), so
+        // refuse fail-closed to manual exit, never guess.
+        let (base_vault, quote_vault) = tokio::join!(
+            async {
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.base_vault)).await
+            },
+            async {
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.quote_vault)).await
+            }
+        );
+        let (base_vault, quote_vault) = match (base_vault, quote_vault) {
+            (Ok(Ok(b)), Ok(Ok(q))) => (b, q),
+            _ => {
+                return Err(ExecutorError::BadOrder(
+                    "raydium vaults unreadable; refusing unroutable dispatch (fail-closed)"
+                        .to_string(),
+                ));
+            }
+        };
+        if base_vault.owner != crate::instructions::TOKEN_PROGRAM_ID
+            || quote_vault.owner != crate::instructions::TOKEN_PROGRAM_ID
+        {
+            warn!(mint = %order.mint, "Token-2022 raydium vaults: unproven path; refusing (fail-closed, manual exit)");
+            return Err(ExecutorError::BadOrder(
+                "Token-2022 raydium vaults unproven; refusing (fail-closed)".to_string(),
+            ));
+        }
+        let vault_amount = |data: &[u8]| -> Option<u64> {
+            data.get(64..72)?.try_into().ok().map(u64::from_le_bytes)
+        };
+        let (Some(base_reserve), Some(quote_reserve)) = (
+            vault_amount(&base_vault.data),
+            vault_amount(&quote_vault.data),
+        ) else {
+            return Err(ExecutorError::BadOrder(
+                "raydium vault balances unreadable; refusing".to_string(),
+            ));
+        };
+        // Our bags hold the QUOTE-side token (base side is WSOL on
+        // migrations): token in, WSOL out.
+        let quoted =
+            crate::raydium::quote_base_in_std(order.amount_tokens, quote_reserve, base_reserve)
+                .ok_or_else(|| {
+                    ExecutorError::BadOrder("raydium quote unroutable at this size".to_string())
+                })?;
+        let floor = crate::raydium::raydium_sell_floor(quoted, order.slippage_bps).ok_or_else(|| {
+            ExecutorError::BadOrder("raydium floor unguardable (dust); refusing".to_string())
+        })?;
+        // WSOL destination ([6]) receives the proceeds and must exist
+        // (the program never creates accounts). Idempotent prefix: safe
+        // whether or not it exists.
+        let user_destination = crate::instructions::user_ata_with_program(
+            &payer,
+            &crate::instructions::WSOL_MINT,
+            &crate::instructions::TOKEN_PROGRAM_ID,
+        );
+        let mut ixs = Vec::new();
+        ixs.extend(
+            self.maybe_create_ata_ix(
+                &payer,
+                &payer,
+                &crate::instructions::WSOL_MINT,
+                &user_destination,
+                &crate::instructions::TOKEN_PROGRAM_ID,
+            )
+            .await,
+        );
+        ixs.push(
+            crate::raydium::build_swap_base_in_v2_ix(
+                &order.amm,
+                &ids::RAYDIUM_VAULT_AUTHORITY,
+                &order.base_vault,
+                &order.quote_vault,
+                &source_ata,
+                &user_destination,
+                &payer,
+                order.amount_tokens,
+                floor,
+            )
+            .ok_or_else(|| {
+                ExecutorError::BadOrder("raydium swap ix refused to build".to_string())
+            })?,
+        );
+        Ok(ixs)
     }
 
     /// Shared buy path: solvency preflight plus swap instruction.

@@ -19,7 +19,7 @@ use simulator::{ExitReason, Mark, PaperPortfolio, check_exit};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveTrader, PendingRecheck};
+use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveTrader, PendingRecheck, RaydiumPoolLeg};
 use crate::live_mirror::{LiveExecution, live_base_mint};
 use crate::follow::FollowState;
 pub use crate::gate::{DailyBreaker, GateState};
@@ -122,6 +122,16 @@ pub trait LiveSink {
         venue_fee_bps: Option<f64>,
     ) -> Result<String, LiveError>;
 
+    /// Post-migration Raydium sell of a tracked position at a validated
+    /// pool leg; returns the bundle UUID. The floor prices from live
+    /// vault reserves (no USD inputs — the curve print is gone on this
+    /// path). Same confirm/retry contract as [`LiveSink::sell`].
+    async fn sell_raydium(
+        &self,
+        position: &LivePosition,
+        pool: &RaydiumPoolLeg,
+    ) -> Result<String, LiveError>;
+
     /// True when at least one buy awaits confirmation (default: none).
     fn has_pending(&self) -> bool {
         false
@@ -180,6 +190,14 @@ impl LiveSink for LiveTrader {
         venue_fee_bps: Option<f64>,
     ) -> Result<String, LiveError> {
         self.sell(position, price_usd, sol_usd, liquidity_usd, venue_fee_bps).await
+    }
+
+    async fn sell_raydium(
+        &self,
+        position: &LivePosition,
+        pool: &RaydiumPoolLeg,
+    ) -> Result<String, LiveError> {
+        self.sell_raydium(position, pool).await
     }
 
     fn has_pending(&self) -> bool {
@@ -855,6 +873,9 @@ mod tests {
     struct StubLiveInner {
         buys: StdMutex<Vec<(String, String, String, f64)>>,
         sells: StdMutex<Vec<(String, u64)>>,
+        /// Raydium-leg sells as `(mint, amm, amount)`: routing assertions
+        /// distinguish the legs instead of merging them into `sells`.
+        raydium_sells: StdMutex<Vec<(String, String, u64)>>,
         fail_buys: std::sync::atomic::AtomicBool,
         fail_sells: std::sync::atomic::AtomicBool,
         /// When set, sells fail transiently (`Unconfirmed`, consumes the
@@ -875,6 +896,7 @@ mod tests {
                 inner: Arc::new(StubLiveInner {
                     buys: StdMutex::new(vec![]),
                     sells: StdMutex::new(vec![]),
+                    raydium_sells: StdMutex::new(vec![]),
                     fail_buys: std::sync::atomic::AtomicBool::new(false),
                     fail_sells: std::sync::atomic::AtomicBool::new(false),
                     fail_sells_transient: std::sync::atomic::AtomicBool::new(false),
@@ -891,6 +913,10 @@ mod tests {
 
         fn sells(&self) -> Vec<(String, u64)> {
             self.inner.sells.lock().expect("lock").clone()
+        }
+
+        fn raydium_sells(&self) -> Vec<(String, String, u64)> {
+            self.inner.raydium_sells.lock().expect("lock").clone()
         }
     }
 
@@ -963,6 +989,37 @@ mod tests {
                 .expect("lock")
                 .push((position.mint.clone(), position.amount_tokens));
             Ok("bundle-stub".to_string())
+        }
+
+        async fn sell_raydium(
+            &self,
+            position: &LivePosition,
+            pool: &RaydiumPoolLeg,
+        ) -> Result<String, LiveError> {
+            // Same failure hooks as the curve leg: tests drive both legs
+            // through one budget.
+            if self
+                .inner
+                .fail_sells
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(LiveError::BadOrder("stubbed raydium sell failure".to_string()));
+            }
+            if self
+                .inner
+                .fail_sells_transient
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(LiveError::Unconfirmed(
+                    "stubbed transient raydium sell failure".to_string(),
+                ));
+            }
+            self.inner
+                .raydium_sells
+                .lock()
+                .expect("lock")
+                .push((position.mint.clone(), pool.amm.clone(), position.amount_tokens));
+            Ok("bundle-stub-raydium".to_string())
         }
     }
 
@@ -2486,6 +2543,51 @@ mod tests {
         pipe.on_tick(&tick("MINT", 3.0)).await;
 
         assert_eq!(live.sells(), vec![("MINT".to_string(), 1_000)]);
+        assert!(pipe.exec.live_positions.lock().await.is_empty());
+        // No pool leg: the Raydium leg stays silent.
+        assert!(live.raydium_sells().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_sell_routes_raydium_when_pool_known() {
+        // Same close, but a validated pool leg is stored: the exit must
+        // take the Raydium leg (curve leg untouched) with the pool's amm.
+        use crate::follow::FollowState;
+        let live = StubLive::working();
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            funded(),
+            screener,
+            Some(live.clone()),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        pipe.followed.lock().await.insert(
+            "MINT".to_string(),
+            FollowState {
+                entry_price: 2.0,
+                alerted_spike: false,
+                last_seen_secs: now_secs(),
+                pool: Some(RaydiumPoolLeg {
+                    mint: "MINT".to_string(),
+                    amm: "AMM".to_string(),
+                    base_vault: "BASE".to_string(),
+                    quote_vault: "QUOTE".to_string(),
+                }),
+            },
+        );
+        pipe.on_tick(&tick("MINT", 3.0)).await;
+
+        assert!(live.sells().is_empty());
+        assert_eq!(
+            live.raydium_sells(),
+            vec![("MINT".to_string(), "AMM".to_string(), 1_000)]
+        );
         assert!(pipe.exec.live_positions.lock().await.is_empty());
     }
 

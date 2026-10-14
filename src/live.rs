@@ -77,6 +77,22 @@ pub const SELL_MAX_ATTEMPTS: u32 = 5;
 /// Recheck rounds for an unconfirmed buy before giving up to manual review.
 pub const PENDING_MAX_ATTEMPTS: u32 = 5;
 
+/// Resolved post-migration Raydium pool leg for one mint: validated
+/// V4 pool addresses (from `parse_validated` stores via the follow
+/// path — never hand-built). Stringly typed like [`LivePosition`];
+/// parsed fail-closed at dispatch.
+#[derive(Debug, Clone)]
+pub struct RaydiumPoolLeg {
+    /// Token mint (base58).
+    pub mint: String,
+    /// Raydium AMM pool account (base58).
+    pub amm: String,
+    /// Coin-side LP vault, WSOL inventory (base58).
+    pub base_vault: String,
+    /// Pc-side LP vault, token inventory (base58).
+    pub quote_vault: String,
+}
+
 /// Tracked live fill (amounts in token base units).
 #[derive(Debug, Clone)]
 pub struct LivePosition {
@@ -216,8 +232,7 @@ pub fn plan_buy(
     // engine downstream recomputes fee-inclusively but is clamped to this
     // guard, so pre-paying here never double-counts.
     let with_fee = u64::try_from(
-        (u64_from_f64_floor(lamports)? as u128
-            * (10_000 + fee_bps_per_side.ceil() as u128))
+        (u64_from_f64_floor(lamports)? as u128 * (10_000 + fee_bps_per_side.ceil() as u128))
             .div_ceil(10_000),
     )
     .ok()?;
@@ -977,6 +992,75 @@ impl LiveTrader {
             // path as a timeout) rather than a dispatch error.
             Err(e) => Err(LiveError::Unconfirmed(format!(
                 "sell bundle {} confirm RPC failed ({e}); still holding",
+                receipt.bundle_id
+            ))),
+        }
+    }
+
+    /// Post-migration Raydium sell of the tracked amount at `pool` via
+    /// Jito bundle. The floor prices from live vault reserves inside the
+    /// executor preflight (no USD price needed — the curve print is gone
+    /// by construction on this path), guarded by the same slippage
+    /// budget as the curve leg. Confirm/recheck semantics are identical
+    /// to [`LiveTrader::sell`]: only a proven on-chain failure means no
+    /// fill. Returns the bundle UUID.
+    pub async fn sell_raydium(
+        &self,
+        position: &LivePosition,
+        pool: &RaydiumPoolLeg,
+    ) -> Result<String, LiveError> {
+        let receipt = match tokio::time::timeout(
+            LIVE_DISPATCH_TIMEOUT,
+            self.executor.sell_raydium_jito(&executor::SellRaydiumOrder {
+                mint: parse_pubkey(&position.mint)
+                    .map_err(|e| LiveError::BadOrder(format!("bad mint '{}': {e}", position.mint)))?,
+                amm: parse_pubkey(&pool.amm)
+                    .map_err(|e| LiveError::BadOrder(format!("bad amm '{}': {e}", pool.amm)))?,
+                base_vault: parse_pubkey(&pool.base_vault)
+                    .map_err(|e| LiveError::BadOrder(format!("bad base_vault '{e}")))?,
+                quote_vault: parse_pubkey(&pool.quote_vault)
+                    .map_err(|e| LiveError::BadOrder(format!("bad quote_vault '{e}")))?,
+                amount_tokens: position.amount_tokens,
+                slippage_bps: self.slippage_bps,
+                tip_lamports: self.tip_lamports,
+            }),
+        )
+        .await
+        {
+            Ok(dispatch) => dispatch?,
+            Err(_) => {
+                return Err(LiveError::Unconfirmed(format!(
+                    "raydium sell dispatch of {} timed out after {:?}; still holding",
+                    position.mint, LIVE_DISPATCH_TIMEOUT
+                )));
+            }
+        };
+        tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE raydium sell dispatched");
+        match self
+            .executor
+            .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
+            .await
+        {
+            Ok(ConfirmOutcome::Confirmed) => {
+                // Write-ahead of the pipeline's custody subtract: a crash
+                // in between replays to a subtracted position, never to a
+                // resurrected bag (which would double-sell on retry).
+                self.record_sell(&position.mint, position.amount_tokens, &receipt.bundle_id);
+                Ok(receipt.bundle_id)
+            }
+            Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
+                "raydium sell bundle {} errored on-chain; still holding",
+                receipt.bundle_id
+            ))),
+            Ok(ConfirmOutcome::Timeout) => Err(LiveError::Unconfirmed(format!(
+                "raydium sell bundle {} unconfirmed after {:?}; still holding",
+                receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
+            ))),
+            // Transport failure mid-confirm: the bundle may already have
+            // landed, so report it as unconfirmed-but-holding (same retry
+            // path as a timeout) rather than a dispatch error.
+            Err(e) => Err(LiveError::Unconfirmed(format!(
+                "raydium sell bundle {} confirm RPC failed ({e}); still holding",
                 receipt.bundle_id
             ))),
         }

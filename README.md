@@ -2,7 +2,7 @@
 
 Paper-trading Solana memecoin sniper: catches new Pump.fun launches → screens risk → paper-trades with auto-exits. Paper-only by default; `--live` adds real Jito-routed execution.
 
-Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms, else heuristic) → paper position → auto-exit → migration hunt → Raydium tracking (price-only: PumpSwap migrations carry no pool so nothing is followed; Raydium follows fire spike cards but never swap — a swap builder exists dormant in `crates/executor/src/raydium.rs` (wire order + Token-2022 program param + off-chain authority helper + frozen-pool replay, authority seed shape still UNVERIFIED), unwired pending a funded run.
+Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms, else heuristic) → paper position → auto-exit → migration hunt → Raydium tracking (price-only: PumpSwap migrations carry no pool so nothing is followed; Raydium follows fire spike cards and track pool prices; post-migration live exits route Raydium sells through the validated pool leg (`crates/executor/src/raydium.rs`, proven: wire order + shared authority + frozen-pool replay + sell-direction sim).
 
 ## Install
 
@@ -58,7 +58,7 @@ Outside `Settings` (process/daemon plumbing, not parsed by `Settings::from_map`)
 
 - Paper-only without `--live`/`IS_LIVE=true`. Live needs a dedicated wallet, small `NOTIONAL_USD`, `MAX_DAILY_LOSS_USD>0`, `SIM_STRICT=true`.
 - Fail-closed everywhere: audit rejects, fresh/serial insiders, non-6-decimal mints, no-quorum timeouts, dev dumps (incl. `sell_v2`), bundled supply monopolies, unconfirmed fills (re-polled, never assumed).
-- Post-migration follows are price-only: PumpSwap migrations carry no pool (nothing followed); Raydium follows track vault prices and fire spike cards but never swap (dormant builder in `crates/executor/src/raydium.rs` has wire order + Token-2022 param + authority helper + frozen replay; authority seeds UNVERIFIED, unwired pending a funded run).
+- Post-migration follows track vault prices and fire spike cards; live post-migration exits route Raydium sells through the validated pool leg (Token-2022 vaults refuse fail-closed to manual exit — unroutable through AMM v4 by program construction, not a missing feature).
 - Exits never block: TP/SL/trailing/timeout + manual `sell`; breaker halts entries only.
 
 ## Layout
@@ -71,4 +71,4 @@ crates/executor/   # live swaps via Jito (only with --live)
 crates/curve|auditor|risk-engine|simulator|ids|alert|migration/
 ```
 
-Each crate has its own README. Tests: `cargo test --workspace` (381, live probes ignored) · `cargo clippy --all-targets` (zero warnings).
+Each crate has its own README. Tests: `cargo test --workspace` (384, live probes ignored) · `cargo clippy --all-targets` (zero warnings).

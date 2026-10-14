@@ -19,6 +19,11 @@ pub const FOLLOW_SPIKE_MULT: f64 = 2.0;
 pub const POOL_TICK_STALE_SECS: u64 = 300;
 
 /// Post-migration follow state per mint.
+/// Post-migration pool watch entry: price baseline plus the validated
+/// pool leg. The leg is stored (not re-hunted) so post-migration exits
+/// can route Raydium sells without extra RPC at exit time; entries die
+/// with the idle sweep below, degrading to manual exit — never a blind
+/// curve dispatch.
 #[derive(Debug, Clone)]
 pub struct FollowState {
     /// First pool-tick price (baseline).
@@ -28,6 +33,10 @@ pub struct FollowState {
     /// Last pool-tick time (unix secs): idle follows older than
     /// [`FOLLOW_TTL_SECS`] are evicted (dead pools, bounded growth).
     pub last_seen_secs: u64,
+    /// Validated Raydium pool leg for live-exit routing (`None` when the
+    /// migration carried no resolvable pool — PumpSwap or trust-gate
+    /// failure — so exits fall back to the curve leg/manual path).
+    pub pool: Option<crate::live::RaydiumPoolLeg>,
 }
 
 /// Idle-follow TTL: post-migration pools that never spike stop being
@@ -90,10 +99,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
-    /// Register a migrated Raydium pool for post-migration price tracking.
-    /// PumpSwap migrations carry no pool: nothing to follow.
-    /// Raydium follows are price-only (spike cards, never swaps — no
-    /// Raydium swap builder yet).
+    /// Register a migrated Raydium pool for post-migration price tracking
+    /// and live-exit routing. PumpSwap migrations carry no pool: nothing
+    /// to follow.
     async fn follow_pool(&self, mint: &str, report: &MigrationReport) {
         let (Some(amm), Some(base_vault), Some(quote_vault)) = (
             report.amm_id.clone(),
@@ -117,7 +125,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // pools that never tick would otherwise stay watched forever —
         // the idle sweep below only sees `followed`, and a dead pool
         // burns 2 vault RPCs per round with no expiry. `or_insert` keeps
-        // a baseline a racing tick already seeded.
+        // a baseline a racing tick already seeded. The pool leg rides
+        // along so live post-migration exits route without re-hunting.
+        let pool = Some(crate::live::RaydiumPoolLeg {
+            mint: mint.to_string(),
+            amm: amm.clone(),
+            base_vault: base_vault.clone(),
+            quote_vault: quote_vault.clone(),
+        });
         self.followed
             .lock()
             .await
@@ -126,14 +141,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 entry_price: f64::NAN,
                 alerted_spike: false,
                 last_seen_secs: now_secs(),
+                pool,
             });
         info!(%mint, amm = %amm, "following migrated pool");
     }
 
     /// One post-migration pool tick: seed the entry on first sight, then
-    /// alert once the price doubles off it. Paper tracking only (price
-    /// cards, never swaps — PumpSwap carries no pool, and Raydium has no
-    /// swap builder yet); entries need a Raydium swap builder (future work).
+    /// alert once the price doubles off it. Ticks are price cards; live
+    /// post-migration exits route through the stored pool leg
+    /// (`live_sell`), never through these ticks.
     pub async fn on_pool_tick(&self, tick: &PoolTick) {
         // Validate at the boundary: non-finite/non-positive prices must not
         // seed baselines or trigger alerts; stale ticks are dropped.
@@ -165,12 +181,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             for mint in &stale {
                 followed.remove(mint);
             }
-        }
-        let mut followed = self.followed.lock().await;
+        }        let mut followed = self.followed.lock().await;
         let state = followed.entry(tick.mint.clone()).or_insert(FollowState {
             entry_price: tick.price_usd,
             alerted_spike: false,
             last_seen_secs: now,
+            // Ticks never create pool legs (only the migration hunt
+            // stores validated legs): a tick-first entry routes curve
+            // leg/manual until a hunt resolves the pool.
+            pool: None,
         });
         state.last_seen_secs = now;
         if state.alerted_spike {
@@ -193,9 +212,50 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 tick.price_usd,
             ));
             // Alert fired: release the pool watch and the follow entry so a
-            // dead pool is not polled forever (unbounded growth).
-            self.vaults.unwatch(&mint).await;
-            self.followed.lock().await.remove(&mint);
+            // dead pool is not polled forever (unbounded growth) — UNLESS
+            // live custody still needs the pool leg for a Raydium exit.
+            // Keeping a needed leg costs 2 vault RPCs/round; dropping it
+            // strands the exit to manual. Paper-only follows release.
+            let keep_for_exit = match &self.exec.live {
+                Some(trader) => self.is_live_tracked(trader, &mint).await,
+                None => false,
+            };
+            if keep_for_exit {
+                info!(mint = %mint, "live custody holds the pool leg past the spike; follow retained for Raydium exits");
+            } else {
+                self.vaults.unwatch(&mint).await;
+                self.followed.lock().await.remove(&mint);
+            }
+        }
+    }
+
+    /// Release a post-spike follow once its live custody cleared: a
+    /// follow kept past its spike alert solely for a Raydium exit dies
+    /// with the bag (or it polls 2 vault RPCs/round forever).
+    /// Un-alerted entries belong to paper spike tracking — untouched.
+    /// No live trader (paper mode) reaps unconditionally: legs are never
+    /// routed there. Never drops a needed leg: any tracked, manual-parked
+    /// (exact or suffixed), or pending bag for the mint keeps it.
+    pub(crate) async fn maybe_release_follow(&self, mint: &str) {
+        // Stage the flag under the guard, decide after it drops: the
+        // custody check awaits and must never run under this lock.
+        let alerted = self
+            .followed
+            .lock()
+            .await
+            .get(mint)
+            .is_some_and(|state| state.alerted_spike);
+        if !alerted {
+            return;
+        }
+        let reap = match &self.exec.live {
+            Some(trader) => !self.is_live_tracked(trader, mint).await,
+            None => true,
+        };
+        if reap {
+            self.vaults.unwatch(mint).await;
+            self.followed.lock().await.remove(mint);
+            info!(mint = %mint, "post-spike follow released with settled custody");
         }
     }
 }

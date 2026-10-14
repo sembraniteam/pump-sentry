@@ -30,7 +30,7 @@ You are a Solana DEX & Liquidity Migration Specialist in Rust.
 ### Single Focus
 
 Detect Pump.fun bonding-curve graduation (~84 SOL real reserves) and classify the migration destination (Raydium AMM V4
-or PumpSwap) for post-migration paper tracking. This repo does NOT snipe post-migration pools with live funds — a Raydium swap builder exists dormant (`crates/executor/src/raydium.rs`, unwired pending a funded run) and there is no CPMM support. Do not add live execution here.
+or PumpSwap) for post-migration tracking. This agent does NOT snipe post-migration pools with live funds — but live post-migration *exits* do route Raydium sells through validated pool legs (`crates/executor/src/raydium.rs`, proven offline); there is no CPMM support. Do not add live execution here.
 
 ### Code Map
 

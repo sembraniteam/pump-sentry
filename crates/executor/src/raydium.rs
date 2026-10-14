@@ -8,16 +8,17 @@
 //! minimum_amount_out u64`.
 //!
 //! Scope: instruction building and constant-product quoting for
-//! post-migration pools the hunt already resolved. Live wiring (funding
-//! decision) is intentionally NOT here: finishing that path needs a
-//! funded acceptance run first. Paper code must not route through this
-//! module without that run.
+//! post-migration pools the hunt already resolved, plus the Jito-routed
+//! post-migration sell path ([`SellRaydiumOrder::sell_raydium_jito`]).
+//! Live post-migration exits route through here when a validated pool
+//! leg is stored; everything else stays paper-only.
 //!
-//! Status of the two preconditions named below: [`amm_authority`]
-//! resolves the vault authority off-chain but is NOT yet proven against
-//! a mainnet swap sample (marked UNVERIFIED, deterministic-only test);
-//! [`build_swap_base_in_v2_ix`] takes the owning token program so
-//! Token-2022 pools are representable. Neither is live-wired.
+//! Provenance (all mainnet): wire order vs a direct `SwapBaseInV2`,
+//! shared vault authority vs swap-sample + vault reads on two pools (a
+//! per-pool PDA derivation was tried and refuted — see
+//! [`ids::RAYDIUM_VAULT_AUTHORITY`]), nonce-seed mechanism pinned
+//! offline on both frozen pools. Token-2022 *vaults* are unroutable by
+//! program construction (see the builder docs) and refuse fail-closed.
 
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
@@ -58,29 +59,53 @@ pub fn quote_base_in_std(amount_in: u64, in_reserve: u64, out_reserve: u64) -> O
     quote_base_in(amount_in, in_reserve, out_reserve, AMM_V4_FEE_BPS)
 }
 
-/// Derive the AMM vault authority PDA off-chain: seeds `[amm_id]`
-/// under the Raydium V4 program (the vaults' owner on every V4 pool).
+/// Slippage floor over a reserve quote: `quote*(10000-bps)/10000`,
+/// floored by integer division. `None` on degenerate inputs — and on a
+/// zero floor: `minimum_amount_out = 0` authorizes the slot leader to
+/// fill at any price (sandwich drain), so full-slippage configs and
+/// sub-lamport dust fail closed instead of dispatching unprotected.
+/// Pure; the preflight prices `quote` from live vault reserves.
+pub fn raydium_sell_floor(quoted_out: u64, slippage_bps: u64) -> Option<u64> {
+    if quoted_out == 0 || slippage_bps >= 10_000 {
+        return None;
+    }
+    let floor = (quoted_out as u128 * (10_000 - slippage_bps as u128) / 10_000u128) as u64;
+    if floor == 0 {
+        return None;
+    }
+    Some(floor)
+}
+
+/// Derive the AMM vault authority off-chain for a pool nonce:
+/// `create_program_address([b"amm authority", &[nonce]])` under the V4
+/// program (upstream `Processor::authority_id`, same seeds the program
+/// checks every swap against).
 ///
-/// UNVERIFIED against a mainnet swap sample: the seed shape follows the
-/// upstream `raydium-amm` processor convention (vault signer derived
-/// from the pool id), but no frozen swap transaction has yet pinned it
-/// here. Deterministic-only test below; a mainnet replay (frozen
-/// `SwapBaseInV2` account list vs this output) must go green before any
-/// live wiring. Returns `(authority, bump)`.
-pub fn amm_authority(amm_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[amm_id.as_ref()], &ids::RAYDIUM_V4_PROGRAM_ID)
+/// Mechanism proof, not the dispatch path: both frozen pools derive the
+/// shared constant below from their stored nonce bytes (pinned in
+/// `derives_frozen_pool_authorities`). Dispatch passes the constant
+/// directly — one fewer moving part on the funded path, and any
+/// nonce-divergent pool fails free at simulation, never on-chain.
+/// `None` when the address lands on-curve (no valid PDA).
+pub fn amm_authority_for_nonce(nonce: u8) -> Option<Pubkey> {
+    Pubkey::create_program_address(&[b"amm authority", &[nonce]], &ids::RAYDIUM_V4_PROGRAM_ID).ok()
 }
 
 /// Build a Raydium AMM v4 `SwapBaseInV2` instruction. All addresses are
 /// caller-resolved (pool vaults from [`crate::RAYDIUM_V4_PROGRAM_ID`]-owned
-/// parsing, authority from [`amm_authority`]); this function only lays
+/// parsing, authority is [`ids::RAYDIUM_VAULT_AUTHORITY`]); this function only lays
 /// out the verified wire order — it performs no RPC and never panics.
-/// `token_program` is the SPL program owning the vaults and user token
-/// accounts (classic or Token-2022 — a wrong program fails on-chain, so
-/// resolve it per pool, never assume the classic one). `None` on a zero
-/// `amount_in` (a doomed ix: the chain would fail it after fees).
-/// Dormant path: post-migration tracking is paper-only — do not wire
-/// this without a funded run proving authority + program selection.
+///
+/// Accounts[0] is ALWAYS the classic SPL Token program (not a
+/// parameter): upstream `process_swap_base_in_v2` hard-requires
+/// `token_program == spl_token::id()` (`InvalidSplTokenProgram`
+/// otherwise) and unpacks every vault/user account with the classic
+/// `spl_token::state::Account` layout plus an owner check against that
+/// same id. Token-2022 vaults are therefore unroutable through AMM v4
+/// by program construction — no client-side parameter can change that
+/// (only other Raydium programs could).
+/// `None` on a zero `amount_in` (a doomed ix: the chain would fail it
+/// after fees).
 #[allow(clippy::too_many_arguments)]
 pub fn build_swap_base_in_v2_ix(
     amm: &Pubkey,
@@ -90,7 +115,6 @@ pub fn build_swap_base_in_v2_ix(
     user_source: &Pubkey,
     user_destination: &Pubkey,
     user_owner: &Pubkey,
-    token_program: &Pubkey,
     amount_in: u64,
     minimum_amount_out: u64,
 ) -> Option<Instruction> {
@@ -104,7 +128,7 @@ pub fn build_swap_base_in_v2_ix(
     Some(Instruction {
         program_id: ids::RAYDIUM_V4_PROGRAM_ID,
         accounts: vec![
-            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(ids::TOKEN_PROGRAM_ID, false),
             AccountMeta::new(*amm, false),
             AccountMeta::new_readonly(*authority, false),
             AccountMeta::new(*coin_vault, false),
@@ -135,7 +159,6 @@ mod tests {
             &key(5),
             &key(6),
             &key(7),
-            &ids::TOKEN_PROGRAM_ID,
             1_000,
             900,
         )
@@ -157,6 +180,18 @@ mod tests {
             u64::from_le_bytes(ix.data[9..17].try_into().expect("u64")),
             900
         );
+    }
+
+    #[test]
+    fn sell_floor_guards_minimum() {
+        // 2% over a 1M quote floors to 980k; dust and full-slippage
+        // configs refuse (a zero minimum authorizes any fill).
+        assert_eq!(raydium_sell_floor(1_000_000, 200), Some(980_000));
+        assert_eq!(raydium_sell_floor(1_000_000, 0), Some(1_000_000));
+        assert_eq!(raydium_sell_floor(0, 200), None);
+        assert_eq!(raydium_sell_floor(1, 9_999), None);
+        assert_eq!(raydium_sell_floor(1_000_000, 10_000), None);
+        assert_eq!(raydium_sell_floor(1_000_000, 10_001), None);
     }
 
     #[test]
@@ -183,7 +218,6 @@ mod tests {
                 &key(5),
                 &key(6),
                 &key(7),
-                &ids::TOKEN_PROGRAM_ID,
                 0,
                 0,
             )
@@ -192,9 +226,12 @@ mod tests {
     }
 
     #[test]
-    fn token_program_is_caller_selected() {
-        // Token-2022 pools route through the 2022 program at [0]: the
-        // builder must not assume the classic program.
+    fn token_program_is_always_classic() {
+        // Upstream `process_swap_base_in_v2` hard-requires
+        // `token_program == spl_token::id()` (`InvalidSplTokenProgram`
+        // otherwise): Token-2022 vaults are unroutable through AMM v4
+        // by program construction, so the builder offers no program
+        // parameter to get wrong.
         let ix = build_swap_base_in_v2_ix(
             &key(1),
             &key(2),
@@ -203,29 +240,70 @@ mod tests {
             &key(5),
             &key(6),
             &key(7),
-            &ids::TOKEN_2022_PROGRAM_ID,
             1_000,
             900,
         )
         .expect("nonzero amount builds");
         assert_eq!(
             ix.accounts[0],
-            AccountMeta::new_readonly(ids::TOKEN_2022_PROGRAM_ID, false)
+            AccountMeta::new_readonly(ids::TOKEN_PROGRAM_ID, false)
         );
-        assert_ne!(ix.accounts[0].pubkey, ids::TOKEN_PROGRAM_ID);
     }
 
     #[test]
-    fn amm_authority_is_deterministic_off_chain() {
-        // Determinism-only: the seed shape is UNVERIFIED against a
-        // mainnet swap sample (see `amm_authority` docs). Distinct pools
-        // derive distinct non-default authorities; same pool is stable.
-        let a = Pubkey::new_from_array([11; 32]);
-        let b = Pubkey::new_from_array([12; 32]);
-        let (auth_a, bump_a) = amm_authority(&a);
-        assert_eq!(amm_authority(&a), (auth_a, bump_a));
-        assert_ne!(auth_a, Pubkey::default());
-        assert_ne!(amm_authority(&b).0, auth_a);
+    fn vault_authority_is_the_proven_constant() {
+        // The authority is NOT derived per pool: a seeds-`[amm_id]` PDA
+        // was refuted by mainnet swap `3Kg6CRL...davX` (derived
+        // `CbaWbgUg...urA47wiG` vs on-chain `5Q544fKr...pge4j1`).
+        // Non-default, well-formed, pinned in `ids` (see its docs for
+        // the two-pool proof).
+        assert_ne!(ids::RAYDIUM_VAULT_AUTHORITY, Pubkey::default());
+        assert_eq!(
+            ids::RAYDIUM_VAULT_AUTHORITY.to_string(),
+            "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"
+        );
+    }
+
+    /// Frozen pool bytes by name (`crates/migration/tests/fixtures/`):
+    /// unknown names panic — a typo must never green-light a test
+    /// against unintended bytes.
+    fn fixture_data(name: &str) -> Vec<u8> {
+        let raw = match name {
+            "fartcoin" => include_str!("../../migration/tests/fixtures/raydium_pool_fartcoin.json"),
+            "mainnet" => include_str!("../../migration/tests/fixtures/raydium_pool_mainnet.json"),
+            unknown => panic!("unknown pool fixture: {unknown}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
+        v["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|b| b.as_u64().expect("byte") as u8)
+            .collect()
+    }
+
+    /// Nonce byte of a V4 pool account (`AmmInfo.nonce` at 8..16, lowest
+    /// byte selects the `create_program_address` seed suffix — matches
+    /// upstream `amm.nonce as u8`).
+    fn fixture_nonce(data: &[u8]) -> u8 {
+        u64::from_le_bytes(data[8..16].try_into().expect("nonce bytes")) as u8
+    }
+
+    #[test]
+    fn derives_frozen_pool_authorities() {
+        // Mechanism proof for the shared constant: both frozen pools'
+        // stored nonces derive exactly `RAYDIUM_VAULT_AUTHORITY` through
+        // the upstream seed shape. A pool created with a different nonce
+        // would derive a different key — and fail free at simulation.
+        for name in ["fartcoin", "mainnet"] {
+            let data = fixture_data(name);
+            let nonce = fixture_nonce(&data);
+            assert_eq!(
+                amm_authority_for_nonce(nonce),
+                Some(ids::RAYDIUM_VAULT_AUTHORITY),
+                "pool {name} (nonce {nonce})"
+            );
+        }
     }
 
     /// Frozen Fartcoin migration pool (`crates/migration/tests/fixtures/
@@ -255,7 +333,7 @@ mod tests {
         )
         .expect("frozen pool validates");
         assert!(pool.is_wsol_based());
-        let (authority, _) = amm_authority(&pool.amm_id);
+        let authority = ids::RAYDIUM_VAULT_AUTHORITY;
         // Holder legs are synthetic (offline replay): only pool-side
         // slots are asserted against the fixture.
         let ix = build_swap_base_in_v2_ix(
@@ -266,7 +344,6 @@ mod tests {
             &key(5),
             &key(6),
             &key(7),
-            &ids::TOKEN_PROGRAM_ID,
             1_000_000,
             900_000,
         )
