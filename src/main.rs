@@ -15,6 +15,7 @@
 
 mod cli;
 mod live;
+mod live_mirror;
 mod pipeline;
 mod settings;
 mod wal;
