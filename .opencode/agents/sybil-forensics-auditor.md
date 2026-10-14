@@ -33,18 +33,23 @@ like `sell_v2`) never enter quorum or monopoly math.
 
 ### Code Map
 
-- `crates/listener/src/screen.rs` — `BundleDetector::evaluate_launch_slot`, `bundle_verdict_tiered`, `trace_funders`
+- `crates/listener/src/screen/` — `BundleDetector::evaluate_launch_slot` (`bundle.rs`),
+  `bundle_verdict_tiered` + `trace_funders` + `genesis_funder` (`rpc.rs`), `EntryGate` (`entry.rs`)
 
 ### Hard Engineering Invariants
 
 1. **Common Funder Detection:**
-    - For the first 8 distinct buyers (`MAX_TRACED_BUYERS`), walk signature history to the genesis funding transaction
-      (3s per-op deadlines inside an 8s per-buyer budget, cached 24h).
+    - For the first 8 distinct buyers **earliest-first** (`MAX_TRACED_BUYERS`; records arrive newest-first so
+      iterate oldest-first — newest-first selection drops creation-slot buyers out of the window and undercounts
+      toward false organic), walk signature history to the genesis funding transaction (3s per-op deadlines inside an 8s
+      per-buyer budget, cached 24h).
     - If ≥ 2 wallets trace to the same parent, cluster them. Resolved-below-half ancestry escalates Safe → Suspect
       (unknown is not organic).
 2. **Cluster Monopolization Gate:**
     - Slot attribution uses each buyer's EARLIEST slot; supply share counts creation-slot buys ONLY (later
-      accumulation must not inflate it). If the cluster controls > 15.0% of curve supply → `RejectBundledMonopoly`;
+      accumulation must not inflate it), summed over ALL creation-slot buys — not just the 8 traced wallets (the trace
+      cap must not shrink the monopoly denominator; the all-buyer total raises the verdict past
+      15% when the window hides volume). If the cluster controls > 15.0% of curve supply → `RejectBundledMonopoly`;
       bundled-but-small → `SuspectLowVolume` (paper-only); else `SafeOrganic`.
 3. **Execution Latency:**
     - Two-tier: slot clustering decides free from gate swaps; funder walks (cached, concurrent) run only when slots

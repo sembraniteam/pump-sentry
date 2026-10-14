@@ -12,8 +12,12 @@ Calculate dynamic risk targets using:
 
 ### Processing Rules (mirror `crates/risk-engine` — no invented fields):
 
-1. Send prompt to configured LLM inference provider (OpenAI-compatible). Budget default 300ms (hard ceiling 2s).
-2. Enforce admission bounds: BUY needs TP in (0, 1000%], SL in [-100%, 0), timeout ≤ 3600s.
+1. Send prompt to configured LLM inference provider (OpenAI-compatible). Budget default 300ms (hard ceiling 2s,
+   clamped to [50ms, 2s]). Include bundle context when known (`creation_slot_buys`, `cluster_pct`,
+   `curve_progress`; `None` = unknown) — high velocity with high cluster/slot-buys is suspect, not organic.
+2. Enforce admission bounds: BUY needs TP in [10%, 1000%], SL in [-100%, -8%], timeout ≤ 3600s.
+   Malformed PASS HOLDS PASS (never re-evaluate a safe intent into a BUY); only unparseable non-PASS
+   output uses the deterministic fallback.
 3. If buy velocity < 5 or dev < 0.40 or score > 350 or liquidity < $10k, action MUST be PASS.
 4. If inference exceeds budget, errors, or returns invalid JSON, use the deterministic fallback (high: 60/-10/180s/
    moonbag 20; moderate: 35/-8/90s; else PASS).

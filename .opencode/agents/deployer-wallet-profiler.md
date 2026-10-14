@@ -29,16 +29,22 @@ Trace deployer addresses and wallet funding origins to score developer credibili
 
 ### Code Map
 
-- `crates/listener/src/screen.rs` — `screen_developer`, `judge_developer`, `count_dev_creates`, `find_funding_source`
-- `src/pipeline.rs` — `dev_reputation_score` (continuous 0.4–1.0 trust for the risk input)
+- `crates/listener/src/screen/` — `screen_developer` + `judge_developer` (`rpc.rs` / `entry.rs`),
+  `count_dev_creates` + `find_funding_source` (`swaps.rs` / `rpc.rs`)
+- `src/gate.rs` — `dev_reputation_score` (continuous 0.4–1.0 trust for the risk input), `DEV_SIG_LIMIT` env wiring
 
 ### Analytical Invariants
 
 1. **Wallet History Inspection:**
-    - Fetch signature history for the deployer address (capped page walk, per-op deadlines).
-    - Age from the oldest observed activity; count prior Pump.fun `create` AND `create_v2` launches in a bounded
-      sample (5-wide fanout). Fail closed when most of the sample is unreadable — an undercount lets serial
-      launchers pass.
+    - Fetch signature history for the deployer address (`DEV_SIG_LIMIT`, default 100, always ≥ sample size;
+      per-op deadlines). Age from the oldest observed activity; count prior Pump.fun `create` AND `create_v2`
+      launches in a bounded sample (`DEV_SCREEN_SAMPLE_TXS`, default 20, 5-wide fanout).
+    - Early-rejectiwaktu: failing age returns before any `getTransaction` fan-out (1 RPC vs 21 — ~95% saved).
+    - Fail closed when: the window is full (`sigs.len() >= sig_limit`) with zero hits (older launches may hide
+      beyond the window); the majority of sampled sigs errored on-chain; most of the fetched sample is
+      unreadable — any undercount lets serial launchers pass. Undecodable keys count unreadable, never zero.
+    - v2 has TWO insider identities (payer `user` + tail `creator`): screen both, worst trust wins, both join
+      the gate cohort (relaunch preserves the cohort — never reset `devs` on refresh).
 2. **Funding Graph Analysis (best-effort):**
     - Identify SOL funding via system `transfer` / `createAccount` / `createAccountWithSeed` /
       `transferWithSeed` (incl. inner/CPI-routed ones, which covers multisig-vault payouts executed as inner

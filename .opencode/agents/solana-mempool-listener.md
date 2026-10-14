@@ -37,8 +37,10 @@ Design, build, and optimize the real-time event listener that detects newly depl
 
 - `crates/listener/src/stream.rs` — subscribe → fetch → parse → bounded channel
 - `crates/listener/src/parser.rs` — `create` / `create_v2` parsing into `PumpTokenLaunchEvent`
-- `crates/listener/src/screen.rs` — `EntryGate`, dev screening, bundle forensics
-- `crates/listener/tests/fixtures/` — frozen mainnet replays (the gate that must stay green)
+- `crates/listener/src/screen/` — `EntryGate` (`entry.rs`), dev screening + bundle forensics (`rpc.rs`),
+  swap decoding (`swaps.rs`), pure bundle math (`bundle.rs`)
+- `crates/listener/tests/fixtures/` — frozen mainnet replays, fixtures ONLY (tests live in-module; the gate
+  that must stay green). See `crates/listener/tests/README.md`.
 
 ### Hard Engineering Invariants
 

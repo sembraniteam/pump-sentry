@@ -14,9 +14,11 @@ Inspect graduation progress for the following token:
    then virtual/real reserves and the `complete` flag.
 2. Compute graduation percentage against the ~84 SOL threshold:
    $$\text{Progress} = \left (\frac{\text{Real SOL Lamports}}{84,000,000,000}\right) \times 100$$
-3. If graduated, classify the migration tx (Raydium needs program + `initialize2` log + watched-curve/base linkage;
-   PumpSwap needs `migrate` discriminator or `MigrateV2` log + linkage) and resolve the pool through the trust gate
-   (Raydium-owned, WSOL quote, expected base). Unresolvable pools report pool-less, loudly — never silently.
+3. If graduated, classify the migration tx (Raydium needs program + `initialize2` log + watched-curve/mint
+   linkage; PumpSwap needs `migrate` discriminator or `MigrateV2` log + linkage) and resolve the pool through
+   the trust gate (Raydium-owned, WSOL BASE, quote equals the expected migrated mint — pools are WSOL-based,
+   not WSOL-quoted). Unvalidated hits return `None` (retry next tick) — never a pool-less Raydium report;
+   `follow_pool` refuses pool-less migrations loudly.
 4. Display current market cap estimate and distance to migration. Paper tracking only — no live pool entries exist.
 
 ### Expected Output Format:
@@ -27,7 +29,7 @@ Token Mint:           $ARGUMENTS
 Real SOL in Curve:    <amount> SOL / 84.00 SOL
 Curve Completion:     <pct>%
 Market Cap Estimate:  $<usd_mcap>
-Migration:            [NONE | RAYDIUM <amm> | PUMPSWAP | UNRESOLVED_POOL]
+Migration:            [NONE | RAYDIUM <amm> | PUMPSWAP | UNRESOLVED_RETRY_NEXT_TICK]
 Status:               [BONDING | NEAR_GRADUATION (>=90%) | GRADUATED_TO_RAYDIUM]
 Action Directive:     [MONITOR | TRACK_POOL_PAPER | TRADING_ON_RAYDIUM]
 ============================================

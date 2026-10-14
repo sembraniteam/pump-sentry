@@ -40,9 +40,30 @@ form leaves volume untracked.
 ## Rust Instruction Builder Implementation
 
 > **DELETED Oct-2026, do not re-add — dispatch is v3-only (17-account
-> `buy_v3`/`sell_v3`).** The builder below is the retired legacy shape,
+> `buy_v3`/`sell_v3`/`buy_exact_quote_in_v3`).** The builder below is the retired legacy shape,
 > kept as a parsing/screening reference only. Production dispatch code
 > was deleted; see `AGENTS.md` ("Dispatch is v3-only").
+>
+> Production code MUST use `PumpSwapBuilder::build_buy_v3_ix` /
+> `build_sell_v3_ix` / `build_buy_exact_quote_in_v3_ix` with explicit
+> `BuyV3Accounts` / `SellV3Accounts` (`crates/executor/src/instructions.rs:64-199`):
+>
+> - **v3 17-account layout** (byte-verified against mainnet, `instructions.rs:315,407,500`):
+>   `[0] global, [1] mint, [2] quote mint, [3] base token program, [4] quote token program,
+>   [5] curve, [6] assoc curve, [7] curve-quote ATA, [8] payer/signer, [9] base ATA,
+>   [10] quote ATA, [11] user-volume PDA, [12] fee-config, [13] buyback recipient,
+>   [14] system, [15] event authority, [16] program`. Writable: 5,6,7,8,9,10,11,13.
+> - **No fee recipient:** fees stay on the curve (v3 has no creator-vault /
+>   sharing-config / global-volume accounts — do not re-add them).
+> - **Token programs: resolve per mint** — classic SPL vs Token-2022;
+>   ATA derivation AND the create-ATA ix (`build_create_ata_ix`, `instructions.rs:250-272`)
+>   must use the mint's OWN program (`IncorrectProgramId` otherwise).
+> - **Buyback [13]: any of the 8 published** (`crates/ids/src/pump.rs:57-68`, default index 0);
+>   on non-WSOL quotes the payer funds one ATA for someone else's buyback (bounded rent cost).
+> - **ATA prefix: idempotent** (`data: [1]`, `CreateIdempotent`) — safe on existing accounts and immune to
+>   check-vs-land races.
+> - **Never re-add a retired shape** (12-account core, 18-account mayhem, 27/26-account v2)
+>   without a frozen v3-era sample proving a NEW launch uses it (`AGENTS.md`).
 
 ```rust
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -147,10 +168,10 @@ impl PumpSwapBuilder {
 }
 ```
 
-> **This skill's builder above is the LEGACY shape and was DELETED Oct-2026 — do not re-add; dispatch is
-> v3-only (17-account `buy_v3`/`sell_v3`)** (`build_buy_ix` /
-> `build_sell_ix` bake in the canonical fee recipient, classic token program, no creator, and untracked volume).
-> Production code MUST use `PumpSwapBuilder::build_swap_ix` with explicit `SwapAccounts`
+> **The paragraph below described the RETIRED mayhem shape and is superseded by the v3
+> block above. It is kept for one release so old reviews stay searchable — do not follow it.**
+>
+> ~~Production code MUST use `PumpSwapBuilder::build_swap_ix` with explicit `SwapAccounts`
 > (`crates/executor/src/instructions.rs`):
 >
 > - **Fee recipient: resolve live** — explicit override → Global account bytes 41..73 → canonical constant. The
@@ -164,4 +185,4 @@ impl PumpSwapBuilder {
 > - **ATA prefix: idempotent** (`data: [1]`, `CreateIdempotent`) — safe on existing accounts and immune to
 >   check-vs-land races.
 > - **Buyback accounts [16]/[17]: UNMAPPED** — per-token sourcing is open work; the ignored
->   `mainnet_layout_acceptance` probe is the gate that must turn green before funding.
+>   `mainnet_layout_acceptance` probe is the gate that must turn green before funding.~~

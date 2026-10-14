@@ -30,7 +30,9 @@ You are a Solana DEX & Liquidity Migration Specialist in Rust.
 ### Single Focus
 
 Detect Pump.fun bonding-curve graduation (~84 SOL real reserves) and classify the migration destination (Raydium AMM V4
-or PumpSwap) for post-migration tracking. This agent does NOT snipe post-migration pools with live funds — but live post-migration *exits* do route Raydium sells through validated pool legs (`crates/executor/src/raydium.rs`, proven offline); there is no CPMM support. Do not add live execution here.
+or PumpSwap) for post-migration tracking. This agent does NOT snipe post-migration pools with live funds — but live
+post-migration *exits* do route Raydium sells through validated pool legs (`crates/executor/src/raydium.rs`, proven
+offline); there is no CPMM support. Do not add live execution here.
 
 ### Code Map
 
@@ -53,7 +55,11 @@ or PumpSwap) for post-migration tracking. This agent does NOT snipe post-migrati
     - `parse_validated` only: Raydium-owned account, WSOL **base**, quote equals the expected migrated mint.
       Pump.fun migration pools are WSOL-based (Fartcoin pool + one fresh pump-token pool frozen in
       `crates/migration/tests/fixtures/`). Anything else keeps scanning.
+    - Unvalidated hits (failed trust gate / pool fetch / AMM resolve) return `None` and retry next tick —
+      NEVER a pool-less Raydium report. `follow_pool` refuses pool-less migrations loudly. Hunt budget:
+      3 pages × 10 sigs, 10 successful fetches (+4 transport-failure allowance; blips don't burn progress).
     - Vault pricing verifies token-program ownership, exact mint pairing (base vault holds WSOL, quote vault the
-      token), and positive prices; followed pools evict after 24h idle or on spike (bounded growth).
+      token), and positive prices; followed pools evict after 24h idle or on spike (bounded growth), with a
+      timer-driven `sweep_idle` so fully-idle tickers can't leak follows to restart.
 4. **No Live Sniping:** pool addresses feed alerts + paper follow only. No ATA pre-warming exists — do not claim any.
 5. **Verify:** `cargo test -p migration` (frozen-tx replays + trust-gate tests).

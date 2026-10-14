@@ -26,8 +26,17 @@ INPUT PAYLOAD:
   "liquidity_usd": <number>,
   "buy_velocity_5s": <number>,
   "dev_reputation": <0.0-1.0>,
-  "rugcheck_score": <number>
+  "rugcheck_score": <number>,
+  "creation_slot_buys": <number | null>,
+  "cluster_pct": <number | null>,
+  "curve_progress": <number | null>
 }
+
+Bundle forensics (`creation_slot_buys`, `cluster_pct`) is threaded from
+`screen_bundle` into `confirm_open`; `None` = unknown. The prompt bands
+below do not see them as gates — they are context against wash/bundle
+momentum. Treat high velocity WITH high `cluster_pct`/slot-buys as
+suspect momentum, not organic breakout.
 
 OUTPUT SCHEMA:
 {
@@ -45,12 +54,24 @@ RULES:
 - High Momentum (velocity > 25, liq > $20k) -> TP: 45.0 to 100.0, SL: -10.0, trailing: true, timeout: 180, moonbag: 20.0.
 - Moderate Momentum (velocity 5-25, liq >= $10k) -> TP: 30.0 to 50.0, SL: -8.0, trailing: false, timeout: 90, moonbag: 0.0.
 - Otherwise (low liquidity or stagnant volume) -> "action": "PASS" (Never buy dead tokens).
+- Bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. On high-fee tiers,
+  widen SL past round-trip costs instead. (These two sentences are part of `SYSTEM_PROMPT` — keep them here;
+  the sync test pins the numeric constants.)
 
 ADMISSION BOUNDS (model output must satisfy `is_valid`, else fallback):
-- BUY: TP in [10%, 1000%], SL in [-100%, -1%], timeout <= 3600s. Sub-fee targets are guaranteed losers, so they fail closed. Unbounded magnitudes would never TP/expire.
+- BUY: TP in [10%, 1000%], SL in [-100%, -8%] (tighter stops drown in 2–4% spread/impact — the prompt
+  floor and `MIN_STOP_MAGNITUDE_PCT = 8.0` agree), timeout <= 3600s. Sub-fee targets are guaranteed losers,
+  so they fail closed. Unbounded magnitudes would never TP/expire.
+- PASS must be exactly zeroed (tp/sl/timeout/moonbag = 0, trailing = false); a malformed PASS
+  (e.g. non-zeroed timeout) still HOLDS PASS — it is never re-evaluated into a heuristic BUY.
+  Only unparseable non-PASS output falls back to the heuristic (which may BUY).
+- Fenced/preamble output is tolerated: strip one fence layer, then slice to the outer `{...}` object.
 - Strategy shaping downstream: `adaptive` verbatim; `scalp` clamps TP DOWN to +35% (below-band honored, never
   widened); `runner` forces moonbag + trailing. Invalid profiles pass through untouched for the caller to reject.
 - Inference budget default 300ms (hard ceiling 2s at build); endpoint must parse as http/https.
+  Counters are split: `fallback_count` total, `timeout_count` (slow) vs `invalid_count` (non-compliant) —
+  read them before blaming the model vs the network. Explicit heuristic use (`evaluate_fallback`)
+  does not touch the trouble counters.
 ```
 
 ## Deterministic Heuristic Fallback (Rust)

@@ -36,7 +36,8 @@ live SOL using Pump.fun instructions, Jito MEV bundles, and non-blocking Discord
 
 ### Code Map (single source of truth)
 
-- `crates/executor/src/instructions.rs` — `PumpSwapBuilder::build_swap_ix` + `SwapAccounts`
+- `crates/executor/src/instructions.rs` — `PumpSwapBuilder::build_buy_v3_ix` / `build_sell_v3_ix` /
+  `build_buy_exact_quote_in_v3_ix` + `BuyV3Accounts` / `SellV3Accounts` (v3-only, 17 accounts)
 - `crates/executor/src/executor.rs` — `SwapExecutor` (solvency → build → simulate → send)
 - `crates/executor/src/jito.rs` — `JitoClient` bundle dispatch + tip accounts
 - `crates/executor/src/wallet.rs` — `WalletGuard` key loading + solvency
@@ -52,11 +53,14 @@ live SOL using Pump.fun instructions, Jito MEV bundles, and non-blocking Discord
     - Prepend `ComputeBudgetInstruction` (limit + priority fee) when configured.
     - Prepend idempotent `create_ata_ix` bound to the mint's OWN token program (classic SPL vs Token-2022 — a 2022
       mint through the classic program fails with `IncorrectProgramId`).
-    - Build swaps ONLY via `PumpSwapBuilder::build_swap_ix` with explicit `SwapAccounts` (live fee recipient from the
-      Global account, per-mint token program, creator for the mayhem shape). The legacy `build_buy_ix` /
-      `build_sell_ix` wrappers are DELETED Oct-2026 (do not re-add; dispatch is v3-only, 17-account): they baked in
-      the canonical recipient, classic program, no creator, and untracked volume, and cannot express mayhem routing.
-    - Run `simulateTransaction` preflight first: definitive failures refuse before fees burn.
+    - Build swaps ONLY via `build_buy_v3_ix` / `build_sell_v3_ix` (`BuyV3Accounts` / `SellV3Accounts`, v3 17-account:
+      `[0] global … [8] payer … [11] user-volume PDA … [13] buyback … [16] program`; no fee-recipient /
+      creator-vault accounts exist on v3 — fees stay on the curve). The legacy `build_buy_ix` /
+      `build_sell_ix` wrappers are DELETED Oct-2026 (do not re-add; they baked in
+      the canonical recipient, classic program, no creator, and untracked volume). Never re-add a retired
+      12/18/27/26-account shape without a frozen v3-era sample proving a NEW launch uses it.
+    - Run `simulateTransaction` preflight first: definitive failures refuse before fees burn (`SIM_STRICT=true`
+      refuses transport/timeout ambiguity on live paths).
 3. **MEV Defense (Jito Bundles):**
     - For all live buys/sells, package the transaction with a Jito tip instruction (`jito-mev-execution`).
     - Submit via Jito Block Engine JSON-RPC `sendBundle` with `{"encoding": "base64"}` (without it every bundle is

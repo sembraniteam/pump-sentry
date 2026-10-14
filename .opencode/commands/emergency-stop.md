@@ -9,10 +9,11 @@ Trigger emergency shutdown and market liquidation:
 ### Immediate Actions:
 
 1. Query all non-zero SPL token accounts owned by the wallet.
-2. For each token held on Pump.fun bonding curves, build the exit via `PumpSwapBuilder::build_swap_ix`
-   (`SwapKind::Sell`, NEVER the deprecated `build_sell_ix` — mayhem curves need creator + live recipient):
+2. For each token held on Pump.fun bonding curves, build the exit via `build_sell_v3_ix`
+   (`SellV3Accounts`, v3 17-account — NEVER a retired 12/18/27/26-account builder):
     - Sell 100% of the tracked balance (floor, never ceiling — never oversell custody).
-    - Set an explicit `min_sol_output` floor; a zero floor is REJECTED (authorizes any fill price).
+    - Sell 100% of the tracked balance (floor, never ceiling — never oversell custody).
+    - Set an explicit `min_sol_output` floor (preflight rejects 0 — a zero floor authorizes any fill price).
     - Bundle with a Jito tip for priority inclusion; preflight `simulateTransaction` first.
     - Sign and dispatch; unconfirmed sells stay tracked with cooldown + 5-attempt budget, then escalate to manual
       exit — never assume unfilled.

@@ -1,7 +1,5 @@
 ---
 description: Execute compiler checks, unit tests, and clippy linter across all workspace crates.
-agent: build
-subtask: false
 ---
 
 Execute full compilation and test validation of the Rust workspace:

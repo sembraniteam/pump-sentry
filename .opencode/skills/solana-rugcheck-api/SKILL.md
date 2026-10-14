@@ -46,6 +46,11 @@ pub struct RugCheckReport {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RiskItem {
     pub name: String,
+    // `#[serde(default)]` on value/description/score/level is a deliberate
+    // divergence from the strict snippet: the API omits fields, and a missing
+    // scalar must not fail the whole report (policy still fails closed on
+    // empty/unknown `level` and missing `token`). Do not "tighten" this
+    // without checking live payloads.
     pub value: String,
     pub description: String,
     pub score: u32,
@@ -56,6 +61,8 @@ pub struct RiskItem {
 pub struct TokenInfo {
     pub mint_authority: Option<String>,
     pub freeze_authority: Option<String>,
+    // Informational only: policy and sizing never read these (decimals come
+    // from RPC `token_decimals`).
     pub supply: u64,
     pub decimals: u8,
 }
@@ -82,8 +89,9 @@ impl RugCheckClient {
     pub async fn evaluate_token(&self, mint: &str) -> Result<RugCheckReport, RugCheckError> {
         // Fail-closed boundaries (see crates/auditor): 32-byte base58 mint
         // before it touches the URL; report mint must match the request;
-        // bodies capped at 1MB; retries capped at 5, for timeouts/connects/
-        // 5xx/429/408 only.
+        // bodies stream-capped at 1MB incremental (never buffer-then-check);
+        // retries capped at 5, for timeouts/connects/body-stalls/5xx/429/408
+        // only; schema breaks are terminal, never retried.
         let url = format!("{}/tokens/{}/report", self.base_url, mint);
 
         let response = self.client.get(&url).send().await?;

@@ -11,11 +11,16 @@ Simulate a paper trade execution for:
 
 ### Verification Tasks (mirror `crates/simulator`):
 
-1. Price the fill through `FillModel::BondingCurve` (size impact + 125 bps/side venue fee, 25% cap) — never at spot.
-2. Charge `fee_bps` commission on notionals on top (default 0 = no commission; never 125 on the default model or the venue
-   fee double-counts).
-3. Open via `open_position_params` (explicit rejects: empty mint, bad price/notional/TP/SL/fraction) and report the
-   numeric position id. Exits: TP/SL/trailing/timeout; TakeProfit scale-outs ratchet to move-breakeven, lift the
+1. Price the fill through `FillModel::BondingCurve` (size impact + 125 bps/side venue fee, 25% cap on the
+   capped estimator). Execution paths use `try_fill_price`/`try_slip_fraction_for_side`: buys past the curve
+   (`notional >= liquidity`) REJECT with `CurveExhausted` instead of printing a capped fill — never at spot.
+2. Charge `fee_bps` commission on notionals on top (default 0 = no commission; never 125 on the default model or the
+   venue
+   fee double-counts). Dispatch bleed (tips/base/rent) is tracked separately (`total_dispatch_usd`,
+   `realized_net_pnl`) — headlines must net it, or thin paper wins hide live losses.
+3. Open via `open_position_params` (explicit rejects: empty mint, bad price/notional/TP/SL/fraction,
+   SL outside [-100%, 0), `CurveExhausted`) and report the numeric position id. Exits: TP/SL/trailing/timeout;
+   TakeProfit scale-outs ratchet to move-breakeven, lift the
    time-stop, and disarm the moonbag — Manual trims preserve terms.
 
 ### Expected Output Format:

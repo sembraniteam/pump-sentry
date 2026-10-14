@@ -62,6 +62,9 @@ pub const JITO_TIP_ACCOUNTS: [&str; 4] = [
 pub struct JitoClient {
     client: Client,
     endpoint: String,
+    // Tip rotation + refresh state (see `maybe_refresh_tips`): the struct
+    // carries more than client+endpoint — do not construct it literally.
+    tips: std::sync::Arc<std::sync::Mutex<(Vec<String>, u64)>>,
 }
 
 impl JitoClient {
@@ -122,7 +125,13 @@ impl JitoClient {
 /// Tip accounts refresh hourly from `getTipAccounts` (2s budget, silent
 /// fallback to the compiled rotation). Post to the SAME bundles endpoint —
 /// Jito routes by the `method` field, not the path (posting to the bare base
-/// URL returns nothing and silently pins the fallback forever). Trust-but-verify:
-/// a fetched set with zero overlap against the compiled rotation is rejected
-/// (hijack/stale guard) instead of poisoning tips for an hour.
+/// URL returns nothing and silently pins the fallback forever).
+/// Deviation from the old trust-but-verify note, deliberate and logged:
+/// a fetched set with zero overlap against the compiled rotation is ADOPTED
+/// with a `warn!` (availability over hijack-guard — `crates/executor/src/jito.rs:187-191`);
+/// rotation is time-bounded (15min TTL) so a bad list self-heals.
+///
+/// NOTE: this repo builds on granular `solana-*` v3/v4 crates
+/// (`solana-client 4.3`, `solana_pubkey`, `solana_instruction`), NOT the
+/// `solana-sdk 5` used in the snippet above — do not "unify" them (`AGENTS.md`).
 ```

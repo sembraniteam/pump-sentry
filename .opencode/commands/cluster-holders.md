@@ -10,7 +10,9 @@ Analyze early-buyer distribution and detect potential sybil rings:
 ### Execution Steps (mirror `bundle_verdict_tiered` — this bot traces early BUYERS, not top holders):
 
 1. Read recent curve swaps (paginated, 3×25) and keep proven `Buy` sides only (unmapped layouts excluded).
-2. Take the first 8 distinct buyers; attribute each to its EARLIEST slot and sum creation-slot amounts only.
+2. Take the first 8 distinct buyers EARLIEST-first (records arrive newest-first — newest-first selection drops
+   creation-slot buyers and undercounts toward false organic); attribute each to its EARLIEST slot and sum
+   creation-slot amounts only. The monopoly denominator sums ALL creation-slot buys, not just the 8 traced.
 3. Walk each buyer's genesis funding (cached, 8s budget each); cluster wallets sharing a parent funder.
 4. Escalate Safe → Suspect when fewer than half the walked buyers resolve (unknown is not organic).
 

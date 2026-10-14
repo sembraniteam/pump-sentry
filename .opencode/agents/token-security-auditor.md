@@ -49,8 +49,12 @@ not explicitly verified is fail-closed.
     - Top-holder distribution analysis does not exist (see the sybil auditor for buyer-cluster forensics instead).
 3. **RugCheck Metrics:**
     - Reject if score > 400. Reject on `danger` severity; reject on ANY unknown/empty severity (only `warn` passes).
-    - Transport: 1500ms timeout, retries for timeouts/connects/5xx/429/408 only (capped at 5), mint validated as
-      32-byte base58 before it touches the URL.
+    - Transport: 1500ms timeout, retries for timeouts/connects/body-stalls/5xx/429/408 only (capped at 5),
+      mint validated as 32-byte base58 before it touches the URL. Bodies stream-capped at 1MB (incremental
+      `chunk()` cap — never `bytes()`-then-check, a lying `Content-Length` would OOM). Schema breaks (`Deserialization`)
+      are TERMINAL — never watchlist-retry a permanent break every 3s.
+    - `supply`/`decimals` on `TokenInfo` are informational only (policy never reads them; decimals come
+      from RPC `token_decimals`). `AuditPolicy` toggles are test-only — production uses `::default()`.
 4. **Output Contract:**
     - `assess` collects EVERY violation; `into_result` joins them into one `SecurityRejection` string. Transport
       errors propagate as-is (pipeline treats them as fail-closed skips).
