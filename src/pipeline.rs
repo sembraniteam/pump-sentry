@@ -2026,11 +2026,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// both `on_tick` branches so the rule cannot diverge again; every
     /// step is idempotent, so concurrent empties are harmless.
     ///
-    /// Manual-parked bags do NOT pin the feed: they are never auto-probed
-    /// (only an explicit `sell <mint>` touches them, and it fetches its
-    /// own tick plus recreates the serial entries on demand), so keeping
-    /// their curves watched would grow the watch set without bound on
-    /// every give-up. Custody stays listed in `live_manual` and the
+    /// Manual-parked bags do NOT pin the feed once the curve is gone:
+    /// they are never auto-probed (only an explicit `sell <mint>`
+    /// touches them, and it fetches its own tick plus recreates the
+    /// serial entries on demand), so keeping graduated curves watched
+    /// would grow the watch set without bound on every give-up. While
+    /// the curve is still live, manual bags DO pin the watch — a later
+    /// graduation must still fire the migration card and pool follow
+    /// (the operator's `sell` tick would too, but automation should
+    /// not depend on it). Custody stays listed in `live_manual` and the
     /// shutdown snapshot either way.
     async fn maybe_unwatch(&self, tick: &PriceTick) {
         if !self
@@ -2045,8 +2049,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.exec.live_positions.lock().await.contains_key(&tick.mint) {
             return;
         }
-        // Manual-parked bags never block eviction (see doc above): no
-        // auto-probing reads them, and `manual_sell` recreates locks.
+        // Manual-parked bags pin the watch only while the curve is still
+        // live (later graduation must fire the migration hunt + follow).
+        // Once complete, the hunt runs below and the feed is released.
+        if !tick.complete && self.exec.live_manual.lock().await.contains_key(&tick.mint) {
+            return;
+        }
         if self.gate_state.lock().await.gate.contains(&tick.mint) {
             return;
         }
@@ -2322,6 +2330,20 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(amm = %amm, error = %e, "pool watch failed");
             return;
         }
+        // Seed the follow entry NOW (baseline set on first valid tick):
+        // pools that never tick would otherwise stay watched forever —
+        // the idle sweep below only sees `followed`, and a dead pool
+        // burns 2 vault RPCs per round with no expiry. `or_insert` keeps
+        // a baseline a racing tick already seeded.
+        self.followed
+            .lock()
+            .await
+            .entry(mint.to_string())
+            .or_insert(FollowState {
+                entry_price: f64::NAN,
+                alerted_spike: false,
+                last_seen_secs: now_secs(),
+            });
         info!(%mint, amm = %amm, "following migrated pool");
     }
 
@@ -2368,6 +2390,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         });
         state.last_seen_secs = now;
         if state.alerted_spike {
+            return;
+        }
+        // Baseline for follows seeded without a first tick (see
+        // `follow_pool`): the first valid print sets it, never alerts.
+        if state.entry_price.is_nan() {
+            state.entry_price = tick.price_usd;
             return;
         }
         if tick.price_usd >= state.entry_price * FOLLOW_SPIKE_MULT {
@@ -3440,6 +3468,12 @@ mod tests {
         assert!(cards[0].contains("explorer.solana.com/tx/migsig"));
         // Pool follow registered for post-migration tracking.
         assert_eq!(pipe.vaults.watched_count().await, 1);
+        // Follow entry seeded at follow time (not first tick): dead pools
+        // expire via the idle sweep instead of watching forever.
+        let followed = pipe.followed.lock().await;
+        let state = followed.get(&mint).expect("follow seeded");
+        assert!(state.entry_price.is_nan(), "baseline set on first tick");
+        assert!(!state.alerted_spike);
     }
 
     #[tokio::test]

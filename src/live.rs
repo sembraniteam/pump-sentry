@@ -966,9 +966,10 @@ impl LiveTrader {
 
     /// Append one WAL line (best-effort: IO failure warns, never fails
     /// the dispatch — the in-memory map stays authoritative this run).
-    /// No `fsync`: a lost tail replays as recheck-then-track (safe), and
-    /// a sync per dispatch would serialize every sell through disk
-    /// latency on the hot path.
+    /// Durable via `sync_all`: dispatches are seconds apart at most, so
+    /// the fsync cost never serializes a hot path, and a crash between
+    /// receipt and WAL must not lose a real fill (the replay would never
+    /// know to re-poll it).
     fn wal_append(&self, line: String) {
         let Some(path) = self.wal_path.as_ref() else {
             return;
@@ -988,8 +989,8 @@ impl LiveTrader {
         }
         match opts.open(path) {
             Ok(mut f) => {
-                if writeln!(f, "{line}").is_err() {
-                    tracing::warn!("live WAL append failed (non-fatal)");
+                if writeln!(f, "{line}").is_err() || f.sync_all().is_err() {
+                    tracing::warn!("live WAL append/fsync failed (non-fatal)");
                 }
             }
             Err(e) => tracing::warn!(error = %e, "live WAL unwritable (non-fatal)"),

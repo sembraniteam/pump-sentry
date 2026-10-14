@@ -5,7 +5,7 @@ Guarded wallet, exact instruction builders, Jito bundles. Deliberately not wired
 - Route-aware funding (official BUY.md/TRADE_V3.md): SOL-pair buys pay **native SOL** (guard asserted natively); token-paired quotes debit the quote ATA via `TransferChecked`.
 - 17-account `buy_v3`/`sell_v3` from derived addresses + listed buyback; spend guard is the order ceiling (fresh quotes only lower it); `simulateTransaction` preflight gates every dispatch (`SIM_STRICT=true` for live).
 - Retired shapes (legacy/18/mayhem/v2) deleted; cashback/complete/creatorless curves fail closed.
-- Wallet: env-only secret (zeroized), 0.05 SOL floor; tips refresh ≤15min; pending buys re-polled, never assumed; crash WAL replays custody.
+- Wallet: env-only secret (zeroized), 0.05 SOL floor; tips refresh ≤15min; pending buys re-polled, never assumed; crash WAL (`src/live.rs`, fsync'd) replays custody.
 
 ```sh
 cargo test -p executor
