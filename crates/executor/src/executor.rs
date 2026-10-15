@@ -1546,7 +1546,7 @@ impl SwapExecutor {
                 Ok(())
             }
             Ok(Err(e)) => {
-                warn!(%label, error = %e, "simulation RPC failed; proceeding without preflight");
+                warn!(%label, error = %ids::strip_error_url(&e.to_string()), "simulation RPC failed; proceeding without preflight");
                 sim_transport_outcome(self.strict_sim, "RPC failure")
             }
             Err(_) => {

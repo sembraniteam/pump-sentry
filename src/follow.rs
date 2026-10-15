@@ -88,7 +88,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.migrated.lock().await.remove(mint);
             }
             Err(e) => {
-                warn!(%mint, error = %e, "migration hunt failed");
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "migration hunt failed");
                 // Retry later.
                 self.migrated.lock().await.remove(mint);
             }
@@ -119,7 +119,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .await
         };
         if let Err(e) = watched {
-            warn!(amm = %amm, error = %e, "pool watch failed");
+            warn!(amm = %amm, error = %ids::strip_error_url(&e.to_string()), "pool watch failed");
             return;
         }
         // Seed now: pools that never tick still expire. Keeps raced baseline.

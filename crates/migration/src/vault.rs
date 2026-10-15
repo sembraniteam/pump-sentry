@@ -385,7 +385,7 @@ impl VaultTicker {
             {
                 Ok(Ok(mut got)) => accounts.append(&mut got),
                 Ok(Err(e)) => {
-                    warn!(error = %e, pools = watched.len(), "pool vault batch failed; backing off");
+                    warn!(error = %ids::strip_error_url(&e.to_string()), pools = watched.len(), "pool vault batch failed; backing off");
                     break;
                 }
                 Err(_) => {

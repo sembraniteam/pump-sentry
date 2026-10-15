@@ -72,7 +72,7 @@ pub fn resolve_entry_with_flag(
         }
         Err(e) => match quote_override {
             Some(quote) if quote.is_finite() && quote > 0.0 => {
-                warn!(error = %e, "curve read failed; pricing via QUOTE_USD override");
+                warn!(error = %ids::strip_error_url(&e.to_string()), "curve read failed; pricing via QUOTE_USD override");
                 let liquidity = if fallback_liquidity.is_finite() && fallback_liquidity >= 0.0 {
                     fallback_liquidity
                 } else {
@@ -81,7 +81,7 @@ pub fn resolve_entry_with_flag(
                 Some((quote, liquidity, true))
             }
             _ => {
-                warn!(error = %e, "curve read failed and no valid override; dropping signal");
+                warn!(error = %ids::strip_error_url(&e.to_string()), "curve read failed and no valid override; dropping signal");
                 None
             }
         },
@@ -422,7 +422,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     continue;
                 }
                 Err(e) => {
-                    warn!(%mint, error = %e, "curve observation failed; keeping watch");
+                    warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "curve observation failed; keeping watch");
                     continue;
                 }
             };
@@ -621,7 +621,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return;
             }
             Err(e) => {
-                warn!(%mint, error = %e, "mint decimals unreadable; dropping signal (fail-closed)");
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "mint decimals unreadable; dropping signal (fail-closed)");
                 return;
             }
         }

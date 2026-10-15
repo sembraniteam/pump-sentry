@@ -260,7 +260,7 @@ impl CurveTicker {
                     }
                     Ok(Err(e)) => {
                         if warn_throttled(&TICK_WARN_AT) {
-                            warn!(error = %e, n = keys.len(), "round failed; backing off");
+                            warn!(error = %ids::strip_error_url(&e.to_string()), n = keys.len(), "round failed; backing off");
                         }
                         tokio::time::sleep(self.backoff.fail_sleep()).await;
                         continue;
@@ -293,7 +293,7 @@ impl CurveTicker {
                     Ok(d) => d,
                     Err(e) => {
                         if warn_throttled(&TICK_WARN_AT) {
-                            warn!(mint = %entry.mint, error = %e, "mint decimals unreadable for rounds; skipping ticks");
+                            warn!(mint = %entry.mint, error = %ids::strip_error_url(&e.to_string()), "mint decimals unreadable for rounds; skipping ticks");
                         }
                         continue;
                     }

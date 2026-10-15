@@ -403,7 +403,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
             Err(e) => {
                 // No fill: paper stays open but diverged.
-                warn!(%mint, error = %e, "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
                 self.exec.mark_diverged(mint, e.to_string()).await;
                 self.emit(format!("LIVE buy failed on {mint} ({e}); paper open WITHOUT live cover"));
             }
@@ -629,7 +629,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                     self.exec.note_giveup(now).await;
                     if deterministic {
-                        warn!(%mint, error = %e, "LIVE sell deterministically rejected after budget; parked for manual exit (still HELD)");
+                        warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "LIVE sell deterministically rejected after budget; parked for manual exit (still HELD)");
                     } else {
                         warn!(%mint, "LIVE sell gave up after retries; parked for manual exit (still HELD)");
                     }
@@ -638,10 +638,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.flush_deferred_pnl(mint).await;
                     true
                 } else if deterministic {
-                    warn!(%mint, error = %e, attempts, "LIVE sell rejected before dispatch; holding, will re-probe");
+                    warn!(%mint, error = %ids::strip_error_url(&e.to_string()), attempts, "LIVE sell rejected before dispatch; holding, will re-probe");
                     false
                 } else {
-                    warn!(%mint, error = %e, "LIVE sell unconfirmed; holding, will retry");
+                    warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "LIVE sell unconfirmed; holding, will retry");
                     false
                 }
             }
@@ -709,7 +709,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return true;
             }
             Err(e) => {
-                warn!(%mint, error = %e, "manual sell price unreadable; keeping request for next round");
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "manual sell price unreadable; keeping request for next round");
                 return false;
             }
         };

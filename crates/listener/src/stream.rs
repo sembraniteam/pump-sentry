@@ -188,7 +188,7 @@ impl PumpFunListener {
         {
             Ok(Ok(sigs)) => sigs,
             Ok(Err(e)) => {
-                warn!(error = %e, "backfill signature page failed; gap stays");
+                warn!(error = %ids::strip_error_url(&e.to_string()), "backfill signature page failed; gap stays");
                 return;
             }
             Err(_) => {
@@ -446,21 +446,21 @@ async fn fetch_tx_permit_bound(
                         Ok(v) => Some(v),
                         Err(e) => {
                             stats.inc_fetch_err();
-                            debug!(signature = %sig_str, error = %e, "getTransaction rate-limit retry failed");
+                            debug!(signature = %sig_str, error = %ids::strip_error_url(&e.to_string()), "getTransaction rate-limit retry failed");
                             None
                         }
                     }
                 }
                 Err(e) => {
                     stats.inc_fetch_err();
-                    debug!(signature = %sig_str, error = %e, "getTransaction retry failed");
+                    debug!(signature = %sig_str, error = %ids::strip_error_url(&e.to_string()), "getTransaction retry failed");
                     None
                 }
             }
         }
         Err(e) => {
             stats.inc_fetch_err();
-            debug!(signature = %sig_str, error = %e, "getTransaction failed");
+            debug!(signature = %sig_str, error = %ids::strip_error_url(&e.to_string()), "getTransaction failed");
             None
         }
     }

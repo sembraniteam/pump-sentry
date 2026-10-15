@@ -127,7 +127,7 @@ async fn replay_live_wal(
     for (mint, curve) in &watched {
         if let Err(e) = ticker.watch(mint, curve).await {
             unwatched += 1;
-            warn!(%mint, error = %e, "WAL replay: re-watch failed; bag tracked without exit feed (manual review)");
+            warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "WAL replay: re-watch failed; bag tracked without exit feed (manual review)");
         }
     }
     warn!(
@@ -366,7 +366,7 @@ async fn run_pipeline(live_arg: bool) {
     let engine = match engine_builder.build() {
         Ok(engine) => Some(engine),
         Err(e) => {
-            warn!(error = %e, "bad inference endpoint; heuristic-only mode");
+            warn!(error = %ids::strip_error_url(&e.to_string()), "bad inference endpoint; heuristic-only mode");
             None
         }
     };
