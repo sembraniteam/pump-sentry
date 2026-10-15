@@ -570,6 +570,8 @@ async fn run_pipeline(live_arg: bool) {
                             &event.associated_bonding_curve.to_string(),
                             &event.user.to_string(),
                             creator.as_deref(),
+                            &event.name,
+                            &event.symbol,
                             event.slot,
                         )
                         .await;

@@ -7,7 +7,7 @@ use alert::Alerter;
 use auditor::RugCheckError;
 use curve::{CurveError, PriceTick};
 use listener::{
-    BundleVerdict, EntryGate, GateOutcome, ScreenError,
+    BundleVerdict, EntryGate, GateOutcome, PUMP_PROGRAM_ID, ScreenError,
 };
 use risk_engine::{
     Action, DecisionSource, RiskDecision, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
@@ -132,6 +132,12 @@ struct TrackedOpen<'a> {
     /// SOL/USD stamped at confirm. Rechecked at use; stale fails closed.
     sol: Option<(f64, u64)>,
     trail_percent: f64,
+}
+
+/// Log-safe token text: on-chain name/symbol are attacker-controlled,
+/// so strip control chars (log injection) and cap length. Pure.
+fn log_token_text(s: &str, max: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(max).collect()
 }
 
 /// Watchlist entry context.
@@ -277,6 +283,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     }
 
     /// Audit, screen, watchlist. Never opens here; skips fail closed.
+    #[allow(clippy::too_many_arguments)] // launch identity is flat by design; a struct adds no safety here.
     pub async fn on_launch(
         &self,
         mint: &str,
@@ -284,8 +291,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         assoc_curve: &str,
         dev: &str,
         creator: Option<&str>,
+        name: &str,
+        symbol: &str,
         slot: u64,
     ) {
+        info!(mint = %mint, name = %log_token_text(name, 32),
+            symbol = %log_token_text(symbol, 10), program = %PUMP_PROGRAM_ID,
+            slot, "new launch");
         // 1. Audit, fail closed. Retryable watchlists scoreless for retry.
         let now = now_secs();
         let (audit_score, last_audit_secs) = match self.auditor.evaluate_token(mint).await {
