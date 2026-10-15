@@ -979,11 +979,6 @@ impl LiveTrader {
         ));
     }
 
-    /// Base Jito tip (live_sell escalates it by attempts).
-    pub fn base_tip(&self) -> u64 {
-        self.tip_lamports
-    }
-
     /// Congestion-aware tip for an attempt: escalated base lifted to
     /// the landed-tip floor, bounded at 4x base. Static tips underland
     /// in congestion and overpay in calm; the floor adapts both legs.

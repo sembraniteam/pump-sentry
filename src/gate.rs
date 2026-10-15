@@ -7,7 +7,7 @@ use alert::Alerter;
 use auditor::RugCheckError;
 use curve::{CurveError, PriceTick};
 use listener::{
-    BundleVerdict, EntryGate, GateOutcome, ScreenError, SwapRecord,
+    BundleVerdict, EntryGate, GateOutcome, ScreenError,
 };
 use risk_engine::{
     Action, DecisionSource, RiskDecision, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
@@ -16,14 +16,14 @@ use risk_engine::{
 use simulator::Side;
 use tracing::{debug, info, warn};
 
-use crate::pipeline::{AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener};
+use crate::pipeline::{AlertSink, Auditor, CurveRead, LiveSink, Pipeline, ReserveFeed, Screener};
 use crate::settings::now_secs;
 
-/// One curve read: `(mint, signal, swaps+watermark+truncated or error)`.
+/// One curve read: `(mint, signal, full-or-truncated swaps or error)`.
 type Observation = (
     String,
     PendingSignal,
-    Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError>,
+    Result<CurveRead, ScreenError>,
 );
 
 /// Max concurrent RPC per gate phase (slow rounds halve it).
@@ -156,10 +156,9 @@ pub struct PendingSignal {
 pub struct GateState {
     pub gate: EntryGate,
     pub meta: HashMap<String, PendingSignal>,
-    /// Poll exclusion: stale claims may be taken over.
-    pub poll_busy: bool,
-    /// Claim time (0 when free).
-    pub poll_started_secs: u64,
+    /// Poll exclusion: `Some(started_at)` while a round owns the slot;
+    /// stale claims may be taken over. One field — never "0 means free".
+    pub poll: Option<u64>,
     /// Fanout width this round.
     pub fanout: usize,
 }
@@ -241,8 +240,7 @@ impl GateState {
         Self {
             gate,
             meta: HashMap::new(),
-            poll_busy: false,
-            poll_started_secs: 0,
+            poll: None,
             fanout: GATE_FANOUT,
         }
     }
@@ -259,25 +257,23 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     pub async fn try_begin_poll(&self) -> bool {
         let mut state = self.gate_state.lock().await;
         let now = now_secs();
-        if state.poll_busy && now.saturating_sub(state.poll_started_secs) < STALE_POLL_SECS {
-            return false;
-        }
-        if state.poll_busy {
+        if let Some(started) = state.poll {
+            if now.saturating_sub(started) < STALE_POLL_SECS {
+                return false;
+            }
             warn!(
                 "stale gate-poll claim (age {:?}s); taking over",
-                now.saturating_sub(state.poll_started_secs)
+                now.saturating_sub(started)
             );
         }
-        state.poll_busy = true;
-        state.poll_started_secs = now;
+        state.poll = Some(now);
         true
     }
 
     /// Release the poll slot.
     pub async fn end_poll(&self) {
         let mut state = self.gate_state.lock().await;
-        state.poll_busy = false;
-        state.poll_started_secs = 0;
+        state.poll = None;
     }
 
     /// Audit, screen, watchlist. Never opens here; skips fail closed.
@@ -418,18 +414,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         let mut confirmed: Vec<(String, PendingSignal, u32)> = Vec::new();
         for (mint, mut signal, observed) in observations {
-            let (swaps, newest, truncated) = match observed {
-                Ok(observed) => observed,
+            let (swaps, newest) = match observed {
+                Ok(CurveRead::Full { swaps, watermark }) => (swaps, watermark),
+                Ok(CurveRead::Truncated) => {
+                    // Partial view: never confirm.
+                    debug!(%mint, "curve observation truncated; holding watch without quorum");
+                    continue;
+                }
                 Err(e) => {
                     warn!(%mint, error = %e, "curve observation failed; keeping watch");
                     continue;
                 }
             };
-            if truncated {
-                // Partial view: never confirm.
-                debug!(%mint, "curve observation truncated; holding watch without quorum");
-                continue;
-            }
             // `None` score is still indexing. Throttled retry; deadline aborts.
             let audit_at_snapshot = signal.audit_score;
             let mut audit_changed = false;

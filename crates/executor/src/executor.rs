@@ -262,12 +262,6 @@ pub enum ConfirmOutcome {
     Timeout,
 }
 
-/// Confirmed swap receipt.
-#[derive(Debug, Clone)]
-pub struct SwapReceipt {
-    pub signature: String,
-}
-
 /// Accepted Jito bundle receipt (acceptance != landing).
 #[derive(Debug, Clone)]
 pub struct JitoReceipt {
@@ -658,18 +652,6 @@ impl SwapExecutor {
             Some(jito) => jito.tip_floor_lamports().await,
             None => 0,
         }
-    }
-
-    /// Buy `amount_tokens` for at most `max_sol_cost` lamports.
-    pub async fn buy(&self, order: &BuyOrder) -> Result<SwapReceipt, ExecutorError> {
-        let ixs = self.preflight_buy(order, false).await?;
-        self.send(&ixs, "buy").await
-    }
-
-    /// Sell `amount_tokens` for at least `min_sol_output` lamports.
-    pub async fn sell(&self, order: &SellOrder) -> Result<SwapReceipt, ExecutorError> {
-        let ixs = self.preflight_sell(order, false).await?;
-        self.send(&ixs, "sell").await
     }
 
     /// Buy via Jito bundle (swap + tip, atomic). Requires `with_jito`.
@@ -1468,47 +1450,10 @@ impl SwapExecutor {
         ixs.push(tip_instruction(&payer, &tip, tip_lamports));
     }
 
-    /// Sign and confirm. One blockhash resample on expiry.
-    /// No resend after send error: it may have landed.
-    async fn send(
-        &self,
-        ixs: &[solana_instruction::Instruction],
-        label: &str,
-    ) -> Result<SwapReceipt, ExecutorError> {
-        let mut tx = self.build_tx(ixs).await?;
-        match self.simulate_tx(&tx, label).await {
-            Ok(()) => {}
-            Err(e) if is_blockhash_expired(&e) => {
-                warn!(%label, "stale blockhash under load; resampling once");
-                tx = self.build_tx(ixs).await?;
-                self.simulate_tx(&tx, label).await?;
-            }
-            Err(e) => return Err(e),
-        }
-        match tokio::time::timeout(
-            Duration::from_secs(90),
-            self.rpc.send_and_confirm_transaction(&tx),
-        )
-        .await
-        {
-            Ok(Ok(signature)) => {
-                info!(%label, %signature, "swap confirmed");
-                Ok(SwapReceipt {
-                    signature: signature.to_string(),
-                })
-            }
-            Ok(Err(e)) => {
-                warn!(%label, error = %e, "swap failed");
-                Err(ExecutorError::Rpc(e))
-            }
-            Err(_) => {
-                warn!(%label, "swap confirmation timed out");
-                Err(ExecutorError::Timeout("send_and_confirm"))
-            }
-        }
-    }
-
     /// Sign and dispatch as a single-tx Jito bundle. One blockhash resample.
+    /// This is the ONLY dispatch path: sniper flow never touches the
+    /// public mempool (sandwich exposure). Do NOT add a mempool send
+    /// without a written MEV analysis.
     async fn send_bundle(
         &self,
         ixs: &[solana_instruction::Instruction],

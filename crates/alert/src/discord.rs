@@ -15,6 +15,10 @@ pub const HERMES_BIN_ENV: &str = "HERMES_BIN";
 /// Max Hermes children. Excess drops with a counter.
 pub const MAX_INFLIGHT_ALERTS: usize = 4;
 
+/// Explorer deep-link roots (single source; cards reference these).
+pub const EXPLORER_ADDRESS: &str = "https://explorer.solana.com/address";
+pub const EXPLORER_TX: &str = "https://explorer.solana.com/tx";
+
 /// Fire-and-forget alerter. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Alerter {
@@ -217,7 +221,7 @@ impl Alerter {
              • **Size:** `${notional_usd:.2}`\n\
              • **Target TP:** `+{tp_pct:.1}%` | **Stop Loss:** `{sl_pct:.1}%`\n\
              • **Risk:** `{risk}`\n\
-             • **Explorer:** https://explorer.solana.com/address/{mint}",
+             • **Explorer:** {EXPLORER_ADDRESS}/{mint}",
             Self::mode_line(ctx),
         )
     }
@@ -295,7 +299,7 @@ impl Alerter {
              • **Token Mint:** `{mint}`\n\
              • **Amount:** `{amount_tokens}` base units\n\
              • **Bundle:** `{bundle_id}`\n\
-             • **Explorer:** https://explorer.solana.com/address/{mint}",
+             • **Explorer:** {EXPLORER_ADDRESS}/{mint}",
             Self::mode_line(ctx),
         )
     }
@@ -309,7 +313,7 @@ impl Alerter {
              {}\n\
              • **Token Mint:** `{mint}`\n\
              • **Bundle:** `{bundle_id}`\n\
-             • **Explorer:** https://explorer.solana.com/address/{mint}",
+             • **Explorer:** {EXPLORER_ADDRESS}/{mint}",
             Self::mode_line(ctx),
         )
     }
@@ -338,7 +342,7 @@ impl Alerter {
              • **AMM:** `{}`\n\
              • **Base Mint:** `{}`\n\
              • **Quote Mint:** `{}`\n\
-             • **Tx:** https://explorer.solana.com/tx/{signature}",
+             • **Tx:** {EXPLORER_TX}/{signature}",
             Self::mode_line(ctx),
             amm,
             base,
@@ -407,7 +411,7 @@ impl Alerter {
              • **Token Mint:** `{mint}`\n\
              • **Move:** `{multiple:.1}x off migration`\n\
              • **Price:** `${price_usd:.8}`\n\
-             • **Explorer:** https://explorer.solana.com/address/{mint}",
+             • **Explorer:** {EXPLORER_ADDRESS}/{mint}",
             Self::mode_line(ctx),
         )
     }

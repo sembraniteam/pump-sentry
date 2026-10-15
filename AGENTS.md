@@ -79,6 +79,9 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   assumption fails closed there — our own holdings are always canonical
   via the idempotent ATA prefix). Simulation with `sig_verify:false`
   proves layout/logic, never authorization.
+- Dispatch is Jito-bundles-only (`send_bundle`): no public-mempool
+  send exists anywhere (deleted — sniper flow must never face
+  sandwich exposure). Do NOT re-add one without a written MEV analysis.
 - PumpSwap `sell_v2` IS sim-proven now (`pumpswap_sell_v2_simulates`:
   builder + quote floor vs live pool + live funded holder, GREEN).
   Still no frozen sell_v2 fill fixture, and no funded trial

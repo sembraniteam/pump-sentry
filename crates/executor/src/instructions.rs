@@ -290,17 +290,9 @@ impl PumpSwapBuilder {
     }
 }
 
-/// Derive the payer ATA for a mint.
-pub fn user_ata(payer: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let theirs = spl_associated_token_account::get_associated_token_address(
-        &pubkey_into_theirs(payer),
-        &pubkey_into_theirs(mint),
-    );
-    Pubkey::new_from_array(theirs.to_bytes())
-}
-
 /// ATA bound to an explicit token program. Needed for Token-2022:
-/// seeds are `[owner, program, mint]`, so the classic helper is wrong.
+/// seeds are `[owner, program, mint]`, so a program-less helper would
+/// be wrong there (and every production caller passes the program).
 pub fn user_ata_with_program(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     let theirs = spl_associated_token_account::get_associated_token_address_with_program_id(
         &pubkey_into_theirs(owner),
@@ -751,12 +743,10 @@ mod tests {
 
     #[test]
     fn program_bound_ata_differs_for_token_2022() {
-        // Classic helper is wrong for 2022 mints (`IncorrectProgramId`).
+        // Classic derivation is wrong for 2022 mints (`IncorrectProgramId`).
         let owner = Pubkey::new_from_array([7; 32]);
         let mint = Pubkey::new_from_array([8; 32]);
-        let classic = user_ata(&owner, &mint);
-        let modern = user_ata_with_program(&owner, &mint, &TOKEN_PROGRAM_ID);
-        assert_eq!(classic, modern, "classic program must agree");
+        let classic = user_ata_with_program(&owner, &mint, &TOKEN_PROGRAM_ID);
         let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").expect("t22");
         let modern22 = user_ata_with_program(&owner, &mint, &token_2022);
         assert_ne!(modern22, classic, "2022 derivation must differ");
@@ -792,7 +782,7 @@ mod tests {
     fn ata_matches_pda_derivation() {
         let payer = Pubkey::new_from_array([11; 32]);
         let mint = Pubkey::new_from_array([12; 32]);
-        let ata = user_ata(&payer, &mint);
+        let ata = user_ata_with_program(&payer, &mint, &TOKEN_PROGRAM_ID);
         let (expected, _bump) = Pubkey::find_program_address(
             &[
                 &payer.to_bytes(),

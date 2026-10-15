@@ -1231,21 +1231,6 @@ fn spawn_background(
             .parse::<u32>()
             .map_err(|e| std::io::Error::other(format!("invalid pid from sh: {e}")))
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (invocation, first_run);
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)?;
-        let child = std::process::Command::new(exe)
-            .args(&child_args)
-            .stdin(std::process::Stdio::null())
-            .stdout(log_file.try_clone()?)
-            .stderr(log_file)
-            .spawn()?;
-        Ok(child.id())
-    }
 }
 
 #[cfg(test)]

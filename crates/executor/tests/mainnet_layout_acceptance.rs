@@ -23,94 +23,16 @@
 //! `MAINNET_LAYOUT=1 cargo test -p executor --test mainnet_layout_acceptance -- --ignored --nocapture`
 
 use executor::instructions::PumpSwapBuilder;
-use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
-use solana_instruction::Instruction;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_pubkey::Pubkey;
-use solana_transaction::Transaction;
 use std::str::FromStr;
 
+mod common;
+
 const PUMP_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-
-fn decode_b58(s: &str) -> Vec<u8> {
-    bs58::decode(s).into_vec().expect("valid base58")
-}
-
-/// Shared RPC constructor: `MAINNET_RPC_URL` (Helius, backslash escapes
-/// sanitized) when set, else the public endpoint. Every probe must use
-/// this — the public node 429s after bulk scans, which turns a 3-minute
-/// run into 20 minutes of backoff.
-fn rpc_client() -> RpcClient {
-    let url = std::env::var("MAINNET_RPC_URL")
-        .ok()
-        .map(|v| v.replace('\\', ""))
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| RPC_URL.to_string());
-    RpcClient::new(url)
-}
 
 async fn live_token_program(rpc: &RpcClient, mint: &Pubkey) -> Pubkey {
     rpc.get_account(mint).await.expect("mint readable").owner
-}
-
-/// Simulate a rebuilt skeleton with the sampled trader as payer
-/// (dust amount, open guard, sig_verify off) and assert clean
-/// execution. Returns `true` on GREEN; transport trouble returns
-/// `false` (caller resamples); layout-level failure panics with the
-/// sim logs (the gate that guards funds). Simulation only, never sends
-/// anything.
-async fn sim_skeleton_green(
-    rpc: &RpcClient,
-    payer: &Pubkey,
-    ixs: Vec<Instruction>,
-    label: &str,
-) -> bool {
-    let blockhash = match rpc.get_latest_blockhash().await {
-        Ok(b) => b,
-        Err(e) => {
-            println!("{label}: blockhash failed ({e}); resampling");
-            return false;
-        }
-    };
-    let message = solana_message::Message::new_with_blockhash(&ixs, Some(payer), &blockhash);
-    let tx = Transaction {
-        signatures: vec![
-            solana_signature::Signature::default();
-            message.header.num_required_signatures as usize
-        ],
-        message,
-    };
-    let res = match rpc
-        .simulate_transaction_with_config(
-            &tx,
-            RpcSimulateTransactionConfig { sig_verify: false, ..Default::default() },
-        )
-        .await
-    {
-        Ok(res) => res,
-        Err(e) => {
-            println!("{label}: simulate RPC failed ({e}); resampling");
-            return false;
-        }
-    };
-    println!(
-        "SIM logs ({label}):\n{}",
-        res.value.logs.as_ref().map(|l| l.join("\n")).unwrap_or_default()
-    );
-    if let Some(err) = &res.value.err {
-        // Stale blockhash under load proves nothing about layout: fresh
-        // retry with a new blockhash instead of failing the gate.
-        let err_str = format!("{err:?}");
-        let stale = err_str.contains("BlockhashNotFound")
-            && res.value.logs.as_ref().map(|l| l.is_empty()).unwrap_or(true);
-        if stale {
-            println!("{label}: stale blockhash under load; resampling");
-            return false;
-        }
-        panic!("{label} simulation failed: {err:?}");
-    }
-    println!("{label} GREEN");
-    true
 }
 
 #[tokio::test]
@@ -131,71 +53,13 @@ async fn mainnet_v3_17_simulates() {
         build_create_ata_ix, user_ata_with_program,
         user_volume_accumulator_pda,
     };
-    let rpc = rpc_client();
+    let rpc = common::rpc_client();
 
-    // --- helpers: parse frozen fixture into (mint, quote_mint, curve, assoc, buyback)
-    // plus the fixture's own trader ([8] payer) and base ATA ([9]).
-    // The trader/ATA pair is the offline fallback when
+    // Fixture parsing lives in `common` (single 17-shape table); the
+    // trader/ATA pair is the offline fallback when
     // `get_token_largest_accounts` is throttled (public RPC 429s on the
     // heavy indexing call): the fixture already names a real seller and
     // its ATA, so the sim gate can run without the largest-holders RPC.
-    fn fixture_v3_trader(raw: &str, path: &str) -> (Pubkey, Pubkey) {
-        let raw: serde_json::Value =
-            serde_json::from_str(raw).expect("fixture json");
-        let msg = &raw["transaction"]["message"];
-        let mut keys: Vec<String> = serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-        if let Some(loaded) = raw["meta"]["loadedAddresses"].as_object() {
-            for table in ["writable", "readonly"] {
-                for addr in loaded.get(table).and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-                    keys.push(addr.as_str().expect("addr").to_string());
-                }
-            }
-        }
-        let pump = ids::PUMP_PROGRAM_ID.to_string();
-        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            if ix["programIdIndex"].as_u64() != Some(pi as u64) { continue; }
-            let data = bs58::decode(ix["data"].as_str().expect("data")).into_vec().expect("b58");
-            let is_v3 = (data.starts_with(&ids::PUMP_BUY_V3_DISCRIMINATOR) || data.starts_with(&ids::PUMP_SELL_V3_DISCRIMINATOR)) && data.len() == 24;
-            if !is_v3 { continue; }
-            let idx: Vec<usize> = serde_json::from_value(ix["accounts"].clone()).expect("accts");
-            assert_eq!(idx.len(), 17, "fixture {path} must be 17 accounts");
-            let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
-            // Positions per 17-shape: [8] payer/trader, [9] base ATA.
-            return (key(8), key(9));
-        }
-        panic!("no v3 ix in fixture {path}");
-    }
-
-    fn fixture_v3_accounts(raw: &str, path: &str) -> (Pubkey, Pubkey, Pubkey, Pubkey, Pubkey) {
-        let raw: serde_json::Value =
-            serde_json::from_str(raw).expect("fixture json");
-        // Bare getTransaction shape (no envelope).
-        let msg = &raw["transaction"]["message"];
-        let mut keys: Vec<String> = serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-        if let Some(loaded) = raw["meta"]["loadedAddresses"].as_object() {
-            for table in ["writable", "readonly"] {
-                for addr in loaded.get(table).and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-                    keys.push(addr.as_str().expect("addr").to_string());
-                }
-            }
-        }
-        let pump = ids::PUMP_PROGRAM_ID.to_string();
-        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            if ix["programIdIndex"].as_u64() != Some(pi as u64) { continue; }
-            let data = bs58::decode(ix["data"].as_str().expect("data")).into_vec().expect("b58");
-            // Accept either buy_v3 or sell_v3 discriminator (both 17 accounts).
-            let is_v3 = (data.starts_with(&ids::PUMP_BUY_V3_DISCRIMINATOR) || data.starts_with(&ids::PUMP_SELL_V3_DISCRIMINATOR)) && data.len() == 24;
-            if !is_v3 { continue; }
-            let idx: Vec<usize> = serde_json::from_value(ix["accounts"].clone()).expect("accts");
-            assert_eq!(idx.len(), 17, "fixture {path} must be 17 accounts");
-            let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
-            // Positions per 17-shape: [1] mint, [2] quote, [5] curve, [6] assoc, [13] buyback
-            return (key(1), key(2), key(5), key(6), key(13));
-        }
-        panic!("no v3 ix in fixture {path}");
-    }
 
     // Deterministic fixture set: both directions, same 17-body.
     let fixtures = [
@@ -211,7 +75,7 @@ async fn mainnet_v3_17_simulates() {
 
     for (raw, path) in fixtures {
         if buy_green && sell_green { break; }
-        let (mint, quote_mint, curve, assoc, buyback) = fixture_v3_accounts(raw, path);
+        let (mint, quote_mint, curve, assoc, buyback) = common::fixture_v3_accounts(raw, path);
         eprintln!("fixture {path}: mint={mint} curve={curve}");
         let token_program = match rpc.get_account(&mint).await { Ok(a) => a.owner, Err(_) => continue };
         let quote_program = match rpc.get_account(&quote_mint).await { Ok(a) => a.owner, Err(_) => continue };
@@ -261,7 +125,7 @@ async fn mainnet_v3_17_simulates() {
             // canonical (aux-filtered) and balance-checked live below, so a
             // stale zero-balance fallback simply yields no candidate rather
             // than a false GREEN.
-            let (ftrader, fata) = fixture_v3_trader(raw, path);
+            let (ftrader, fata) = common::fixture_v3_trader(raw, path);
             if user_ata_with_program(&ftrader, &mint, &token_program) == fata && ftrader != curve {
                 let hbase: u64 = match rpc.get_token_account_balance(&fata).await { Ok(b) => b.amount.parse().unwrap_or(0), Err(_) => 0 };
                 if hbase >= 1_000 {
@@ -307,7 +171,7 @@ async fn mainnet_v3_17_simulates() {
                     buyback_recipient: &buyback,
                 }));
                 sim_attempts += 1;
-                if sim_skeleton_green(&rpc, howner, ixs, "V3-BUY").await { buy_green = true; break; }
+                if common::sim_skeleton_green(&rpc, howner, ixs, "V3-BUY").await { buy_green = true; break; }
             }
             if !buy_green { poor_drops += 1; }
         }
@@ -329,7 +193,7 @@ async fn mainnet_v3_17_simulates() {
                     buyback_recipient: &buyback,
                 }));
                 sim_attempts += 1;
-                if sim_skeleton_green(&rpc, &howner, ixs, "V3-SELL").await { sell_green = true; hit = true; break; }
+                if common::sim_skeleton_green(&rpc, &howner, ixs, "V3-SELL").await { sell_green = true; hit = true; break; }
             }
             if !hit { poor_drops += 1; eprintln!("no sellable holder on {mint}"); }
         }
@@ -364,29 +228,9 @@ async fn mainnet_v3_17_simulates() {
             Ok(a) => a.owner,
             Err(_) => return (false, sims, aux, uvol, poor),
         };
-        let holders: Vec<_> = match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            rpc.get_token_largest_accounts(mint),
-        )
-        .await
-        {
-            Ok(Ok(h)) => h,
-            _ => Vec::new(),
-        };
-        for h in holders.iter().take(10) {
-            let Ok(hata) = Pubkey::from_str(&h.address) else { continue };
-            let Ok(hdata) = rpc.get_account(&hata).await else { continue };
-            if hdata.data.len() < 72 { continue; }
-            let howner = Pubkey::new_from_array(hdata.data[32..64].try_into().expect("32B"));
-            if howner == *curve { continue; }
-            if user_ata_with_program(&howner, mint, &token_program) != hata {
-                aux += 1;
-                continue;
-            }
-            let hbase: u64 = match rpc.get_token_account_balance(&hata).await {
-                Ok(b) => b.amount.parse().unwrap_or(0),
-                Err(_) => continue,
-            };
+        let (holders, dropped_aux) = common::holder_atas(rpc, mint, curve).await;
+        aux += dropped_aux;
+        for (howner, _, hbase) in holders {
             if hbase < 1_000 { continue; }
             if rpc.get_balance(&howner).await.unwrap_or(0) < 50_000 { continue; }
             if rpc.get_account(&user_volume_accumulator_pda(&howner)).await.is_err() {
@@ -405,7 +249,7 @@ async fn mainnet_v3_17_simulates() {
                 buyback_recipient: buyback,
             }));
             sims += 1;
-            if sim_skeleton_green(rpc, &howner, ixs, "V3-SELL").await {
+            if common::sim_skeleton_green(rpc, &howner, ixs, "V3-SELL").await {
                 return (true, sims, aux, uvol, poor);
             }
         }
@@ -458,7 +302,7 @@ async fn mainnet_v3_17_simulates() {
                         },
                     ));
                     sims += 1;
-                    if sim_skeleton_green(rpc, &ftrader, ixs, "V3-SELL-FALLBACK").await {
+                    if common::sim_skeleton_green(rpc, &ftrader, ixs, "V3-SELL-FALLBACK").await {
                         return (true, sims, aux, uvol, poor);
                     }
                 }
@@ -472,7 +316,7 @@ async fn mainnet_v3_17_simulates() {
         // Fixture mints first (same order as the buy loop above).
         for (raw, path) in fixtures {
             if sell_green { break; }
-            let (mint, quote_mint, curve, assoc, buyback) = fixture_v3_accounts(raw, path);
+            let (mint, quote_mint, curve, assoc, buyback) = common::fixture_v3_accounts(raw, path);
             let (green, s, a, u, p) = try_v3_sell(
                 &rpc,
                 &mint,
@@ -480,7 +324,7 @@ async fn mainnet_v3_17_simulates() {
                 &curve,
                 &assoc,
                 &buyback,
-                Some(fixture_v3_trader(raw, path)),
+                Some(common::fixture_v3_trader(raw, path)),
             )
             .await;
             sim_attempts += s;
@@ -497,86 +341,36 @@ async fn mainnet_v3_17_simulates() {
                 Vec::new();
             for _ in 0..60u32 {
                 if fresh.len() >= 4 { break; }
-                let block = match rpc
-                    .get_block_with_config(
-                        probe,
-                        solana_client::rpc_config::RpcBlockConfig {
-                            encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
-                            transaction_details: Some(
-                                solana_transaction_status::TransactionDetails::Full,
-                            ),
-                            rewards: Some(false),
-                            commitment: None,
-                            max_supported_transaction_version: Some(1),
-                        },
-                    )
-                    .await
-                {
-                    Ok(b) => b,
-                    Err(_) => {
-                        probe = probe.saturating_sub(10);
-                        continue;
-                    }
-                };
-                let empty = Vec::new();
-                let transactions = block.transactions.as_ref().unwrap_or(&empty);
-                if transactions.is_empty() {
+                let Some(txs) = common::scan_block(&rpc, probe).await else {
                     probe = probe.saturating_sub(10);
                     continue;
-                }
-                for tx_meta in transactions {
-                    if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
-                        continue;
-                    }
-                    let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
-                        &tx_meta.transaction
+                };
+                for tx in &txs {
+                    if fresh.len() >= 4 { break; }
+                    let Some(pump_idx) = tx
+                        .keys
+                        .iter()
+                        .position(|k| k.to_string() == PUMP_PROGRAM)
+                        .map(|i| i as u8)
                     else {
                         continue;
                     };
-                    let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
-                        continue;
-                    };
-                    let mut keys: Vec<Pubkey> = raw
-                        .account_keys
-                        .iter()
-                        .filter_map(|k| Pubkey::from_str(k).ok())
-                        .collect();
-                    if keys.len() != raw.account_keys.len() {
-                        continue;
-                    }
-                    if let Some(meta) = &tx_meta.meta {
-                        use solana_transaction_status::option_serializer::OptionSerializer;
-                        if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
-                            for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
-                                let Ok(p) = Pubkey::from_str(k) else { continue };
-                                keys.push(p);
-                            }
-                        }
-                    }
-                    let pump_idx = match keys.iter().position(|k| k.to_string() == PUMP_PROGRAM) {
-                        Some(i) => i as u8,
-                        None => continue,
-                    };
-                    for cix in &raw.instructions {
+                    for cix in &tx.ixs {
                         if fresh.len() >= 4 { break; }
-                        if cix.program_id_index != pump_idx {
+                        if cix.program_idx != pump_idx {
                             continue;
                         }
-                        let data = decode_b58(&cix.data);
-                        if data.len() != 24 || data[..8] != ids::PUMP_SELL_V3_DISCRIMINATOR {
+                        if cix.data.len() != 24
+                            || cix.data[..8] != ids::PUMP_SELL_V3_DISCRIMINATOR
+                        {
                             continue;
                         }
                         if cix.accounts.len() != 17 {
                             continue;
                         }
-                        let accounts: Vec<Pubkey> = cix
-                            .accounts
-                            .iter()
-                            .filter_map(|i| keys.get(usize::from(*i)).copied())
-                            .collect();
-                        if accounts.len() != 17 {
+                        let Some(accounts) = common::resolve_accounts(tx, cix) else {
                             continue;
-                        }
+                        };
                         let (mint, quote, curve, assoc, buyback) =
                             (accounts[1], accounts[2], accounts[5], accounts[6], accounts[13]);
                         if fresh.iter().any(|(m, ..)| *m == mint) {
@@ -639,7 +433,7 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
         return;
     }
     use listener::parser::{parse_pump_create_v2, PUMP_CREATE_V2_DISCRIMINATOR};
-    let rpc = rpc_client();
+    let rpc = common::rpc_client();
     // Bulk reads below retry with backoff instead of failing the run
     // on the first throttle (Helius rarely needs it; public RPC does).
     async fn rpc_retry<F, Fut, T>(label: &str, mut f: F) -> T
@@ -677,99 +471,43 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
         if launch.is_some() {
             break;
         }
-        let block = match rpc
-            .get_block_with_config(
-                probe_slot,
-                solana_client::rpc_config::RpcBlockConfig {
-                    encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
-                    transaction_details: Some(
-                        solana_transaction_status::TransactionDetails::Full,
-                    ),
-                    rewards: Some(false),
-                    commitment: None,
-                    max_supported_transaction_version: Some(1),
-                },
-            )
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("slot {probe_slot} unavailable ({e}); backing off");
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                probe_slot = probe_slot.saturating_sub(25);
-                continue;
-            }
-        };
-        let empty = Vec::new();
-        let transactions = block.transactions.as_ref().unwrap_or(&empty);
-        blocks_scanned += 1;
-        txs_scanned += transactions.len() as u64;
-        // Empty bodies (pruned/archive-miss) carry no launches; say so
-        // instead of silently scanning nothing.
-        eprintln!("slot {probe_slot}: {} txs", transactions.len());
-        if transactions.is_empty() {
+        let Some(txs) = common::scan_block(&rpc, probe_slot).await else {
+            eprintln!("slot {probe_slot} unavailable or empty; backing off");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             probe_slot = probe_slot.saturating_sub(25);
             continue;
-        }
-        for tx_meta in transactions {
-            // Failed transactions create nothing: their account
-            // references (curves, vaults) may never exist on-chain.
-            // Skipping them here (not just at sig-scan) after one
-            // wasted probe proved the gap.
-            if tx_meta
-                .meta
-                .as_ref()
-                .is_some_and(|m| m.err.is_some())
-            {
-                continue;
+        };
+        blocks_scanned += 1;
+        txs_scanned += txs.len() as u64;
+        // Empty bodies (pruned/archive-miss) carry no launches; say so
+        // instead of silently scanning nothing.
+        eprintln!("slot {probe_slot}: {} txs", txs.len());
+        for tx in &txs {
+            if launch.is_some() {
+                break;
             }
-            let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
-                &tx_meta.transaction
+            let Some(pump_idx) = tx
+                .keys
+                .iter()
+                .position(|k| k.to_string() == PUMP_PROGRAM)
+                .map(|i| i as u8)
             else {
                 continue;
             };
-            let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
-                continue;
-            };
-            let mut keys: Vec<Pubkey> = raw
-                .account_keys
-                .iter()
-                .filter_map(|k| Pubkey::from_str(k).ok())
-                .collect();
-            if keys.len() != raw.account_keys.len() {
-                continue;
-            }
-            if let Some(meta) = &tx_meta.meta {
-                use solana_transaction_status::option_serializer::OptionSerializer;
-                if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
-                    for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
-                        let Ok(p) = Pubkey::from_str(k) else { continue };
-                        keys.push(p);
-                    }
-                }
-            }
-            let pump_idx = match keys.iter().position(|k| k.to_string() == PUMP_PROGRAM) {
-                Some(i) => i as u8,
-                None => continue,
-            };
-            for cix in &raw.instructions {
-                if cix.program_id_index != pump_idx {
+            for cix in &tx.ixs {
+                if cix.program_idx != pump_idx {
                     continue;
                 }
-                let data = decode_b58(&cix.data);
-                if data.len() < 8 || data[..8] != PUMP_CREATE_V2_DISCRIMINATOR {
+                if cix.data.len() < 8 || cix.data[..8] != PUMP_CREATE_V2_DISCRIMINATOR {
                     continue;
                 }
-                let accounts: Vec<Pubkey> = cix
-                    .accounts
-                    .iter()
-                    .filter_map(|i| keys.get(usize::from(*i)).copied())
-                    .collect();
+                let Some(accounts) = common::resolve_accounts(tx, cix) else {
+                    continue;
+                };
                 if accounts.len() < 14 {
                     continue;
                 }
-                let sig = ui_tx.signatures.first().cloned().unwrap_or_default();
-                match parse_pump_create_v2(&data, &accounts, sig, probe_slot) {
+                match parse_pump_create_v2(&cix.data, &accounts, tx.sig.clone(), probe_slot) {
                     Ok(ev) => {
                         // Curve must still be live (ungraduated) for a
                         // meaningful sim; the buyer is hunted separately
@@ -912,7 +650,7 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
                     if cix.program_id_index != pump_idx {
                         continue;
                     }
-                    let data = decode_b58(&cix.data);
+                    let data = common::decode_b58(&cix.data);
                     // Buy-side shape → (buyer, base-ATA, mint) positions.
                     let shape =
                         if data.len() == 25 && data[..8] == PUMP_BUY_DISCRIMINATOR
@@ -1071,41 +809,21 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
     ixs.push(swap);
     // NOTE: unsigned skeleton around the real buyer (sig_verify off) —
     // this proves account layout and program logic, not authorization.
-    let blockhash = rpc_retry("blockhash", || rpc.get_latest_blockhash()).await;
-    let message =
-        solana_message::Message::new_with_blockhash(&ixs, Some(&buyer), &blockhash);
-    let tx = Transaction {
-        signatures: vec![solana_signature::Signature::default(); message.header.num_required_signatures as usize],
-        message,
-    };
-    let res = rpc_retry("simulate", || {
-        rpc.simulate_transaction_with_config(
-            &tx,
-            RpcSimulateTransactionConfig { sig_verify: false, ..Default::default() },
-        )
-    })
-    .await;
-    println!(
-        "SIM logs:\n{}",
-        res.value.logs.as_ref().map(|l| l.join("\n")).unwrap_or_default()
-    );
-    // Attribute the failure: a funding move between hunt and sim (buyer
-    // drained, curve graduated mid-flight) surfaces as `insufficient
-    // funds` inside a TransferChecked — a stale sample, not a layout
-    // bug. A stale sample refetches fresh (see loop head); only a
-    // layout failure reds the gate, loudly either way.
-    if let Some(err) = &res.value.err {
-        let logs = res.value.logs.as_ref().map(|l| l.join("\n")).unwrap_or_default();
-        if logs.contains("insufficient funds") {
+    // A funding move between hunt and sim (buyer drained, curve
+    // graduated mid-flight) surfaces as `insufficient funds` inside a
+    // TransferChecked — a stale sample, not a layout bug. A stale
+    // sample refetches fresh (see loop head); only a layout failure
+    // reds the gate, loudly either way.
+    match common::sim_ix_green(&rpc, &buyer, ixs, "MAYHEM-BUY").await {
+        Ok(()) => {}
+        Err(e) if e.contains("insufficient funds") => {
             eprintln!("FLAKY SAMPLE (funds moved between hunt and sim); hunting a fresh sample");
             if _round >= 2 {
-                panic!(
-                    "FLAKY SAMPLE on the final round; rerun for a fresh launch: {err:?}"
-                );
+                panic!("FLAKY SAMPLE on the final round; rerun for a fresh launch: {e}");
             }
             continue '_rounds;
         }
-        panic!("mayhem extended buy simulation failed: {err:?}");
+        Err(e) => panic!("mayhem extended buy simulation failed: {e}"),
     }
     println!("MAYHEM BUY GREEN mint={}", ev.mint);
     return;
@@ -1136,7 +854,7 @@ async fn pumpswap_sell_v2_simulates() {
         pumpswap_fee_bps, pumpswap_sell_floor, pumpswap_sell_out, PoolView,
     };
     use migration::pumpswap::PumpSwapPool;
-    let rpc = rpc_client();
+    let rpc = common::rpc_client();
     const PUMP_AMM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
     // Hunt recent sell_v2 fills (bulk blocks, newest first).
@@ -1147,88 +865,41 @@ async fn pumpswap_sell_v2_simulates() {
         if samples.len() >= 4 {
             break;
         }
-        let block = match rpc
-            .get_block_with_config(
-                probe_slot,
-                solana_client::rpc_config::RpcBlockConfig {
-                    encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
-                    transaction_details: Some(
-                        solana_transaction_status::TransactionDetails::Full,
-                    ),
-                    rewards: Some(false),
-                    commitment: None,
-                    max_supported_transaction_version: Some(1),
-                },
-            )
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("slot {probe_slot} unavailable ({e}); backing off");
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                probe_slot = probe_slot.saturating_sub(10);
-                continue;
-            }
-        };
-        let empty = Vec::new();
-        let transactions = block.transactions.as_ref().unwrap_or(&empty);
-        if transactions.is_empty() {
+        let Some(txs) = common::scan_block(&rpc, probe_slot).await else {
+            eprintln!("slot {probe_slot} unavailable or empty; backing off");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             probe_slot = probe_slot.saturating_sub(10);
             continue;
-        }
-        for tx_meta in transactions {
-            if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
-                continue;
+        };
+        for tx in &txs {
+            if samples.len() >= 4 {
+                break;
             }
-            let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
-                &tx_meta.transaction
+            let Some(amm_idx) = tx
+                .keys
+                .iter()
+                .position(|k| k.to_string() == PUMP_AMM)
+                .map(|i| i as u8)
             else {
                 continue;
             };
-            let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
-                continue;
-            };
-            let mut keys: Vec<Pubkey> = raw
-                .account_keys
-                .iter()
-                .filter_map(|k| Pubkey::from_str(k).ok())
-                .collect();
-            if keys.len() != raw.account_keys.len() {
-                continue;
-            }
-            if let Some(meta) = &tx_meta.meta {
-                use solana_transaction_status::option_serializer::OptionSerializer;
-                if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
-                    for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
-                        let Ok(p) = Pubkey::from_str(k) else { continue };
-                        keys.push(p);
-                    }
-                }
-            }
-            let amm_idx = match keys.iter().position(|k| k.to_string() == PUMP_AMM) {
-                Some(i) => i as u8,
-                None => continue,
-            };
-            for cix in &raw.instructions {
-                if cix.program_id_index != amm_idx {
-                    continue;
-                }
-                let data = decode_b58(&cix.data);
-                if data.len() != 24 || data[..8] != ids::PUMP_AMM_SELL_V2_DISCRIMINATOR {
-                    continue;
-                }
-                let accounts: Vec<Pubkey> = cix
-                    .accounts
-                    .iter()
-                    .filter_map(|i| keys.get(usize::from(*i)).copied())
-                    .collect();
-                if accounts.len() != 17 {
-                    continue;
-                }
-                samples.push(accounts);
+            for cix in &tx.ixs {
                 if samples.len() >= 4 {
                     break;
                 }
+                if cix.program_idx != amm_idx {
+                    continue;
+                }
+                if cix.data.len() != 24 || cix.data[..8] != ids::PUMP_AMM_SELL_V2_DISCRIMINATOR {
+                    continue;
+                }
+                if cix.accounts.len() != 17 {
+                    continue;
+                }
+                let Some(accounts) = common::resolve_accounts(tx, cix) else {
+                    continue;
+                };
+                samples.push(accounts);
             }
         }
         probe_slot = probe_slot.saturating_sub(10);
@@ -1485,7 +1156,7 @@ async fn pumpswap_sell_v2_simulates() {
                 buyback_fee_recipient: &buyback,
             },
         ));
-        if sim_skeleton_green(&rpc, &user, ixs, "PUMPSWAP-SELL-V2").await {
+        if common::sim_skeleton_green(&rpc, &user, ixs, "PUMPSWAP-SELL-V2").await {
             green = true;
         } else {
             failures.push(format!("pool {pool}: transport trouble; resampled"));

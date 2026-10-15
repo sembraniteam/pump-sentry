@@ -770,24 +770,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             self.exec.stash_deferred_pnl(&tick.mint, closed_pnls).await;
             return false;
         }
-        self.recheck_live_pending().await;
-        if self
-            .portfolio
-            .lock()
-            .await
-            .positions_for_mint(&tick.mint)
-            .is_empty()
-        {
-            self.exec.clear_diverged(&tick.mint).await;
-            self.exec.clear_synthetic(&tick.mint).await;
-            // Settle deferred PnL only when no live exposure remains.
-            let live_held = self.exec.is_tracked(&tick.mint).await
-                || self.exec.manual_holds(&tick.mint).await;
-            if !live_held {
-                self.flush_deferred_pnl(&tick.mint).await;
-            }
-        }
-        self.maybe_unwatch(&tick).await;
+        self.settle_close_tail(&tick).await;
         true
     }
 }

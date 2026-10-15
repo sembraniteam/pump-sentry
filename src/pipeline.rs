@@ -15,7 +15,9 @@ use simulator::{ExitReason, Mark, PaperPortfolio};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams, escalated_tip};
+use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams};
+#[cfg(test)]
+use crate::live::escalated_tip;
 use crate::live_mirror::{LiveExecution, live_base_mint};
 use crate::follow::FollowState;
 pub use crate::gate::{DailyBreaker, GateState, SpecCounters};
@@ -87,11 +89,16 @@ impl ReserveFeed for CurveTicker {
     }
 }
 
-/// Live sink. Only used with `--live`.
-pub trait LiveSink {
+/// Live buy dispatch. Only used with `--live`.
+pub trait BuySink {
     /// Buy per params. Returns position plus bundle.
     async fn buy(&self, req: &LiveBuyParams<'_>) -> Result<(LivePosition, String), LiveError>;
+}
 
+/// Live sell dispatch: curve plus both pool venues. One trait (not
+/// three) because every venue shares the floor/guard contract and
+/// every caller handles all three arms together.
+pub trait SellSink {
     /// Sell a tracked position. `None` fee is standard.
     async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError>;
 
@@ -100,68 +107,70 @@ pub trait LiveSink {
 
     /// PumpSwap sell at a pool leg. Same contract as `sell`.
     async fn sell_pumpswap(&self, req: &PumpSwapSellParams<'_>) -> Result<String, LiveError>;
+}
 
-    /// Base Jito tip (live_sell escalates it by attempts).
-    fn base_tip_lamports(&self) -> u64;
-
-    /// Congestion-aware tip for an attempt. Default is pure
-    /// escalation (stubs have no oracle); live lifts to the floor.
-    async fn effective_tip(&self, failed_attempts: u32) -> u64 {
-        escalated_tip(self.base_tip_lamports(), failed_attempts)
-    }
-
+/// Unconfirmed-buy tracking plus the resend guard. Split from dispatch
+/// so stubs must state their pending semantics explicitly instead of
+/// inheriting silent no-ops.
+pub trait PendingStore {
     /// True when a buy awaits confirmation.
-    fn has_pending(&self) -> bool {
-        false
-    }
+    fn has_pending(&self) -> bool;
 
     /// Mints awaiting confirmation.
-    fn pending_mints(&self) -> Vec<String> {
-        Vec::new()
-    }
+    fn pending_mints(&self) -> Vec<String>;
 
     /// True when the last sell bundle for `mint` is still
     /// engine-pending: resends must wait, never compete with it.
-    /// Default proceeds (stubs have no bundle client).
-    async fn prior_sell_pending(&self, _mint: &str) -> bool {
-        false
-    }
-
-    /// Per-dispatch overhead in lamports.
-    fn dispatch_cost_lamports(&self) -> u64 {
-        0
-    }
-
-    /// Overhead at an explicit tip (escalated retries debit actuals).
-    fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64 {
-        tip_lamports
-    }
-
-    /// First-buy cost (dispatch plus rent). Debit on buys only.
-    fn first_touch_cost_lamports(&self) -> u64 {
-        self.dispatch_cost_lamports()
-    }
-
-    /// Record a fill (call AFTER tracking).
-    fn acknowledge_buy(&self, _position: &LivePosition, _bundle_id: &str) {}
-
-    /// Record a manual bag (call BEFORE parking).
-    fn record_manual(&self, _position: &LivePosition, _note: &str) {}
-
-    /// Record a sell (call BEFORE subtracting).
-    fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {}
+    async fn prior_sell_pending(&self, mint: &str) -> bool;
 
     /// Re-poll pending buys once.
-    async fn recheck_pending(&self) -> Vec<PendingRecheck> {
-        Vec::new()
-    }
+    async fn recheck_pending(&self) -> Vec<PendingRecheck>;
 }
 
-impl LiveSink for LiveTrader {
+/// Tip escalation plus dispatch cost accounting. Live lifts tips to
+/// the oracle floor; stubs escalate purely. Only the composite
+/// queries live here (`effective_tip`, `dispatch_cost_for_tip`,
+/// `first_touch_cost_lamports`) — the pieces they are built from are
+/// inherent methods on each type, not trait surface.
+pub trait CostLedger {
+    /// Congestion-aware tip for an attempt.
+    async fn effective_tip(&self, failed_attempts: u32) -> u64;
+
+    /// Overhead at an explicit tip (escalated retries debit actuals).
+    fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64;
+
+    /// First-buy cost (dispatch plus rent). Debit on buys only.
+    fn first_touch_cost_lamports(&self) -> u64;
+}
+
+/// Custody event log. Prod writes WAL-first; stubs record calls for
+/// assertions. No defaults anywhere: every implementor states each
+/// behavior, so a new method forces every stub to decide.
+pub trait WalSink {
+    /// Record a fill (call AFTER tracking).
+    fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str);
+
+    /// Record a manual bag (call BEFORE parking).
+    fn record_manual(&self, position: &LivePosition, note: &str);
+
+    /// Record a sell (call BEFORE subtracting).
+    fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str);
+}
+
+/// Umbrella bound for the full live contract. New code depends on the
+/// focused traits; this alias only keeps the six `L: ...` sites below
+/// readable. Blanket-implemented, never implemented by hand.
+pub trait LiveSink: BuySink + SellSink + PendingStore + CostLedger + WalSink {}
+
+impl<T: BuySink + SellSink + PendingStore + CostLedger + WalSink> LiveSink for T {}
+
+impl BuySink for LiveTrader {
     async fn buy(&self, req: &LiveBuyParams<'_>) -> Result<(LivePosition, String), LiveError> {
         self.buy(req).await
     }
+}
 
+impl SellSink for LiveTrader {
     async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
         self.sell(req).await
     }
@@ -173,15 +182,9 @@ impl LiveSink for LiveTrader {
     async fn sell_pumpswap(&self, req: &PumpSwapSellParams<'_>) -> Result<String, LiveError> {
         self.sell_pumpswap(req).await
     }
+}
 
-    fn base_tip_lamports(&self) -> u64 {
-        self.base_tip()
-    }
-
-    async fn effective_tip(&self, failed_attempts: u32) -> u64 {
-        self.effective_tip(failed_attempts).await
-    }
-
+impl PendingStore for LiveTrader {
     fn has_pending(&self) -> bool {
         self.has_pending()
     }
@@ -194,8 +197,14 @@ impl LiveSink for LiveTrader {
         self.prior_sell_pending(mint).await
     }
 
-    fn dispatch_cost_lamports(&self) -> u64 {
-        self.dispatch_cost_lamports()
+    async fn recheck_pending(&self) -> Vec<PendingRecheck> {
+        self.recheck_pending().await
+    }
+}
+
+impl CostLedger for LiveTrader {
+    async fn effective_tip(&self, failed_attempts: u32) -> u64 {
+        self.effective_tip(failed_attempts).await
     }
 
     fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64 {
@@ -205,7 +214,9 @@ impl LiveSink for LiveTrader {
     fn first_touch_cost_lamports(&self) -> u64 {
         self.first_touch_cost_lamports()
     }
+}
 
+impl WalSink for LiveTrader {
     fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
         self.acknowledge_buy(position, bundle_id)
     }
@@ -216,10 +227,6 @@ impl LiveSink for LiveTrader {
 
     fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
         self.record_sell(mint, amount_tokens, bundle_id)
-    }
-
-    async fn recheck_pending(&self) -> Vec<PendingRecheck> {
-        self.recheck_pending().await
     }
 }
 
@@ -234,17 +241,32 @@ impl AlertSink for Alerter {
     }
 }
 
+/// Curve read outcome. `Truncated` carries no data on purpose:
+/// partial views must never reach quorum math.
+#[derive(Debug, Clone)]
+pub enum CurveRead {
+    /// Full window: swaps plus the newest watermark.
+    Full {
+        swaps: Vec<SwapRecord>,
+        watermark: Option<String>,
+    },
+    /// Partial view (indexing/transport cut). Hold, never confirm.
+    Truncated,
+}
+
 /// Screening source.
 pub trait Screener {
     /// Dev verdict; `Err` skips fail-closed.
     async fn screen_dev(&self, dev: &str) -> Result<DevVerdict, ScreenError>;
-    /// Swaps since `since_sig`, plus watermark and truncated flag.
+    /// Swaps since `since_sig`, plus watermark. A truncated view must
+    /// never confirm — a variant, not a flag, so new consumers cannot
+    /// miss it.
     async fn observe_curve(
         &self,
         mint: &str,
         curve: &str,
         since_sig: Option<&str>,
-    ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError>;
+    ) -> Result<CurveRead, ScreenError>;
     /// Bundle forensics; `Err` drops fail-closed.
     async fn screen_bundle(
         &self,
@@ -270,9 +292,14 @@ impl Screener for RpcScreener {
         _mint: &str,
         curve: &str,
         since_sig: Option<&str>,
-    ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError> {
+    ) -> Result<CurveRead, ScreenError> {
         let curve = listener::parse_address(curve)?;
-        self.curve_swaps(&curve, since_sig).await
+        let (swaps, watermark, truncated) = self.curve_swaps(&curve, since_sig).await?;
+        Ok(if truncated {
+            CurveRead::Truncated
+        } else {
+            CurveRead::Full { swaps, watermark }
+        })
     }
 
     async fn screen_bundle(
@@ -479,6 +506,33 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
+    /// Shared close tail: recheck pendings, clear custody marks when
+    /// no paper position remains, settle deferred PnL once live is
+    /// clear, then unwatch. Both the tick path and manual sell run it
+    /// after the live leg settles; unsettled paths return before it.
+    pub(crate) async fn settle_close_tail(&self, tick: &PriceTick) {
+        // Recheck before unwatch.
+        self.recheck_live_pending().await;
+        if self
+            .portfolio
+            .lock()
+            .await
+            .positions_for_mint(&tick.mint)
+            .is_empty()
+        {
+            self.exec.clear_diverged(&tick.mint).await;
+            self.exec.clear_synthetic(&tick.mint).await;
+            // Settle deferred PnL only when no live exposure remains.
+            let live_held = self.exec.is_tracked(&tick.mint).await
+                || self.exec.manual_holds(&tick.mint).await;
+            if !live_held {
+                self.flush_deferred_pnl(&tick.mint).await;
+            }
+        }
+        // Shared tail under fresh locks.
+        self.maybe_unwatch(tick).await;
+    }
+
     /// Per-mint mutex, created on first use.
     pub(crate) async fn lock_for(
         map: &Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -679,26 +733,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(mint = %tick.mint, "paper closed but live still holds; breaker PnL deferred until live settles");
             self.exec.stash_deferred_pnl(&tick.mint, closed_pnls).await;
         }
-        // Recheck before unwatch.
-        self.recheck_live_pending().await;
-        if self
-            .portfolio
-            .lock()
-            .await
-            .positions_for_mint(&tick.mint)
-            .is_empty()
-        {
-            self.exec.clear_diverged(&tick.mint).await;
-            self.exec.clear_synthetic(&tick.mint).await;
-            // Settle deferred only when live is clear.
-            let live_held = self.exec.is_tracked(&tick.mint).await
-                || self.exec.manual_holds(&tick.mint).await;
-            if !live_held {
-                self.flush_deferred_pnl(&tick.mint).await;
-            }
-        }
-        // Shared tail under fresh locks.
-        self.maybe_unwatch(tick).await;
+        self.settle_close_tail(tick).await;
     }
 
 
@@ -852,7 +887,7 @@ mod tests {
         }
     }
 
-    impl LiveSink for StubLive {
+    impl BuySink for StubLive {
         async fn buy(&self, req: &LiveBuyParams<'_>) -> Result<(LivePosition, String), LiveError> {
             let mint = req.mint;
             let curve = req.curve;
@@ -882,7 +917,9 @@ mod tests {
                 "bundle-stub".to_string(),
             ))
         }
+    }
 
+    impl SellSink for StubLive {
         async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
             let position = req.position;
             if self
@@ -987,10 +1024,53 @@ mod tests {
                 .push(req.tip_lamports);
             Ok("bundle-stub-pumpswap".to_string())
         }
+    }
 
-        fn base_tip_lamports(&self) -> u64 {
-            self.inner.tip_lamports
+    impl PendingStore for StubLive {
+        // No unconfirmed-buy tracking: stub dispatches settle
+        // synchronously, so every pending query is visibly empty
+        // (previously inherited silent defaults).
+        fn has_pending(&self) -> bool {
+            false
         }
+
+        fn pending_mints(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn prior_sell_pending(&self, _mint: &str) -> bool {
+            false
+        }
+
+        async fn recheck_pending(&self) -> Vec<PendingRecheck> {
+            Vec::new()
+        }
+    }
+
+    impl CostLedger for StubLive {
+        // Pure escalation (no oracle floor): the stub states its
+        // ledger semantics explicitly instead of inheriting them.
+        async fn effective_tip(&self, failed_attempts: u32) -> u64 {
+            escalated_tip(self.inner.tip_lamports, failed_attempts)
+        }
+
+        fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64 {
+            tip_lamports
+        }
+
+        // Stub ledgers book no costs (matches the old composed zero).
+        fn first_touch_cost_lamports(&self) -> u64 {
+            0
+        }
+    }
+
+    impl WalSink for StubLive {
+        // No durability: stub custody lives in test memory.
+        fn acknowledge_buy(&self, _position: &LivePosition, _bundle_id: &str) {}
+
+        fn record_manual(&self, _position: &LivePosition, _note: &str) {}
+
+        fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {}
     }
 
     /// Canned reserve feed with watch tracking.
@@ -1232,7 +1312,7 @@ mod tests {
             mint: &str,
             _curve: &str,
             _since_sig: Option<&str>,
-        ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ScreenError> {
+        ) -> Result<CurveRead, ScreenError> {
             let swaps = self
                 .inner
                 .swaps
@@ -1245,7 +1325,14 @@ mod tests {
                 .inner
                 .truncated
                 .load(std::sync::atomic::Ordering::Relaxed);
-            Ok((swaps, Some("sig-stub".to_string()), truncated))
+            Ok(if truncated {
+                CurveRead::Truncated
+            } else {
+                CurveRead::Full {
+                    swaps,
+                    watermark: Some("sig-stub".to_string()),
+                }
+            })
         }
 
         async fn screen_bundle(
@@ -1665,8 +1752,7 @@ mod tests {
         // instead of stalling the gate forever.
         {
             let mut state = pipe.gate_state.lock().await;
-            state.poll_busy = true;
-            state.poll_started_secs = 0;
+            state.poll = Some(0);
         }
         assert!(pipe.try_begin_poll().await);
         pipe.end_poll().await;
@@ -2161,8 +2247,10 @@ mod tests {
         // expire via the idle sweep instead of watching forever.
         let followed = pipe.followed.lock().await;
         let state = followed.get(&mint).expect("follow seeded");
-        assert!(state.entry_price.is_nan(), "baseline set on first tick");
-        assert!(!state.alerted_spike);
+        assert!(
+            matches!(state.stage, crate::follow::FollowStage::Seeding),
+            "baseline set on first tick"
+        );
     }
 
     #[tokio::test]
@@ -2748,7 +2836,7 @@ mod tests {
     async fn live_sell_routes_raydium_when_pool_known() {
         // Same close, but a validated pool leg is stored: the exit must
         // take the Raydium leg (curve leg untouched) with the pool's amm.
-        use crate::follow::FollowState;
+        use crate::follow::{FollowStage, FollowState};
         let live = StubLive::working();
         let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
         let reserves = StubReserves::with_tick(tick("MINT", 2.0));
@@ -2766,8 +2854,7 @@ mod tests {
         pipe.followed.lock().await.insert(
             "MINT".to_string(),
             FollowState {
-                entry_price: 2.0,
-                alerted_spike: false,
+                stage: FollowStage::Watching { entry_price: 2.0 },
                 last_seen_secs: now_secs(),
                 pool: Some(PoolLeg {
                     mint: "MINT".to_string(),
@@ -2792,7 +2879,7 @@ mod tests {
     async fn live_sell_routes_pumpswap_when_pool_known() {
         // Same close, but the leg is a PumpSwap pool: the exit must
         // take the PumpSwap leg (curve and Raydium legs untouched).
-        use crate::follow::FollowState;
+        use crate::follow::{FollowStage, FollowState};
         let live = StubLive::working();
         let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
         let reserves = StubReserves::with_tick(tick("MINT", 2.0));
@@ -2810,8 +2897,7 @@ mod tests {
         pipe.followed.lock().await.insert(
             "MINT".to_string(),
             FollowState {
-                entry_price: 2.0,
-                alerted_spike: false,
+                stage: FollowStage::Watching { entry_price: 2.0 },
                 last_seen_secs: now_secs(),
                 pool: Some(PoolLeg {
                     mint: "MINT".to_string(),

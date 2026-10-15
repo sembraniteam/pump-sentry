@@ -17,14 +17,27 @@ pub const POOL_TICK_STALE_SECS: u64 = 300;
 /// Pool watch entry with exit leg. Dies on idle sweep.
 #[derive(Debug, Clone)]
 pub struct FollowState {
-    /// First pool-tick price.
-    pub entry_price: f64,
-    /// Spike card fired.
-    pub alerted_spike: bool,
+    /// Lifecycle stage (baseline seeding → watching → alerted).
+    pub stage: FollowStage,
     /// Last tick time (unix secs).
     pub last_seen_secs: u64,
     /// Pool leg (`None` when unresolvable).
     pub pool: Option<crate::live::PoolLeg>,
+}
+
+/// Follow lifecycle. Replaces the old NaN-price + alerted-bool pair:
+/// two encodings for one fact, and NaN silently poisons every
+/// comparison it touches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FollowStage {
+    /// No baseline yet; the first tick seeds it (never alerts).
+    Seeding,
+    /// Baseline set; the 2x card fires at `entry_price * MULT`.
+    Watching {
+        entry_price: f64,
+    },
+    /// Spike card fired; the leg is retained only for live exits.
+    Alerted,
 }
 
 /// Idle-follow TTL (a day).
@@ -132,8 +145,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 state.last_seen_secs = now_secs();
             })
             .or_insert(FollowState {
-                entry_price: f64::NAN,
-                alerted_spike: false,
+                stage: FollowStage::Seeding,
                 last_seen_secs: now_secs(),
                 pool,
             });
@@ -144,7 +156,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// poll loop on a timer). `on_pool_tick` also sweeps, but a fully
     /// idle ticker would otherwise leak `followed` + vault subs to restart.
     pub async fn sweep_idle(&self) -> Vec<String> {
-        let now = now_secs();
+        self.evict_idle_follows(now_secs()).await
+    }
+
+    /// Idle follows past TTL without live custody, evicted (unwatch +
+    /// map remove). Candidates collected under a short guard; custody
+    /// checks await after it drops (never hold a lock across await).
+    /// Skips mints with live custody: evicting a held bag's leg strands
+    /// its exit to manual.
+    async fn evict_idle_follows(&self, now: u64) -> Vec<String> {
         let candidates: Vec<String> = {
             let followed = self.followed.lock().await;
             followed
@@ -187,58 +207,32 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         }
         let now = now_secs();
-        // Evict idle follows first. Candidates collected under a short
-        // guard; custody checks await after it drops (never hold a lock
-        // across await). Skips mints with live custody: evicting a held
-        // bag's leg strands its Raydium exit to manual.
-        let candidates: Vec<String> = {
-            let followed = self.followed.lock().await;
-            followed
-                .iter()
-                .filter(|(_, state)| now.saturating_sub(state.last_seen_secs) > FOLLOW_TTL_SECS)
-                .map(|(mint, _)| mint.clone())
-                .collect()
-        };
-        let mut stale = Vec::new();
-        for mint in candidates {
-            // Same custody rule as the spike path: any tracked, parked,
-            // or pending bag keeps its leg.
-            let held = match &self.exec.live {
-                Some(trader) => self.is_live_tracked(trader, &mint).await,
-                None => false,
-            };
-            if !held {
-                stale.push(mint);
-            }
-        }
-        for mint in &stale {
-            self.vaults.unwatch(mint).await;
-        }
-        if !stale.is_empty() {
-            let mut followed = self.followed.lock().await;
-            for mint in &stale {
-                followed.remove(mint);
-            }
-        }
+        // Evict idle follows first. Skips mints with live custody:
+        // evicting a held bag's leg strands its Raydium exit to manual.
+        // Same custody rule as the spike path: any tracked, parked,
+        // or pending bag keeps its leg.
+        let _ = self.evict_idle_follows(now).await;
         let mut followed = self.followed.lock().await;
         let state = followed.entry(tick.mint.clone()).or_insert(FollowState {
-            entry_price: tick.price_usd,
-            alerted_spike: false,
+            stage: FollowStage::Seeding,
             last_seen_secs: now,
             // Ticks never create pool legs.
             pool: None,
         });
         state.last_seen_secs = now;
-        if state.alerted_spike {
-            return;
-        }
-        // First print seeds baseline, never alerts.
-        if state.entry_price.is_nan() {
-            state.entry_price = tick.price_usd;
-            return;
-        }
-        if tick.price_usd >= state.entry_price * FOLLOW_SPIKE_MULT {
-            state.alerted_spike = true;
+        let entry_price = match state.stage {
+            // First print seeds baseline, never alerts.
+            FollowStage::Seeding => {
+                state.stage = FollowStage::Watching {
+                    entry_price: tick.price_usd,
+                };
+                return;
+            }
+            FollowStage::Alerted => return,
+            FollowStage::Watching { entry_price } => entry_price,
+        };
+        if tick.price_usd >= entry_price * FOLLOW_SPIKE_MULT {
+            state.stage = FollowStage::Alerted;
             let mint = tick.mint.clone();
             drop(followed);
             info!(mint = %mint, multiple = FOLLOW_SPIKE_MULT, price = tick.price_usd, "post-migration spike");
@@ -270,7 +264,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .lock()
             .await
             .get(mint)
-            .is_some_and(|state| state.alerted_spike);
+            .is_some_and(|state| matches!(state.stage, FollowStage::Alerted));
         if !alerted {
             return;
         }

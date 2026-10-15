@@ -23,6 +23,8 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
+mod common;
+
 /// Live probe: dummy bundle acceptance on mainnet block engine.
 #[tokio::test]
 #[ignore]
@@ -44,9 +46,7 @@ async fn mainnet_bundle_acceptance() {
     assert_eq!(ix.data.len(), 12);
 
     // 3. Fresh blockhash (free read-only RPC) + local signing (free).
-    let rpc = solana_client::nonblocking::rpc_client::RpcClient::new(
-        "https://api.mainnet-beta.solana.com".to_string(),
-    );
+    let rpc = common::rpc_client();
     let blockhash = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         rpc.get_latest_blockhash(),
