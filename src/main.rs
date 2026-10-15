@@ -202,6 +202,11 @@ async fn run_pipeline(live_arg: bool) {
         }
     };
     let settings = Settings::from_file(table.as_ref());
+    // Scrub the bearer token from the process environment now that
+    // Settings owns a copy: same rule as the trading keypair — secrets
+    // live in guarded memory, not in `/proc` environ or later children.
+    // (Test-only: tests set their own maps and never rely on this.)
+    unsafe { std::env::remove_var("INFERENCE_API_KEY") };
 
     if CurveTicker::parse_commitment(&settings.commitment).is_none() {
         eprintln!("bad COMMITMENT: {}", settings.commitment);

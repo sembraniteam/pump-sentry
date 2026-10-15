@@ -10,7 +10,7 @@ pub const DEFAULT_JITO_ENDPOINT: &str = "https://mainnet.block-engine.jito.wtf";
 /// Default local chat-completions endpoint (override via `INFERENCE_ENDPOINT`).
 pub const DEFAULT_INFERENCE_ENDPOINT: &str = "http://127.0.0.1:11434/v1/chat/completions";
 
-/// Runtime knobs, all overridable via env.
+/// Runtime knobs, all tunable via config.toml (secrets stay in env).
 #[derive(Clone)]
 pub struct Settings {
     pub ws_url: String,
@@ -254,6 +254,11 @@ impl Settings {
                 "STRATEGY_MODE='{}' unknown; falling back to adaptive",
                 self.strategy_mode
             ));
+        }
+        if self.inference_api_key.is_some() && is_plain_http_remote(&self.inference_endpoint) {
+            out.push(
+                "INFERENCE_API_KEY is set with a non-local plain-http INFERENCE_ENDPOINT: the bearer token travels in cleartext — use https or keep inference on localhost".to_string(),
+            );
         }
         if !self.runner_moonbag_percent.is_finite()
             || self.runner_moonbag_percent < 0.0
@@ -543,6 +548,27 @@ pub fn redact_url_query(url: &str) -> &str {
     }
 }
 
+/// True for plain-http endpoints outside localhost: bearer tokens
+/// sent there travel in cleartext. Local servers are exempt.
+fn is_plain_http_remote(endpoint: &str) -> bool {
+    let rest = match endpoint.trim().strip_prefix("http://") {
+        Some(r) => r,
+        None => return false,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip a port (`127.0.0.1:11434`); bracketed IPv6 keeps its
+    // colons (`[::1]:11434`).
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !(host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1")
+}
+
 /// Unix seconds; `0` when the clock fails (never panics).
 pub fn now_secs() -> u64 {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -713,6 +739,32 @@ mod tests {
         assert_eq!(s.slippage_vol_window_secs, 60);
         assert_eq!(s.slippage_vol_extra_cap_bps, 150);
         assert!(!s.warnings().iter().any(|w| w.contains("SLIPPAGE_VOL")));
+    }
+
+    #[test]
+    fn bearer_over_plain_http_warns() {
+        // No key set: nothing to leak, no warning.
+        let s = Settings::from_map(&vars(&[("INFERENCE_ENDPOINT", "http://llm.example/v1")]));
+        assert!(!s.warnings().iter().any(|w| w.contains("cleartext")));
+        // Key + remote plain http: warn.
+        let s = Settings::from_map(&vars(&[
+            ("INFERENCE_ENDPOINT", "http://llm.example/v1"),
+            ("INFERENCE_API_KEY", "k"),
+        ]));
+        assert!(s.warnings().iter().any(|w| w.contains("cleartext")));
+        // Key + https or localhost: silent.
+        let mut https = s.clone();
+        https.inference_endpoint = "https://llm.example/v1".to_string();
+        assert!(!https.warnings().iter().any(|w| w.contains("cleartext")));
+        for local in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:11434/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            let mut ep = s.clone();
+            ep.inference_endpoint = local.to_string();
+            assert!(!ep.warnings().iter().any(|w| w.contains("cleartext")), "{local}");
+        }
     }
 
     #[test]

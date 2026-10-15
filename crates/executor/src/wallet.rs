@@ -47,11 +47,18 @@ pub struct WalletGuard {
 
 impl WalletGuard {
     /// Load from `SOLANA_PRIVATE_KEY` (trims whitespace, zeroizes).
+    /// On success the variable is scrubbed from the process
+    /// environment: the keypair lives only in guarded memory
+    /// afterwards, not in `/proc` environ, core dumps, or children
+    /// spawned later. A second load fails loudly (`MissingKeyEnv`) —
+    /// that is the guarantee working, not a bug.
     pub fn load_from_env() -> Result<Self, WalletGuardError> {
         let key_str = Zeroizing::new(
             env::var("SOLANA_PRIVATE_KEY").map_err(|_| WalletGuardError::MissingKeyEnv)?,
         );
-        Self::from_base58(key_str.trim())
+        let loaded = Self::from_base58(key_str.trim())?;
+        unsafe { env::remove_var("SOLANA_PRIVATE_KEY") };
+        Ok(loaded)
     }
 
     /// Build from base58: 64-byte secret or 32-byte seed.
@@ -181,6 +188,8 @@ mod tests {
         };
         let loaded = WalletGuard::load_from_env().expect("load");
         assert_eq!(loaded.pubkey(), keypair.pubkey());
+        // Post-load scrub: the variable is gone afterwards.
+        assert!(env::var("SOLANA_PRIVATE_KEY").is_err());
         match saved {
             Some(v) => unsafe { env::set_var("SOLANA_PRIVATE_KEY", v) },
             None => unsafe { env::remove_var("SOLANA_PRIVATE_KEY") },

@@ -105,3 +105,22 @@ week, not before): `ALERT_DIVERGED_WARN_N=3`,
 `ALERT_RISK_FALLBACK_WARN_PCT=50`, `ALERT_GIVEUP_BURST_N=3`.
 A week with fallback/429 nominal and no burst is the exit criterion
 for the burn-in gate.
+
+## 9. Secrets handling (read once, follow always)
+
+Three secrets exist: `SOLANA_PRIVATE_KEY` (moves money), `INFERENCE_API_KEY` (bills your LLM account),
+and the `?api-key=` inside RPC URLs (bills your RPC account). What the bot guarantees and what you must do:
+
+**Bot guarantees (coded + tested):**
+- Secrets enter via env only, never via `config.toml` (no file mapping exists — a test fails the build if one is added).
+- Trading keypair buffers are zeroized; both secrets are scrubbed from process env right after load (no `/proc` environ, no core-dump, no inheritance by later children).
+- Secrets never reach logs: bearer redacted, URL queries stripped, keypair has no `Debug`. Error paths (`BadSecret`, decode failures) carry lengths/reasons, never key material.
+
+**Operator rules (the bot cannot do these for you):**
+- Never `export SECRET=...` inline — it lands in shell history. Use `read -s SOLANA_PRIVATE_KEY` (then `export`), a `0600` env file sourced per session, or the OS keychain.
+- Scope RPC keys per use (bot vs personal), with IP allowlists where Helius offers them. A key pasted into `config.toml` makes that file a secret: keep `~/.pump-sentry/` `0700` (new config files are `0600` from birth).
+- Keep inference on localhost; a remote plain-http endpoint with a key set raises a `cleartext` boot warning — treat it as a finding, not noise.
+
+**Rotation (do in this order):**
+1. RPC/inference keys: mint a new key at the provider, swap env, restart, delete the old key. No funds move — 5 minutes.
+2. Trading keypair (suspected leak): generate a new keypair OFFLINE, fund it per §2, point `SOLANA_PRIVATE_KEY` at it, `sell <every-tracked-mint>` the old bags or transfer out, then drain the old wallet to the new one and abandon it. Never reuse a leaked keypair "after cleanup" — rotation means replacement.
