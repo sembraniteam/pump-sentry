@@ -5,7 +5,7 @@ moves real SOL: do every item in order, skip nothing.
 
 ## 1. Pre-flight checklist (boot refuses without these)
 
-Tunables live in `~/.pump-sentry/config.toml` by category (auto-created; env overrides per key, secrets env-only) — the checklist below names the effective values whatever their source.
+Tunables live in `~/.pump-sentry/config.toml` by category (auto-created; the file is the only source — env is not read for tunables, secrets stay env-only) — the checklist below names the effective values whatever their source.
 
 - [ ] `MAX_DAILY_LOSS_USD>0` — day-loss breaker (exits always work).
 - [ ] `SIM_STRICT=true` — unproven sims refuse instead of warn-and-proceed.

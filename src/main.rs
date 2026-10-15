@@ -180,10 +180,11 @@ async fn run_pipeline(live_arg: bool) {
         });
     }
 
-    // Layered config: categorized config.toml under environment.
-    // The file is auto-created (template with every tunable); a
-    // missing file simply means env/defaults rule. Parse errors are
-    // fatal — a typo'd value must never silently become a default.
+    // File config: categorized config.toml is the only source for
+    // tunables (INFERENCE_API_KEY stays env-only). The file is
+    // auto-created (template with every tunable); a missing file
+    // simply means defaults rule. Parse errors are fatal — a typo'd
+    // value must never silently become a default.
     let config_path = config::resolve_config_path();
     match config::ensure_config_file(&config_path) {
         Ok(true) => println!("wrote default config to {}", config_path.display()),
@@ -200,7 +201,7 @@ async fn run_pipeline(live_arg: bool) {
             std::process::exit(1);
         }
     };
-    let settings = Settings::from_layered(table.as_ref(), &std::env::vars().collect());
+    let settings = Settings::from_file(table.as_ref());
 
     if CurveTicker::parse_commitment(&settings.commitment).is_none() {
         eprintln!("bad COMMITMENT: {}", settings.commitment);

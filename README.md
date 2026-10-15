@@ -30,11 +30,11 @@ Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fe
 ## Config
 
 `~/.pump-sentry/config.toml` (auto-created on first start; `pump-sentry init-config`, `CONFIG_FILE` overrides the path), grouped by category.
-Precedence: **built-in defaults < config.toml < environment** — every file key lists its env override in a comment.
+This file is the **only source for tunables** — environment variables are not read for them.
 Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env and are never read from the file.
 | Env                                                                     | Default                       | Meaning                                                                                      |
 |-------------------------------------------------------------------------|-------------------------------|----------------------------------------------------------------------------------------------|
-| Category   | Keys (TOML → env)                                                                                                                  | Defaults                          |
+| Category   | Keys                                                                                                                             | Defaults                          |
 |------------|------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------|
 | `network`  | `mainnet_rpc_url`, `mainnet_wss_rpc_url`, `commitment`, `tick_interval_ms`, `vault_tick_interval_ms`                               | public RPC / `confirmed` / `1000` / `5000` |
 | `trading`  | `start_balance`, `fee_bps`, `notional_usd`, `max_open_positions`, `mint_cooldown_secs`, `max_daily_loss_usd`, `quote_usd`*, `liquidity_usd` | `100` / `0` / `10` / `3` / `3600` / `0` (off) / unset / `0` |

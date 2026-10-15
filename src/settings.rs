@@ -163,13 +163,15 @@ impl std::fmt::Debug for Settings {
 }
 
 impl Settings {
-    /// Layered read: `config.toml` table under environment. Env wins
-    /// per key; file typos surface as warnings, never silent defaults.
-    pub fn from_layered(
-        file: Option<&toml::Table>,
-        env: &std::collections::HashMap<String, String>,
-    ) -> Self {
-        let (merged, mut file_notes) = crate::config::overlay(file, env);
+    /// Read from the config file table. The file is the only source
+    /// for tunables; `INFERENCE_API_KEY` is the single env exception
+    /// (secret, never in the file). File typos surface as warnings,
+    /// never silent defaults.
+    pub fn from_file(file: Option<&toml::Table>) -> Self {
+        let (mut merged, mut file_notes) = crate::config::overlay(file);
+        if let Ok(key) = std::env::var("INFERENCE_API_KEY") {
+            merged.insert("INFERENCE_API_KEY".to_string(), key);
+        }
         let mut settings = Self::from_map(&merged);
         // File notes first: they name the source of a value.
         file_notes.append(&mut settings.parse_notes);
@@ -722,20 +724,36 @@ mod tests {
     }
 
     #[test]
-    fn layered_file_under_env_with_notes() {
+    fn file_is_the_only_source_for_tunables() {
         let file: toml::Table = "[trading]\nnotional_usd = 42.0\n[gate]\ngate_window_sec = 5\n"
             .parse()
             .expect("test toml");
-        // File rules when env is silent.
-        let s = Settings::from_layered(Some(&file), &HashMap::new());
+        let s = Settings::from_file(Some(&file));
         assert_eq!(s.notional_usd, 42.0);
         assert!(s.warnings().iter().any(|w| w.contains("[gate].gate_window_sec unknown")), "{:?}", s.warnings());
-        // Env wins per key; other file keys still apply.
-        let s = Settings::from_layered(Some(&file), &vars(&[("NOTIONAL_USD", "7.5")]));
-        assert_eq!(s.notional_usd, 7.5);
-        // No file: pure env behavior, unchanged.
-        let s = Settings::from_layered(None, &vars(&[("NOTIONAL_USD", "9.0")]));
-        assert_eq!(s.notional_usd, 9.0);
+        // No file: pure defaults.
+        let s = Settings::from_file(None);
+        assert_eq!(s.notional_usd, 10.0);
+    }
+
+    #[test]
+    fn inference_key_stays_env_only() {
+        // The single sanctioned env exception: a bearer token must
+        // never sit in the config file.
+        let file: toml::Table = "[risk]\n".parse().expect("test toml");
+        let saved = std::env::var("INFERENCE_API_KEY").ok();
+        unsafe { std::env::set_var("INFERENCE_API_KEY", "test-secret") };
+        let s = Settings::from_file(Some(&file));
+        assert_eq!(s.inference_api_key.as_deref(), Some("test-secret"));
+        match saved {
+            Some(v) => unsafe { std::env::set_var("INFERENCE_API_KEY", v) },
+            None => unsafe { std::env::remove_var("INFERENCE_API_KEY") },
+        }
+        // ... and the file cannot provide it (no such key exists).
+        assert!(
+            !crate::config::KEYMAP.iter().any(|(_, _, flat)| *flat == "INFERENCE_API_KEY"),
+            "inference key must never gain a file mapping"
+        );
     }
 
     #[test]
