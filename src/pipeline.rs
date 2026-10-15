@@ -22,6 +22,8 @@ use crate::live_mirror::{LiveExecution, live_base_mint};
 use crate::follow::FollowState;
 pub use crate::gate::{DailyBreaker, GateState, SpecCounters};
 #[cfg(test)]
+pub use crate::gate::LaunchRequest;
+#[cfg(test)]
 pub(crate) use crate::gate::{dev_reputation_score, fee_aware_sl_floor, resolve_entry_with_flag};
 #[cfg(test)]
 pub(crate) use listener::BundleVerdict;
@@ -1446,8 +1448,17 @@ mod tests {
             None,
             spec_engine(),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         // Force a stale snapshot (window 0): re-audit overlaps the bet,
         // scores agree, the spawned decision is used.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -1480,8 +1491,17 @@ mod tests {
             None,
             spec_engine(),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         pipe.poll_gates().await;
         // Drifted score aborts the bet; the serial decision still opens
@@ -1506,8 +1526,17 @@ mod tests {
             None,
             spec_engine(),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
         assert_eq!(pipe.spec_counters.hit.load(Ordering::Relaxed), 0);
@@ -1649,8 +1678,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
 
         // Signal accepted, but no position until buyer quorum confirms.
         assert_eq!(pipe.pending_count().await, 1);
@@ -1673,8 +1711,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert_eq!(pipe.pending_count().await, 1);
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         let state = pipe.gate_state.lock().await;
@@ -1695,8 +1742,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert_eq!(pipe.pending_count().await, 1);
         // Age the attempt past the retry throttle so this round re-polls.
         pipe.gate_state
@@ -1724,8 +1780,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert_eq!(pipe.pending_count().await, 1);
         pipe.poll_gates().await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -1878,7 +1943,17 @@ mod tests {
         );
         // Seed a blown day, then run the full confirm flow.
         pipe.daily.lock().await.record(-10.0, now_secs());
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000).await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
 
@@ -1910,8 +1985,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         // 3 buyers → scalp branch with widened TP/SL (40/-10), not 18/-4.
@@ -1943,8 +2027,17 @@ mod tests {
                 screener,
                 None,
             );
-            pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-                .await;
+            pipe.on_launch(&LaunchRequest {
+                mint: "MINT",
+                curve: "CURVE",
+                assoc_curve: "ASSOC",
+                dev: &dev_wallet(),
+                creator: None,
+                name: "TestToken",
+                symbol: "TEST",
+                slot: 5000,
+            })
+            .await;
             pipe.poll_gates().await;
             assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
             assert!(
@@ -2046,8 +2139,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert_eq!(pipe.pending_count().await, 1);
@@ -2066,8 +2168,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         let portfolio = pipe.portfolio.lock().await;
@@ -2090,8 +2201,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -2115,8 +2235,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -2134,8 +2263,17 @@ mod tests {
             StubScreener::passing(),
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert_eq!(pipe.pending_count().await, 1);
         pipe.poll_gates().await;
 
@@ -2155,8 +2293,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -2176,8 +2323,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         // Paper opens (tightened risk = no real funds), live stays quiet.
@@ -2198,8 +2354,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -2389,8 +2554,17 @@ mod tests {
                 StubScreener::with_dev(dev),
                 None,
             );
-            pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-                .await;
+            pipe.on_launch(&LaunchRequest {
+                mint: "MINT",
+                curve: "CURVE",
+                assoc_curve: "ASSOC",
+                dev: &dev_wallet(),
+                creator: None,
+                name: "TestToken",
+                symbol: "TEST",
+                slot: 5000,
+            })
+            .await;
             assert!(pipe.portfolio.lock().await.position_ids().is_empty());
             assert_eq!(pipe.pending_count().await, 0);
         }
@@ -2409,8 +2583,17 @@ mod tests {
             StubScreener::rejecting(&creator),
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), Some(&creator), "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: Some(&creator),
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert_eq!(pipe.pending_count().await, 0);
     }
@@ -2431,8 +2614,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), Some(&creator), "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: Some(&creator),
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert_eq!(pipe.pending_count().await, 1);
         pipe.poll_gates().await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -2451,8 +2643,17 @@ mod tests {
             StubScreener::passing(),
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert_eq!(pipe.pending_count().await, 0);
         assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
@@ -2473,8 +2674,17 @@ mod tests {
             StubScreener::passing(),
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert_eq!(pipe.pending_count().await, 1);
         assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
@@ -2492,8 +2702,17 @@ mod tests {
             StubScreener::passing(),
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert_eq!(pipe.pending_count().await, 0);
         assert!(pipe.reserves.watched.lock().expect("lock").is_empty());
@@ -2510,8 +2729,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert_eq!(pipe.pending_count().await, 0);
@@ -2531,7 +2759,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000).await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
         assert_eq!(pipe.pending_count().await, 0);
@@ -2550,8 +2788,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         let portfolio = pipe.portfolio.lock().await;
         let id = portfolio.position_ids()[0];
@@ -2573,8 +2820,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         assert!(pipe.exec.synthetic_mints.lock().await.contains("MINT"));
         // +100% over the 3.0 override entry clears TP with real profit.
@@ -2598,8 +2854,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         // +50% over the 2.0 entry clears the 35% TP.
@@ -2630,8 +2895,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         pipe.on_tick(&tick("MINT", 2.1)).await;
@@ -2652,8 +2926,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("A", "CURVE_A", "ASSOC_A", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "A",
+            curve: "CURVE_A",
+            assoc_curve: "ASSOC_A",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         // Same portfolio, second mint opened directly at the same price.
         {
@@ -2736,8 +3019,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         let mut migrated = tick("MINT", 2.0);
@@ -2762,8 +3054,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         assert_eq!(
@@ -2796,8 +3097,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         // Paper record survives; nothing tracked for exits, but the
@@ -2821,8 +3131,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         pipe.on_tick(&tick("MINT", 3.0)).await;
 
@@ -2848,8 +3167,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         pipe.followed.lock().await.insert(
             "MINT".to_string(),
@@ -2891,8 +3219,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         pipe.followed.lock().await.insert(
             "MINT".to_string(),
@@ -2933,8 +3270,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
         // -7.7% gross: a gross-mark stop holds here, but the fill nets
@@ -3072,8 +3418,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         pipe.on_tick(&tick("MINT", 3.0)).await;
         assert!(pipe.exec.live_positions.lock().await.is_empty());
@@ -3093,8 +3448,17 @@ mod tests {
             None,
             Some(alerts.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         pipe.on_tick(&tick("MINT", 3.0)).await;
 
@@ -3122,8 +3486,17 @@ mod tests {
             Some(live),
             Some(alerts.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         pipe.on_tick(&tick("MINT", 3.0)).await;
 
@@ -3148,8 +3521,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         // +40% clears the clamped 35% TP: full exit, nothing rides.
         pipe.on_tick(&tick("MINT", 2.8)).await;
@@ -3174,8 +3556,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         // +40% clears TP 35: 80% out, 20% runner with trailing armed
         // and the 90s time-stop lifted (checked directly: position
@@ -3212,8 +3603,17 @@ mod tests {
             None,
             Some(alerts.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         // +70% clears the 60% TP: 80% out, 20% runner stays armed-off.
@@ -3264,8 +3664,17 @@ mod tests {
             Some(live.clone()),
             Some(alerts.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         // Tracked 1000 base units: TP sells 800, runner keeps 200 tracked.
@@ -3299,8 +3708,17 @@ mod tests {
             None,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         pipe.on_tick(&tick("MINT", 3.0)).await;
         assert_eq!(pipe.portfolio.lock().await.history().len(), 1);
@@ -3337,8 +3755,17 @@ mod tests {
                 )
                 .expect("open");
         }
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         let portfolio = pipe.portfolio.lock().await;
@@ -3384,8 +3811,17 @@ mod tests {
             screener,
             None,
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
 
         assert!(pipe.portfolio.lock().await.position_ids().is_empty());
@@ -3405,8 +3841,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         // First close attempt dispatches (and fails); immediate retries
         // are skipped by the cooldown.
@@ -3450,8 +3895,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         // Tick 1: TP closes paper, live sell fails transiently.
         pipe.on_tick(&tick("MINT", 3.0)).await;
@@ -3486,8 +3940,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         {
             let mut retry = pipe.exec.live_retry.lock().await;
@@ -3515,8 +3978,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         pipe.on_tick(&tick("MINT", 3.0)).await;
         assert!(live.sells().is_empty());
@@ -3622,8 +4094,17 @@ mod tests {
             screener,
             Some(live.clone()),
         );
-        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, "TestToken", "TEST", 5000)
-            .await;
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
         pipe.poll_gates().await;
         assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
         assert!(live.buys().is_empty());

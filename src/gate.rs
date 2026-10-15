@@ -103,6 +103,21 @@ pub(crate) fn fee_aware_sl_floor(sl_percent: f64, venue_fee_bps: f64) -> f64 {
 /// dropping signals under load would miss the exact trades we want).
 const WATCHLIST_WARN_SIZE: usize = 64;
 
+/// Launch identity for watchlist intake: everything `on_launch` needs
+/// in one value, mirroring `OpenRequest` below. Eight flat params
+/// tripped `too_many_arguments`; the struct is the honest fix.
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchRequest<'a> {
+    pub mint: &'a str,
+    pub curve: &'a str,
+    pub assoc_curve: &'a str,
+    pub dev: &'a str,
+    pub creator: Option<&'a str>,
+    pub name: &'a str,
+    pub symbol: &'a str,
+    pub slot: u64,
+}
+
 /// Confirm-open request: gate signal plus quorum.
 #[derive(Debug, Clone, Copy)]
 struct OpenRequest<'a> {
@@ -283,20 +298,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     }
 
     /// Audit, screen, watchlist. Never opens here; skips fail closed.
-    #[allow(clippy::too_many_arguments)] // launch identity is flat by design; a struct adds no safety here.
-    pub async fn on_launch(
-        &self,
-        mint: &str,
-        curve: &str,
-        assoc_curve: &str,
-        dev: &str,
-        creator: Option<&str>,
-        name: &str,
-        symbol: &str,
-        slot: u64,
-    ) {
-        info!(mint = %mint, name = %log_token_text(name, 32),
-            symbol = %log_token_text(symbol, 10), program = %PUMP_PROGRAM_ID,
+    pub async fn on_launch(&self, req: &LaunchRequest<'_>) {
+        let (mint, dev, slot) = (req.mint, req.dev, req.slot);
+        info!(mint = %mint, name = %log_token_text(req.name, 32),
+            symbol = %log_token_text(req.symbol, 10), program = %PUMP_PROGRAM_ID,
             slot, "new launch");
         // 1. Audit, fail closed. Retryable watchlists scoreless for retry.
         let now = now_secs();
@@ -324,7 +329,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
         // 2b. v2 creator: worst trust wins.
         let mut trust = dev_trust;
-        let distinct_creator = creator.filter(|c| *c != dev);
+        let distinct_creator = req.creator.filter(|c| *c != dev);
         if let Some(creator) = distinct_creator {
             match self.screen_wallet(mint, creator, "creator").await {
                 Some(creator_trust) => trust = trust.min(creator_trust),
@@ -349,13 +354,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         state.meta.insert(
             mint.to_string(),
             PendingSignal {
-                curve: curve.to_string(),
-                assoc_curve: assoc_curve.to_string(),
+                curve: req.curve.to_string(),
+                assoc_curve: req.assoc_curve.to_string(),
                 audit_score,
                 last_audit_secs,
                 creation_slot: slot,
                 last_sig: None,
-                creator: creator.map(|c| c.to_string()),
+                creator: req.creator.map(|c| c.to_string()),
                 dev_trust: trust,
             },
         );

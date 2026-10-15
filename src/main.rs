@@ -24,6 +24,7 @@ use simulator::PaperPortfolio;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use gate::LaunchRequest;
 use live::LiveTrader;
 use pipeline::{AlertSink, Pipeline};
 use settings::Settings;
@@ -564,16 +565,16 @@ async fn run_pipeline(live_arg: bool) {
                     };
                     let creator = event.creator.as_ref().map(|c| c.to_string());
                     pipeline
-                        .on_launch(
-                            &event.mint.to_string(),
-                            &event.bonding_curve.to_string(),
-                            &event.associated_bonding_curve.to_string(),
-                            &event.user.to_string(),
-                            creator.as_deref(),
-                            &event.name,
-                            &event.symbol,
-                            event.slot,
-                        )
+                        .on_launch(&LaunchRequest {
+                            mint: &event.mint.to_string(),
+                            curve: &event.bonding_curve.to_string(),
+                            assoc_curve: &event.associated_bonding_curve.to_string(),
+                            dev: &event.user.to_string(),
+                            creator: creator.as_deref(),
+                            name: &event.name,
+                            symbol: &event.symbol,
+                            slot: event.slot,
+                        })
                         .await;
                     let snap = stats.snapshot();
                     let pending = pipeline.pending_count().await;
