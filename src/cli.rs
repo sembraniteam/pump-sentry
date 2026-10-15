@@ -1141,15 +1141,10 @@ pub fn cmd_upgrade() -> ! {
             std::process::exit(1);
         }
     };
-    if let Err(e) = std::fs::copy(&staged, &exe) {
+    if let Err(e) = replace_binary(&staged, &exe) {
         eprintln!("cannot replace {}: {e}", exe.display());
         let _ = std::fs::remove_dir_all(&dir);
         std::process::exit(1);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
     }
     let _ = std::fs::remove_dir_all(&dir);
     println!(
@@ -1158,6 +1153,30 @@ pub fn cmd_upgrade() -> ! {
         latest.tag()
     );
     std::process::exit(0);
+}
+
+/// Atomically replace the running binary. `fs::copy` over `exe`
+/// fails with ETXTBSY on unix because the `upgrade` process itself
+/// executes from that file — truncating a running executable is
+/// refused. Staging beside it + `rename` instead only swaps the
+/// directory entry; the running process keeps its old inode and
+/// exits normally. Same-filesystem staging is required (rename does
+/// not cross devices), hence the `.new` sibling, cleaned on failure.
+fn replace_binary(staged: &Path, exe: &Path) -> std::io::Result<()> {
+    let tmp = exe.with_extension("new");
+    // Stale sibling from an interrupted upgrade must not be trusted.
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::copy(staged, &tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, exe) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// SHA-256 hex of a file via system tooling (`sha256sum`, else
@@ -1379,6 +1398,30 @@ mod tests {
         let asset = release_asset_name().expect("tier-1 platform");
         assert!(asset.starts_with("pump-sentry-"), "{asset}");
         assert!(asset.ends_with(".tar.gz"), "{asset}");
+    }
+
+    #[test]
+    fn replace_binary_swaps_contents_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "cli-replace-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let exe = dir.join("pump-sentry");
+        let staged = dir.join("staged");
+        std::fs::write(&exe, b"v0").expect("write");
+        std::fs::write(&staged, b"v1").expect("write");
+        replace_binary(&staged, &exe).expect("replace");
+        assert_eq!(std::fs::read(&exe).expect("read"), b"v1");
+        assert!(
+            !exe.with_extension("new").exists(),
+            "no staging sibling left behind"
+        );
+        // Missing staged source surfaces an error, never a half-write.
+        assert!(replace_binary(&dir.join("absent"), &exe).is_err());
+        assert_eq!(std::fs::read(&exe).expect("read"), b"v1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
