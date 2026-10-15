@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use alert::Alerter;
+use alert::{Alerter, CardCtx};
 use auditor::{RugCheckClient, RugCheckError, RugCheckReport};
 use curve::{CurveError, CurveTicker, PriceTick, SolUsdFeed};
 use listener::{
@@ -466,6 +466,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
+    /// Card context for Discord alerts: live/paper from dispatcher
+    /// presence, effective strategy (parsed, never the raw setting).
+    pub(crate) fn card_ctx(&self) -> CardCtx<'static> {
+        CardCtx {
+            mode: if self.exec.live.is_some() {
+                "live"
+            } else {
+                "paper"
+            },
+            strategy: self.strategy.as_str(),
+        }
+    }
+
     /// Per-mint mutex, created on first use.
     pub(crate) async fn lock_for(
         map: &Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -642,6 +655,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         drop(portfolio);
         for (reason, pnl, pct, equity, moonbag) in closed_cards {
             self.emit(Alerter::format_exit(
+                &self.card_ctx(),
                 &tick.mint, &reason, pnl, pct, equity, moonbag,
             ));
         }

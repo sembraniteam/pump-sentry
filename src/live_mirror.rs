@@ -380,7 +380,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.portfolio.lock().await.debit_dispatch_cost(buy_tip_usd);
                 }
                 warn!(%mint, "LIVE buy dispatched via Jito (real funds)");
-                self.emit(Alerter::format_live_buy(mint, &bundle, amount));
+                self.emit(Alerter::format_live_buy(&self.card_ctx(), mint, &bundle, amount));
             }
             Err(LiveError::UnknownDispatch { position, reason }) => {
                 // No signature: fill unknown, park manual.
@@ -448,7 +448,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         }
                     }
                     warn!(mint = %mint, "LIVE buy confirmed late; now tracked with exits");
-                    self.emit(Alerter::format_live_buy(&mint, &recheck.bundle_id, amount));
+                    self.emit(Alerter::format_live_buy(&self.card_ctx(), &mint, &recheck.bundle_id, amount));
                 }
                 RecheckOutcome::FailedOnChain => {
                     warn!(mint = %mint, bundle = %recheck.bundle_id, "pending LIVE buy errored on-chain; no fill, dropping");
@@ -607,7 +607,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.portfolio.lock().await.debit_dispatch_cost(tip_usd);
                 }
                 warn!(%mint, %bundle, "LIVE sell dispatched via Jito (real funds)");
-                self.emit(Alerter::format_live_sell(mint, &bundle));
+                self.emit(Alerter::format_live_sell(&self.card_ctx(), mint, &bundle));
                 true
             }
             Err(e) => {
@@ -751,6 +751,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         drop(portfolio);
         for (reason, pnl, pct, equity, moonbag) in closed_cards {
             self.emit(Alerter::format_exit(
+                &self.card_ctx(),
                 &tick.mint, &reason, pnl, pct, equity, moonbag,
             ));
         }

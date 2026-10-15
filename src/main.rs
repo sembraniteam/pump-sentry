@@ -587,6 +587,7 @@ async fn run_pipeline(live_arg: bool) {
                     manual_bags: manual,
                     diverged,
                     pending_buys,
+                    strategy: pipeline.strategy.as_str(),
                     cash_usd: cash,
                     equity_usd: equity,
                 });

@@ -30,10 +30,22 @@ pub struct Alerter {
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Mode + strategy tag carried by every card. Both are
+/// operator-facing config, never secrets.
+#[derive(Debug, Clone, Copy)]
+pub struct CardCtx<'a> {
+    /// `live` or `paper`.
+    pub mode: &'a str,
+    /// `adaptive` | `scalp` | `runner`.
+    pub strategy: &'a str,
+}
+
 /// Heartbeat payload: counters plus cash.
 pub struct HeartbeatReport<'a> {
     /// `live` or `paper`.
     pub mode: &'a str,
+    /// Effective strategy (`adaptive` | `scalp` | `runner`).
+    pub strategy: &'a str,
     /// Seconds since boot.
     pub uptime_secs: u64,
     /// Listener throughput counters.
@@ -172,8 +184,16 @@ impl Alerter {
         });
     }
 
+    /// `live · adaptive`-style mode line shared by every card.
+    fn mode_line(ctx: &CardCtx<'_>) -> String {
+        let mode = Self::sanitize(ctx.mode);
+        let strategy = Self::sanitize(ctx.strategy);
+        format!("• **Mode:** `{mode} · {strategy}`")
+    }
+
     /// Entry card.
     pub fn format_entry(
+        ctx: &CardCtx<'_>,
         mint: &str,
         entry_usd: f64,
         tp_pct: f64,
@@ -183,11 +203,13 @@ impl Alerter {
         let mint = Self::sanitize(mint);
         format!(
             "🟢 **[TRADE OPENED]**\n\
+             {}\n\
              • **Token Mint:** `{mint}`\n\
              • **Entry Price:** `${entry_usd:.8}`\n\
              • **Size:** `${notional_usd:.2}`\n\
              • **Target TP:** `+{tp_pct:.1}%` | **Stop Loss:** `{sl_pct:.1}%`\n\
-             • **Explorer:** https://explorer.solana.com/address/{mint}"
+             • **Explorer:** https://explorer.solana.com/address/{mint}",
+            Self::mode_line(ctx),
         )
     }
 
@@ -209,6 +231,7 @@ impl Alerter {
 
     /// Exit card.
     pub fn format_exit(
+        ctx: &CardCtx<'_>,
         mint: &str,
         reason: &str,
         net_pnl: f64,
@@ -226,40 +249,52 @@ impl Alerter {
         };
         format!(
             "{icon} **[{tag}]**\n\
+             {}\n\
              • **Token Mint:** `{mint}`\n\
              • **Exit Reason:** `{reason}`\n\
              • **Realized PnL:** `${net_pnl:+.2}` (`{pct:+.2}%`)\n\
-             • **Portfolio Equity:** `${equity:.2}`"
+             • **Portfolio Equity:** `${equity:.2}`",
+            Self::mode_line(ctx),
         )
     }
 
     /// Live buy card (bundle id for tracking).
-    pub fn format_live_buy(mint: &str, bundle_id: &str, amount_tokens: u64) -> String {
+    pub fn format_live_buy(
+        ctx: &CardCtx<'_>,
+        mint: &str,
+        bundle_id: &str,
+        amount_tokens: u64,
+    ) -> String {
         let mint = Self::sanitize(mint);
         let bundle_id = Self::sanitize(bundle_id);
         format!(
             "🚀 **[LIVE BUY SENT]**\n\
+             {}\n\
              • **Token Mint:** `{mint}`\n\
              • **Amount:** `{amount_tokens}` base units\n\
              • **Bundle:** `{bundle_id}`\n\
-             • **Explorer:** https://explorer.solana.com/address/{mint}"
+             • **Explorer:** https://explorer.solana.com/address/{mint}",
+            Self::mode_line(ctx),
         )
     }
 
     /// Live sell dispatch card.
-    pub fn format_live_sell(mint: &str, bundle_id: &str) -> String {
+    pub fn format_live_sell(ctx: &CardCtx<'_>, mint: &str, bundle_id: &str) -> String {
         let mint = Self::sanitize(mint);
         let bundle_id = Self::sanitize(bundle_id);
         format!(
             "🔻 **[LIVE SELL SENT]**\n\
+             {}\n\
              • **Token Mint:** `{mint}`\n\
              • **Bundle:** `{bundle_id}`\n\
-             • **Explorer:** https://explorer.solana.com/address/{mint}"
+             • **Explorer:** https://explorer.solana.com/address/{mint}",
+            Self::mode_line(ctx),
         )
     }
 
     /// Migration card. Missing ids render as `unknown`.
     pub fn format_migration(
+        ctx: &CardCtx<'_>,
         mint: &str,
         destination: &str,
         signature: &str,
@@ -275,24 +310,29 @@ impl Alerter {
         let quote = quote_mint.map(Self::sanitize).unwrap_or_else(|| "unknown".to_string());
         format!(
             "🌉 **[MIGRATION DETECTED]**\n\
+             {}\n\
              • **Token Mint:** `{mint}`\n\
              • **Destination:** `{destination}`\n\
              • **AMM:** `{}`\n\
              • **Base Mint:** `{}`\n\
              • **Quote Mint:** `{}`\n\
              • **Tx:** https://explorer.solana.com/tx/{signature}",
-            amm, base, quote,
+            Self::mode_line(ctx),
+            amm,
+            base,
+            quote,
         )
     }
 
-    /// Heartbeat card. Only mode needs sanitize (rest are numbers).
+    /// Heartbeat card. Only mode/strategy need sanitize (rest are numbers).
     pub fn format_heartbeat(r: &HeartbeatReport<'_>) -> String {
         let mode = Self::sanitize(r.mode);
+        let strategy = Self::sanitize(r.strategy);
         let uptime_h = r.uptime_secs / 3_600;
         let uptime_m = (r.uptime_secs % 3_600) / 60;
         format!(
             "💚 **[BOT HEARTBEAT]**\n\
-             • **Mode:** `{mode}`\n\
+             • **Mode:** `{mode} · {strategy}`\n\
              • **Uptime:** `{uptime_h}h {uptime_m}m`\n\
              • **Logs seen:** `{}`\n\
              • **Candidates:** `{}`\n\
@@ -320,14 +360,21 @@ impl Alerter {
     }
 
     /// Post-migration spike card.
-    pub fn format_follow_spike(mint: &str, multiple: f64, price_usd: f64) -> String {
+    pub fn format_follow_spike(
+        ctx: &CardCtx<'_>,
+        mint: &str,
+        multiple: f64,
+        price_usd: f64,
+    ) -> String {
         let mint = Self::sanitize(mint);
         format!(
             "🚀 **[POST-MIGRATION SPIKE]**\n\
+             {}\n\
              • **Token Mint:** `{mint}`\n\
              • **Move:** `{multiple:.1}x off migration`\n\
              • **Price:** `${price_usd:.8}`\n\
-             • **Explorer:** https://explorer.solana.com/address/{mint}"
+             • **Explorer:** https://explorer.solana.com/address/{mint}",
+            Self::mode_line(ctx),
         )
     }
 }
@@ -344,32 +391,36 @@ fn is_format_char(c: char) -> bool {
 mod tests {
     use super::*;
 
+    const PAPER: CardCtx = CardCtx { mode: "paper", strategy: "adaptive" };
+    const LIVE: CardCtx = CardCtx { mode: "live", strategy: "scalp" };
+
     #[test]
     fn entry_card_marks_fields() {
-        let card = Alerter::format_entry("MINT", 0.00000420, 40.0, -10.0, 10.0);
+        let card = Alerter::format_entry(&PAPER, "MINT", 0.00000420, 40.0, -10.0, 10.0);
         assert!(card.contains("[TRADE OPENED]"));
         assert!(card.contains("`MINT`"));
         assert!(card.contains("$0.00000420"));
         assert!(card.contains("+40.0%"));
         assert!(card.contains("-10.0%"));
         assert!(card.contains("explorer.solana.com/address/MINT"));
+        assert!(card.contains("`paper · adaptive`"));
     }
 
     #[test]
     fn exit_card_signs_and_tags() {
-        let win = Alerter::format_exit("M", "TakeProfit", 4.2, 42.0, 104.2, false);
+        let win = Alerter::format_exit(&PAPER, "M", "TakeProfit", 4.2, 42.0, 104.2, false);
         assert!(win.contains("🎯"));
         assert!(win.contains("POSITION CLOSED"));
         assert!(win.contains("$+4.20"));
-        let loss = Alerter::format_exit("M", "StopLoss", -1.5, -15.0, 98.5, false);
+        let loss = Alerter::format_exit(&PAPER, "M", "StopLoss", -1.5, -15.0, 98.5, false);
         assert!(loss.contains("🛑"));
-        let moon = Alerter::format_exit("M", "Manual", 0.0, 0.0, 100.0, true);
+        let moon = Alerter::format_exit(&PAPER, "M", "Manual", 0.0, 0.0, 100.0, true);
         assert!(moon.contains("MOONBAG PARTIAL EXIT"));
     }
 
     #[test]
     fn follow_spike_card_marks_multiple() {
-        let card = Alerter::format_follow_spike("M", 2.0, 0.01);
+        let card = Alerter::format_follow_spike(&PAPER, "M", 2.0, 0.01);
         assert!(card.contains("[POST-MIGRATION SPIKE]"));
         assert!(card.contains("2.0x"));
         assert!(card.contains("explorer.solana.com/address/M"));
@@ -379,6 +430,7 @@ mod tests {
     fn heartbeat_card_marks_counters() {
         let card = Alerter::format_heartbeat(&HeartbeatReport {
             mode: "live",
+            strategy: "runner",
             uptime_secs: 7_500,
             logs_seen: 1000,
             candidates: 50,
@@ -393,7 +445,7 @@ mod tests {
             equity_usd: 102.25,
         });
         assert!(card.contains("[BOT HEARTBEAT]"));
-        assert!(card.contains("`live`"));
+        assert!(card.contains("`live · runner`"));
         assert!(card.contains("2h 5m"));
         assert!(card.contains("`1000`"));
         assert!(card.contains("`2` held"));
@@ -404,22 +456,23 @@ mod tests {
     #[test]
     fn migration_card_marks_pool() {
         let card =
-            Alerter::format_migration("M", "RaydiumV4", "sig", Some("AMM"), Some("BASE"), None);
+            Alerter::format_migration(&LIVE, "M", "RaydiumV4", "sig", Some("AMM"), Some("BASE"), None);
         assert!(card.contains("[MIGRATION DETECTED]"));
         assert!(card.contains("RaydiumV4"));
         assert!(card.contains("`AMM`"));
         assert!(card.contains("explorer.solana.com/tx/sig"));
-        let bare = Alerter::format_migration("M", "PumpSwap", "sig", None, None, None);
+        let bare = Alerter::format_migration(&LIVE, "M", "PumpSwap", "sig", None, None, None);
         assert!(bare.contains("unknown"));
     }
 
     #[test]
     fn interpolated_fields_are_sanitized() {
         // Attacker-shaped inputs must not survive as mentions, fences, or links.
-        let card = Alerter::format_exit("@everyone `x`", "TakeProfit", 1.0, 1.0, 1.0, false);
+        let card = Alerter::format_exit(&PAPER, "@everyone `x`", "TakeProfit", 1.0, 1.0, 1.0, false);
         assert!(!card.contains("@everyone"));
         assert!(!card.contains("`x`"));
         let mig = Alerter::format_migration(
+            &PAPER,
             "M",
             "X",
             "https://evil.example/@everyone",
@@ -430,13 +483,13 @@ mod tests {
         assert!(!mig.contains('@'));
         assert!(!mig.contains("https://evil.example"));
         // Backtick payloads collapse to plain text inside the template's own span.
-        let tricky = Alerter::format_migration("M", "X", "s", Some("`A`M`M`"), None, None);
+        let tricky = Alerter::format_migration(&PAPER, "M", "X", "s", Some("`A`M`M`"), None, None);
         assert!(tricky.contains("`AMM`"));
     }
 
     #[test]
     fn sanitize_blocks_links_and_bidi() {
-        let card = Alerter::format_exit("[click](https://evil.example)", "TakeProfit", 1.0, 1.0, 1.0, false);
+        let card = Alerter::format_exit(&PAPER, "[click](https://evil.example)", "TakeProfit", 1.0, 1.0, 1.0, false);
         assert!(!card.contains("https://evil.example"));
         assert!(!card.contains("[click]"));
         // Zero-width and bidi-override characters are stripped.

@@ -5,4 +5,4 @@
 
 pub mod discord;
 
-pub use discord::{Alerter, HeartbeatReport};
+pub use discord::{Alerter, CardCtx, HeartbeatReport};

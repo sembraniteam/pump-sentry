@@ -23,6 +23,19 @@ pub enum StrategyMode {
     Runner,
 }
 
+impl StrategyMode {
+    /// Config string for operator-facing surfaces (`adaptive` |
+    /// `scalp` | `runner`). Matches [`FromStr`] so cards echo the
+    /// effective mode, never a typo'd raw setting.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StrategyMode::Adaptive => "adaptive",
+            StrategyMode::ScalpQuick => "scalp",
+            StrategyMode::Runner => "runner",
+        }
+    }
+}
+
 impl FromStr for StrategyMode {
     type Err = String;
 

@@ -862,6 +862,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     equity = format!("{:.2}", snap.equity), "paper position opened");
                 // Emit after unlock: never alert under lock.
                 let card = Alerter::format_entry(
+                    &self.card_ctx(),
                     mint,
                     entry_quote,
                     profile.tp_percent,

@@ -59,6 +59,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Ok(Some(report)) => {
                 info!(mint = %mint, sig = %report.signature, dest = ?report.destination, amm = ?report.amm_id, "migration detected");
                 self.emit(Alerter::format_migration(
+                    &self.card_ctx(),
                     mint,
                     &format!("{:?}", report.destination),
                     &report.signature,
@@ -242,6 +243,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             drop(followed);
             info!(mint = %mint, multiple = FOLLOW_SPIKE_MULT, price = tick.price_usd, "post-migration spike");
             self.emit(Alerter::format_follow_spike(
+                &self.card_ctx(),
                 &mint,
                 FOLLOW_SPIKE_MULT,
                 tick.price_usd,

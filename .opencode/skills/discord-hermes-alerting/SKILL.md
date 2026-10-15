@@ -66,9 +66,10 @@ impl DiscordAlert {
         });
     }
 
-    pub fn format_entry(mint: &str, entry_usd: f64, tp_pct: f64, sl_pct: f64, notional_usd: f64) -> String {
+    pub fn format_entry(ctx: &CardCtx<'_>, mint: &str, entry_usd: f64, tp_pct: f64, sl_pct: f64, notional_usd: f64) -> String {
         format!(
             "🟢 **[TRADE OPENED]**\n\
+             • **Mode:** `paper · adaptive`\n\
              • **Token Mint:** `{mint}`\n\
              • **Entry Price:** `${entry_usd:.8}`\n\
              • **Size:** `${notional_usd:.2}`\n\
@@ -78,6 +79,7 @@ impl DiscordAlert {
     }
 
     pub fn format_exit(
+        ctx: &CardCtx<'_>,
         mint: &str,
         reason: &str,
         net_pnl: f64,
