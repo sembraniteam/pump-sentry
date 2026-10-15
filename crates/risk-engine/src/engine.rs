@@ -168,15 +168,22 @@ impl std::fmt::Debug for RiskEngine {
     }
 }
 
-/// Endpoint without query strings for logs. Providers take keys in
-/// `?`; a raw endpoint in a warn line leaks them into bot.log. (The
-/// binary crate carries the same rule for RPC URLs; this crate cannot
-/// depend on it, so the 5-liner is duplicated.)
-fn log_endpoint(url: &str) -> &str {
-    match url.find('?') {
-        Some(i) => &url[..i],
-        None => url,
+/// Endpoint reduced to `scheme://host` for logs. Providers hide keys
+/// in the query (Helius) or the path (Chainstack, dRPC); query-only
+/// stripping still leaks path keys. Mirror of `ids::redact_endpoint`
+/// (canonical, unit-tested there); kept local so risk-engine stays
+/// dependency-light.
+fn log_endpoint(url: &str) -> String {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => return "<unparseable-endpoint>".to_string(),
+    };
+    let scheme = &url[..url.len() - rest.len() - 3];
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if scheme.is_empty() || host.is_empty() {
+        return "<unparseable-endpoint>".to_string();
     }
+    format!("{scheme}://{host}")
 }
 
 impl RiskEngine {
@@ -554,17 +561,21 @@ mod tests {
 
     #[test]
     fn debug_and_logs_redact_endpoint_query() {
-        // Provider keys live in `?`: Debug and log lines keep the
-        // host and drop the query.
+        // Provider keys live in `?` or the path: Debug and log lines
+        // keep scheme://host and drop the rest.
         let engine = RiskEngine::builder()
             .endpoint("https://llm.example/v1?key=K9")
             .build()
             .expect("engine");
         let dbg = format!("{engine:?}");
         assert!(!dbg.contains("K9"), "{dbg}");
-        assert!(dbg.contains("https://llm.example/v1"), "{dbg}");
-        assert_eq!(log_endpoint("https://x/y?a=b"), "https://x/y");
-        assert_eq!(log_endpoint("https://x/y"), "https://x/y");
+        assert!(dbg.contains("https://llm.example"), "{dbg}");
+        assert_eq!(log_endpoint("https://x/y?a=b"), "https://x");
+        assert_eq!(log_endpoint("https://x/y"), "https://x");
+        assert_eq!(
+            log_endpoint("wss://solana-mainnet.core.chainstack.com/eeb0secret"),
+            "wss://solana-mainnet.core.chainstack.com"
+        );
         // Transport keeps the raw URL.
         assert_eq!(engine.endpoint, "https://llm.example/v1?key=K9");
     }

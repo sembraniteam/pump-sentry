@@ -324,7 +324,7 @@ impl PumpFunListener {
             }
         };
         info!(
-            ws = %self.config.ws_url,
+            ws = %ids::redact_endpoint(&self.config.ws_url),
             commitment = %self.config.commitment,
             "subscribed to pump.fun logs"
         );
