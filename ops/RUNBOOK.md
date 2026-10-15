@@ -81,3 +81,25 @@ The supervisor also rotates ≥50 MB logs at start time as a backstop.
 | Exits stalled, SOL/USD stale  | Jupiter feed down                                                    | By design (no static fallback); exits resume on recovery          |
 | `MANUAL REVIEW REQUIRED`      | Unknown fill / retries exhausted                                     | Explorer first, then `sell <mint>`                                |
 | Duplicate cards after restart | Crash between dispatch and WAL                                       | WAL replay is conservative; verify on-chain, exit dups via `sell` |
+
+## 8. Burn-in observables (first live week)
+
+Every threshold below is `0` = off by default; all fire log-only
+(`warn!`), never Discord cards. Set them for the burn-in week, then
+tune from what you observe — nominal baselines are unknown until
+real traffic flows.
+
+| Env (default)                      | Fires when                                              | Meaning / action                                                                 |
+|------------------------------------|---------------------------------------------------------|----------------------------------------------------------------------------------|
+| `ALERT_DIVERGED_WARN_N` (`0`)      | Heartbeat diverged count ≥ N                            | Paper without live cover piles up: fund, fix dispatch, or accept paper-only       |
+| `ALERT_RISK_FALLBACK_WARN_PCT` (`0`)| LLM fallback share since boot ≥ pct                    | Model down/degraded: entries run heuristic (lower bound quality); check endpoint |
+| `ALERT_GIVEUP_BURST_N` (`0`) + `ALERT_GIVEUP_WINDOW_SECS` (`3600`) | N GiveUps in the trailing window | Systemic dispatch trouble (RPC/Jito/congestion): stop funding more before cause found |
+| (always on) tip-floor fetch warn   | Jito oracle unreachable (≤1 warn/60s TTL)               | Base tip rules unmodified: underland risk under congestion; check `tip_floor` vs actual landing |
+
+The heartbeat card already carries `Diverged` and `Pending buys`
+counts every 6h, and listener `Dropped` (full + throttled) proxies
+RPC 429 pressure. Suggested burn-in starting points (tune after a
+week, not before): `ALERT_DIVERGED_WARN_N=3`,
+`ALERT_RISK_FALLBACK_WARN_PCT=50`, `ALERT_GIVEUP_BURST_N=3`.
+A week with fallback/429 nominal and no burst is the exit criterion
+for the burn-in gate.

@@ -142,6 +142,10 @@ pub struct RiskEngine {
     max_tokens: u32,
     /// Heuristic-fallback count.
     fallback_count: Arc<AtomicU64>,
+    /// Total `evaluate` calls (denominator for the fallback rate;
+    /// deliberate heuristic-only calls via `evaluate_fallback` are
+    /// excluded — this measures model trouble, not mode).
+    decision_count: Arc<AtomicU64>,
     /// Timeouts only (subset of fallbacks; operator can tell
     /// whether the model is slow vs non-compliant).
     timeout_count: Arc<AtomicU64>,
@@ -198,6 +202,7 @@ impl RiskEngine {
             temperature: b.temperature.clamp(0.0, 1.0),
             max_tokens,
             fallback_count: Arc::new(AtomicU64::new(0)),
+            decision_count: Arc::new(AtomicU64::new(0)),
             timeout_count: Arc::new(AtomicU64::new(0)),
             invalid_count: Arc::new(AtomicU64::new(0)),
         })
@@ -206,6 +211,11 @@ impl RiskEngine {
     /// Heuristic-fallback count since construction.
     pub fn fallback_count(&self) -> u64 {
         self.fallback_count.load(Ordering::Relaxed)
+    }
+
+    /// Total `evaluate` calls since construction.
+    pub fn decision_count(&self) -> u64 {
+        self.decision_count.load(Ordering::Relaxed)
     }
 
     /// Timeout fallbacks since construction (subset of [`Self::fallback_count`]).
@@ -240,6 +250,7 @@ impl RiskEngine {
     /// valid BUY is required to buy, never a heuristic re-evaluation
     /// of garbled output.
     pub async fn evaluate(&self, metrics: &TokenMetrics) -> RiskDecision {
+        self.decision_count.fetch_add(1, Ordering::Relaxed);
         let (system, user) = build_prompt(metrics);
         let request = ChatRequest {
             model: self.model.clone(),

@@ -204,6 +204,12 @@ impl JitoClient {
             .unwrap_or(true);
         if stale {
             let fresh = self.fetch_tip_floor().await.unwrap_or(0);
+            if fresh == 0 {
+                // Rare path (oracle down): one warn per TTL window —
+                // fetches only happen when stale, so this cannot spam.
+                // Floor 0 means the base tip rules unmodified.
+                tracing::warn!("jito tip-floor oracle unreachable; using configured tip (underland risk under congestion)");
+            }
             if let Ok(mut guard) = self.floor.lock() {
                 if fresh > 0 {
                     guard.0 = fresh;

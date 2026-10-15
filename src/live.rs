@@ -5,6 +5,7 @@ use crate::wal;
 use executor::{BuyOrder, BundleStatus, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, parse_pubkey};
 use ids::{ATA_RENT_LAMPORTS, BASE_TX_FEE_LAMPORTS};
 use simulator::{FillModel, Side};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
@@ -20,6 +21,9 @@ pub const VENUE_FEE_BPS: u64 = simulator::STANDARD_VENUE_FEE_BPS as u64;
 /// Basis-point denominator shared by fee and slippage math.
 /// Single source is `executor::quote::BPS_DENOMINATOR` (u128 domain there).
 pub const BPS_DENOMINATOR: u64 = executor::quote::BPS_DENOMINATOR as u64;
+
+/// Mark-price trail per mint for volatility-adaptive slippage.
+type MarkTrail = std::sync::Arc<std::sync::Mutex<HashMap<String, VecDeque<(u64, f64)>>>>;
 
 /// Live-trade failures.
 #[derive(Error, Debug)]
@@ -165,6 +169,12 @@ pub fn escalated_tip(base_tip_lamports: u64, failed_attempts: u32) -> u64 {
 /// Mirrors live debiting (first-touch plus ATA rent on open, dispatch
 /// on close) so paper-only PnL nets the same bleed live pays.
 /// Zero when priceless.
+///
+/// Absolute lamports, NOT a rate: at defaults (100k tip, SOL $150)
+/// the round trip is ~$0.34 — ~0.3% on a $113 ticket but ~3.4% on the
+/// default $10 `NOTIONAL_USD`, larger than the 2.53% venue round trip.
+/// Live pays the moving Jito `tip_floor` oracle instead of this static
+/// estimate, so expect small drift under congestion.
 pub fn paper_dispatch_legs_usd(tip_lamports: u64, sol_usd: f64) -> (f64, f64) {
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
         return (0.0, 0.0);
@@ -308,6 +318,14 @@ pub struct LiveTrader {
     wal_path: Option<PathBuf>,
     /// Unconfirmed buys, re-polled until settled or out of tries.
     pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+    /// Recent mark prices per mint for volatility-adaptive slippage.
+    /// Fed from live dispatch prints (entry/exit); tick-level feed is
+    /// future work, so thin histories simply yield the base slippage.
+    marks: MarkTrail,
+    /// Volatility window, secs (`0` = adaptive off, base slippage only).
+    vol_window_secs: u64,
+    /// Cap on the volatility add-on, bps (`0` = adaptive off).
+    vol_extra_cap_bps: u64,
     /// Last sell bundle per mint (resend guard: never compete with
     /// an inflight-pending prior bundle for the same bag).
     last_sell_bundle: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
@@ -360,6 +378,9 @@ impl LiveTrader {
             priority_fee_micro_lamports: 0,
             compute_unit_limit: 0,
             wal_path: None,
+            marks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            vol_window_secs: 0,
+            vol_extra_cap_bps: 0,
             pending: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -385,6 +406,82 @@ impl LiveTrader {
         self.compute_unit_limit = compute_unit_limit;
         self.priority_fee_micro_lamports = priority_fee_micro_lamports;
         self
+    }
+
+    /// Volatility-adaptive slippage: `window_secs` of mark history per
+    /// mint, with the add-on capped at `extra_cap_bps`. Zero/zero (the
+    /// default) is bit-identical to static `slippage_bps`.
+    pub fn with_adaptive_slippage(mut self, window_secs: u64, extra_cap_bps: u64) -> Self {
+        self.vol_window_secs = window_secs;
+        self.vol_extra_cap_bps = extra_cap_bps;
+        self
+    }
+
+    /// Record a live print for the volatility window. Degenerate
+    /// prices are ignored (never poison the range).
+    pub fn note_mark(&self, mint: &str, price_usd: f64, now_secs: u64) {
+        if !price_usd.is_finite() || price_usd <= 0.0 || self.vol_window_secs == 0 {
+            return;
+        }
+        let window = self.vol_window_secs;
+        let cutoff = now_secs.saturating_sub(window);
+        match self.marks.lock() {
+            Ok(mut guard) => {
+                let q = guard.entry(mint.to_string()).or_default();
+                q.push_back((now_secs, price_usd));
+                while q.front().is_some_and(|(ts, _)| *ts < cutoff) {
+                    q.pop_front();
+                }
+                // Bounded memory even when the clock stalls.
+                while q.len() > 1024 {
+                    q.pop_front();
+                }
+            }
+            Err(_) => {
+                tracing::warn!("marks-tracker lock poisoned during note_mark; skipping");
+            }
+        }
+    }
+
+    /// Slippage for this dispatch: base plus the in-window range as
+    /// bps, capped. Thin or calm histories yield exactly the base, so
+    /// static behavior is the default, not a special case.
+    pub fn effective_slippage_bps(&self, mint: &str, now_secs: u64) -> u64 {
+        let base = self.slippage_bps;
+        if self.vol_window_secs == 0 || self.vol_extra_cap_bps == 0 {
+            return base;
+        }
+        let window = self.vol_window_secs;
+        let cutoff = now_secs.saturating_sub(window);
+        let range_bps = match self.marks.lock() {
+            Ok(mut guard) => {
+                let Some(q) = guard.get_mut(mint) else {
+                    return base;
+                };
+                while q.front().is_some_and(|(ts, _)| *ts < cutoff) {
+                    q.pop_front();
+                }
+                let (mut lo, mut hi) = (f64::INFINITY, 0.0f64);
+                for (_, p) in q.iter() {
+                    lo = lo.min(*p);
+                    hi = hi.max(*p);
+                }
+                if !(hi > lo && lo > 0.0 && hi.is_finite()) {
+                    return base;
+                }
+                ((hi - lo) / lo * BPS_DENOMINATOR as f64).max(0.0)
+            }
+            Err(_) => {
+                tracing::warn!("marks-tracker lock poisoned during effective_slippage; using base");
+                return base;
+            }
+        };
+        if !range_bps.is_finite() {
+            return base;
+        }
+        base
+            .saturating_add((range_bps as u64).min(self.vol_extra_cap_bps))
+            .min(BPS_DENOMINATOR.saturating_sub(1))
     }
 
     /// Per-dispatch overhead: tip plus fees. Excludes first-buy ATA rent.
@@ -585,13 +682,14 @@ impl LiveTrader {
             notional_usd,
             price_usd,
             sol_usd,
-            self.slippage_bps,
+            self.effective_slippage_bps(mint, now_secs()),
             req.liquidity_usd,
             req.venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
         )
         .ok_or_else(|| {
             LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
         })?;
+        self.note_mark(mint, price_usd, now_secs());
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.buy_jito(&BuyOrder {
@@ -605,7 +703,7 @@ impl LiveTrader {
                 max_sol_cost: plan.max_sol_cost,
                 tip_lamports: self.effective_tip(0).await,
                 creator,
-                slippage_bps: self.slippage_bps,
+                slippage_bps: self.effective_slippage_bps(mint, now_secs()),
             }),
         )
         .await
@@ -923,15 +1021,17 @@ impl LiveTrader {
     /// Sell the full tracked amount via Jito.
     pub async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
         let position = req.position;
+        let slip = self.effective_slippage_bps(&position.mint, now_secs());
         let floor = plan_sell_floor(
             position.amount_tokens,
             req.price_usd,
             req.sol_usd,
-            self.slippage_bps,
+            slip,
             req.liquidity_usd,
             req.venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
         )
         .ok_or_else(|| LiveError::BadOrder(format!("cannot floor sell of {}", position.mint)))?;
+        self.note_mark(&position.mint, req.price_usd, now_secs());
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.sell_jito(&SellOrder {
@@ -1034,7 +1134,7 @@ impl LiveTrader {
                 quote_vault: parse_pubkey(&pool.quote_vault)
                     .map_err(|e| LiveError::BadOrder(format!("bad quote_vault '{e}")))?,
                 amount_tokens: position.amount_tokens,
-                slippage_bps: self.slippage_bps,
+                slippage_bps: self.effective_slippage_bps(&position.mint, now_secs()),
                 tip_lamports: req.tip_lamports,
             }),
         )
@@ -1070,7 +1170,7 @@ impl LiveTrader {
                 quote_vault: parse_pubkey(&pool.quote_vault)
                     .map_err(|e| LiveError::BadOrder(format!("bad quote_vault '{e}")))?,
                 amount_tokens: position.amount_tokens,
-                slippage_bps: self.slippage_bps,
+                slippage_bps: self.effective_slippage_bps(&position.mint, now_secs()),
                 tip_lamports: req.tip_lamports,
             }),
         )
@@ -1296,6 +1396,38 @@ mod tests {
         )
         .expect("executor");
         LiveTrader::new(exec, 200, tip_lamports).with_dispatch_fees(unit_limit, unit_price)
+    }
+
+    #[test]
+    fn adaptive_slippage_off_by_default() {
+        // Defaults: bit-identical to static slippage (200).
+        let trader = cost_trader(10_000, 0, 0);
+        trader.note_mark("M", 1.0, 1000);
+        trader.note_mark("M", 2.0, 1001);
+        assert_eq!(trader.effective_slippage_bps("M", 1001), 200);
+        assert_eq!(trader.effective_slippage_bps("UNKNOWN", 1001), 200);
+    }
+
+    #[test]
+    fn adaptive_slippage_tracks_window_range_capped() {
+        let trader = cost_trader(10_000, 0, 0).with_adaptive_slippage(60, 150);
+        // Thin history: base.
+        trader.note_mark("M", 1.0, 1000);
+        assert_eq!(trader.effective_slippage_bps("M", 1000), 200);
+        // 10% range in window: +1000bps raw, capped at +150.
+        trader.note_mark("M", 1.1, 1010);
+        assert_eq!(trader.effective_slippage_bps("M", 1010), 350);
+        // Small range: exact add-on (1% -> +100bps).
+        let calm = cost_trader(10_000, 0, 0).with_adaptive_slippage(60, 150);
+        calm.note_mark("M", 1.0, 1000);
+        calm.note_mark("M", 1.01, 1010);
+        assert_eq!(calm.effective_slippage_bps("M", 1010), 300);
+        // Window expiry: stale marks fall out, back to base.
+        assert_eq!(trader.effective_slippage_bps("M", 2000), 200);
+        // Degenerate marks never poison the range.
+        trader.note_mark("M", 0.0, 2001);
+        trader.note_mark("M", f64::NAN, 2001);
+        assert_eq!(trader.effective_slippage_bps("M", 2001), 200);
     }
 
     #[test]

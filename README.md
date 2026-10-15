@@ -2,7 +2,7 @@
 
 Paper-trading Solana memecoin sniper: catches new Pump.fun launches → screens risk → paper-trades with auto-exits. Paper-only by default; `--live` adds real Jito-routed execution.
 
-Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms, else heuristic) → paper position → auto-exit → migration hunt → pool tracking (PumpSwap: effective-quote ticks + live `sell_v2` exits; Raydium legacy: spike cards + live exits through the validated pool leg).
+Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms when a server is reachable, else the deterministic heuristic — paper and live share this exact path, so paper without a server understates entry quality) → paper position → auto-exit → migration hunt → pool tracking (PumpSwap: effective-quote ticks + live `sell_v2` exits; Raydium legacy: spike cards + live exits through the validated pool leg).
 
 ## Install
 
@@ -43,12 +43,16 @@ Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fe
 | `STRATEGY_MODE` / `RUNNER_MOONBAG_PERCENT` / `RUNNER_TRAIL_PERCENT`     | `adaptive` / `20` / `20`      | `adaptive`/`scalp`/`runner` + runner shape                                                   |
 | `MAX_DAILY_LOSS_USD`                                                    | `0` (off)                     | Halts new entries past the cap; exits always work                                            |
 | `SLIPPAGE_BPS` / `JITO_TIP_LAMPORTS` / `JITO_ENDPOINT`                  | `200` / `100000` / global     | Buy guard, per-bundle tip, block-engine (global)                                             |
-| `PRIORITY_FEE_MICRO_LAMPORTS` / `COMPUTE_UNIT_LIMIT`                    | `0` / `0`                     | Compute budget (0 = off)                                                                     |
+| `SLIPPAGE_VOL_WINDOW_SECS` / `SLIPPAGE_VOL_EXTRA_CAP_BPS`            | `0` / `0` (off)               | Adaptive add-on: in-window mark range as bps, capped; `0`/`0` = static `SLIPPAGE_BPS`        |
+| `PRIORITY_FEE_MICRO_LAMPORTS` / `COMPUTE_UNIT_LIMIT`                    | `0` / `0`                     | Compute budget (0 = off — set nonzero at deploy for congestion; sized in runbook §2)         |
 | `SIM_STRICT`                                                            | `false`                       | Unproven sims refuse dispatch (required live)                                                |
 | `QUOTE_USD` / `LIQUIDITY_USD`                                           | *(unset)* / `0`               | Test-only price override / reserve fallback                                                  |
 | `IS_LIVE` / `SOLANA_PRIVATE_KEY`                                        | *(unset)*                     | Live mode + trading keypair (base58)                                                         |
 | `DISCORD_ALERTS` / `DISCORD_CHANNEL` / `HERMES_BIN`                     | `true` / *(unset)* / `hermes` | Trade cards via Hermes CLI                                                                   |
+| `ALERT_DIVERGED_WARN_N` / `ALERT_RISK_FALLBACK_WARN_PCT`               | `0` / `0` (off)               | Burn-in warns (log-only): diverged count, LLM fallback share since boot                      |
+| `ALERT_GIVEUP_BURST_N` / `ALERT_GIVEUP_WINDOW_SECS`                    | `0` / `3600`                  | Burn-in warn (log-only): GiveUps in trailing window; see runbook §8                           |
 | `INFERENCE_API_KEY`                                                     | *(unset)*                     | Bearer token when the provider needs one                                                     |
+| `SPECULATIVE_INFERENCE`                                               | `false`                       | Overlap confirm re-audit with the model call (exact score-match only; default = serial path) |
 
 `STRATEGY_MODE`: `adaptive` runs the profile verbatim; `scalp` clamps TP into +25…+35% (sub-band honored); `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
 

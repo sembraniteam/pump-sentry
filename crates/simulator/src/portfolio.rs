@@ -157,6 +157,8 @@ pub struct PaperPortfolio {
     total_dispatch_usd: f64,
     /// Paper-mode per-leg bleed estimates (open, close), USD. Live
     /// mode debits actuals instead (see `set_paper_dispatch_legs`).
+    /// Absolute lamports, not a rate: the drag as a percent falls as
+    /// `NOTIONAL_USD` rises (see `paper_dispatch_legs_usd`).
     paper_dispatch_legs: (f64, f64),
 }
 
@@ -475,7 +477,7 @@ impl PaperPortfolio {
                 liquidity_usd,
                 reason,
                 now_secs,
-            );
+            )?;
             self.record(trade.clone());
             return Ok(trade);
         }
@@ -486,7 +488,7 @@ impl PaperPortfolio {
                 .ok_or(PortfolioError::PositionNotFound(id))?;
             CloseSlice::part(position, fraction)
         };
-        let trade = self.book(&slice, quote, liquidity_usd, reason, now_secs);
+        let trade = self.book(&slice, quote, liquidity_usd, reason, now_secs)?;
         if let Some(open) = self.positions.get_mut(&id) {
             open.quantity -= slice.quantity;
             open.entry_notional -= slice.entry_notional;
@@ -524,13 +526,23 @@ impl PaperPortfolio {
         liquidity_usd: f64,
         reason: ExitReason,
         now_secs: u64,
-    ) -> ClosedTrade {
-        let exit_price = self.fill_for_mint(&slice.mint).fill_price(
-            flip_side(slice.side),
-            quote,
-            slice.quantity.abs() * quote,
-            liquidity_usd,
-        );
+    ) -> Result<ClosedTrade, PortfolioError> {
+        // Execution pricing, uncapped: the settle probe above priced
+        // the identical notional, so this agrees with the trigger by
+        // construction and can only fail on buy-side exhaustion.
+        let exit_notional_probe = slice.quantity.abs() * quote;
+        let exit_price = self
+            .fill_for_mint(&slice.mint)
+            .try_fill_price(
+                flip_side(slice.side),
+                quote,
+                exit_notional_probe,
+                liquidity_usd,
+            )
+            .ok_or(PortfolioError::CurveExhausted {
+                notional: exit_notional_probe,
+                liquidity: liquidity_usd,
+            })?;
         let exit_notional = slice.quantity.abs() * exit_price;
         let exit_fee = self.fee_for(exit_notional);
 
@@ -552,7 +564,7 @@ impl PaperPortfolio {
             Side::Short => self.cash -= exit_notional + exit_fee,
         }
 
-        ClosedTrade {
+        Ok(ClosedTrade {
             id: slice.id,
             mint: slice.mint.clone(),
             side: slice.side,
@@ -569,7 +581,7 @@ impl PaperPortfolio {
             closed_at: now_secs,
             hold_seconds: now_secs.saturating_sub(slice.opened_at),
             dispatch_usd: dispatch,
-        }
+        })
     }
 
     /// Mutable position access.
@@ -619,20 +631,27 @@ impl PaperPortfolio {
             let value = match marks.get(&position.mint) {
                 Some(mark) if mark.price.is_finite() && mark.price > 0.0 => {
                     let exit_size = position.quantity.abs() * mark.price;
-                    let slip = self.fill_for_mint(&position.mint).slip_fraction_for_side(
+                    // Same uncapped execution pricing as settlement, so
+                    // marks and books agree. Unpriceable (buy-side
+                    // exhaustion) holds the basis instead of a fiction.
+                    match self.fill_for_mint(&position.mint).try_slip_fraction_for_side(
                         flip_side(position.side),
                         exit_size,
                         mark.liquidity_usd,
-                    );
-                    let exit_price = match position.side {
-                        Side::Long => mark.price * (1.0 - slip).max(0.0),
-                        Side::Short => mark.price * (1.0 + slip),
-                    };
-                    let exit_notional = position.quantity.abs() * exit_price;
-                    let exit_fee = self.fee_for(exit_notional);
-                    match position.side {
-                        Side::Long => exit_notional - exit_fee,
-                        Side::Short => -(exit_notional + exit_fee),
+                    ) {
+                        Some(slip) => {
+                            let exit_price = match position.side {
+                                Side::Long => mark.price * (1.0 - slip).max(0.0),
+                                Side::Short => mark.price * (1.0 + slip),
+                            };
+                            let exit_notional = position.quantity.abs() * exit_price;
+                            let exit_fee = self.fee_for(exit_notional);
+                            match position.side {
+                                Side::Long => exit_notional - exit_fee,
+                                Side::Short => -(exit_notional + exit_fee),
+                            }
+                        }
+                        None => basis,
                     }
                 }
                 _ => basis,
@@ -1432,6 +1451,87 @@ mod tests {
                 "sl={bad_sl}"
             );
         }
+    }
+
+    #[test]
+    fn giant_long_exit_books_true_impact_not_capped() {
+        // Liquidity evaporates between entry and exit: the exit sizes
+        // ~10x the remaining book. Old code printed 0.75 * quote
+        // (capped); honest pricing prints true impact (~0.08 here).
+        let mut pf = PaperPortfolio::new(10_000.0, 0.0);
+        let id = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 100.0,
+                liquidity_usd: 1e9,
+                tp_percent: 100.0,
+                sl_percent: -50.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
+            .expect("open");
+        // Trigger and settlement must agree (no phantom trigger on a
+        // capped fiction): the realizable SL fires here because true
+        // proceeds are ~-92%, not -25%.
+        assert_eq!(
+            pf.check_exit_realizable(id, 1.0, 10.0, 1),
+            Some(ExitReason::StopLoss)
+        );
+        let trade = pf
+            .close_position(id, 1.0, 10.0, ExitReason::StopLoss, 1)
+            .expect("close");
+        assert!(
+            trade.exit_price < 0.5,
+            "exit must print true impact, not 0.75: {}",
+            trade.exit_price
+        );
+        assert!(trade.net_pnl < -50.0, "net={}", trade.net_pnl);
+    }
+
+    #[test]
+    fn short_exit_in_cap_band_prices_true_impact() {
+        // Short exit at s = 0.5: true slip is 1.0125, not the 0.25 cap.
+        let mut pf = PaperPortfolio::new(100_000.0, 0.0);
+        let id = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Short,
+                quote: 1.0,
+                notional_usd: 100.0,
+                liquidity_usd: 1e9,
+                tp_percent: 100.0,
+                sl_percent: -50.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
+            .expect("open");
+        let qty = pf.positions.get(&id).expect("open").quantity.abs();
+        let trade = pf
+            .close_position(id, 1.0, 200.0, ExitReason::Manual, 1)
+            .expect("close");
+        // Exit notional drifts off round 100 by the entry fee; price
+        // the true size, not a nominal one.
+        let s = qty * 1.0 / 200.0;
+        let want = 1.0 * (1.0 + s / (1.0 - s) + 0.0125);
+        assert!(
+            (trade.exit_price - want).abs() < 1e-9,
+            "exit={} want={} s={s}",
+            trade.exit_price,
+            want
+        );
+        assert!(
+            trade.exit_price > 1.25,
+            "must print through the 0.25 cap: {}",
+            trade.exit_price
+        );
     }
 
     #[test]

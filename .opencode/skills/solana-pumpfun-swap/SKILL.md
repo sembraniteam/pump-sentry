@@ -30,8 +30,9 @@ swaps against the Pump.fun bonding curve program.
 - **Buy:** `[102, 6, 61, 18, 1, 218, 235, 234]` (`0x66063d1201daebea`)
 - **Sell:** `[51, 230, 133, 164, 1, 127, 131, 173]` (`0x33e685a4017f83ad`)
 - **Buy_v2:** `[184, 23, 238, 97, 103, 197, 211, 61]` (mayhem-curve buys; trader at account index 13)
-- **Sell_v2:** `[93, 246, 130, 60, 231, 233, 64, 178]` (docs-sourced, UNOBSERVED on-chain — dev dumps through it stay
-  invisible; gate fail-closes on unknown pump ixs instead)
+- **Sell_v2:** `[93, 246, 130, 60, 231, 233, 64, 178]` (PumpSwap AMM sells; live-observed in block scans and
+  sim-proven via `pumpswap_sell_v2_simulates` — 17-account table + PDA legs cross-checked against live frames;
+  still no frozen fill fixture)
 - **Create_v2:** `[214, 144, 76, 236, 95, 139, 49, 180]` (current launches; 14–16 accounts)
 
 Buy args carry a trailing plain `bool track_volume` (live 25-byte payloads end `0x00`/`0x01`); the legacy 24-byte

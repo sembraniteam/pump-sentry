@@ -47,6 +47,8 @@ pub struct LiveExecution<L = LiveTrader> {
     pub deferred_pnl: Mutex<HashMap<String, (f64, usize)>>,
     /// Per-mint dispatch locks: slow mint A never blocks B.
     pub live_sell_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// GiveUp timestamps (secs) for burst alerting. Pruned on read.
+    pub giveup_stamps: Mutex<Vec<u64>>,
 }
 
 impl<L> LiveExecution<L> {
@@ -61,6 +63,7 @@ impl<L> LiveExecution<L> {
             synthetic_mints: Mutex::new(std::collections::HashSet::new()),
             deferred_pnl: Mutex::new(HashMap::new()),
             live_sell_locks: Mutex::new(HashMap::new()),
+            giveup_stamps: Mutex::new(Vec::new()),
         }
     }
 
@@ -177,6 +180,31 @@ impl<L> LiveExecution<L> {
     /// Diverged mints for reporting.
     pub async fn diverged_keys(&self) -> Vec<String> {
         self.live_diverged.lock().await.keys().cloned().collect()
+    }
+
+    /// Stamp a GiveUp (buy-unconfirmed or sell-budget-exhausted) for
+    /// burst alerting. Custody parking itself is unchanged.
+    pub async fn note_giveup(&self, now_secs: u64) {
+        self.giveup_stamps.lock().await.push(now_secs);
+    }
+
+    /// GiveUps within the trailing window (prunes older stamps).
+    pub async fn giveups_since(&self, window_secs: u64, now_secs: u64) -> usize {
+        let cutoff = now_secs.saturating_sub(window_secs);
+        let mut stamps = self.giveup_stamps.lock().await;
+        stamps.retain(|ts| *ts >= cutoff);
+        stamps.len()
+    }
+
+    /// Pending-buy count for the heartbeat (unconfirmed fills).
+    pub fn live_pending_count(&self) -> usize
+    where
+        L: LiveSink,
+    {
+        self.live
+            .as_ref()
+            .map(|t| t.pending_mints().len())
+            .unwrap_or(0)
     }
 
     /// Record one failed sell; return new count.
@@ -433,6 +461,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     warn!(mint = %mint, bundle = %recheck.bundle_id, sig = %recheck.signature, "pending LIVE buy unconfirmed after retries; parked for MANUAL REVIEW (may hold — look up sig on explorer)");
                     trader.record_manual(&recheck.position, &recheck.signature);
                     self.exec.park_manual(mint.clone(), recheck.position).await;
+                    self.exec.note_giveup(now_secs()).await;
                     self.emit(format!("LIVE buy unconfirmed on {mint} (sig {}); MANUAL REVIEW REQUIRED (may hold)", recheck.signature));
                 }
             }
@@ -598,6 +627,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     if let Some(held) = self.exec.remove_tracked(mint).await {
                         self.exec.park_manual(mint.to_string(), held).await;
                     }
+                    self.exec.note_giveup(now).await;
                     if deterministic {
                         warn!(%mint, error = %e, "LIVE sell deterministically rejected after budget; parked for manual exit (still HELD)");
                     } else {

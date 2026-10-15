@@ -393,7 +393,7 @@ async fn run_pipeline(live_arg: bool) {
             executor,
             settings.slippage_bps,
             settings.tip_lamports,
-        ).with_dispatch_fees(settings.compute_unit_limit, settings.priority_fee_micro_lamports).with_wal(live_wal_path()))
+        ).with_dispatch_fees(settings.compute_unit_limit, settings.priority_fee_micro_lamports).with_adaptive_slippage(settings.slippage_vol_window_secs, settings.slippage_vol_extra_cap_bps).with_wal(live_wal_path()))
     } else {
         None
     };
@@ -572,6 +572,8 @@ async fn run_pipeline(live_arg: bool) {
                 let pending = pipeline.pending_count().await;
                 let open = pipeline.open_position_mints().await.len();
                 let manual = pipeline.exec.manual_keys().await.len();
+                let diverged = pipeline.exec.diverged_keys().await.len();
+                let pending_buys = pipeline.exec.live_pending_count();
                 let (cash, equity) = pipeline.paper_cash_equity().await;
                 let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
                     mode: if live_mode { "live" } else { "paper" },
@@ -583,11 +585,35 @@ async fn run_pipeline(live_arg: bool) {
                     watchlist_pending: pending,
                     open_positions: open,
                     manual_bags: manual,
+                    diverged,
+                    pending_buys,
                     cash_usd: cash,
                     equity_usd: equity,
                 });
-                info!("heartbeat: logs={} candidates={} watchlist={} open={} manual={} equity={:.2}",
-                    snap.logs_seen, snap.candidates, pending, open, manual, equity);
+                info!("heartbeat: logs={} candidates={} watchlist={} open={} manual={} diverged={} pending_buys={} equity={:.2}",
+                    snap.logs_seen, snap.candidates, pending, open, manual, diverged, pending_buys, equity);
+                // Burn-in thresholds (all 0 = off): log-only, never cards.
+                let thresholds = &pipeline.settings;
+                if thresholds.alert_diverged_warn_n > 0 && diverged as u64 >= thresholds.alert_diverged_warn_n {
+                    warn!("alert: {diverged} diverged mints (paper without live cover) >= ALERT_DIVERGED_WARN_N={}; review funding/dispatch, or accept paper-only", thresholds.alert_diverged_warn_n);
+                }
+                if let Some(engine) = pipeline.engine.as_ref() {
+                    let decisions = engine.decision_count();
+                    let fallbacks = engine.fallback_count();
+                    if thresholds.alert_risk_fallback_warn_pct > 0 && decisions > 0 {
+                        let pct = fallbacks.saturating_mul(100).saturating_div(decisions);
+                        if pct >= thresholds.alert_risk_fallback_warn_pct {
+                            warn!("alert: risk-engine fallback rate {pct}% ({fallbacks}/{decisions}) >= ALERT_RISK_FALLBACK_WARN_PCT={}; model may be down, entries run heuristic", thresholds.alert_risk_fallback_warn_pct);
+                        }
+                    }
+                }
+                if thresholds.alert_giveup_burst_n > 0 {
+                    let now = settings::now_secs();
+                    let burst = pipeline.exec.giveups_since(thresholds.alert_giveup_window_secs, now).await;
+                    if burst as u64 >= thresholds.alert_giveup_burst_n {
+                        warn!("alert: {burst} GiveUps in trailing {}s >= ALERT_GIVEUP_BURST_N={}; systemic dispatch trouble, check RPC/Jito before funding more", thresholds.alert_giveup_window_secs, thresholds.alert_giveup_burst_n);
+                    }
+                }
                 if let Some(alerts) = pipeline.alerts.as_ref() {
                     alerts.alert(card);
                 }

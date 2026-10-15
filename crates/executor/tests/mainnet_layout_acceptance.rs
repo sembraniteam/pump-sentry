@@ -335,53 +335,287 @@ async fn mainnet_v3_17_simulates() {
         }
     }
     // Fresh-mint sell replay: fixture mints flipped to zero base (holders
-    // all 0), so sell needs a live mint. Discovered via inner-CPI scan of
-    // recent pump fills: sig 28Nfc4KzX14WZjtmtju1bFqW91ojNECey1SA5x44qzDahjVTaRNFX1MjoGqc9CDDsqysEDxe89zGGZiVvN6nZ58j
-    // carries a 17-account sell_v3 whose layout is positionally identical
-    // to build_v3_ix (global/mint/quote/base-prog/quote-prog/curve/assoc/
-    // curve-quote/payer/base-ata/quote-ata/uvol/fee-config/buyback/
-    // system/event-auth/pump). Buyback GXPFM2... is in BUYBACK_FEE_RECIPIENTS.
-    if !sell_green {
-        let mint: Pubkey = "9hADEDaSQ84QGJ7F4JK8nyaiFurQMFZwMpgcujdApump".parse().expect("mint");
-        let quote_mint: Pubkey = "So11111111111111111111111111111111111111112".parse().expect("wsol");
-        let curve: Pubkey = "6zVUqSPGKuiR6QaUHjpxLwFHkh7Q2uLBWF7w3uK3SWX5".parse().expect("curve");
-        let assoc: Pubkey = "FX8f1cFaJBBCu4kQvfhLZcpdgjnuYXMv5ySTkHNFdJTN".parse().expect("assoc");
-        let buyback: Pubkey = "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL".parse().expect("buyback");
-        eprintln!("fresh-sell: mint={mint} curve={curve}");
-        let token_program = match rpc.get_account(&mint).await { Ok(a) => a.owner, Err(_) => Pubkey::default() };
-        let quote_program = match rpc.get_account(&quote_mint).await { Ok(a) => a.owner, Err(_) => Pubkey::default() };
-        if token_program != Pubkey::default() {
-            let holders = match tokio::time::timeout(std::time::Duration::from_secs(15), rpc.get_token_largest_accounts(&mint)).await {
-                Ok(Ok(h)) => h, _ => Vec::new(),
-            };
-            eprintln!("fresh-sell: largest={}", holders.len());
-            for h in holders.iter().take(10) {
-                if sell_green { break; }
-                let Ok(hata) = Pubkey::from_str(&h.address) else { continue };
-                let Ok(hdata) = rpc.get_account(&hata).await else { continue };
-                if hdata.data.len() < 72 { continue; }
-                let howner = Pubkey::new_from_array(hdata.data[32..64].try_into().expect("32B"));
-                if howner == curve { continue; }
-                if user_ata_with_program(&howner, &mint, &token_program) != hata { aux_drops += 1; continue; }
-                let hbase: u64 = match rpc.get_token_account_balance(&hata).await { Ok(b) => b.amount.parse().unwrap_or(0), Err(_) => continue };
-                if hbase < 1_000 { continue; }
-                if rpc.get_balance(&howner).await.unwrap_or(0) < 50_000 { continue; }
-                if rpc.get_account(&user_volume_accumulator_pda(&howner)).await.is_err() { uvol_drops += 1; continue; }
-                let hquote = user_ata_with_program(&howner, &quote_mint, &quote_program);
-                let mut ixs = Vec::new();
-                if rpc.get_account(&hquote).await.is_err() {
-                    ixs.push(build_create_ata_ix(&howner, &howner, &quote_mint, &hquote, &quote_program));
-                }
-                ixs.push(PumpSwapBuilder::build_sell_v3_ix(1_000, 0, &SellV3Accounts {
-                    payer: &howner, mint: &mint, quote_mint: &quote_mint,
-                    bonding_curve: &curve, associated_bonding_curve: &assoc,
-                    base_token_program: &token_program, quote_token_program: &quote_program,
-                    buyback_recipient: &buyback,
-                }));
-                sim_attempts += 1;
-                if sim_skeleton_green(&rpc, &howner, ixs, "V3-SELL-FRESH").await { sell_green = true; break; }
+    // all 0), so sell needs a live mint. Discovered DYNAMICALLY: scan
+    // recent blocks for fresh sell_v3 fills and extract the 17-account
+    // layout positionally (mint [1], quote [2], curve [5], assoc [6],
+    // buyback [13]). A hardcoded mint rots (graduation/collection);
+    // the scan always finds this week's flow. Graduated curves are
+    // filtered (curve sells legitimately fail post-migration — sampling
+    // one would red the gate on a true negative).
+    async fn try_v3_sell(
+        rpc: &RpcClient,
+        mint: &Pubkey,
+        quote_mint: &Pubkey,
+        curve: &Pubkey,
+        assoc: &Pubkey,
+        buyback: &Pubkey,
+        fallback: Option<(Pubkey, Pubkey)>,
+    ) -> (bool, u32, u64, u64, u64) {
+        use executor::instructions::{
+            PumpSwapBuilder, SellV3Accounts, build_create_ata_ix,
+            user_ata_with_program, user_volume_accumulator_pda,
+        };
+        let (mut sims, mut aux, mut uvol, mut poor) = (0u32, 0u64, 0u64, 0u64);
+        let token_program = match rpc.get_account(mint).await {
+            Ok(a) => a.owner,
+            Err(_) => return (false, sims, aux, uvol, poor),
+        };
+        let quote_program = match rpc.get_account(quote_mint).await {
+            Ok(a) => a.owner,
+            Err(_) => return (false, sims, aux, uvol, poor),
+        };
+        let holders: Vec<_> = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            rpc.get_token_largest_accounts(mint),
+        )
+        .await
+        {
+            Ok(Ok(h)) => h,
+            _ => Vec::new(),
+        };
+        for h in holders.iter().take(10) {
+            let Ok(hata) = Pubkey::from_str(&h.address) else { continue };
+            let Ok(hdata) = rpc.get_account(&hata).await else { continue };
+            if hdata.data.len() < 72 { continue; }
+            let howner = Pubkey::new_from_array(hdata.data[32..64].try_into().expect("32B"));
+            if howner == *curve { continue; }
+            if user_ata_with_program(&howner, mint, &token_program) != hata {
+                aux += 1;
+                continue;
             }
-            if !sell_green { eprintln!("fresh-sell: no sellable holder"); }
+            let hbase: u64 = match rpc.get_token_account_balance(&hata).await {
+                Ok(b) => b.amount.parse().unwrap_or(0),
+                Err(_) => continue,
+            };
+            if hbase < 1_000 { continue; }
+            if rpc.get_balance(&howner).await.unwrap_or(0) < 50_000 { continue; }
+            if rpc.get_account(&user_volume_accumulator_pda(&howner)).await.is_err() {
+                uvol += 1;
+                continue;
+            }
+            let hquote = user_ata_with_program(&howner, quote_mint, &quote_program);
+            let mut ixs = Vec::new();
+            if rpc.get_account(&hquote).await.is_err() {
+                ixs.push(build_create_ata_ix(&howner, &howner, quote_mint, &hquote, &quote_program));
+            }
+            ixs.push(PumpSwapBuilder::build_sell_v3_ix(1_000, 0, &SellV3Accounts {
+                payer: &howner, mint, quote_mint,
+                bonding_curve: curve, associated_bonding_curve: assoc,
+                base_token_program: &token_program, quote_token_program: &quote_program,
+                buyback_recipient: buyback,
+            }));
+            sims += 1;
+            if sim_skeleton_green(rpc, &howner, ixs, "V3-SELL").await {
+                return (true, sims, aux, uvol, poor);
+            }
+        }
+        if let Some((ftrader, fata)) = fallback {
+            // Sample's own trader: a real seller minutes ago. Usable
+            // when the indexing call is throttled (public RPC 429s it
+            // first) or holders flipped since. Verified canonical and
+            // balance-checked live, so a stale sample yields no
+            // candidate rather than a false GREEN.
+            if user_ata_with_program(&ftrader, mint, &token_program) == fata
+                && ftrader != *curve
+            {
+                let held: u64 = rpc
+                    .get_token_account_balance(&fata)
+                    .await
+                    .ok()
+                    .and_then(|b| b.amount.parse().ok())
+                    .unwrap_or(0);
+                if held >= 1_000
+                    && rpc.get_balance(&ftrader).await.unwrap_or(0) >= 50_000
+                    && rpc
+                        .get_account(&user_volume_accumulator_pda(&ftrader))
+                        .await
+                        .is_ok()
+                {
+                    let hquote =
+                        user_ata_with_program(&ftrader, quote_mint, &quote_program);
+                    let mut ixs = Vec::new();
+                    if rpc.get_account(&hquote).await.is_err() {
+                        ixs.push(build_create_ata_ix(
+                            &ftrader,
+                            &ftrader,
+                            quote_mint,
+                            &hquote,
+                            &quote_program,
+                        ));
+                    }
+                    ixs.push(PumpSwapBuilder::build_sell_v3_ix(
+                        1_000,
+                        0,
+                        &SellV3Accounts {
+                            payer: &ftrader,
+                            mint,
+                            quote_mint,
+                            bonding_curve: curve,
+                            associated_bonding_curve: assoc,
+                            base_token_program: &token_program,
+                            quote_token_program: &quote_program,
+                            buyback_recipient: buyback,
+                        },
+                    ));
+                    sims += 1;
+                    if sim_skeleton_green(rpc, &ftrader, ixs, "V3-SELL-FALLBACK").await {
+                        return (true, sims, aux, uvol, poor);
+                    }
+                }
+            }
+        }
+        poor += 1;
+        eprintln!("no sellable holder on {mint}");
+        (false, sims, aux, uvol, poor)
+    }
+    if !sell_green {
+        // Fixture mints first (same order as the buy loop above).
+        for (raw, path) in fixtures {
+            if sell_green { break; }
+            let (mint, quote_mint, curve, assoc, buyback) = fixture_v3_accounts(raw, path);
+            let (green, s, a, u, p) = try_v3_sell(
+                &rpc,
+                &mint,
+                &quote_mint,
+                &curve,
+                &assoc,
+                &buyback,
+                Some(fixture_v3_trader(raw, path)),
+            )
+            .await;
+            sim_attempts += s;
+            aux_drops += a;
+            uvol_drops += u;
+            poor_drops += p;
+            sell_green = green;
+        }
+        if !sell_green {
+            // Dynamic fresh-mint hunt (see header comment).
+            let tip = rpc.get_slot().await.expect("slot");
+            let mut probe = tip.saturating_sub(20);
+            let mut fresh: Vec<(Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey)> =
+                Vec::new();
+            for _ in 0..60u32 {
+                if fresh.len() >= 4 { break; }
+                let block = match rpc
+                    .get_block_with_config(
+                        probe,
+                        solana_client::rpc_config::RpcBlockConfig {
+                            encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
+                            transaction_details: Some(
+                                solana_transaction_status::TransactionDetails::Full,
+                            ),
+                            rewards: Some(false),
+                            commitment: None,
+                            max_supported_transaction_version: Some(1),
+                        },
+                    )
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(_) => {
+                        probe = probe.saturating_sub(10);
+                        continue;
+                    }
+                };
+                let empty = Vec::new();
+                let transactions = block.transactions.as_ref().unwrap_or(&empty);
+                if transactions.is_empty() {
+                    probe = probe.saturating_sub(10);
+                    continue;
+                }
+                for tx_meta in transactions {
+                    if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
+                        continue;
+                    }
+                    let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
+                        &tx_meta.transaction
+                    else {
+                        continue;
+                    };
+                    let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
+                        continue;
+                    };
+                    let mut keys: Vec<Pubkey> = raw
+                        .account_keys
+                        .iter()
+                        .filter_map(|k| Pubkey::from_str(k).ok())
+                        .collect();
+                    if keys.len() != raw.account_keys.len() {
+                        continue;
+                    }
+                    if let Some(meta) = &tx_meta.meta {
+                        use solana_transaction_status::option_serializer::OptionSerializer;
+                        if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+                            for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
+                                let Ok(p) = Pubkey::from_str(k) else { continue };
+                                keys.push(p);
+                            }
+                        }
+                    }
+                    let pump_idx = match keys.iter().position(|k| k.to_string() == PUMP_PROGRAM) {
+                        Some(i) => i as u8,
+                        None => continue,
+                    };
+                    for cix in &raw.instructions {
+                        if fresh.len() >= 4 { break; }
+                        if cix.program_id_index != pump_idx {
+                            continue;
+                        }
+                        let data = decode_b58(&cix.data);
+                        if data.len() != 24 || data[..8] != ids::PUMP_SELL_V3_DISCRIMINATOR {
+                            continue;
+                        }
+                        if cix.accounts.len() != 17 {
+                            continue;
+                        }
+                        let accounts: Vec<Pubkey> = cix
+                            .accounts
+                            .iter()
+                            .filter_map(|i| keys.get(usize::from(*i)).copied())
+                            .collect();
+                        if accounts.len() != 17 {
+                            continue;
+                        }
+                        let (mint, quote, curve, assoc, buyback) =
+                            (accounts[1], accounts[2], accounts[5], accounts[6], accounts[13]);
+                        if fresh.iter().any(|(m, ..)| *m == mint) {
+                            continue;
+                        }
+                        // Ungraduated only (see header comment).
+                        let Ok(curve_data) = rpc.get_account(&curve).await else { continue };
+                        if curve_data.data.len() < 49 || curve_data.data[48] != 0 {
+                            continue;
+                        }
+                        eprintln!("fresh sell_v3 sample: mint={mint}");
+                        // Trader legs ride along as the throttle-proof
+                        // fallback (a real seller minutes ago).
+                        fresh.push((mint, quote, curve, assoc, buyback, accounts[8], accounts[9]));
+                    }
+                }
+                probe = probe.saturating_sub(10);
+            }
+            for (mint, quote_mint, curve, assoc, buyback, ftrader, fata) in &fresh {
+                if sell_green { break; }
+                let (green, s, a, u, p) = try_v3_sell(
+                    &rpc,
+                    mint,
+                    quote_mint,
+                    curve,
+                    assoc,
+                    buyback,
+                    Some((*ftrader, *fata)),
+                )
+                .await;
+                sim_attempts += s;
+                aux_drops += a;
+                uvol_drops += u;
+                poor_drops += p;
+                sell_green = green;
+            }
+            if !sell_green {
+                eprintln!("fresh-sell: no sellable holder in {} samples", fresh.len());
+            }
         }
     }
     eprintln!("v3 summary: sim_attempts={sim_attempts} aux_drops={aux_drops} uvol_drops={uvol_drops} poor_drops={poor_drops} buy_green={buy_green} sell_green={sell_green}");
@@ -426,6 +660,12 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
             }
         }
     }
+    // Fresh launch hunt (bulk blocks, as before). Labeled retry: a
+    // funding move between hunt and sim (or a dry hunt) refetches a
+    // FRESH launch+buyer instead of failing the gate — only a layout
+    // failure or 3 dry rounds reds it. (The loop body keeps its
+    // original indentation; the loop is load-bearing, not style.)
+    '_rounds: for _round in 0..3u32 {
     // Fresh launch hunt (bulk blocks, as before).
     let tip = rpc.get_slot().await.expect("slot");
     eprintln!("hunting from tip {tip}");
@@ -550,11 +790,13 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
         }
         probe_slot = probe_slot.saturating_sub(25);
     }
-    let ev = launch.unwrap_or_else(|| {
-        panic!(
-            "no fresh create_v2 in {blocks_scanned} blocks ({txs_scanned} txs); launches are sporadic, rerun"
-        )
-    });
+    let Some(ev) = launch else {
+        eprintln!("no fresh create_v2 in {blocks_scanned} blocks ({txs_scanned} txs); launches are sporadic");
+        if _round >= 2 {
+            panic!("no fresh create_v2 after 3 hunt rounds; rerun later");
+        }
+        continue '_rounds;
+    };
     let creator = ev.creator.expect("v2 launch must carry a creator");
     // Curve must still be live (ungraduated) for a meaningful sim.
     // Single attempt: a missing curve means a bad sample (e.g. failed
@@ -582,7 +824,8 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
     let buyer: Pubkey = {
         let mut before = None;
         let mut found = None;
-        for _ in 0..3usize {
+        let mut scan_fails = 0u32;
+        for _ in 0..6usize {
             let sigs: Vec<String> = match rpc
                 .get_signatures_for_address_with_config(
                     &Pubkey::from_str(PUMP_PROGRAM).expect("pump id"),
@@ -597,8 +840,15 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
             {
                 Ok(list) => list,
                 Err(e) => {
-                    eprintln!("buyer hunt scan failed ({e}); stopping");
-                    break;
+                    // Throttle, not verdict: back off and refetch the
+                    // same page (up to 3), then keep older pages.
+                    scan_fails += 1;
+                    eprintln!("buyer hunt scan failed ({e}); backoff {scan_fails}/3");
+                    if scan_fails > 3 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * scan_fails as u64)).await;
+                    continue;
                 }
             }
             .into_iter()
@@ -739,7 +989,14 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        found.unwrap_or_else(|| panic!("no funded buyer in recent buy flow; rerun"))
+        let Some(buyer) = found else {
+            eprintln!("no funded buyer in recent buy flow");
+            if _round >= 2 {
+                panic!("no funded buyer after 3 hunt rounds; rerun");
+            }
+            continue '_rounds;
+        };
+        buyer
     };
     println!("buyer: {buyer} (funded stranger)");
     let buyer_token_program = live_token_program(&rpc, &ev.mint).await;
@@ -835,17 +1092,410 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
     // Attribute the failure: a funding move between hunt and sim (buyer
     // drained, curve graduated mid-flight) surfaces as `insufficient
     // funds` inside a TransferChecked — a stale sample, not a layout
-    // bug. Fail loudly either way, but label flaky samples as reruns so
-    // a red run is never misread as a mapping regression (observed once:
-    // same code GREEN on rerun with a fresh sample).
+    // bug. A stale sample refetches fresh (see loop head); only a
+    // layout failure reds the gate, loudly either way.
     if let Some(err) = &res.value.err {
         let logs = res.value.logs.as_ref().map(|l| l.join("\n")).unwrap_or_default();
         if logs.contains("insufficient funds") {
-            panic!(
-                "FLAKY SAMPLE (funds moved between hunt and sim); rerun for a fresh launch: {err:?}"
-            );
+            eprintln!("FLAKY SAMPLE (funds moved between hunt and sim); hunting a fresh sample");
+            if _round >= 2 {
+                panic!(
+                    "FLAKY SAMPLE on the final round; rerun for a fresh launch: {err:?}"
+                );
+            }
+            continue '_rounds;
         }
         panic!("mayhem extended buy simulation failed: {err:?}");
     }
     println!("MAYHEM BUY GREEN mint={}", ev.mint);
+    return;
+    } // '_rounds: GREEN exits via return above; dry/flaky rounds loop for a fresh launch+buyer
+}
+
+#[tokio::test]
+#[ignore]
+async fn pumpswap_sell_v2_simulates() {
+    // Syarat-1 gap closure: the PumpSwap exit leg. `sell_pumpswap_v2_ix`
+    // was doc-pinned only ("No frozen sell_v2 fill yet"); this replays
+    // OUR builder + OUR quote math (floor from live reserves) against a
+    // live pool with a live funded holder, `simulateTransaction`
+    // (sig_verify off, dust, open guards). Simulation only, never
+    // sends anything. Cashback pools are skipped (6079 refuses
+    // on-chain; our builder refuses identically in preflight).
+    if std::env::var("MAINNET_LAYOUT").as_deref() != Ok("1") {
+        eprintln!("skipped: set MAINNET_LAYOUT=1 to run the live layout probe");
+        return;
+    }
+    use executor::instructions::{
+        PumpAmmSellV2Accounts, PumpSwapBuilder, amm_event_authority_pda,
+        amm_user_volume_accumulator_pda, build_create_ata_ix,
+        user_ata_with_program,
+    };
+    use executor::quote::{
+        market_cap, parse_amm_creator_gate, parse_fee_schedule,
+        pumpswap_fee_bps, pumpswap_sell_floor, pumpswap_sell_out, PoolView,
+    };
+    use migration::pumpswap::PumpSwapPool;
+    let rpc = rpc_client();
+    const PUMP_AMM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
+    // Hunt recent sell_v2 fills (bulk blocks, newest first).
+    let tip = rpc.get_slot().await.expect("slot");
+    let mut probe_slot = tip.saturating_sub(30);
+    let mut samples: Vec<Vec<Pubkey>> = Vec::new();
+    for _ in 0..40u32 {
+        if samples.len() >= 4 {
+            break;
+        }
+        let block = match rpc
+            .get_block_with_config(
+                probe_slot,
+                solana_client::rpc_config::RpcBlockConfig {
+                    encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
+                    transaction_details: Some(
+                        solana_transaction_status::TransactionDetails::Full,
+                    ),
+                    rewards: Some(false),
+                    commitment: None,
+                    max_supported_transaction_version: Some(1),
+                },
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("slot {probe_slot} unavailable ({e}); backing off");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                probe_slot = probe_slot.saturating_sub(10);
+                continue;
+            }
+        };
+        let empty = Vec::new();
+        let transactions = block.transactions.as_ref().unwrap_or(&empty);
+        if transactions.is_empty() {
+            probe_slot = probe_slot.saturating_sub(10);
+            continue;
+        }
+        for tx_meta in transactions {
+            if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
+                continue;
+            }
+            let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
+                &tx_meta.transaction
+            else {
+                continue;
+            };
+            let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
+                continue;
+            };
+            let mut keys: Vec<Pubkey> = raw
+                .account_keys
+                .iter()
+                .filter_map(|k| Pubkey::from_str(k).ok())
+                .collect();
+            if keys.len() != raw.account_keys.len() {
+                continue;
+            }
+            if let Some(meta) = &tx_meta.meta {
+                use solana_transaction_status::option_serializer::OptionSerializer;
+                if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+                    for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
+                        let Ok(p) = Pubkey::from_str(k) else { continue };
+                        keys.push(p);
+                    }
+                }
+            }
+            let amm_idx = match keys.iter().position(|k| k.to_string() == PUMP_AMM) {
+                Some(i) => i as u8,
+                None => continue,
+            };
+            for cix in &raw.instructions {
+                if cix.program_id_index != amm_idx {
+                    continue;
+                }
+                let data = decode_b58(&cix.data);
+                if data.len() != 24 || data[..8] != ids::PUMP_AMM_SELL_V2_DISCRIMINATOR {
+                    continue;
+                }
+                let accounts: Vec<Pubkey> = cix
+                    .accounts
+                    .iter()
+                    .filter_map(|i| keys.get(usize::from(*i)).copied())
+                    .collect();
+                if accounts.len() != 17 {
+                    continue;
+                }
+                samples.push(accounts);
+                if samples.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        probe_slot = probe_slot.saturating_sub(10);
+    }
+    assert!(!samples.is_empty(), "no sell_v2 in recent blocks; rerun");
+
+    // Try each sample: layout cross-check + live-holder sim.
+    let mut failures: Vec<String> = Vec::new();
+    let mut green = false;
+    for cacc in &samples {
+        if green {
+            break;
+        }
+        let (pool, user) = (cacc[0], cacc[1]);
+        let (base_mint, quote_mint) = (cacc[3], cacc[4]);
+        // Layout cross-check: our 17-account table against the live
+        // frame (globals, fee config, program). [14] varies by pool
+        // (recipient ATA) and [12]/[15] are derived below instead.
+        if cacc[2] != ids::PUMP_AMM_GLOBAL_CONFIG
+            || cacc[13] != ids::PUMP_AMM_FEE_CONFIG
+            || cacc[16] != ids::PUMP_AMM_PROGRAM_ID
+        {
+            failures.push(format!("pool {pool}: frame globals mismatch; skipping sample"));
+            continue;
+        }
+        if quote_mint != ids::WSOL_MINT {
+            failures.push(format!("pool {pool}: non-WSOL quote; skipping sample"));
+            continue;
+        }
+        let pool_acct = match rpc.get_account(&pool).await {
+            Ok(a) => a,
+            Err(_) => {
+                failures.push(format!("pool {pool}: unreadable; skipping sample"));
+                continue;
+            }
+        };
+        if pool_acct.owner != ids::PUMP_AMM_PROGRAM_ID {
+            failures.push(format!("pool {pool}: owner mismatch; skipping sample"));
+            continue;
+        }
+        let Some(parsed) =
+            PumpSwapPool::parse_validated(&pool, &pool_acct.data, &pool_acct.owner, &base_mint)
+        else {
+            failures.push(format!("pool {pool}: trust gate failed; skipping sample"));
+            continue;
+        };
+        if parsed.is_cashback {
+            failures.push(format!("pool {pool}: cashback (6079 refuses); skipping sample"));
+            continue;
+        }
+        if parsed.base_vault != cacc[7] || parsed.quote_vault != cacc[8] {
+            failures.push(format!("pool {pool}: vaults differ from frame; skipping sample"));
+            continue;
+        }
+        // Holder legs: canonical base ATA with dust, funded payer.
+        let token_program = match rpc.get_account(&base_mint).await {
+            Ok(a) => a.owner,
+            Err(_) => {
+                failures.push(format!("pool {pool}: mint unreadable; skipping sample"));
+                continue;
+            }
+        };
+        if user_ata_with_program(&user, &base_mint, &token_program) != cacc[5] {
+            failures.push(format!("pool {pool}: base ATA non-canonical; skipping sample"));
+            continue;
+        }
+        let held: u64 = match rpc.get_token_account_balance(&cacc[5]).await {
+            Ok(b) => b.amount.parse().unwrap_or(0),
+            Err(_) => {
+                failures.push(format!("pool {pool}: base balance unreadable; skipping"));
+                continue;
+            }
+        };
+        if rpc.get_balance(&user).await.unwrap_or(0) < 50_000 {
+            failures.push(format!("pool {pool}: payer poor; skipping sample"));
+            continue;
+        }
+        // Fee inputs + live reserves (mirror preflight, read-only).
+        let vaults = async {
+            let b = rpc.get_account(&parsed.base_vault).await.ok()?;
+            let q = rpc.get_account(&parsed.quote_vault).await.ok()?;
+            Some((b, q))
+        }
+        .await;
+        let global = rpc.get_account(&ids::PUMP_AMM_GLOBAL_CONFIG).await.ok();
+        let fee_config = rpc.get_account(&ids::PUMP_AMM_FEE_CONFIG).await.ok();
+        let supply = rpc.get_token_supply(&base_mint).await.ok();
+        let (Some((base_vault, quote_vault)), Some(global), Some(fee_config), Some(supply)) =
+            (vaults, global, fee_config, supply)
+        else {
+            failures.push(format!("pool {pool}: fee/reserve reads failed; skipping"));
+            continue;
+        };
+        if global.owner != ids::PUMP_AMM_PROGRAM_ID
+            || fee_config.owner != ids::FEE_CONFIG_PROGRAM
+            || global
+                .data
+                .get(ids::PUMP_AMM_GLOBAL_DISABLE_FLAGS_OFFSET)
+                .copied()
+                .unwrap_or(1)
+                != 0
+        {
+            failures.push(format!("pool {pool}: global/fee-config untrusted; skipping"));
+            continue;
+        }
+        let gate_on = match parse_amm_creator_gate(&global.data) {
+            Ok(g) => g,
+            Err(_) => {
+                failures.push(format!("pool {pool}: creator gate unparsable; skipping"));
+                continue;
+            }
+        };
+        let schedule = match parse_fee_schedule(&fee_config.data) {
+            Ok(s) => s,
+            Err(_) => {
+                failures.push(format!("pool {pool}: fee schedule unparsable; skipping"));
+                continue;
+            }
+        };
+        let quote_program = quote_vault.owner;
+        if base_vault.owner != ids::TOKEN_PROGRAM_ID
+            && base_vault.owner != ids::TOKEN_2022_PROGRAM_ID
+        {
+            failures.push(format!("pool {pool}: base vault program unknown; skipping"));
+            continue;
+        }
+        if quote_program != ids::TOKEN_PROGRAM_ID
+            && quote_program != ids::TOKEN_2022_PROGRAM_ID
+        {
+            failures.push(format!("pool {pool}: quote vault program unknown; skipping"));
+            continue;
+        }
+        let base_reserve: u64 = match rpc.get_token_account_balance(&parsed.base_vault).await {
+            Ok(b) => b.amount.parse().unwrap_or(0),
+            Err(_) => continue,
+        };
+        let quote_reserve: u64 = match rpc.get_token_account_balance(&parsed.quote_vault).await {
+            Ok(b) => b.amount.parse().unwrap_or(0),
+            Err(_) => continue,
+        };
+        let eff_quote = match (i128::from(quote_reserve))
+            .checked_add(parsed.virtual_quote_reserves)
+            .and_then(|v| u64::try_from(v).ok())
+            .filter(|v| *v > 0)
+        {
+            Some(v) => v,
+            None => {
+                failures.push(format!("pool {pool}: effective reserves non-positive; skipping"));
+                continue;
+            }
+        };
+        let real_cap = match u64::try_from(parsed.fee_buckets)
+            .ok()
+            .and_then(|buckets| quote_reserve.checked_sub(buckets))
+        {
+            Some(v) => v,
+            None => {
+                failures.push(format!("pool {pool}: fee buckets exceed vault; skipping"));
+                continue;
+            }
+        };
+        let circulating = if parsed.is_mayhem {
+            ids::PUMP_AMM_MAYHEM_SUPPLY
+        } else {
+            match supply.amount.parse::<u64>() {
+                Ok(s) => s,
+                Err(_) => {
+                    failures.push(format!("pool {pool}: supply unparsable; skipping"));
+                    continue;
+                }
+            }
+        };
+        let mcap = match market_cap(eff_quote, base_reserve, circulating) {
+            Ok(m) => m,
+            Err(_) => {
+                failures.push(format!("pool {pool}: mcap uncomputable; skipping"));
+                continue;
+            }
+        };
+        let fees = match pumpswap_fee_bps(
+            &schedule,
+            gate_on,
+            parsed.creator_fee_bps,
+            parsed.coin_creator == Pubkey::default(),
+            mcap,
+        ) {
+            Ok(f) => f,
+            Err(_) => {
+                failures.push(format!("pool {pool}: fee tier unresolvable; skipping"));
+                continue;
+            }
+        };
+        let view = PoolView {
+            base_reserve,
+            eff_quote_reserve: eff_quote,
+            real_quote_cap: real_cap,
+            lp_bps: fees.lp,
+            proto_bps: fees.protocol,
+            creator_bps: fees.creator,
+        };
+        // Dust ladder: first amount the holder covers that our own
+        // formula floors (formula + layout proven together).
+        let mut sized: Option<(u64, u64)> = None;
+        for dust in [1_000_000u64, 100_000, 10_000, 1_000] {
+            if held < dust {
+                continue;
+            }
+            let Ok(net) = pumpswap_sell_out(&view, dust) else { continue };
+            if let Some(floor) = pumpswap_sell_floor(net, 200) {
+                sized = Some((dust, floor));
+                break;
+            }
+        }
+        let Some((amount, floor)) = sized else {
+            failures.push(format!("pool {pool}: no dust size floors (held={held}); skipping"));
+            continue;
+        };
+        // Derived legs must match the live frame ([12] uvol, [15]
+        // event auth): positional proof of our PDA derivations.
+        if amm_user_volume_accumulator_pda(&user) != cacc[12]
+            || amm_event_authority_pda() != cacc[15]
+        {
+            failures.push(format!("pool {pool}: PDA legs mismatch; skipping sample"));
+            continue;
+        }
+        // Buyback recipient ATA must exist (never created by the trade).
+        let buyback = user_ata_with_program(
+            &ids::DEFAULT_BUYBACK_FEE_RECIPIENT,
+            &ids::WSOL_MINT,
+            &quote_program,
+        );
+        if rpc.get_account(&buyback).await.is_err() {
+            failures.push(format!("pool {pool}: buyback ATA missing; skipping sample"));
+            continue;
+        }
+        let mut ixs = Vec::new();
+        if rpc.get_account(&cacc[6]).await.is_err() {
+            ixs.push(build_create_ata_ix(&user, &user, &quote_mint, &cacc[6], &quote_program));
+        }
+        ixs.push(PumpSwapBuilder::build_sell_pumpswap_v2_ix(
+            amount,
+            floor,
+            &PumpAmmSellV2Accounts {
+                pool: &pool,
+                user: &user,
+                base_mint: &base_mint,
+                quote_mint: &quote_mint,
+                user_base_token_account: &cacc[5],
+                user_quote_token_account: &cacc[6],
+                pool_base_token_account: &parsed.base_vault,
+                pool_quote_token_account: &parsed.quote_vault,
+                base_token_program: &token_program,
+                quote_token_program: &quote_program,
+                buyback_fee_recipient: &buyback,
+            },
+        ));
+        if sim_skeleton_green(&rpc, &user, ixs, "PUMPSWAP-SELL-V2").await {
+            green = true;
+        } else {
+            failures.push(format!("pool {pool}: transport trouble; resampled"));
+        }
+    }
+    assert!(
+        green,
+        "no pumpswap sell_v2 simulating clean after {} samples:\n{}",
+        samples.len(),
+        failures.join("\n")
+    );
+    println!("PUMPSWAP SELL_V2 GREEN");
 }

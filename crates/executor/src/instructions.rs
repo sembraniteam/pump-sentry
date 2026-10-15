@@ -498,9 +498,12 @@ mod tests {
 
     #[test]
     fn sell_pumpswap_v2_matches_documented_layout() {
-        // No frozen sell_v2 fill yet: pins the 17-account table from
-        // PUMP_SWAP_TRADE_V2.md plus IDL writability (pool/user/volumes
-        // writable, configs/programs readonly, user signer).
+        // Layout cross-checked against live sell_v2 frames by the
+        // `pumpswap_sell_v2_simulates` acceptance probe (globals, fee
+        // config, program slot, both PDA legs); this unit test pins the
+        // 17-account table from PUMP_SWAP_TRADE_V2.md plus IDL
+        // writability (pool/user/volumes writable, configs/programs
+        // readonly, user signer). Still no frozen fill fixture.
         use std::collections::HashSet;
         let key = |b: u8| Pubkey::new_from_array([b; 32]);
         let accts = PumpAmmSellV2Accounts {

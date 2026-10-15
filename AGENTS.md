@@ -16,7 +16,7 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 397 tests; live probes stay ignored
+cargo test --workspace            # 443 tests; live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
@@ -79,6 +79,11 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   assumption fails closed there — our own holdings are always canonical
   via the idempotent ATA prefix). Simulation with `sig_verify:false`
   proves layout/logic, never authorization.
+- PumpSwap `sell_v2` IS sim-proven now (`pumpswap_sell_v2_simulates`:
+  builder + quote floor vs live pool + live funded holder, GREEN).
+  Still no frozen sell_v2 fill fixture, and no funded trial
+  (buy-then-sell for real) — that trial is an operator action, never
+  run from here.
 - Mainnet fixtures live in `crates/listener/tests/fixtures/`; replay
   tests are the gate that must stay green.
 

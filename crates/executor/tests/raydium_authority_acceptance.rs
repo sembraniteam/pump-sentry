@@ -20,9 +20,7 @@
 
 use executor::build_swap_base_in_v2_ix;
 use solana_client::{
-    nonblocking::rpc_client::RpcClient,
-    rpc_client::GetConfirmedSignaturesForAddress2Config,
-    rpc_config::{RpcSimulateTransactionConfig, RpcTransactionConfig},
+    nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig,
 };
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
@@ -33,6 +31,8 @@ const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const RAYDIUM_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 /// Proving pool: frozen Fartcoin migration (`raydium_pool_fartcoin.json`).
 const FARTCOIN_MINT: &str = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump";
+/// Second pool (fresher flow when Fartcoin is router-dominated).
+const MAINNET_MINT: &str = "HyDKNdnhZNVYQMruBevbNsUWruA9STmAQrS4srXApump";
 
 fn decode_b58(s: &str) -> Vec<u8> {
     bs58::decode(s).into_vec().expect("valid base58")
@@ -57,75 +57,64 @@ async fn raydium_authority_and_bundle_simulate() {
         return;
     }
     let rpc = rpc_client();
-    // Frozen pool slots (amm/vaults/mints), trust-gated off-chain.
-    let raw = include_str!("../../migration/tests/fixtures/raydium_pool_fartcoin.json");
-    let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
-    let parse = |s: &str| Pubkey::from_str(v[s].as_str().expect("pubkey str")).expect("pubkey");
-    let (amm, owner) = (parse("amm"), parse("owner"));
-    let data: Vec<u8> = v["data"]
-        .as_array()
-        .expect("data array")
-        .iter()
-        .map(|b| b.as_u64().expect("byte") as u8)
-        .collect();
-    let pool = migration::pool::RaydiumV4Pool::parse_validated(
-        &amm,
-        &data,
-        &owner,
-        &Pubkey::from_str(FARTCOIN_MINT).expect("mint"),
-    )
-    .expect("frozen pool validates");
-    assert!(pool.is_wsol_based());
-
     // --- Gate 1: authority proof against a live direct swap. ---
+    // Hunt recent blocks for direct top-level SwapBaseInV2 (tag 16,
+    // 17 bytes, 8 accounts): staking fixed pools starves when router
+    // flow dominates them (observed: 0 direct swaps in 1561 sigs over
+    // 2 pools). Hunting flow finds this week's swaps on ANY pool; each
+    // sample replays against its own live-parsed pool. Block payloads
+    // carry full txs, so no per-signature fetch burns RPC budget.
     let raydium = Pubkey::from_str(RAYDIUM_PROGRAM).expect("raydium id");
-    assert_eq!(owner, raydium, "fixture owner must be the AMM v4 program");
-    let mut before = None;
-    let mut proof: Option<(String, Vec<Pubkey>, Pubkey)> = None;
+    // Candidates, not a single proof: one bad sample (spent ATA,
+    // composed inner frame, moved funds) must resample, never red
+    // the gate. Authority proof uses the first; sims try each.
+    let mut candidates: Vec<(String, Vec<Pubkey>, Pubkey)> = Vec::new();
     let mut scanned = 0u32;
-    'scan: for _ in 0..4 {
-        let sigs: Vec<String> = rpc
-            .get_signatures_for_address_with_config(
-                &amm,
-                GetConfirmedSignaturesForAddress2Config {
-                    before,
-                    until: None,
-                    limit: Some(50),
+    let mut blocks = 0u32;
+    let tip = rpc.get_slot().await.expect("slot");
+    let mut probe_slot = tip.saturating_sub(20);
+    'scan: for _ in 0..60u32 {
+        if candidates.len() >= 6 {
+            break;
+        }
+        let block = match rpc
+            .get_block_with_config(
+                probe_slot,
+                solana_client::rpc_config::RpcBlockConfig {
+                    encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
+                    transaction_details: Some(
+                        solana_transaction_status::TransactionDetails::Full,
+                    ),
+                    rewards: Some(false),
                     commitment: None,
+                    max_supported_transaction_version: Some(1),
                 },
             )
             .await
-            .expect("signatures readable")
-            .into_iter()
-            .filter(|s| s.err.is_none())
-            .map(|s| s.signature)
-            .collect();
-        if sigs.is_empty() {
-            break;
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("slot {probe_slot} unavailable ({e}); skipping");
+                probe_slot = probe_slot.saturating_sub(10);
+                continue;
+            }
+        };
+        let empty = Vec::new();
+        let transactions = block.transactions.as_ref().unwrap_or(&empty);
+        if transactions.is_empty() {
+            probe_slot = probe_slot.saturating_sub(10);
+            continue;
         }
-        before = sigs
-            .last()
-            .and_then(|s| solana_signature::Signature::from_str(s).ok());
-        for sig in &sigs {
-            scanned += 1;
-            let Ok(sig_parsed) = solana_signature::Signature::from_str(sig) else {
+        blocks += 1;
+        for tx_meta in transactions {
+            if candidates.len() >= 6 {
+                break 'scan;
+            }
+            if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
                 continue;
-            };
-            let Ok(fetched) = rpc
-                .get_transaction_with_config(
-                    &sig_parsed,
-                    RpcTransactionConfig {
-                        encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
-                        commitment: None,
-                        max_supported_transaction_version: Some(1),
-                    },
-                )
-                .await
-            else {
-                continue;
-            };
+            }
             let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
-                &fetched.transaction.transaction
+                &tx_meta.transaction
             else {
                 continue;
             };
@@ -140,7 +129,7 @@ async fn raydium_authority_and_bundle_simulate() {
             if keys.len() != raw.account_keys.len() {
                 continue;
             }
-            if let Some(meta) = &fetched.transaction.meta {
+            if let Some(meta) = &tx_meta.meta {
                 use solana_transaction_status::option_serializer::OptionSerializer;
                 if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
                     for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
@@ -171,17 +160,27 @@ async fn raydium_authority_and_bundle_simulate() {
                 if accounts.len() != 8 {
                     continue;
                 }
-                proof = Some((sig.clone(), accounts, keys[0]));
-                break 'scan;
+                scanned += 1;
+                let sig = ui_tx.signatures.first().cloned().unwrap_or_default();
+                candidates.push((sig, accounts, keys[0]));
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        probe_slot = probe_slot.saturating_sub(10);
     }
-    let Some((sig, accounts, payer)) = proof else {
+    let Some((sig, accounts, _)) = candidates.first().cloned() else {
         panic!(
-            "no direct SwapBaseInV2 in {scanned} signatures for {amm}; rerun (router txs dominate) — NOT a builder verdict"
+            "no direct SwapBaseInV2 in {scanned} swap ixs over {blocks} blocks; rerun (router txs dominate) — NOT a builder verdict"
         );
     };
+    // The sample's pool must itself be a Raydium AMM account.
+    let amm_acct = rpc
+        .get_account(&accounts[1])
+        .await
+        .expect("sample pool readable");
+    assert_eq!(
+        amm_acct.owner, raydium,
+        "sample pool not owned by the AMM program"
+    );
     let derived = ids::RAYDIUM_VAULT_AUTHORITY;
     println!("proving tx: {sig}");
     println!("on-chain authority (accounts[2]): {}", accounts[2]);
@@ -206,7 +205,7 @@ async fn raydium_authority_and_bundle_simulate() {
         ),
         (
             "../migration/tests/fixtures/raydium_pool_mainnet.json",
-            "HyDKNdnhZNVYQMruBevbNsUWruA9STmAQrS4srXApump",
+            MAINNET_MINT,
         ),
     ] {
         let raw = std::fs::read_to_string(fixture).expect("fixture readable");
@@ -239,125 +238,229 @@ async fn raydium_authority_and_bundle_simulate() {
         println!("vault owners GREEN ({fixture})");
     }
 
-    // --- Gate 2: our builder rebuilds the sampled legs, sim only. ---
+    // --- Gates 2+3: our builder rebuilds sampled legs, sim only. ---
     // No token-program resolution: upstream hard-requires classic at
     // [0], so the builder carries no program parameter to resolve.
-    let ix = build_swap_base_in_v2_ix(
-        &pool.amm_id,
-        &derived,
-        &pool.base_vault,
-        &pool.quote_vault,
-        &accounts[5],
-        &accounts[6],
-        &accounts[7],
-        1_000,
-        0,
-    )
-    .expect("replay builds");
-    assert_eq!(ix.program_id, raydium);
-    let blockhash = rpc.get_latest_blockhash().await.expect("blockhash");
-    let ixs: Vec<Instruction> = vec![ix];
-    let message = solana_message::Message::new_with_blockhash(&ixs, Some(&payer), &blockhash);
-    let tx = Transaction {
-        signatures: vec![
-            solana_signature::Signature::default();
-            message.header.num_required_signatures as usize
-        ],
-        message,
-    };
-    let res = rpc
-        .simulate_transaction_with_config(
-            &tx,
-            RpcSimulateTransactionConfig {
-                sig_verify: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("simulate RPC");
-    println!(
-        "SIM logs:\n{}",
-        res.value
-            .logs
-            .as_ref()
-            .map(|l| l.join("\n"))
-            .unwrap_or_default()
-    );
+    // Resampling: each candidate is leg-validated with cheap reads,
+    // then simmed in both directions. A failing sample (spent ATA,
+    // composed frame, moved funds) is skipped with its logs — only
+    // an all-candidate failure reds the gate. Observed once: a lone
+    // sample failed `Custom(38)` while the resample went GREEN on
+    // both directions, so single-sample verdicts are retired here.
+    async fn token_legs(
+        rpc: &RpcClient,
+        ata: &Pubkey,
+    ) -> Option<(Pubkey, u64)> {
+        let data = rpc.get_account_data(ata).await.ok()?;
+        if data.len() < 72 {
+            return None;
+        }
+        let owner = Pubkey::new_from_array(data[32..64].try_into().ok()?);
+        let bal: u64 = rpc
+            .get_token_account_balance(ata)
+            .await
+            .ok()?
+            .amount
+            .parse()
+            .ok()?;
+        Some((owner, bal))
+    }
+    async fn sim_ix_green(
+        rpc: &RpcClient,
+        payer: &Pubkey,
+        ix: Instruction,
+        label: &str,
+    ) -> Result<(), String> {
+        // Fresh blockhash per sim: the scan + reads between gates can
+        // outlive a previous hash (stale hash proves nothing).
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .await
+            .map_err(|e| format!("{label}: blockhash failed ({e})"))?;
+        let message =
+            solana_message::Message::new_with_blockhash(&[ix], Some(payer), &blockhash);
+        let tx = Transaction {
+            signatures: vec![
+                solana_signature::Signature::default();
+                message.header.num_required_signatures as usize
+            ],
+            message,
+        };
+        let res = rpc
+            .simulate_transaction_with_config(
+                &tx,
+                RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| format!("{label}: simulate RPC failed ({e})"))?;
+        println!(
+            "SIM logs ({label}):\n{}",
+            res.value
+                .logs
+                .as_ref()
+                .map(|l| l.join("\n"))
+                .unwrap_or_default()
+        );
+        match &res.value.err {
+            None => {
+                println!("{label} GREEN");
+                Ok(())
+            }
+            Some(err) => Err(format!("{label} simulation failed: {err:?}")),
+        }
+    }
+    let mut failures: Vec<String> = Vec::new();
+    let mut bundle_green = false;
+    let mut sell_green = false;
+    for (csig, cacc, cpayer) in candidates.iter() {
+        if bundle_green && sell_green {
+            break;
+        }
+        // Each sample replays against its own live-parsed pool
+        // (migration orientation: WSOL base, token quote).
+        let amm_acct = match rpc.get_account(&cacc[1]).await {
+            Ok(a) => a,
+            Err(_) => {
+                failures.push(format!("{csig}: pool unreadable; skipping sample"));
+                continue;
+            }
+        };
+        if amm_acct.owner != raydium {
+            failures.push(format!("{csig}: pool owner mismatch; skipping sample"));
+            continue;
+        }
+        let pool = match migration::pool::RaydiumV4Pool::parse(&cacc[1], &amm_acct.data) {
+            Ok(p) if p.is_wsol_based() => p,
+            _ => {
+                failures.push(format!("{csig}: pool unparsable/non-WSOL-based; skipping"));
+                continue;
+            }
+        };
+        // [5] must be a live token account owned by [7] with dust to
+        // move; anything else is a composed frame or a spent sample.
+        // [6] must at least EXIST: swept/closed dest ATAs (rent
+        // reclaimed minutes after the swap) fail the replay with a
+        // program error that says nothing about our builder — observed
+        // once as `Invalid SPL token program` on a closed dest.
+        let (owner5, bal5) = match token_legs(&rpc, &cacc[5]).await {
+            Some(v) => v,
+            None => {
+                failures.push(format!("{csig}: source [5] unreadable; skipping sample"));
+                continue;
+            }
+        };
+        let (owner6, _) = match token_legs(&rpc, &cacc[6]).await {
+            Some(v) => v,
+            None => {
+                failures.push(format!("{csig}: dest [6] missing (swept?); skipping sample"));
+                continue;
+            }
+        };
+        if owner5 != cacc[7] {
+            failures.push(format!("{csig}: source owner != [7] (composed frame?); skipping"));
+            continue;
+        }
+        if owner6 != cacc[7] {
+            failures.push(format!("{csig}: dest owner != [7] (composed frame?); skipping"));
+            continue;
+        }
+        if bal5 < 1_000 {
+            failures.push(format!("{csig}: source empty ({bal5}); skipping sample"));
+            continue;
+        }
+        if rpc.get_balance(cpayer).await.unwrap_or(0) < 50_000 {
+            failures.push(format!("{csig}: payer poor; skipping sample"));
+            continue;
+        }
+        if !bundle_green {
+            let ix = build_swap_base_in_v2_ix(
+                &pool.amm_id,
+                &derived,
+                &pool.base_vault,
+                &pool.quote_vault,
+                &cacc[5],
+                &cacc[6],
+                &cacc[7],
+                1_000,
+                0,
+            )
+            .expect("replay builds");
+            assert_eq!(ix.program_id, raydium);
+            match sim_ix_green(&rpc, cpayer, ix, "RAYDIUM-BUNDLE").await {
+                Ok(()) => {
+                    bundle_green = true;
+                    println!("RAYDIUM BUNDLE GREEN");
+                }
+                Err(e) => {
+                    failures.push(format!("{csig}: {e}"));
+                    continue;
+                }
+            }
+        }
+        if !sell_green {
+            // The SELL direction we will actually dispatch. Read the
+            // sampled user-source mint: WSOL there means the sample was
+            // a buy, so flip the legs for our sell (and vice versa).
+            let src_data = rpc
+                .get_account_data(&cacc[5])
+                .await
+                .expect("src readable");
+            let src_mint = Pubkey::new_from_array(
+                src_data[0..32]
+                    .try_into()
+                    .expect("token account holds its mint at [0..32]"),
+            );
+            let (sell_src, sell_dst) = if src_mint == ids::WSOL_MINT {
+                (cacc[6], cacc[5])
+            } else {
+                (cacc[5], cacc[6])
+            };
+            let sell_bal = match token_legs(&rpc, &sell_src).await {
+                Some((_, b)) => b,
+                None => {
+                    failures.push(format!("{csig}: sell source unreadable; skipping sample"));
+                    continue;
+                }
+            };
+            if token_legs(&rpc, &sell_dst).await.is_none() {
+                failures.push(format!("{csig}: sell dest missing (swept?); skipping sample"));
+                continue;
+            }
+            if sell_bal < 1_000 {
+                failures.push(format!("{csig}: sell source empty; skipping sample"));
+                continue;
+            }
+            let sell_ix = build_swap_base_in_v2_ix(
+                &pool.amm_id,
+                &derived,
+                &pool.base_vault,
+                &pool.quote_vault,
+                &sell_src,
+                &sell_dst,
+                &cacc[7],
+                1_000,
+                0,
+            )
+            .expect("sell replay builds");
+            match sim_ix_green(&rpc, cpayer, sell_ix, "RAYDIUM-SELL").await {
+                Ok(()) => {
+                    sell_green = true;
+                    println!("RAYDIUM SELL GREEN");
+                }
+                Err(e) => {
+                    failures.push(format!("{csig}: {e}"));
+                    continue;
+                }
+            }
+        }
+    }
     assert!(
-        res.value.err.is_none(),
-        "raydium replay simulation failed: {:?}",
-        res.value.err
+        bundle_green && sell_green,
+        "no raydium replay simulating clean after {} candidates:\n{}",
+        candidates.len(),
+        failures.join("\n")
     );
-    println!("RAYDIUM BUNDLE GREEN");
-
-    // --- Gate 3: the SELL direction we will actually dispatch. ---
-    // Our stuck bags hold the quote-side token and want WSOL out. Read
-    // the sampled user-source mint: WSOL there means the sample was a
-    // buy, so flip the legs for our sell (and vice versa).
-    let src_data = rpc
-        .get_account_data(&accounts[5])
-        .await
-        .expect("src readable");
-    let src_mint = Pubkey::new_from_array(
-        src_data[0..32]
-            .try_into()
-            .expect("token account holds its mint at [0..32]"),
-    );
-    let (sell_src, sell_dst) = if src_mint == ids::WSOL_MINT {
-        (accounts[6], accounts[5])
-    } else {
-        (accounts[5], accounts[6])
-    };
-    let sell_ix = build_swap_base_in_v2_ix(
-        &pool.amm_id,
-        &derived,
-        &pool.base_vault,
-        &pool.quote_vault,
-        &sell_src,
-        &sell_dst,
-        &accounts[7],
-        1_000,
-        0,
-    )
-    .expect("sell replay builds");
-    // Fresh blockhash per gate: the scan + vault reads between gates can
-    // outlive the previous hash (stale hash proves nothing — resample,
-    // like the pump probes).
-    let sell_hash = rpc.get_latest_blockhash().await.expect("sell blockhash");
-    let sell_msg = solana_message::Message::new_with_blockhash(
-        std::slice::from_ref(&sell_ix),
-        Some(&payer),
-        &sell_hash,
-    );
-    let sell_tx = Transaction {
-        signatures: vec![
-            solana_signature::Signature::default();
-            sell_msg.header.num_required_signatures as usize
-        ],
-        message: sell_msg,
-    };
-    let res = rpc
-        .simulate_transaction_with_config(
-            &sell_tx,
-            RpcSimulateTransactionConfig {
-                sig_verify: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("sell simulate RPC");
-    println!(
-        "SELL SIM logs:\n{}",
-        res.value
-            .logs
-            .as_ref()
-            .map(|l| l.join("\n"))
-            .unwrap_or_default()
-    );
-    assert!(
-        res.value.err.is_none(),
-        "raydium sell-direction simulation failed: {:?}",
-        res.value.err
-    );
-    println!("RAYDIUM SELL GREEN");
 }

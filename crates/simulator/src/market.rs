@@ -15,9 +15,11 @@ pub const STANDARD_VENUE_FEE_BPS: f64 = 125.0;
 ///
 /// The infallible helpers (`slip_fraction*`, `fill_price`) are capped
 /// estimators for sizing guards (live slippage ceilings/floors are
-/// protection, not fills). Execution paths must use the `try_*`
-/// variants, which return `None` instead of printing a fictitious
-/// capped fill when the curve cannot absorb the size.
+/// protection, not fills): past the cap they understate true cost by
+/// construction, so they must never settle a book. Execution paths
+/// must use the `try_*` variants, which price uncapped true impact
+/// and return `None` instead of printing a fictitious fill when the
+/// curve cannot absorb the size (buy-side exhaustion).
 #[derive(Debug, Clone, Copy)]
 pub enum FillModel {
     /// Fill at quote (tests only).
@@ -74,23 +76,22 @@ impl FillModel {
         self.slip_fraction_for_side(side, notional_usd, liquidity_usd)
     }
 
-    /// Fallible one-side cost. `None` when the price is unknowable:
+    /// Fallible one-side cost, UNCAPPED. `None` when the price is unknowable:
     /// bad notional, non-finite/negative liquidity, or a buy whose size
     /// exhausts the curve (`notional >= liquidity`, where the
     /// constant-product impact `s/(1-s)` is unbounded). Zero liquidity
     /// prices fee-only (synthetic-grade: the caller decides whether that
-    /// book is headline-eligible). Sells always absorb (bounded impact).
-    /// Otherwise identical to `slip_fraction_for_side`, cap included.
+    /// book is headline-eligible). Sells always absorb (bounded impact
+    /// `s/(1+s)`), so a whale Long exit prices near zero instead of a
+    /// fictitious capped fill. Unlike `slip_fraction_for_side`, the
+    /// 25% cap does NOT apply here: the cap lives only in the
+    /// infallible sizing estimators, never in execution pricing.
     pub fn try_slip_fraction_for_side(
         &self,
         side: Side,
         notional_usd: f64,
         liquidity_usd: f64,
     ) -> Option<f64> {
-        let cap = match *self {
-            FillModel::Exact => 0.0,
-            FillModel::BondingCurve { max_slip_frac, .. } => max_slip_frac.max(0.0),
-        };
         if matches!(*self, FillModel::Exact) {
             return Some(0.0);
         }
@@ -105,7 +106,7 @@ impl FillModel {
             FillModel::BondingCurve { fee_bps_per_side, .. } => fee_bps_per_side.max(0.0) / 10_000.0,
         };
         if liquidity_usd == 0.0 {
-            return Some(fee.clamp(0.0, cap));
+            return Some(fee);
         }
         let size = (notional_usd / liquidity_usd).max(0.0);
         let impact = match side {
@@ -113,7 +114,8 @@ impl FillModel {
             Side::Long => size / (1.0 - size),
             Side::Short => size / (1.0 + size),
         };
-        Some((impact + fee).clamp(0.0, cap))
+        // Deliberately uncapped (see doc): execution prices true impact.
+        Some((impact + fee).max(0.0))
     }
 
     /// `try_slip_fraction_for_side` with the position side implied by `side`.
@@ -184,9 +186,11 @@ impl FillModel {
         }
     }
 
-    /// Fallible quote to execution price. `None` exactly when
-    /// `try_slip_fraction_for_side` is `None` (bad inputs, unknown
-    /// liquidity, or curve exhaustion on buys).
+    /// Fallible quote to execution price (uncapped true impact).
+    /// `None` exactly when `try_slip_fraction_for_side` is `None`
+    /// (bad inputs, unknown liquidity, or curve exhaustion on buys).
+    /// A giant Long exit (sell side) prices near zero, never at a
+    /// capped `0.75 * quote` fiction.
     pub fn try_fill_price(
         &self,
         side: Side,
@@ -363,6 +367,37 @@ mod tests {
             !model
                 .fill_price(Side::Long, f64::NAN, 100.0, 10_000.0)
                 .is_finite()
+        );
+    }
+
+    #[test]
+    fn try_execution_pricing_is_uncapped() {
+        // Execution prints true impact: the 25% cap binds only the
+        // infallible sizing estimators, never a booked fill. At
+        // 125bps/side the sell cap would bind at s ~= 0.31; the
+        // execution leg prices straight through it.
+        let model = FillModel::default();
+        // In-band sell (s = 0.5): true 0.5/1.5 + fee, not 0.25.
+        let slip = model
+            .try_slip_fraction(Side::Short, 5_000.0, 10_000.0)
+            .expect("sells always absorb");
+        assert!((slip - (0.5 / 1.5 + 0.0125)).abs() < 1e-12, "slip={slip}");
+        // In-band buy (s = 0.5): true 0.5/0.5 + fee, not 0.25.
+        let buy_slip = model
+            .try_slip_fraction(Side::Long, 5_000.0, 10_000.0)
+            .expect("s < 1 prices");
+        assert!((buy_slip - (1.0 + 0.0125)).abs() < 1e-12, "buy_slip={buy_slip}");
+        // Whale Long exit (s = 1000): impact ~= 1.0, fill floors at 0.
+        let whale = model
+            .try_fill_price(Side::Short, 1.0, 10_000_000.0, 10_000.0)
+            .expect("bounded impact prices");
+        assert_eq!(whale, 0.0, "whale exit must print ~0, not 0.75");
+        // Buy-side exhaustion still rejects (unbounded impact).
+        assert_eq!(model.try_fill_price(Side::Long, 1.0, 10_000_000.0, 10_000.0), None);
+        // Zero liquidity stays fee-only (synthetic-grade, caller-gated).
+        assert_eq!(
+            model.try_slip_fraction(Side::Short, 100.0, 0.0),
+            Some(0.0125)
         );
     }
 

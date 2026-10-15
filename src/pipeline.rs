@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams, escalated_tip};
 use crate::live_mirror::{LiveExecution, live_base_mint};
 use crate::follow::FollowState;
-pub use crate::gate::{DailyBreaker, GateState};
+pub use crate::gate::{DailyBreaker, GateState, SpecCounters};
 #[cfg(test)]
 pub(crate) use crate::gate::{dev_reputation_score, fee_aware_sl_floor, resolve_entry_with_flag};
 #[cfg(test)]
@@ -340,6 +340,9 @@ pub struct Pipeline<
     pub strategy: StrategyMode,
     /// Alerts; `None` silences.
     pub alerts: Option<T>,
+    /// Speculative-inference counters (all zero unless
+    /// `SPECULATIVE_INFERENCE=true`).
+    pub spec_counters: SpecCounters,
 }
 
 
@@ -388,6 +391,7 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             vaults,
             sol_feed,
             last_marks: Mutex::new(HashMap::new()),
+            spec_counters: SpecCounters::default(),
         })
     }
 
@@ -706,6 +710,13 @@ mod tests {
             fails_left: std::sync::Mutex<usize>,
             score: u32,
         },
+        /// First audit scores `first`, every later audit scores `rest`
+        /// (drifting re-audit for the speculative-mismatch path).
+        Shift {
+            first: u32,
+            rest: u32,
+            used: std::sync::Mutex<bool>,
+        },
     }
 
     struct StubAuditor {
@@ -743,6 +754,18 @@ mod tests {
                 AuditOutcome::Broken => Err(RugCheckError::Deserialization(
                     serde_json::from_str::<u32>("bogus").expect_err("must fail"),
                 )),
+                AuditOutcome::Shift { first, rest, used } => {
+                    let mut used = used.lock().expect("lock");
+                    let score = if *used { *rest } else { *first };
+                    *used = true;
+                    Ok(RugCheckReport {
+                        mint: mint.to_string(),
+                        score,
+                        rugged: false,
+                        risks: vec![],
+                        token: None,
+                    })
+                }
             }
         }
     }
@@ -1261,6 +1284,134 @@ mod tests {
         live: Option<StubLive>,
     ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
         pipeline_alerted(settings, outcome, reserves, portfolio, screener, live, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline_engined(
+        settings: Settings,
+        outcome: AuditOutcome,
+        reserves: StubReserves,
+        portfolio: PaperPortfolio,
+        screener: StubScreener,
+        live: Option<StubLive>,
+        alerts: Option<StubAlerts>,
+        engine: Option<risk_engine::RiskEngine>,
+    ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
+        let vaults = VaultTicker::new(
+            listener::types::DEFAULT_HTTP_RPC_URL,
+            CurveTicker::parse_commitment("confirmed").expect("known commitment"),
+            std::time::Duration::from_millis(500),
+            SolUsdFeed::new_for_test(150.0),
+        )
+        .expect("vault ticker");
+        Pipeline::shared(
+            settings,
+            StubAuditor { outcome },
+            engine,
+            reserves,
+            portfolio,
+            live,
+            screener,
+            alerts,
+            vaults,
+            SolUsdFeed::new_for_test(150.0),
+        )
+    }
+
+    /// Unreachable model endpoint: refuses fast, always heuristic.
+    fn spec_engine() -> Option<risk_engine::RiskEngine> {
+        risk_engine::RiskEngine::builder()
+            .endpoint("http://127.0.0.1:9")
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .ok()
+    }
+
+    #[tokio::test]
+    async fn speculative_overlap_hits_on_matching_reaudit() {
+        use std::sync::atomic::Ordering;
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_engined(
+            settings(&[
+                ("SPECULATIVE_INFERENCE", "true"),
+                ("GATE_WINDOW_SECS", "0"),
+            ]),
+            AuditOutcome::Allow(100),
+            reserves,
+            PaperPortfolio::new(100.0, 0.0),
+            screener,
+            None,
+            None,
+            spec_engine(),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        // Force a stale snapshot (window 0): re-audit overlaps the bet,
+        // scores agree, the spawned decision is used.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        pipe.poll_gates().await;
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+        assert_eq!(pipe.spec_counters.hit.load(Ordering::Relaxed), 1);
+        assert_eq!(pipe.spec_counters.stale.load(Ordering::Relaxed), 0);
+        assert_eq!(pipe.spec_counters.wasted.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn speculative_overlap_restarts_on_score_drift() {
+        use std::sync::atomic::Ordering;
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_engined(
+            settings(&[
+                ("SPECULATIVE_INFERENCE", "true"),
+                ("GATE_WINDOW_SECS", "0"),
+            ]),
+            AuditOutcome::Shift {
+                first: 100,
+                rest: 200,
+                used: std::sync::Mutex::new(false),
+            },
+            reserves,
+            PaperPortfolio::new(100.0, 0.0),
+            screener,
+            None,
+            None,
+            spec_engine(),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        pipe.poll_gates().await;
+        // Drifted score aborts the bet; the serial decision still opens
+        // (200 is BUY-eligible) — a wasted call, never a wrong profile.
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+        assert_eq!(pipe.spec_counters.hit.load(Ordering::Relaxed), 0);
+        assert_eq!(pipe.spec_counters.stale.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn speculation_off_leaves_counters_zero() {
+        use std::sync::atomic::Ordering;
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        let pipe = pipeline_engined(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            PaperPortfolio::new(100.0, 0.0),
+            screener,
+            None,
+            None,
+            spec_engine(),
+        );
+        pipe.on_launch("MINT", "CURVE", "ASSOC", &dev_wallet(), None, 5000)
+            .await;
+        pipe.poll_gates().await;
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+        assert_eq!(pipe.spec_counters.hit.load(Ordering::Relaxed), 0);
+        assert_eq!(pipe.spec_counters.stale.load(Ordering::Relaxed), 0);
+        assert_eq!(pipe.spec_counters.wasted.load(Ordering::Relaxed), 0);
     }
 
     fn pipeline_alerted(

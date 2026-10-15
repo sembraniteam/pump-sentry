@@ -65,8 +65,15 @@ pub struct Settings {
     pub inference_timeout_ms: u64,
     /// Bearer token, if the provider needs one.
     pub inference_api_key: Option<String>,
+    /// Overlap confirm-time re-audit with the model call (`false` =
+    /// today's serial path, bit-identical).
+    pub speculative_inference: bool,
     /// Slippage guard in bps.
     pub slippage_bps: u64,
+    /// Volatility window for adaptive slippage, secs (`0` = off).
+    pub slippage_vol_window_secs: u64,
+    /// Cap on the volatility slippage add-on, bps (`0` = off).
+    pub slippage_vol_extra_cap_bps: u64,
     /// `adaptive` | `scalp` | `runner`. Unknown falls back.
     pub strategy_mode: String,
     /// Runner share kept after TP, 0–100.
@@ -85,6 +92,14 @@ pub struct Settings {
     pub discord_channel: Option<String>,
     /// Strict preflight: sim failures reject. Use for live.
     pub sim_strict: bool,
+    /// Diverged-count warn threshold on the heartbeat (`0` = off).
+    pub alert_diverged_warn_n: u64,
+    /// Risk-engine fallback-rate warn threshold, pct (`0` = off).
+    pub alert_risk_fallback_warn_pct: u64,
+    /// GiveUp-burst warn threshold per window (`0` = off).
+    pub alert_giveup_burst_n: u64,
+    /// Trailing window for the GiveUp burst, secs.
+    pub alert_giveup_window_secs: u64,
     /// Parse failures seen by `from_map`. Surfaced in `warnings`.
     pub parse_notes: Vec<String>,
 }
@@ -122,7 +137,10 @@ impl std::fmt::Debug for Settings {
                 "inference_api_key",
                 &self.inference_api_key.as_ref().map(|_| "<redacted>"),
             )
+            .field("speculative_inference", &self.speculative_inference)
             .field("slippage_bps", &self.slippage_bps)
+            .field("slippage_vol_window_secs", &self.slippage_vol_window_secs)
+            .field("slippage_vol_extra_cap_bps", &self.slippage_vol_extra_cap_bps)
             .field("strategy_mode", &self.strategy_mode)
             .field("runner_moonbag_percent", &self.runner_moonbag_percent)
             .field("priority_fee_micro_lamports", &self.priority_fee_micro_lamports)
@@ -132,6 +150,13 @@ impl std::fmt::Debug for Settings {
             .field("discord_alerts", &self.discord_alerts)
             .field("discord_channel", &self.discord_channel)
             .field("sim_strict", &self.sim_strict)
+            .field("alert_diverged_warn_n", &self.alert_diverged_warn_n)
+            .field(
+                "alert_risk_fallback_warn_pct",
+                &self.alert_risk_fallback_warn_pct,
+            )
+            .field("alert_giveup_burst_n", &self.alert_giveup_burst_n)
+            .field("alert_giveup_window_secs", &self.alert_giveup_window_secs)
             .field("parse_notes", &self.parse_notes)
             .finish()
     }
@@ -174,7 +199,10 @@ impl Settings {
             inference_model: get_string(vars, "INFERENCE_MODEL", "llama3.2:1b"),
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300, &mut notes),
             inference_api_key: vars.get("INFERENCE_API_KEY").cloned(),
+            speculative_inference: get_bool(vars, "SPECULATIVE_INFERENCE", false, &mut notes),
             slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200, &mut notes),
+            slippage_vol_window_secs: get_int(vars, "SLIPPAGE_VOL_WINDOW_SECS", 0, &mut notes),
+            slippage_vol_extra_cap_bps: get_int(vars, "SLIPPAGE_VOL_EXTRA_CAP_BPS", 0, &mut notes),
             strategy_mode: get_string(vars, "STRATEGY_MODE", "adaptive"),
             runner_moonbag_percent: get_float(vars, "RUNNER_MOONBAG_PERCENT", 20.0, &mut notes),
             priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0, &mut notes),
@@ -187,6 +215,10 @@ impl Settings {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             sim_strict: get_bool(vars, "SIM_STRICT", false, &mut notes),
+            alert_diverged_warn_n: get_int(vars, "ALERT_DIVERGED_WARN_N", 0, &mut notes),
+            alert_risk_fallback_warn_pct: get_int(vars, "ALERT_RISK_FALLBACK_WARN_PCT", 0, &mut notes),
+            alert_giveup_burst_n: get_int(vars, "ALERT_GIVEUP_BURST_N", 0, &mut notes),
+            alert_giveup_window_secs: get_int(vars, "ALERT_GIVEUP_WINDOW_SECS", 3600, &mut notes),
             parse_notes: notes,
         }
     }
@@ -199,6 +231,12 @@ impl Settings {
                 "SLIPPAGE_BPS={} exceeds 100%; quotes fail closed (no guard can cover it — check the value, likely a typo)",
                 self.slippage_bps
             ));
+        }
+        if self.slippage_vol_window_secs == 0 && self.slippage_vol_extra_cap_bps > 0 {
+            out.push("SLIPPAGE_VOL_EXTRA_CAP_BPS>0 with SLIPPAGE_VOL_WINDOW_SECS=0: adaptive slippage is off (no window), the cap does nothing".to_string());
+        }
+        if self.slippage_vol_window_secs > 0 && self.slippage_vol_extra_cap_bps == 0 {
+            out.push("SLIPPAGE_VOL_WINDOW_SECS>0 with SLIPPAGE_VOL_EXTRA_CAP_BPS=0: marks are tracked but the add-on is capped at 0 (static behavior)".to_string());
         }
         if self.strategy_mode.parse::<StrategyMode>().is_err() {
             out.push(format!(
@@ -631,6 +669,36 @@ mod tests {
         assert!(w.contains("JITO_TIP_LAMPORTS=0"), "{w}");
         assert!(w.contains("SLIPPAGE_BPS=20000"), "{w}");
         assert!(w.contains("QUOTE_USD override is set"), "{w}");
+    }
+
+    #[test]
+    fn half_armed_adaptive_slippage_warns() {
+        // Defaults: off, silent.
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.slippage_vol_window_secs, 0);
+        assert_eq!(s.slippage_vol_extra_cap_bps, 0);
+        assert!(!s.warnings().iter().any(|w| w.contains("SLIPPAGE_VOL")));
+        // Cap without a window (and vice versa) warns loudly.
+        let s = Settings::from_map(&vars(&[("SLIPPAGE_VOL_EXTRA_CAP_BPS", "150")]));
+        assert!(s.warnings().iter().any(|w| w.contains("SLIPPAGE_VOL_EXTRA_CAP_BPS>0")), "{:?}", s.warnings());
+        let s = Settings::from_map(&vars(&[("SLIPPAGE_VOL_WINDOW_SECS", "60")]));
+        assert!(s.warnings().iter().any(|w| w.contains("SLIPPAGE_VOL_WINDOW_SECS>0")), "{:?}", s.warnings());
+        // Fully armed: parses, no warning.
+        let s = Settings::from_map(&vars(&[
+            ("SLIPPAGE_VOL_WINDOW_SECS", "60"),
+            ("SLIPPAGE_VOL_EXTRA_CAP_BPS", "150"),
+        ]));
+        assert_eq!(s.slippage_vol_window_secs, 60);
+        assert_eq!(s.slippage_vol_extra_cap_bps, 150);
+        assert!(!s.warnings().iter().any(|w| w.contains("SLIPPAGE_VOL")));
+    }
+
+    #[test]
+    fn speculative_inference_defaults_off() {
+        let s = Settings::from_map(&HashMap::new());
+        assert!(!s.speculative_inference);
+        let s = Settings::from_map(&vars(&[("SPECULATIVE_INFERENCE", "true")]));
+        assert!(s.speculative_inference);
     }
 
     #[test]

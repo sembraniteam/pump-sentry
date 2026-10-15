@@ -50,6 +50,10 @@ pub struct HeartbeatReport<'a> {
     pub open_positions: usize,
     /// Live bags held for manual exit. Hidden from paper equity.
     pub manual_bags: usize,
+    /// Paper-open but live-missing (no fill): needs review/funding.
+    pub diverged: usize,
+    /// Buys awaiting confirmation (unknown fills).
+    pub pending_buys: usize,
     /// Free paper cash (USD).
     pub cash_usd: f64,
     /// Mark-to-market paper equity (USD).
@@ -297,6 +301,8 @@ impl Alerter {
              • **Watchlist:** `{}` pending\n\
              • **Open:** `{}` position(s)\n\
              • **Manual bags:** `{}` held\n\
+             • **Diverged:** `{}` (paper without live cover)\n\
+             • **Pending buys:** `{}` unconfirmed\n\
              • **Cash:** `${:.2}`\n\
              • **Equity:** `${:.2}`",
             r.logs_seen,
@@ -306,6 +312,8 @@ impl Alerter {
             r.watchlist_pending,
             r.open_positions,
             r.manual_bags,
+            r.diverged,
+            r.pending_buys,
             r.cash_usd,
             r.equity_usd,
         )
@@ -379,6 +387,8 @@ mod tests {
             watchlist_pending: 3,
             open_positions: 1,
             manual_bags: 2,
+            diverged: 1,
+            pending_buys: 0,
             cash_usd: 90.5,
             equity_usd: 102.25,
         });

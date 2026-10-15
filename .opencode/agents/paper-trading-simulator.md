@@ -37,9 +37,11 @@ telemetry. All amounts are USD-denominated; positions are keyed by incrementing 
 
 1. **Realistic Execution Model:**
     - Do NOT fill orders at spot price. Fill through `FillModel::BondingCurve`: constant-product size impact plus the
-      125 bps/side Pump.fun venue fee, capped at 25% slip on the capped estimator. Execution paths use
-      `try_fill_price` / `try_slip_fraction_for_side`: buys past the curve (`notional >= liquidity`) REJECT with
-      `CurveExhausted` — never print a fictitious capped fill. There is NO randomized execution delay — timestamps are
+      125 bps/side Pump.fun venue fee. The 25% cap binds ONLY the infallible sizing estimators
+      (`slip_fraction*`, `fill_price`). Execution paths use `try_fill_price` / `try_slip_fraction_for_side`,
+      which price UNCAPPED true impact: buys past the curve (`notional >= liquidity`) REJECT with
+      `CurveExhausted`, and whale Long exits book near zero — never print a fictitious capped fill.
+      There is NO randomized execution delay — timestamps are
       caller-provided unix seconds so backtests stay deterministic.
 2. **Accurate Fee Accounting:**
     - Two layers, never confused: `fee_bps` commission on entry/exit notionals (e.g. 30 = 0.30%) PLUS the venue fee

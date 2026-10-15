@@ -1,6 +1,7 @@
 //! Entry gate: watchlist, quorum polling, confirmed opens.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use alert::Alerter;
 use auditor::RugCheckError;
@@ -163,6 +164,17 @@ pub struct GateState {
 
 /// Stale claim age.
 pub const STALE_POLL_SECS: u64 = 30;
+
+/// Speculative-inference counters (opt-in overlap; all zero when off).
+#[derive(Debug, Default)]
+pub struct SpecCounters {
+    /// Spawned bet priced the final metrics and was used.
+    pub hit: AtomicU64,
+    /// Bet aborted on score mismatch (re-evaluated synchronously).
+    pub stale: AtomicU64,
+    /// Bet aborted because the re-audit itself failed.
+    pub wasted: AtomicU64,
+}
 
 /// Min spacing between audit retries per mint.
 pub const AUDIT_RETRY_SECS: u64 = 3;
@@ -603,12 +615,49 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Confirm-time re-audit: LP pulls / authority flips between
         // launch and quorum are invisible to the snapshot. Snapshots
         // younger than one gate window skip the extra round-trip.
-        let score = if now_secs().saturating_sub(signal.last_audit_secs)
-            > self.settings.gate_window_secs
-        {
+        let stale_snapshot = now_secs().saturating_sub(signal.last_audit_secs)
+            > self.settings.gate_window_secs;
+        // Speculative overlap (opt-in `SPECULATIVE_INFERENCE`): when the
+        // snapshot is stale, the re-audit RPC and the model call overlap
+        // instead of serializing. The spawned call bets on the snapshot
+        // score; any mismatch aborts it and re-evaluates synchronously,
+        // so a wrong bet costs one wasted call, never a wrong profile.
+        // Cross-round caches are deliberately NOT used: buyers,
+        // liquidity, and bundle stats are unknowable before confirm, so
+        // a placeholder bet could never hash-match — pure waste plus
+        // 429 pressure on the inference budget.
+        let spec_bet: Option<(TokenMetrics, tokio::task::JoinHandle<RiskDecision>)> = match (
+            &self.engine,
+            stale_snapshot,
+            self.settings.speculative_inference,
+            signal.audit_score,
+        ) {
+            (Some(engine), true, true, Some(snap_score)) => {
+                let bet_metrics = TokenMetrics {
+                    liquidity_usd,
+                    buy_velocity_5s: buyers,
+                    dev_reputation: signal.dev_trust,
+                    rugcheck_score: snap_score,
+                    creation_slot_buys: req.creation_slot_buys,
+                    cluster_pct: req.cluster_pct,
+                    curve_progress: None,
+                };
+                let engine_c = engine.clone();
+                Some((
+                    bet_metrics,
+                    tokio::spawn(async move { engine_c.evaluate(&bet_metrics).await }),
+                ))
+            }
+            _ => None,
+        };
+        let score = if stale_snapshot {
             match self.auditor.evaluate_token(mint).await {
                 Ok(report) => report.score,
                 Err(e) => {
+                    if let Some((_, handle)) = spec_bet {
+                        handle.abort();
+                        self.spec_counters.wasted.fetch_add(1, Ordering::Relaxed);
+                    }
                     warn!(%mint, error = %e, "confirm-time re-audit failed; dropping (fail-closed)");
                     return;
                 }
@@ -634,7 +683,29 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // INFERENCE_TIMEOUT_MS only knowing it costs entry price).
         let started = std::time::Instant::now();
         let decision = match &self.engine {
-            Some(engine) => engine.evaluate(&metrics).await,
+            Some(engine) => match spec_bet {
+                // Exact-match only: the bet priced the final metrics
+                // (same tick, buyers, bundle — only the score was a bet).
+                Some((bet_metrics, handle)) if bet_metrics.rugcheck_score == score => {
+                    match handle.await {
+                        Ok(d) => {
+                            self.spec_counters.hit.fetch_add(1, Ordering::Relaxed);
+                            d
+                        }
+                        Err(_) => {
+                            // Spawned task died: serial path, same decision.
+                            self.spec_counters.stale.fetch_add(1, Ordering::Relaxed);
+                            engine.evaluate(&metrics).await
+                        }
+                    }
+                }
+                Some((_, handle)) => {
+                    handle.abort();
+                    self.spec_counters.stale.fetch_add(1, Ordering::Relaxed);
+                    engine.evaluate(&metrics).await
+                }
+                None => engine.evaluate(&metrics).await,
+            },
             None => RiskDecision {
                 profile: evaluate_heuristic_fallback(
                     metrics.liquidity_usd,
@@ -649,7 +720,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if let Some(engine) = &self.engine {
             info!(%mint, source = ?decision.source, latency_ms = started.elapsed().as_millis(),
                 fallbacks = engine.fallback_count(), timeouts = engine.timeout_count(),
-                invalid = engine.invalid_count(), "risk decided at confirm");
+                invalid = engine.invalid_count(),
+                spec_hit = self.spec_counters.hit.load(Ordering::Relaxed),
+                spec_stale = self.spec_counters.stale.load(Ordering::Relaxed),
+                spec_wasted = self.spec_counters.wasted.load(Ordering::Relaxed),
+                "risk decided at confirm");
         }
         if profile.action != Action::Buy {
             info!(%mint, buyers, score, "risk PASS at confirm");
