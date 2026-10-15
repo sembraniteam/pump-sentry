@@ -1,0 +1,412 @@
+//! Layered configuration: categorized TOML file, environment overrides.
+//!
+//! Precedence is `built-in defaults < config.toml < environment`.
+//! The file carries every tunable by category; env keeps working as an
+//! override (containers, one-off runs, tests) and is the ONLY home for
+//! secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY` are never read
+//! from — or written to — the file).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+/// Env override for the config path (mirrors `PID_FILE`/`LOG_FILE`).
+pub const CONFIG_FILE_ENV: &str = "CONFIG_FILE";
+/// Config filename inside the state dir.
+pub const CONFIG_FILE_NAME: &str = "config.toml";
+
+/// Config load failures. Parse errors are fatal with file position:
+/// a typo'd value must never silently become a default.
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    /// Filesystem trouble (missing dir, permissions).
+    #[error("config file error at {0}: {1}")]
+    Io(String, #[source] std::io::Error),
+    /// TOML syntax trouble (message carries line/column).
+    #[error("config parse error at {0}: {1}")]
+    Parse(String, String),
+}
+
+/// `(toml section, toml key, env name)`. The single mapping table:
+/// template, overlay, and docs all derive from it.
+pub const KEYMAP: &[(&str, &str, &str)] = &[
+    ("network", "mainnet_rpc_url", "MAINNET_RPC_URL"),
+    ("network", "mainnet_wss_rpc_url", "MAINNET_WSS_RPC_URL"),
+    ("network", "commitment", "COMMITMENT"),
+    ("network", "tick_interval_ms", "TICK_INTERVAL_MS"),
+    ("network", "vault_tick_interval_ms", "VAULT_TICK_INTERVAL_MS"),
+    ("trading", "start_balance", "START_BALANCE"),
+    ("trading", "fee_bps", "FEE_BPS"),
+    ("trading", "notional_usd", "NOTIONAL_USD"),
+    ("trading", "max_open_positions", "MAX_OPEN_POSITIONS"),
+    ("trading", "mint_cooldown_secs", "MINT_COOLDOWN_SECS"),
+    ("trading", "max_daily_loss_usd", "MAX_DAILY_LOSS_USD"),
+    ("trading", "quote_usd", "QUOTE_USD"),
+    ("trading", "liquidity_usd", "LIQUIDITY_USD"),
+    ("exits", "trail_percent", "TRAIL_PERCENT"),
+    ("exits", "runner_trail_percent", "RUNNER_TRAIL_PERCENT"),
+    ("gate", "gate_window_secs", "GATE_WINDOW_SECS"),
+    ("gate", "gate_min_buyers", "GATE_MIN_BUYERS"),
+    ("gate", "gate_poll_ms", "GATE_POLL_MS"),
+    ("gate", "dev_min_age_secs", "DEV_MIN_AGE_SECS"),
+    ("gate", "dev_max_prior_launches", "DEV_MAX_PRIOR_LAUNCHES"),
+    ("gate", "dev_screen_sample_txs", "DEV_SCREEN_SAMPLE_TXS"),
+    ("gate", "dev_sig_limit", "DEV_SIG_LIMIT"),
+    ("risk", "strategy_mode", "STRATEGY_MODE"),
+    ("risk", "runner_moonbag_percent", "RUNNER_MOONBAG_PERCENT"),
+    ("risk", "inference_endpoint", "INFERENCE_ENDPOINT"),
+    ("risk", "inference_model", "INFERENCE_MODEL"),
+    ("risk", "inference_timeout_ms", "INFERENCE_TIMEOUT_MS"),
+    ("risk", "speculative_inference", "SPECULATIVE_INFERENCE"),
+    ("execution", "slippage_bps", "SLIPPAGE_BPS"),
+    ("execution", "slippage_vol_window_secs", "SLIPPAGE_VOL_WINDOW_SECS"),
+    ("execution", "slippage_vol_extra_cap_bps", "SLIPPAGE_VOL_EXTRA_CAP_BPS"),
+    (
+        "execution",
+        "priority_fee_micro_lamports",
+        "PRIORITY_FEE_MICRO_LAMPORTS",
+    ),
+    ("execution", "compute_unit_limit", "COMPUTE_UNIT_LIMIT"),
+    ("execution", "jito_tip_lamports", "JITO_TIP_LAMPORTS"),
+    ("execution", "jito_endpoint", "JITO_ENDPOINT"),
+    ("execution", "sim_strict", "SIM_STRICT"),
+    ("alerts", "discord_alerts", "DISCORD_ALERTS"),
+    ("alerts", "discord_channel", "DISCORD_CHANNEL"),
+    ("alerts", "alert_diverged_warn_n", "ALERT_DIVERGED_WARN_N"),
+    (
+        "alerts",
+        "alert_risk_fallback_warn_pct",
+        "ALERT_RISK_FALLBACK_WARN_PCT",
+    ),
+    ("alerts", "alert_giveup_burst_n", "ALERT_GIVEUP_BURST_N"),
+    (
+        "alerts",
+        "alert_giveup_window_secs",
+        "ALERT_GIVEUP_WINDOW_SECS",
+    ),
+];
+
+/// Shipped template: every tunable by category, defaults identical to
+/// the built-in ones. Empty strings mean "unset" (public endpoint,
+/// host-default channel). Secrets are env-only — see header comments.
+pub const DEFAULT_CONFIG_TOML: &str = r#"# pump-sentry config — auto-created on first start (also `pump-sentry init-config`).
+# Precedence: built-in defaults < this file < environment variables.
+# Secrets (SOLANA_PRIVATE_KEY, INFERENCE_API_KEY) stay in env and are NEVER read from here.
+
+[network]
+# Dedicated RPC recommended; empty falls back to the public endpoint.
+mainnet_rpc_url = ""        # env: MAINNET_RPC_URL
+mainnet_wss_rpc_url = ""    # env: MAINNET_WSS_RPC_URL
+commitment = "confirmed"    # env: COMMITMENT (confirmed|finalized; processed is refused live)
+tick_interval_ms = 1000     # env: TICK_INTERVAL_MS (curve polls)
+vault_tick_interval_ms = 5000  # env: VAULT_TICK_INTERVAL_MS (migration pool polls)
+
+[trading]
+start_balance = 100.0       # env: START_BALANCE (virtual paper cash, USD)
+fee_bps = 0.0               # env: FEE_BPS (extra commission/side; venue 125bps already in fills)
+notional_usd = 10.0         # env: NOTIONAL_USD (paper size per trade, USD)
+max_open_positions = 3      # env: MAX_OPEN_POSITIONS (exposure cap)
+mint_cooldown_secs = 3600   # env: MINT_COOLDOWN_SECS (per-mint re-entry cooldown)
+max_daily_loss_usd = 0.0    # env: MAX_DAILY_LOSS_USD (0 = off; live requires >0)
+quote_usd = ""              # env: QUOTE_USD (TEST-ONLY price override; empty = unset)
+liquidity_usd = 0.0         # env: LIQUIDITY_USD (reserve-read fallback; 0 = fail-closed)
+
+[exits]
+trail_percent = 5.0         # env: TRAIL_PERCENT (trailing-stop giveback, %)
+runner_trail_percent = 20.0 # env: RUNNER_TRAIL_PERCENT (runner wide trail, %)
+
+[gate]
+gate_window_secs = 10       # env: GATE_WINDOW_SECS (watchlist window)
+gate_min_buyers = 5         # env: GATE_MIN_BUYERS (buyer-quorum threshold)
+gate_poll_ms = 2000         # env: GATE_POLL_MS (poll cadence)
+dev_min_age_secs = 3600     # env: DEV_MIN_AGE_SECS (min deployer wallet age)
+dev_max_prior_launches = 1  # env: DEV_MAX_PRIOR_LAUNCHES (tolerated serial launches)
+dev_screen_sample_txs = 20  # env: DEV_SCREEN_SAMPLE_TXS (wallet history sample)
+dev_sig_limit = 100         # env: DEV_SIG_LIMIT (history scan cap)
+
+[risk]
+strategy_mode = "adaptive"  # env: STRATEGY_MODE (adaptive|scalp|runner)
+runner_moonbag_percent = 20.0  # env: RUNNER_MOONBAG_PERCENT (runner share kept, 0-100)
+inference_endpoint = "http://127.0.0.1:11434/v1/chat/completions"  # env: INFERENCE_ENDPOINT
+inference_model = "llama3.2:1b"  # env: INFERENCE_MODEL
+inference_timeout_ms = 300  # env: INFERENCE_TIMEOUT_MS (raising past 300ms costs entry price)
+# INFERENCE_API_KEY stays in env (bearer token; secret, never written here).
+speculative_inference = false  # env: SPECULATIVE_INFERENCE (overlap re-audit with model call)
+
+[execution]
+slippage_bps = 200          # env: SLIPPAGE_BPS (static buy guard / sell floor)
+slippage_vol_window_secs = 0     # env: SLIPPAGE_VOL_WINDOW_SECS (0 = adaptive off)
+slippage_vol_extra_cap_bps = 0   # env: SLIPPAGE_VOL_EXTRA_CAP_BPS (0 = adaptive off)
+priority_fee_micro_lamports = 0  # env: PRIORITY_FEE_MICRO_LAMPORTS (0 = off; set nonzero for congestion)
+compute_unit_limit = 0      # env: COMPUTE_UNIT_LIMIT (0 = default)
+jito_tip_lamports = 100000  # env: JITO_TIP_LAMPORTS (per-bundle tip; 0 never lands)
+jito_endpoint = "https://mainnet.block-engine.jito.wtf"  # env: JITO_ENDPOINT
+sim_strict = false          # env: SIM_STRICT (unproven sims refuse; required live)
+
+[alerts]
+discord_alerts = true       # env: DISCORD_ALERTS (trade cards via Hermes CLI)
+discord_channel = ""        # env: DISCORD_CHANNEL (empty = host default)
+alert_diverged_warn_n = 0   # env: ALERT_DIVERGED_WARN_N (0 = off; burn-in threshold)
+alert_risk_fallback_warn_pct = 0  # env: ALERT_RISK_FALLBACK_WARN_PCT (0 = off)
+alert_giveup_burst_n = 0    # env: ALERT_GIVEUP_BURST_N (0 = off)
+alert_giveup_window_secs = 3600  # env: ALERT_GIVEUP_WINDOW_SECS (trailing window, secs)
+"#;
+
+/// Default config path: `~/.pump-sentry/config.toml`.
+pub fn default_config_path() -> PathBuf {
+    let mut dir = default_state_dir();
+    dir.push(CONFIG_FILE_NAME);
+    dir
+}
+
+/// State dir (`~/.pump-sentry`), `HOME`-rooted like pid/log.
+fn default_state_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".pump-sentry")
+}
+
+/// Config path from `CONFIG_FILE`, else the state-dir default.
+pub fn resolve_config_path() -> PathBuf {
+    if let Ok(v) = std::env::var(CONFIG_FILE_ENV) {
+        let v = v.trim();
+        if v.is_empty() {
+            return default_config_path();
+        }
+        if let Some(rest) = v.strip_prefix("~/").or_else(|| (v == "~").then_some(""))
+            && let Some(home) = std::env::var_os("HOME")
+        {
+            return PathBuf::from(home).join(rest);
+        }
+        return PathBuf::from(v);
+    }
+    default_config_path()
+}
+
+/// Write the categorized template when the file is missing (creating
+/// parent dirs). Returns true when it wrote. Existing files are never
+/// touched — operator edits are sacred.
+pub fn ensure_config_file(path: &Path) -> std::io::Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, DEFAULT_CONFIG_TOML)?;
+    Ok(true)
+}
+
+/// Parse the file into a TOML table. `None` when missing (the caller
+/// ensures first; a missing file simply means env/defaults rule).
+pub fn read_table(path: &Path) -> Result<Option<toml::Table>, ConfigError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
+    let table: toml::Table = raw
+        .parse()
+        .map_err(|e: toml::de::Error| ConfigError::Parse(path.display().to_string(), e.to_string()))?;
+    Ok(Some(table))
+}
+
+/// Flatten the TOML table onto env-style keys, env winning. Returns
+/// the merged map plus typo/unknown-key notes for `warnings()`:
+/// unknown sections/keys and non-scalar values never fail the boot,
+/// but they must surface loudly instead of being silently ignored.
+pub fn overlay(
+    table: Option<&toml::Table>,
+    env: &HashMap<String, String>,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut merged = HashMap::new();
+    let mut notes = Vec::new();
+    if let Some(table) = table {
+        let mut known: std::collections::HashSet<(&str, &str)> =
+            std::collections::HashSet::new();
+        for (section, key, env_name) in KEYMAP {
+            known.insert((section, key));
+            if env.contains_key(*env_name) {
+                continue; // env wins, exactly as before (even when blank)
+            }
+            let value = table
+                .get(*section)
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get(*key));
+            match cell_string(value) {
+                Cell::Absent | Cell::Empty => {} // unset: built-in default rules
+                Cell::Set(s) => {
+                    merged.insert(env_name.to_string(), s);
+                }
+                Cell::Bad => {
+                    notes.push(format!(
+                        "config [{section}].{key} ignored (want a single number/string/bool)"
+                    ));
+                }
+            }
+        }
+        // Unknown sections/keys: operator typos must surface.
+        for (section, values) in table.iter() {
+            report_unknown_keys(section, values, &known, &mut notes);
+        }
+    }
+    // Env overlay last: every present env key wins verbatim.
+    for (k, v) in env.iter() {
+        merged.insert(k.clone(), v.clone());
+    }
+    (merged, notes)
+}
+
+/// One TOML cell: absent, empty-unset, set, or non-scalar.
+enum Cell {
+    Absent,
+    Empty,
+    Set(String),
+    Bad,
+}
+
+/// Scalar to string. Empty strings count as unset (the shipped
+/// template uses them as placeholders); non-scalars report instead of
+/// smuggling a value into the map.
+fn cell_string(value: Option<&toml::Value>) -> Cell {
+    let v = match value {
+        None => return Cell::Absent,
+        Some(v) => v,
+    };
+    match v {
+        toml::Value::String(s) if s.trim().is_empty() => Cell::Empty,
+        toml::Value::String(s) => Cell::Set(s.clone()),
+        toml::Value::Integer(i) => Cell::Set(i.to_string()),
+        toml::Value::Float(f) => Cell::Set(float_string(*f)),
+        toml::Value::Boolean(b) => Cell::Set(b.to_string()),
+        _ => Cell::Bad,
+    }
+}
+
+/// Shortest float rendering that parses back (`get_float` uses
+/// `str::parse`, so Rust `Display` round-trips exactly).
+fn float_string(f: f64) -> String {
+    format!("{f}")
+}
+
+fn report_unknown_keys(
+    section: &str,
+    values: &toml::Value,
+    known: &std::collections::HashSet<(&str, &str)>,
+    notes: &mut Vec<String>,
+) {
+    let table = match values.as_table() {
+        Some(t) => t,
+        None => {
+            notes.push(format!(
+                "config [{section}] ignored (want a [section] table, found a single value)"
+            ));
+            return;
+        }
+    };
+    for key in table.keys() {
+        if !known.contains(&(section, key.as_str())) {
+            notes.push(format!(
+                "config [{section}].{key} unknown; ignoring (check for typos)"
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(toml: &str) -> toml::Table {
+        toml.parse().expect("test toml parses")
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn shipped_template_covers_every_key() {
+        // Template and KEYMAP must agree: a key missing from either is
+        // a silent default or a dead comment.
+        let t: toml::Table = DEFAULT_CONFIG_TOML.parse().expect("template parses");
+        for (section, key, _) in KEYMAP {
+            let v = t
+                .get(*section)
+                .and_then(|s| s.as_table())
+                .and_then(|s| s.get(*key));
+            assert!(v.is_some(), "template missing [{section}].{key}");
+        }
+    }
+
+    #[test]
+    fn overlay_prefers_env_over_file() {
+        let t = table("[trading]\nnotional_usd = 42.0\n");
+        let (m, notes) = overlay(Some(&t), &env(&[]));
+        assert_eq!(m.get("NOTIONAL_USD").map(String::as_str), Some("42"));
+        assert!(notes.is_empty(), "{notes:?}");
+        // Env wins verbatim, even when blank (existing blank semantics).
+        let (m, _) = overlay(Some(&t), &env(&[("NOTIONAL_USD", "7.5")]));
+        assert_eq!(m.get("NOTIONAL_USD").map(String::as_str), Some("7.5"));
+    }
+
+    #[test]
+    fn overlay_skips_empties_and_reports_unknowns() {
+        let t = table(
+            "[network]\nmainnet_rpc_url = \"\"\n[trading]\nnotional_usd = [1]\n[nope]\nx = 1\n[gate]\ngate_window_sec = 5\n",
+        );
+        let (m, notes) = overlay(Some(&t), &env(&[]));
+        assert!(!m.contains_key("MAINNET_RPC_URL"), "empty must stay unset");
+        assert!(!m.contains_key("NOTIONAL_USD"), "non-scalar must not enter the map");
+        let joined = notes.join("\n");
+        assert!(joined.contains("[trading].notional_usd ignored"), "{joined}");
+        assert!(joined.contains("[nope].x unknown"), "{joined}");
+        assert!(joined.contains("[gate].gate_window_sec unknown"), "{joined}");
+    }
+
+    #[test]
+    fn overlay_without_file_is_env_only() {
+        let (m, notes) = overlay(None, &env(&[("A", "b")]));
+        assert_eq!(m.get("A").map(String::as_str), Some("b"));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn read_table_handles_missing_and_broken() {
+        let dir = std::env::temp_dir().join(format!(
+            "cfg-read-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let missing = dir.join("nope.toml");
+        assert!(read_table(&missing).expect("missing").is_none());
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[trading\nnotional_usd = ").expect("write");
+        let err = read_table(&bad).expect_err("must fail");
+        assert!(format!("{err}").contains("bad.toml"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_writes_once_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!(
+            "cfg-ensure-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("sub").join("config.toml");
+        assert!(ensure_config_file(&path).expect("create"));
+        assert!(!ensure_config_file(&path).expect("second call"));
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(body.contains("[trading]"), "template content");
+        std::fs::write(&path, "custom = true\n").expect("overwrite");
+        assert!(!ensure_config_file(&path).expect("third call"));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "custom = true\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -163,9 +163,18 @@ impl std::fmt::Debug for Settings {
 }
 
 impl Settings {
-    /// Read from the process environment.
-    pub fn from_env() -> Self {
-        Self::from_map(&std::env::vars().collect())
+    /// Layered read: `config.toml` table under environment. Env wins
+    /// per key; file typos surface as warnings, never silent defaults.
+    pub fn from_layered(
+        file: Option<&toml::Table>,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        let (merged, mut file_notes) = crate::config::overlay(file, env);
+        let mut settings = Self::from_map(&merged);
+        // File notes first: they name the source of a value.
+        file_notes.append(&mut settings.parse_notes);
+        settings.parse_notes = file_notes;
+        settings
     }
 
     /// Build from a map (tests avoid global env).
@@ -710,6 +719,23 @@ mod tests {
         assert!(!s.speculative_inference);
         let s = Settings::from_map(&vars(&[("SPECULATIVE_INFERENCE", "true")]));
         assert!(s.speculative_inference);
+    }
+
+    #[test]
+    fn layered_file_under_env_with_notes() {
+        let file: toml::Table = "[trading]\nnotional_usd = 42.0\n[gate]\ngate_window_sec = 5\n"
+            .parse()
+            .expect("test toml");
+        // File rules when env is silent.
+        let s = Settings::from_layered(Some(&file), &HashMap::new());
+        assert_eq!(s.notional_usd, 42.0);
+        assert!(s.warnings().iter().any(|w| w.contains("[gate].gate_window_sec unknown")), "{:?}", s.warnings());
+        // Env wins per key; other file keys still apply.
+        let s = Settings::from_layered(Some(&file), &vars(&[("NOTIONAL_USD", "7.5")]));
+        assert_eq!(s.notional_usd, 7.5);
+        // No file: pure env behavior, unchanged.
+        let s = Settings::from_layered(None, &vars(&[("NOTIONAL_USD", "9.0")]));
+        assert_eq!(s.notional_usd, 9.0);
     }
 
     #[test]

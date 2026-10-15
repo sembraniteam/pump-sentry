@@ -123,3 +123,11 @@ ST=0
 "$DEST/$APP" status >/dev/null 2>&1 || ST=$?
 [ "$ST" -eq 0 ] || [ "$ST" -eq 1 ] || die "installed binary failed to run (exit $ST)"
 log "smoke test ok"
+
+# Categorized config: best-effort seed (the daemon also auto-creates it
+# on first start, so a skipped seed here is never fatal).
+if "$DEST/$APP" init-config >/dev/null 2>&1; then
+    log "config ready at ~/.pump-sentry/config.toml (edit by category, secrets stay in env)"
+else
+    log "warning: could not seed ~/.pump-sentry/config.toml (created automatically on first start)"
+fi

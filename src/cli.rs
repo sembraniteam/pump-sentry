@@ -46,6 +46,7 @@ Commands:
   logs [-n N] [--follow]  Show the last N log lines (default 100)
   run [--live]            Run in the foreground (for debugging)
   sell <mint>             Queue a manual full exit for one mint now
+  init-config             Write ~/.pump-sentry/config.toml when missing
   help                    Show this help
 
 Options:
@@ -92,6 +93,8 @@ pub enum CliAction {
     Run {
         live: bool,
     },
+    /// Write the categorized default config when missing.
+    InitConfig,
     /// Manual full exit for one mint.
     Sell {
         mint: String,
@@ -122,6 +125,7 @@ pub fn parse_cli(args: &[String]) -> CliAction {
         "run" => CliAction::Run {
             live: live_flag(args),
         },
+        "init-config" => CliAction::InitConfig,
         "logs" => CliAction::Logs {
             lines: log_lines(args),
             follow: args.iter().any(|a| a == "--follow" || a == "-f"),
@@ -995,6 +999,10 @@ mod tests {
         );
         assert_eq!(parse_cli(&argv(&["bot", "status"])), CliAction::Status);
         assert_eq!(
+            parse_cli(&argv(&["bot", "init-config"])),
+            CliAction::InitConfig
+        );
+        assert_eq!(
             parse_cli(&argv(&["bot", "run", "--live"])),
             CliAction::Run { live: true }
         );
@@ -1298,7 +1306,8 @@ mod tests {
     #[test]
     fn usage_lists_all_commands() {
         for cmd in [
-            "start", "stop", "restart", "status", "logs", "run", "sell", "help", "--live",
+            "start", "stop", "restart", "status", "logs", "run", "sell", "init-config", "help",
+            "--live",
         ] {
             assert!(USAGE.contains(cmd), "usage missing {cmd}");
         }

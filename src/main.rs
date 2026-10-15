@@ -1,6 +1,7 @@
 //! Paper pipeline binary. Default is paper; `--live` moves real funds.
 
 mod cli;
+mod config;
 mod follow;
 mod gate;
 mod live;
@@ -38,6 +39,17 @@ async fn main() {
         cli::CliAction::Status => cli::cmd_status(),
         cli::CliAction::Logs { lines, follow } => cli::cmd_logs(lines, follow).await,
         cli::CliAction::Sell { mint } => cli::cmd_sell(&mint),
+        cli::CliAction::InitConfig => {
+            let path = config::resolve_config_path();
+            match config::ensure_config_file(&path) {
+                Ok(true) => println!("wrote default config to {}", path.display()),
+                Ok(false) => println!("config already exists at {}", path.display()),
+                Err(e) => {
+                    eprintln!("cannot write config at {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            }
+        }
         cli::CliAction::Help { error } => {
             if let Some(cause) = error {
                 eprintln!("error: {cause}\n");
@@ -168,7 +180,27 @@ async fn run_pipeline(live_arg: bool) {
         });
     }
 
-    let settings = Settings::from_env();
+    // Layered config: categorized config.toml under environment.
+    // The file is auto-created (template with every tunable); a
+    // missing file simply means env/defaults rule. Parse errors are
+    // fatal — a typo'd value must never silently become a default.
+    let config_path = config::resolve_config_path();
+    match config::ensure_config_file(&config_path) {
+        Ok(true) => println!("wrote default config to {}", config_path.display()),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("cannot set up config at {}: {e}", config_path.display());
+            std::process::exit(1);
+        }
+    }
+    let table = match config::read_table(&config_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bad config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let settings = Settings::from_layered(table.as_ref(), &std::env::vars().collect());
 
     if CurveTicker::parse_commitment(&settings.commitment).is_none() {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
