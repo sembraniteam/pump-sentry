@@ -188,15 +188,23 @@ pub fn resolve_config_path() -> PathBuf {
 
 /// Write the categorized template when the file is missing (creating
 /// parent dirs). Returns true when it wrote. Existing files are never
-/// touched — operator edits are sacred.
+/// touched — operator edits are sacred. New files are owner-only
+/// (`0600` on unix): the file holds no secrets by construction, but an
+/// operator-pasted `?api-key=` RPC URL would be one, so restrictive
+/// from birth costs nothing.
 pub fn ensure_config_file(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
     if path.exists() {
         return Ok(false);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, DEFAULT_CONFIG_TOML)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    let mut file = opts.open(path)?;
+    use std::io::Write;
+    file.write_all(DEFAULT_CONFIG_TOML.as_bytes())?;
     Ok(true)
 }
 
@@ -390,6 +398,22 @@ mod tests {
         std::fs::write(&path, "custom = true\n").expect("overwrite");
         assert!(!ensure_config_file(&path).expect("third call"));
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "custom = true\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "cfg-perm-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("config.toml");
+        assert!(ensure_config_file(&path).expect("create"));
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode={mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
