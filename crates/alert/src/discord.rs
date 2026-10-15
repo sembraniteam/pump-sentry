@@ -66,6 +66,10 @@ pub struct HeartbeatReport<'a> {
     pub diverged: usize,
     /// Buys awaiting confirmation (unknown fills).
     pub pending_buys: usize,
+    /// Breaker currently halting entries.
+    pub breaker_halted: bool,
+    /// Day net PnL (USD) behind the breaker line.
+    pub day_net: f64,
     /// Free paper cash (USD).
     pub cash_usd: f64,
     /// Mark-to-market paper equity (USD).
@@ -191,7 +195,9 @@ impl Alerter {
         format!("• **Mode:** `{mode} · {strategy}`")
     }
 
-    /// Entry card.
+    /// Entry card. `risk` is the profile provenance (`model` |
+    /// `heuristic`) so operators can tell model entries from the
+    /// lower-bound fallback at a glance.
     pub fn format_entry(
         ctx: &CardCtx<'_>,
         mint: &str,
@@ -199,8 +205,10 @@ impl Alerter {
         tp_pct: f64,
         sl_pct: f64,
         notional_usd: f64,
+        risk: &str,
     ) -> String {
         let mint = Self::sanitize(mint);
+        let risk = Self::sanitize(risk);
         format!(
             "🟢 **[TRADE OPENED]**\n\
              {}\n\
@@ -208,7 +216,21 @@ impl Alerter {
              • **Entry Price:** `${entry_usd:.8}`\n\
              • **Size:** `${notional_usd:.2}`\n\
              • **Target TP:** `+{tp_pct:.1}%` | **Stop Loss:** `{sl_pct:.1}%`\n\
+             • **Risk:** `{risk}`\n\
              • **Explorer:** https://explorer.solana.com/address/{mint}",
+            Self::mode_line(ctx),
+        )
+    }
+
+    /// Day-loss halt card. Fires once per UTC day (see
+    /// `DailyBreaker::halt_state`); the heartbeat carries the state
+    /// after that. Exits always work — only entries halt.
+    pub fn format_halt(ctx: &CardCtx<'_>, cap_usd: f64, day_net: f64) -> String {
+        format!(
+            "🛑 **[DAY-LOSS HALT]**\n\
+             {}\n\
+             • **Cap:** `-${cap_usd:.2}/day` | **Day net:** `${day_net:+.2}`\n\
+             • Entries halted; exits always work",
             Self::mode_line(ctx),
         )
     }
@@ -343,6 +365,7 @@ impl Alerter {
              • **Manual bags:** `{}` held\n\
              • **Diverged:** `{}` (paper without live cover)\n\
              • **Pending buys:** `{}` unconfirmed\n\
+             • **Breaker:** {}\n\
              • **Cash:** `${:.2}`\n\
              • **Equity:** `${:.2}`",
             r.logs_seen,
@@ -354,9 +377,20 @@ impl Alerter {
             r.manual_bags,
             r.diverged,
             r.pending_buys,
+            Self::breaker_line(r.breaker_halted, r.day_net),
             r.cash_usd,
             r.equity_usd,
         )
+    }
+
+    /// Breaker line: `armed`, or `HALTED` with the day net that
+    /// tripped it. Plain values, no secrets.
+    fn breaker_line(halted: bool, day_net: f64) -> String {
+        if halted {
+            format!("`HALTED (day ${day_net:+.2})`")
+        } else {
+            "`armed`".to_string()
+        }
     }
 
     /// Post-migration spike card.
@@ -396,7 +430,7 @@ mod tests {
 
     #[test]
     fn entry_card_marks_fields() {
-        let card = Alerter::format_entry(&PAPER, "MINT", 0.00000420, 40.0, -10.0, 10.0);
+        let card = Alerter::format_entry(&PAPER, "MINT", 0.00000420, 40.0, -10.0, 10.0, "model");
         assert!(card.contains("[TRADE OPENED]"));
         assert!(card.contains("`MINT`"));
         assert!(card.contains("$0.00000420"));
@@ -441,6 +475,8 @@ mod tests {
             manual_bags: 2,
             diverged: 1,
             pending_buys: 0,
+            breaker_halted: false,
+            day_net: 3.25,
             cash_usd: 90.5,
             equity_usd: 102.25,
         });
@@ -563,5 +599,20 @@ mod tests {
             .send("hi".to_string());
         // Let detached tasks run; assertions are "no panic, returns fast".
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[test]
+    fn halt_card_and_breaker_line() {
+        let card = Alerter::format_halt(&PAPER, 10.0, -12.34);
+        assert!(card.contains("[DAY-LOSS HALT]"));
+        assert!(card.contains("`paper · adaptive`"));
+        assert!(card.contains("-$10.00/day"));
+        assert!(card.contains("$-12.34"));
+        assert!(card.contains("exits always work"));
+        assert_eq!(Alerter::breaker_line(false, 0.0), "`armed`");
+        assert_eq!(
+            Alerter::breaker_line(true, -12.34),
+            "`HALTED (day $-12.34)`"
+        );
     }
 }

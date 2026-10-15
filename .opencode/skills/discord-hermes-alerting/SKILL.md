@@ -66,7 +66,7 @@ impl DiscordAlert {
         });
     }
 
-    pub fn format_entry(ctx: &CardCtx<'_>, mint: &str, entry_usd: f64, tp_pct: f64, sl_pct: f64, notional_usd: f64) -> String {
+    pub fn format_entry(ctx: &CardCtx<'_>, mint: &str, entry_usd: f64, tp_pct: f64, sl_pct: f64, notional_usd: f64, risk: &str) -> String {
         format!(
             "🟢 **[TRADE OPENED]**\n\
              • **Mode:** `paper · adaptive`\n\
@@ -74,6 +74,7 @@ impl DiscordAlert {
              • **Entry Price:** `${entry_usd:.8}`\n\
              • **Size:** `${notional_usd:.2}`\n\
              • **Target TP:** `+{tp_pct:.1}%` | **Stop Loss:** `{sl_pct:.1}%`\n\
+             • **Risk:** `model`\n\
              • **Explorer:** https://explorer.solana.com/address/{mint}"
         )
     }

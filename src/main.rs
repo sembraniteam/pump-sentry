@@ -575,6 +575,14 @@ async fn run_pipeline(live_arg: bool) {
                 let diverged = pipeline.exec.diverged_keys().await.len();
                 let pending_buys = pipeline.exec.live_pending_count();
                 let (cash, equity) = pipeline.paper_cash_equity().await;
+                let (breaker_halted, day_net) = {
+                    let mut daily = pipeline.daily.lock().await;
+                    let halted = daily.tripped(
+                        pipeline.settings.max_daily_loss_usd,
+                        settings::now_secs(),
+                    );
+                    (halted, daily.day_net)
+                };
                 let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
                     mode: if live_mode { "live" } else { "paper" },
                     uptime_secs: settings::now_secs().saturating_sub(boot_ts),
@@ -587,6 +595,8 @@ async fn run_pipeline(live_arg: bool) {
                     manual_bags: manual,
                     diverged,
                     pending_buys,
+                    breaker_halted,
+                    day_net,
                     strategy: pipeline.strategy.as_str(),
                     cash_usd: cash,
                     equity_usd: equity,

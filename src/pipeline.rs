@@ -2217,8 +2217,24 @@ mod tests {
         // New UTC day rolls the bucket.
         assert!(!b.tripped(10.0, day + 86_400));
         // Stale bucket read also rolls (no phantom trip).
-        let mut stale = DailyBreaker { day, day_net: -1_000.0 };
+        let mut stale = DailyBreaker { day, day_net: -1_000.0, halt_alerted_day: 0 };
         assert!(!stale.tripped(10.0, day + 86_400));
+    }
+
+    #[test]
+    fn halt_card_fires_once_per_day() {
+        let day = 2_000 * 86_400;
+        let mut b = DailyBreaker::new(day);
+        // Not tripped: silence.
+        assert_eq!(b.halt_state(10.0, day), (false, false));
+        b.record(-10.0, day);
+        // Newly tripped: card fires once, state stays tripped.
+        assert_eq!(b.halt_state(10.0, day), (true, true));
+        assert_eq!(b.halt_state(10.0, day), (true, false));
+        // Rollover re-arms both trip and card.
+        assert_eq!(b.halt_state(10.0, day + 86_400), (false, false));
+        b.record(-10.0, day + 86_400);
+        assert_eq!(b.halt_state(10.0, day + 86_400), (true, true));
     }
 
     #[tokio::test]

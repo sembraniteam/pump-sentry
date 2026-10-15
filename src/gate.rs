@@ -123,6 +123,8 @@ struct TrackedOpen<'a> {
     entry_quote: f64,
     liquidity_usd: f64,
     profile: &'a risk_engine::RiskProfile,
+    /// Profile provenance for the entry card (`model` | `heuristic`).
+    risk: &'static str,
     allow_live: bool,
     creator: Option<&'a str>,
     /// Venue tier with the tick. `None` is standard; synthetic forces `None`.
@@ -186,12 +188,14 @@ pub struct DailyBreaker {
     pub day: u64,
     /// Realized net PnL accumulated within `day` (negative = losing).
     pub day_net: f64,
+    /// Day bucket the halt card already fired for (once-per-day alert).
+    pub halt_alerted_day: u64,
 }
 
 impl DailyBreaker {
     /// Fresh breaker (today, flat).
     pub fn new(now_secs: u64) -> Self {
-        Self { day: now_secs / 86_400, day_net: 0.0 }
+        Self { day: now_secs / 86_400, day_net: 0.0, halt_alerted_day: 0 }
     }
 
     /// Fold one closed trade in (rolls the day first).
@@ -214,6 +218,20 @@ impl DailyBreaker {
             self.day_net = 0.0;
         }
         cap_usd.is_finite() && cap_usd > 0.0 && self.day_net <= -cap_usd
+    }
+
+    /// Halt state plus one-shot card: `(tripped, fire_card)`. The card
+    /// fires once per UTC day; silence afterwards is the point — one
+    /// card, then the heartbeat carries the state until rollover.
+    pub fn halt_state(&mut self, cap_usd: f64, now_secs: u64) -> (bool, bool) {
+        if !self.tripped(cap_usd, now_secs) {
+            return (false, false);
+        }
+        if self.halt_alerted_day == self.day {
+            return (true, false);
+        }
+        self.halt_alerted_day = self.day;
+        (true, true)
     }
 }
 
@@ -762,6 +780,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             entry_quote,
             liquidity_usd,
             profile: &profile,
+            risk: match decision.source {
+                DecisionSource::Model => "model",
+                DecisionSource::Fallback => "heuristic",
+            },
             allow_live: req.allow_live && !priced_via_override,
             creator: signal.creator.as_deref(),
             // Synthetic registers no tier.
@@ -784,9 +806,23 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let trail_percent = req.trail_percent;
         let creator = req.creator;
         let sol = req.sol;
-        // Breaker first: past cap, no new risk.
-        if self.daily.lock().await.tripped(self.settings.max_daily_loss_usd, now_secs()) {
-            warn!(%mint, cap = self.settings.max_daily_loss_usd, "daily loss breaker tripped; skipping open");
+        // Breaker first: past cap, no new risk. One card per day;
+        // the heartbeat carries the halted state after that.
+        let (tripped, fire, day_net) = {
+            let mut daily = self.daily.lock().await;
+            let (tripped, fire) =
+                daily.halt_state(self.settings.max_daily_loss_usd, now_secs());
+            (tripped, fire, daily.day_net)
+        };
+        if tripped {
+            warn!(%mint, cap = self.settings.max_daily_loss_usd, day_net, "daily loss breaker tripped; skipping open");
+            if fire {
+                self.emit(Alerter::format_halt(
+                    &self.card_ctx(),
+                    self.settings.max_daily_loss_usd,
+                    day_net,
+                ));
+            }
             return;
         }
         let mut portfolio = self.portfolio.lock().await;
@@ -868,6 +904,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     profile.tp_percent,
                     profile.sl_percent,
                     self.settings.notional_usd,
+                    req.risk,
                 );
                 drop(portfolio);
                 self.emit(card);
