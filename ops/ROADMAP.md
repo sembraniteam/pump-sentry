@@ -1,7 +1,15 @@
 # Roadmap — next release (post-0.3.0)
 
-Planned, not started. Do not implement without re-reading the
-constraints below — the design risks are load-bearing.
+## Yellowstone gRPC ingestion — IMPLEMENTED, awaiting live proof
+
+`listener/src/geyser.rs` (`GeyserSubscriber`): selected automatically
+when `[network].yellowstone_endpoint` is non-empty, WS otherwise —
+never both. Full transactions arrive inline (no `getTransaction`
+fetch, no saturation drops); gap replay rides `from_slot`. Unit-proven
+against the frozen `create_v2` fixture (same name/symbol assertions as
+the WS path). Remaining: run against the real endpoint
+(`YELLOWSTONE_TOKEN` env) and confirm the first `subscribed to
+pump.fun transactions via geyser` line plus live events.
 
 ## RPC endpoint fallback (REST + WebSocket)
 

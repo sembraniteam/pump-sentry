@@ -343,19 +343,47 @@ async fn run_pipeline(live_arg: bool) {
         }
     };
 
-    let (mut rx, stats, listener_handle) = match PumpFunListener::subscribe(ListenerConfig {
-        ws_url: settings.ws_url.clone(),
-        http_url: settings.http_url.clone(),
-        commitment: settings.commitment.clone(),
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("failed to subscribe: {e}");
-            std::process::exit(1);
+    let (mut rx, stats, listener_handle) = if !settings.yellowstone_endpoint.is_empty() {
+        // Geyser replaces WS ingestion (never both): full transactions
+        // arrive inline. REST stays for ticks/screens/sim. The x-token
+        // is env-only (secret, never the config file, never logged).
+        let token = std::env::var(listener::YELLOWSTONE_TOKEN_ENV).ok();
+        match listener::GeyserSubscriber::subscribe(
+            ListenerConfig {
+                ws_url: settings.ws_url.clone(),
+                http_url: settings.http_url.clone(),
+                geyser_url: settings.yellowstone_endpoint.clone(),
+                commitment: settings.commitment.clone(),
+            },
+            token,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("failed to subscribe (geyser): {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match PumpFunListener::subscribe(ListenerConfig {
+            ws_url: settings.ws_url.clone(),
+            http_url: settings.http_url.clone(),
+            geyser_url: String::new(),
+            commitment: settings.commitment.clone(),
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("failed to subscribe: {e}");
+                std::process::exit(1);
+            }
         }
     };
+    // The subscriber (if any) already owns a clone: scrub the token so
+    // it lives in guarded memory only, like the inference key below.
+    unsafe { std::env::remove_var(listener::YELLOWSTONE_TOKEN_ENV) };
 
     let mut engine_builder = RiskEngine::builder()
         .endpoint(&settings.inference_endpoint)

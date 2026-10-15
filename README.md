@@ -36,7 +36,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 
 | Category    | Keys                                                                                                                                                                              | Defaults                                                    |
 |-------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------|
-| `network`   | `mainnet_rpc_url`, `mainnet_wss_rpc_url`, `commitment`, `tick_interval_ms`, `vault_tick_interval_ms`                                                                              | public RPC / `confirmed` / `1000` / `5000`                  |
+| `network`   | `mainnet_rpc_url`, `mainnet_wss_rpc_url`, `yellowstone_endpoint`*, `commitment`, `tick_interval_ms`, `vault_tick_interval_ms`                                                    | public RPC / `confirmed` / `1000` / `5000`                  |
 | `trading`   | `start_balance`, `fee_bps`, `notional_usd`, `max_open_positions`, `mint_cooldown_secs`, `max_daily_loss_usd`, `quote_usd`*, `liquidity_usd`                                       | `100` / `0` / `10` / `3` / `3600` / `0` (off) / unset / `0` |
 | `exits`     | `trail_percent`, `runner_trail_percent`                                                                                                                                           | `5` / `20`                                                  |
 | `gate`      | `gate_window_secs`, `gate_min_buyers`, `gate_poll_ms`, `dev_min_age_secs`, `dev_max_prior_launches`, `dev_screen_sample_txs`, `dev_sig_limit`                                     | `10` / `5` / `2000` / `3600` / `1` / `20` / `100`           |
@@ -44,10 +44,10 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 | `execution` | `slippage_bps`, `slippage_vol_window_secs`, `slippage_vol_extra_cap_bps`, `priority_fee_micro_lamports`, `compute_unit_limit`, `jito_tip_lamports`, `jito_endpoint`, `sim_strict` | `200` / `0` / `0` / `0` / `0` / `100000` / global / `false` |
 | `alerts`    | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs`                                  | `true` / host default / `0` / `0` / `0` / `3600`            |
 
-\* test-only.
+\* test-only. \*`yellowstone_endpoint`: non-empty selects Yellowstone gRPC ingestion instead of WS (x-token via `YELLOWSTONE_TOKEN` env, never the file).
 `strategy_mode`: `adaptive` runs the profile verbatim; `scalp` clamps TP to +25…+35%; `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
 
-Outside config: `HERMES_BIN`, `BOT_DAEMON` (daemon marker), `PID_FILE` / `LOG_FILE` / `CONFIG_FILE` (path overrides).
+Outside config: `HERMES_BIN`, `BOT_DAEMON` (daemon marker), `PID_FILE` / `LOG_FILE` / `CONFIG_FILE` (path overrides), `YELLOWSTONE_TOKEN` (geyser x-token, secret).
 
 ## Safety
 

@@ -3,6 +3,7 @@
 //! `logsSubscribe` → `getTransaction` → parse → bounded channel.
 //! Hot paths never panic and never block the socket loop.
 
+pub mod geyser;
 pub mod parser;
 pub mod screen;
 pub mod stream;
@@ -22,6 +23,7 @@ pub use screen::{
     find_funding_source, fixture_wallet, initialize2_amm_id, judge_developer, migrate_pool_id,
     parse_address, read_curve_swaps, screen_developer,
 };
+pub use geyser::{GeyserError, GeyserSubscriber, YELLOWSTONE_TOKEN_ENV};
 pub use stream::{ListenerError, PumpFunListener, backoff_duration};
 pub use types::{
     DEFAULT_HTTP_RPC_URL, DEFAULT_WS_RPC_URL, ListenerConfig, ListenerEvent, ListenerStats,

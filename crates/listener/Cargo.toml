@@ -28,6 +28,8 @@ base64 = "0.23.1"
 thiserror = "2"
 tracing = "0.1"
 url = "2"
+yellowstone-grpc-client = "15.0.0"
+yellowstone-grpc-proto = "14.0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

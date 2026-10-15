@@ -34,6 +34,7 @@ pub enum ConfigError {
 pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("network", "mainnet_rpc_url", "MAINNET_RPC_URL"),
     ("network", "mainnet_wss_rpc_url", "MAINNET_WSS_RPC_URL"),
+    ("network", "yellowstone_endpoint", "YELLOWSTONE_ENDPOINT"),
     ("network", "commitment", "COMMITMENT"),
     ("network", "tick_interval_ms", "TICK_INTERVAL_MS"),
     ("network", "vault_tick_interval_ms", "VAULT_TICK_INTERVAL_MS"),
@@ -99,6 +100,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# pump-sentry config — auto-created o
 # Dedicated RPC recommended; empty falls back to the public endpoint.
 mainnet_rpc_url = ""        # dedicated RPC recommended; empty = public endpoint
 mainnet_wss_rpc_url = ""    # empty = public endpoint
+yellowstone_endpoint = ""   # Yellowstone gRPC (https URL); non-empty REPLACES ws ingestion (x-token via YELLOWSTONE_TOKEN env, never here)
 commitment = "confirmed"    # (confirmed|finalized; processed is refused live)
 tick_interval_ms = 1000     # (curve polls)
 vault_tick_interval_ms = 5000  # (migration pool polls)

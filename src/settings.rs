@@ -15,6 +15,8 @@ pub const DEFAULT_INFERENCE_ENDPOINT: &str = "http://127.0.0.1:11434/v1/chat/com
 pub struct Settings {
     pub ws_url: String,
     pub http_url: String,
+    /// Yellowstone gRPC endpoint ("" = unset → WS ingestion).
+    pub yellowstone_endpoint: String,
     /// `processed` | `confirmed` | `finalized`.
     pub commitment: String,
     /// Virtual balance in USD.
@@ -109,6 +111,7 @@ impl std::fmt::Debug for Settings {
         f.debug_struct("Settings")
             .field("ws_url", &ids::redact_endpoint(&self.ws_url))
             .field("http_url", &ids::redact_endpoint(&self.http_url))
+            .field("yellowstone_endpoint", &ids::redact_endpoint(&self.yellowstone_endpoint))
             .field("commitment", &self.commitment)
             .field("start_balance", &self.start_balance)
             .field("fee_bps", &self.fee_bps)
@@ -185,6 +188,7 @@ impl Settings {
         Self {
             ws_url: parse_wss_url(vars, &mut notes),
             http_url: parse_rpc_url(vars, &mut notes),
+            yellowstone_endpoint: parse_yellowstone_url(vars, &mut notes),
             commitment: get_string(vars, "COMMITMENT", "confirmed"),
             start_balance: get_float(vars, "START_BALANCE", 100.0, &mut notes),
             fee_bps: get_float(vars, "FEE_BPS", 0.0, &mut notes),
@@ -517,6 +521,35 @@ fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
     }
 }
 
+/// Yellowstone gRPC endpoint. Empty (unset) selects WS ingestion;
+/// non-empty must look like an `http(s)://host` URL (gRPC dials off
+/// the scheme; full validation happens at connect). No legacy alias,
+/// no default: unset is a valid mode.
+fn parse_yellowstone_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
+    let clean = |v: &String| v.replace('\\', "").trim().to_string();
+    match vars
+        .get("YELLOWSTONE_ENDPOINT")
+        .map(clean)
+        .filter(|v| !v.is_empty())
+    {
+        Some(url) => {
+            let rest = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"));
+            match rest {
+                Some(host) if !host.split(['/', '?', '#']).next().unwrap_or("").is_empty() => url,
+                _ => {
+                    notes.push(format!(
+                        "YELLOWSTONE_ENDPOINT='{url}' is not an http/https URL; ignoring (WS ingestion)"
+                    ));
+                    String::new()
+                }
+            }
+        }
+        None => String::new(),
+    }
+}
+
 /// Manual entry quote: only positive finite is honored.
 fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Option<f64> {
     let raw = vars.get("QUOTE_USD")?;
@@ -794,6 +827,43 @@ mod tests {
         assert!(
             !crate::config::KEYMAP.iter().any(|(_, _, flat)| *flat == "INFERENCE_API_KEY"),
             "inference key must never gain a file mapping"
+        );
+    }
+
+    #[test]
+    fn yellowstone_token_stays_env_only() {
+        // Same rule as the inference key: the geyser x-token must never
+        // sit in the config file (it authenticates and bills).
+        assert!(
+            !crate::config::KEYMAP
+                .iter()
+                .any(|(_, _, flat)| *flat == "YELLOWSTONE_TOKEN"),
+            "geyser token must never gain a file mapping"
+        );
+    }
+
+    #[test]
+    fn yellowstone_endpoint_parses() {
+        // Unset selects WS; garbage fails closed to WS with a warning.
+        let s = Settings::from_file(None);
+        assert_eq!(s.yellowstone_endpoint, "");
+        let file: toml::Table = "[network]\nyellowstone_endpoint = \"https://grr.example:443\"\n"
+            .parse()
+            .expect("test toml");
+        let s = Settings::from_file(Some(&file));
+        assert_eq!(s.yellowstone_endpoint, "https://grr.example:443");
+        assert!(s.warnings().iter().all(|w| !w.contains("YELLOWSTONE")));
+        let bad: toml::Table = "[network]\nyellowstone_endpoint = \"notaurl\"\n"
+            .parse()
+            .expect("test toml");
+        let s = Settings::from_file(Some(&bad));
+        assert_eq!(s.yellowstone_endpoint, "");
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("YELLOWSTONE_ENDPOINT")),
+            "{:?}",
+            s.warnings()
         );
     }
 

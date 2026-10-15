@@ -19,9 +19,14 @@ pub const DEFAULT_WS_RPC_URL: &str = "wss://api.mainnet-beta.solana.com";
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
     /// WebSocket RPC URL, e.g. `wss://api.mainnet-beta.solana.com`.
+    /// Unused when `geyser_url` is set (single ingestion source).
     pub ws_url: String,
     /// HTTP RPC URL, e.g. `https://api.mainnet-beta.solana.com`.
     pub http_url: String,
+    /// Yellowstone gRPC endpoint, e.g. `https://atlas-mainnet.helius-rpc.com:443`.
+    /// Non-empty selects Geyser ingestion instead of WS. The `x-token`
+    /// stays env-only (`YELLOWSTONE_TOKEN`), never here.
+    pub geyser_url: String,
     /// Commitment as string: `processed`, `confirmed`, or `finalized`.
     pub commitment: String,
 }
@@ -31,6 +36,7 @@ impl Default for ListenerConfig {
         Self {
             ws_url: DEFAULT_WS_RPC_URL.to_string(),
             http_url: DEFAULT_HTTP_RPC_URL.to_string(),
+            geyser_url: String::new(),
             commitment: "confirmed".to_string(),
         }
     }
@@ -45,6 +51,9 @@ pub enum ConfigError {
     /// HTTP URL is not a valid `http`/`https` URL.
     #[error("invalid http_url: {0}")]
     BadHttpUrl(String),
+    /// Geyser URL is not a valid `http`/`https` URL.
+    #[error("invalid geyser_url: {0}")]
+    BadGeyserUrl(String),
     /// Commitment string is unknown.
     #[error("invalid commitment '{0}': expected processed|confirmed|finalized")]
     BadCommitment(String),
@@ -67,6 +76,15 @@ impl ListenerConfig {
         }
         if http.host_str().is_none_or(|h| h.is_empty()) {
             return Err(ConfigError::BadHttpUrl(self.http_url.clone()));
+        }
+        // Geyser endpoint: empty (WS mode) or http/https.
+        if !self.geyser_url.is_empty() {
+            match url::Url::parse(&self.geyser_url) {
+                Ok(u)
+                    if (u.scheme() == "http" || u.scheme() == "https")
+                        && u.host_str().is_some_and(|h| !h.is_empty()) => {}
+                _ => return Err(ConfigError::BadGeyserUrl(self.geyser_url.clone())),
+            }
         }
         // Split hosts warn only: providers may differ.
         if ws.host_str() != http.host_str() {
@@ -226,6 +244,7 @@ mod tests {
             ws_url: "http://nope".to_string(),
             http_url: DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
+            geyser_url: String::new(),
         };
         assert!(cfg.validate().is_err());
 
@@ -233,6 +252,7 @@ mod tests {
             ws_url: DEFAULT_WS_RPC_URL.to_string(),
             http_url: "notaurl".to_string(),
             commitment: "confirmed".to_string(),
+            geyser_url: String::new(),
         };
         assert!(cfg2.validate().is_err());
 
@@ -240,8 +260,30 @@ mod tests {
             ws_url: DEFAULT_WS_RPC_URL.to_string(),
             http_url: DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "bogus".to_string(),
+            geyser_url: String::new(),
         };
         assert!(cfg3.validate().is_err());
+    }
+
+    #[test]
+    fn geyser_url_validates() {
+        let base = ListenerConfig::default();
+        assert_eq!(base.geyser_url, "");
+        assert!(base.validate().is_ok());
+        for good in ["https://grr.example:443", "http://127.0.0.1:10000"] {
+            let cfg = ListenerConfig {
+                geyser_url: good.to_string(),
+                ..ListenerConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "{good}");
+        }
+        for bad in ["notaurl", "wss://x", "https://"] {
+            let cfg = ListenerConfig {
+                geyser_url: bad.to_string(),
+                ..ListenerConfig::default()
+            };
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

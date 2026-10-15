@@ -847,6 +847,7 @@ mod tests {
             ws_url: "http://x".to_string(),
             http_url: crate::types::DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
+            geyser_url: String::new(),
         };
         assert!(PumpFunListener::new(cfg).is_err());
     }
@@ -857,6 +858,7 @@ mod tests {
             ws_url: crate::types::DEFAULT_WS_RPC_URL.to_string(),
             http_url: crate::types::DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
+            geyser_url: String::new(),
         };
         let listener = PumpFunListener::new(cfg).expect("config");
         listener.mark_seen("sig-a");

@@ -21,6 +21,7 @@ async fn main() {
         ws_url: DEFAULT_WS_RPC_URL.to_string(),
         http_url: DEFAULT_HTTP_RPC_URL.to_string(),
         commitment: "confirmed".to_string(),
+        geyser_url: String::new(),
     };
 
     let (mut rx, stats, _handle) = match PumpFunListener::subscribe(config).await {
