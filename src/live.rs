@@ -527,6 +527,10 @@ impl LiveTrader {
     fn note_sell_bundle(&self, mint: &str, bundle_id: &str) {
         if let Ok(mut guard) = self.last_sell_bundle.lock() {
             guard.insert(mint.to_string(), bundle_id.to_string());
+        } else {
+            tracing::warn!(
+                "sell-bundle lock poisoned during note_sell_bundle; resend guard degraded"
+            );
         }
     }
 
@@ -534,6 +538,10 @@ impl LiveTrader {
     fn clear_sell_bundle(&self, mint: &str) {
         if let Ok(mut guard) = self.last_sell_bundle.lock() {
             guard.remove(mint);
+        } else {
+            tracing::warn!(
+                "sell-bundle lock poisoned during clear_sell_bundle; resend guard degraded"
+            );
         }
     }
 

@@ -9,10 +9,9 @@
 //!    Prints the proving signature. This is what retires hypotheses
 //!    about the authority — a per-pool PDA derivation was refuted here
 //!    first (derived `CbaWbgUg...` vs on-chain `5Q544fKr...`).
-//! 2. Layout simulation: rebuild the ix with OUR builder (fixture slots
-//!    + sampled user legs, dust amount, min-out 0) and
-//!    `simulateTransaction` it. Unsigned skeleton: proves layout and
-//!    the Token-2022 program parameter, not auth.
+//! 2. Layout simulation — rebuild the ix with OUR builder and
+//!    `simulateTransaction` it (unsigned skeleton: proves layout and
+//!    the Token-2022 program parameter, not auth).
 //!
 //! NEVER runs in normal `cargo test` (`#[ignore]`) nor CI. Needs public
 //! mainnet RPC (rate limits may require a rerun):
@@ -87,18 +86,17 @@ async fn raydium_authority_and_bundle_simulate() {
                 if accounts.len() != 8 {
                     continue;
                 }
-                candidates.push((
-                    tx.sig.clone(),
-                    accounts,
-                    tx.keys.first().copied().unwrap_or_default(),
-                ));
+                let Some(payer) = tx.keys.first().copied() else {
+                    continue;
+                };
+                candidates.push((tx.sig.clone(), accounts, payer));
             }
         }
         probe_slot = probe_slot.saturating_sub(10);
     }
     let Some((sig, accounts, _)) = candidates.first().cloned() else {
         panic!(
-            "no direct SwapBaseInV2 in {scanned} swap ixs over {blocks} blocks; rerun (router txs dominate) — NOT a builder verdict"
+            "no direct SwapBaseInV2 in {scanned} raydium txs over {blocks} blocks; rerun (router txs dominate) — NOT a builder verdict"
         );
     };
     // The sample's pool must itself be a Raydium AMM account.

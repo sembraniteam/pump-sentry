@@ -20,9 +20,16 @@ use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use std::str::FromStr;
 
-/// Base58 decode or panic (test scaffolding, never production).
+/// Base58 decode or panic (frozen fixtures only — untrusted RPC data
+/// must use [`decode_b58_opt`] and skip on `None`, never panic).
 pub fn decode_b58(s: &str) -> Vec<u8> {
     bs58::decode(s).into_vec().expect("valid base58")
+}
+
+/// Fallible base58 decode for live RPC payloads. A corrupt `data`
+/// string from RPC is a skip, never a panic.
+pub fn decode_b58_opt(s: &str) -> Option<Vec<u8>> {
+    bs58::decode(s).into_vec().ok()
 }
 
 /// Shared RPC constructor: `MAINNET_RPC_URL` (Helius, backslash escapes
@@ -182,10 +189,12 @@ pub async fn scan_block(rpc: &RpcClient, slot: u64) -> Option<Vec<ScannedTx>> {
         let ixs = raw
             .instructions
             .iter()
-            .map(|cix| ScannedIx {
-                program_idx: cix.program_id_index,
-                data: decode_b58(&cix.data),
-                accounts: cix.accounts.iter().map(|i| usize::from(*i)).collect(),
+            .filter_map(|cix| {
+                Some(ScannedIx {
+                    program_idx: cix.program_id_index,
+                    data: decode_b58_opt(&cix.data)?,
+                    accounts: cix.accounts.iter().map(|i| usize::from(*i)).collect(),
+                })
             })
             .collect();
         out.push(ScannedTx {

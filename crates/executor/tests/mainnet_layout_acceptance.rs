@@ -650,7 +650,9 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
                     if cix.program_id_index != pump_idx {
                         continue;
                     }
-                    let data = common::decode_b58(&cix.data);
+                    let Some(data) = common::decode_b58_opt(&cix.data) else {
+                        continue;
+                    };
                     // Buy-side shape → (buyer, base-ATA, mint) positions.
                     let shape =
                         if data.len() == 25 && data[..8] == PUMP_BUY_DISCRIMINATOR
