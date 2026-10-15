@@ -1,8 +1,8 @@
 # pump-sentry
 
-Paper-trading Solana memecoin sniper: catches new Pump.fun launches → screens risk → paper-trades with auto-exits. Paper-only by default; `--live` adds real Jito-routed execution.
+Paper-trading sniper for new Pump.fun launches. Paper-only by default; `--live` adds real Jito-routed execution.
 
-Flow: `logsSubscribe` → RugCheck audit → dev/creator screen → buyer-quorum watchlist → bundle forensics → TP/SL profile (LLM ≤300ms when a server is reachable, else the deterministic heuristic — paper and live share this exact path, so paper without a server understates entry quality) → paper position → auto-exit → migration hunt → pool tracking (PumpSwap: effective-quote ticks + live `sell_v2` exits; Raydium legacy: spike cards + live exits through the validated pool leg).
+Flow: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum → bundle forensics → TP/SL profile (LLM ≤300ms, else heuristic) → paper position → auto-exit → migration hunt → pool tracking.
 
 ## Install
 
@@ -25,15 +25,14 @@ pump-sentry run              # foreground (debugging)
 
 State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.
 
-Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fees + tips + 0.05 reserve. A **WSOL** float is only needed for token-paired quotes (debit the quote ATA).
+Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fees + tips + 0.05 reserve. A **WSOL** float is only needed for token-paired quotes.
 
 ## Config
 
 `~/.pump-sentry/config.toml` (auto-created on first start; `pump-sentry init-config`, `CONFIG_FILE` overrides the path), grouped by category.
-This file is the **only source for tunables** — environment variables are not read for them.
-Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env and are never read from the file.
-| Env                                                                     | Default                       | Meaning                                                                                      |
-|-------------------------------------------------------------------------|-------------------------------|----------------------------------------------------------------------------------------------|
+This file is the **only source for tunables** — env vars are not read for them.
+Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the file.
+
 | Category   | Keys                                                                                                                             | Defaults                          |
 |------------|------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------|
 | `network`  | `mainnet_rpc_url`, `mainnet_wss_rpc_url`, `commitment`, `tick_interval_ms`, `vault_tick_interval_ms`                               | public RPC / `confirmed` / `1000` / `5000` |
@@ -45,16 +44,16 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env and are never re
 | `alerts`   | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs` | `true` / host default / `0` / `0` / `0` / `3600` |
 
 \* test-only.
-`STRATEGY_MODE`: `adaptive` runs the profile verbatim; `scalp` clamps TP into +25…+35% (sub-band honored); `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
+`strategy_mode`: `adaptive` runs the profile verbatim; `scalp` clamps TP to +25…+35%; `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
 
-Outside `Settings`: `HERMES_BIN`, `BOT_DAEMON` (daemon child marker), `PID_FILE` / `LOG_FILE` / `CONFIG_FILE` (path overrides).
+Outside config: `HERMES_BIN`, `BOT_DAEMON` (daemon marker), `PID_FILE` / `LOG_FILE` / `CONFIG_FILE` (path overrides).
 
 ## Safety
 
-- Paper-only without `--live`/`IS_LIVE=true`. Live needs a dedicated wallet, small `NOTIONAL_USD`, `MAX_DAILY_LOSS_USD>0`, `SIM_STRICT=true`.
+- Paper-only without `--live`/`IS_LIVE=true`. Live needs a dedicated wallet, small `notional_usd`, `max_daily_loss_usd>0`, `sim_strict=true`.
 - Fail-closed everywhere: audit rejects, fresh/serial insiders, non-6-decimal mints, no-quorum timeouts, dev dumps, bundled supply monopolies, unconfirmed fills (re-polled, never assumed).
-- Post-migration: vault prices + spike cards; live exits route Raydium sells through the validated pool leg (Token-2022 vaults refuse fail-closed — unroutable through AMM v4 by program construction).
-- Exits never block: TP/SL/trailing/timeout + manual `sell`; breaker halts entries only.
+- Post-migration exits route through the validated pool leg (Token-2022 vaults refuse fail-closed).
+- Exits never block: TP/SL/trailing/timeout + manual `sell`; the day-loss breaker halts entries only.
 
 ## Layout
 
@@ -66,4 +65,4 @@ crates/executor/   # live swaps via Jito (only with --live)
 crates/curve|auditor|risk-engine|simulator|ids|alert|migration/
 ```
 
-Each crate has its own README. Tests: `cargo test --workspace` (433, live probes ignored) · `cargo clippy --all-targets` (zero warnings).
+Each crate has its own README. Tests: `cargo test --workspace` (live probes ignored) · `cargo clippy --all-targets` (zero warnings).

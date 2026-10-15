@@ -16,7 +16,7 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 443 tests; live probes stay ignored
+cargo test --workspace            # 457 tests; live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
