@@ -351,7 +351,7 @@ async fn run_pipeline(live_arg: bool) {
         let jito = match JitoClient::new(&settings.jito_endpoint) {
             Ok(jito) => jito,
             Err(e) => {
-                eprintln!("bad JITO_ENDPOINT '{}': {e}", settings.jito_endpoint);
+                eprintln!("bad JITO_ENDPOINT '{}': {e}", settings::redact_url_query(&settings.jito_endpoint));
                 std::process::exit(1);
             }
         };

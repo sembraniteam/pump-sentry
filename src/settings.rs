@@ -107,8 +107,8 @@ pub struct Settings {
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Settings")
-            .field("ws_url", &self.ws_url)
-            .field("http_url", &self.http_url)
+            .field("ws_url", &redact_url_query(&self.ws_url))
+            .field("http_url", &redact_url_query(&self.http_url))
             .field("commitment", &self.commitment)
             .field("start_balance", &self.start_balance)
             .field("fee_bps", &self.fee_bps)
@@ -146,7 +146,7 @@ impl std::fmt::Debug for Settings {
             .field("priority_fee_micro_lamports", &self.priority_fee_micro_lamports)
             .field("compute_unit_limit", &self.compute_unit_limit)
             .field("tip_lamports", &self.tip_lamports)
-            .field("jito_endpoint", &self.jito_endpoint)
+            .field("jito_endpoint", &redact_url_query(&self.jito_endpoint))
             .field("discord_alerts", &self.discord_alerts)
             .field("discord_channel", &self.discord_channel)
             .field("sim_strict", &self.sim_strict)
@@ -521,6 +521,17 @@ fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> O
     }
 }
 
+/// Strip a URL query string for human-facing output. RPC providers
+/// take `?api-key=` and a full-URL log line would leak it into bot.log.
+/// Transport keeps the raw value; only logs/debug redact. Twin of the
+/// same rule on `risk_engine::RiskEngine` (other crate, same reason).
+pub fn redact_url_query(url: &str) -> &str {
+    match url.find('?') {
+        Some(i) => &url[..i],
+        None => url,
+    }
+}
+
 /// Unix seconds; `0` when the clock fails (never panics).
 pub fn now_secs() -> u64 {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -747,6 +758,30 @@ mod tests {
         assert!(dbg.contains("<redacted>"), "{dbg}");
         let clean = format!("{:?}", Settings::from_map(&HashMap::new()));
         assert!(!clean.contains("super-secret"), "{clean}");
+    }
+
+    #[test]
+    fn debug_redacts_url_queries() {
+        // Helius-style URLs carry ?api-key=: Debug must keep the host
+        // (debuggable) and drop the query (secret).
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=K1"),
+            ("MAINNET_WSS_RPC_URL", "wss://mainnet.helius-rpc.com/?api-key=K2"),
+            ("JITO_ENDPOINT", "https://jito.example/?key=K3"),
+        ]));
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("K1"), "{dbg}");
+        assert!(!dbg.contains("K2"), "{dbg}");
+        assert!(!dbg.contains("K3"), "{dbg}");
+        assert!(!dbg.contains("api-key"), "{dbg}");
+        assert!(dbg.contains("mainnet.helius-rpc.com/"), "{dbg}");
+        // Transport still uses the raw values.
+        assert_eq!(s.http_url, "https://mainnet.helius-rpc.com/?api-key=K1");
+        assert_eq!(s.ws_url, "wss://mainnet.helius-rpc.com/?api-key=K2");
+        assert_eq!(s.jito_endpoint, "https://jito.example/?key=K3");
+        // Query-less URLs pass through untouched.
+        assert_eq!(redact_url_query("https://x/y"), "https://x/y");
+        assert_eq!(redact_url_query("https://x/y?a=b"), "https://x/y");
     }
 
     #[test]

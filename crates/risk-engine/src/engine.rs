@@ -69,7 +69,7 @@ pub struct RiskEngineBuilder {
 impl std::fmt::Debug for RiskEngineBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RiskEngineBuilder")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &log_endpoint(&self.endpoint))
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("timeout", &self.timeout)
@@ -157,7 +157,7 @@ pub struct RiskEngine {
 impl std::fmt::Debug for RiskEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RiskEngine")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &log_endpoint(&self.endpoint))
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("timeout", &self.timeout)
@@ -165,6 +165,17 @@ impl std::fmt::Debug for RiskEngine {
             .field("max_tokens", &self.max_tokens)
             .field("fallback_count", &self.fallback_count())
             .finish()
+    }
+}
+
+/// Endpoint without query strings for logs. Providers take keys in
+/// `?`; a raw endpoint in a warn line leaks them into bot.log. (The
+/// binary crate carries the same rule for RPC URLs; this crate cannot
+/// depend on it, so the 5-liner is duplicated.)
+fn log_endpoint(url: &str) -> &str {
+    match url.find('?') {
+        Some(i) => &url[..i],
+        None => url,
     }
 }
 
@@ -280,7 +291,7 @@ impl RiskEngine {
                     && metrics.rugcheck_score > RUGCHECK_SCORE_CAP
                 {
                     warn!(
-                        endpoint = %self.endpoint, model = %self.model,
+                        endpoint = %log_endpoint(&self.endpoint), model = %self.model,
                         score = metrics.rugcheck_score,
                         "model BUY re-gated to PASS on audit score"
                     );
@@ -297,7 +308,7 @@ impl RiskEngine {
                 self.note_fallback();
                 // `infer` already warned the cause; stay at debug here.
                 debug!(
-                    endpoint = %self.endpoint, model = %self.model,
+                    endpoint = %log_endpoint(&self.endpoint), model = %self.model,
                     fallbacks = self.fallback_count(),
                     "inference unusable; using heuristic fallback"
                 );
@@ -309,7 +320,7 @@ impl RiskEngine {
             Err(_) => {
                 self.note_timeout();
                 warn!(
-                    endpoint = %self.endpoint, model = %self.model,
+                    endpoint = %log_endpoint(&self.endpoint), model = %self.model,
                     timeout = ?self.timeout,
                     fallbacks = self.fallback_count(),
                     "inference timed out; using heuristic fallback"
@@ -341,18 +352,18 @@ impl RiskEngine {
         let response = match req.send().await {
             Ok(response) => response,
             Err(e) => {
-                warn!(endpoint = %self.endpoint, model = %self.model, error = %e, "inference request failed; using heuristic fallback");
+                warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, error = %e, "inference request failed; using heuristic fallback");
                 return None;
             }
         };
         if !response.status().is_success() {
-            warn!(endpoint = %self.endpoint, model = %self.model, status = ?response.status(), "inference non-2xx status; using heuristic fallback");
+            warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, status = ?response.status(), "inference non-2xx status; using heuristic fallback");
             return None;
         }
         let body: ChatResponse = match response.json().await {
             Ok(body) => body,
             Err(e) => {
-                warn!(endpoint = %self.endpoint, model = %self.model, error = %e, "inference body decode failed; using heuristic fallback");
+                warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, error = %e, "inference body decode failed; using heuristic fallback");
                 return None;
             }
         };
@@ -366,7 +377,7 @@ impl RiskEngine {
                 // BUY (truncation, wrong fence slice) must never
                 // become a heuristic BUY.
                 self.note_noncompliant();
-                warn!(endpoint = %self.endpoint, model = %self.model, error = %e, content = %truncate200(json), "inference output not in schema; holding PASS");
+                warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, error = %e, content = %truncate200(json), "inference output not in schema; holding PASS");
                 return Some(RiskProfile::pass());
             }
         };
@@ -375,12 +386,12 @@ impl RiskEngine {
             // intent: hold PASS instead of re-evaluating to a BUY.
             if profile.action == crate::schema::Action::Pass {
                 self.note_noncompliant();
-                warn!(endpoint = %self.endpoint, model = %self.model, ?profile, "inference PASS malformed; holding PASS");
+                warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, ?profile, "inference PASS malformed; holding PASS");
                 return Some(RiskProfile::pass());
             }
             // Invalid BUY fails closed like undecodable output.
             self.note_noncompliant();
-            warn!(endpoint = %self.endpoint, model = %self.model, ?profile, "inference profile failed validation; holding PASS");
+            warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, ?profile, "inference profile failed validation; holding PASS");
             return Some(RiskProfile::pass());
         }
         Some(profile)
@@ -539,6 +550,23 @@ mod tests {
         assert!(dbg.contains("<redacted>"), "{dbg}");
         let builder = format!("{:?}", RiskEngine::builder().api_key("super-secret"));
         assert!(!builder.contains("super-secret"), "{builder}");
+    }
+
+    #[test]
+    fn debug_and_logs_redact_endpoint_query() {
+        // Provider keys live in `?`: Debug and log lines keep the
+        // host and drop the query.
+        let engine = RiskEngine::builder()
+            .endpoint("https://llm.example/v1?key=K9")
+            .build()
+            .expect("engine");
+        let dbg = format!("{engine:?}");
+        assert!(!dbg.contains("K9"), "{dbg}");
+        assert!(dbg.contains("https://llm.example/v1"), "{dbg}");
+        assert_eq!(log_endpoint("https://x/y?a=b"), "https://x/y");
+        assert_eq!(log_endpoint("https://x/y"), "https://x/y");
+        // Transport keeps the raw URL.
+        assert_eq!(engine.endpoint, "https://llm.example/v1?key=K9");
     }
 
     #[test]
