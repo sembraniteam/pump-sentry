@@ -47,6 +47,7 @@ Commands:
   run [--live]            Run in the foreground (for debugging)
   sell <mint>             Queue a manual full exit for one mint now
   init-config             Write ~/.pump-sentry/config.toml when missing
+  upgrade                 Install the latest release (refuses when behind nothing or daemon runs)
   help                    Show this help
 
 Options:
@@ -95,6 +96,8 @@ pub enum CliAction {
     },
     /// Write the categorized default config when missing.
     InitConfig,
+    /// Install the latest release over this binary.
+    Upgrade,
     /// Manual full exit for one mint.
     Sell {
         mint: String,
@@ -126,6 +129,7 @@ pub fn parse_cli(args: &[String]) -> CliAction {
             live: live_flag(args),
         },
         "init-config" => CliAction::InitConfig,
+        "upgrade" => CliAction::Upgrade,
         "logs" => CliAction::Logs {
             lines: log_lines(args),
             follow: args.iter().any(|a| a == "--follow" || a == "-f"),
@@ -911,6 +915,276 @@ pub fn sell_request_body_mint(body: &str) -> Option<String> {
     Some(mint.to_string())
 }
 
+/// Release repo mirrored from `install.sh`.
+pub const RELEASE_REPO: &str = "sembraniteam/pump-sentry";
+/// `releases/latest` endpoint (same source `install.sh` reads).
+pub const RELEASE_API_URL: &str =
+    "https://api.github.com/repos/sembraniteam/pump-sentry/releases/latest";
+
+/// Parsed `vX.Y.Z` (leading `v` optional, missing parts read as 0).
+/// Derived `Ord` compares numerically, never lexicographically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReleaseVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl ReleaseVersion {
+    /// This binary's version (`Cargo.toml`).
+    pub fn current() -> Self {
+        Self::parse(env!("CARGO_PKG_VERSION")).expect("crate version is semver")
+    }
+
+    /// Parse `v1.2.3` / `1.2`; leading/trailing whitespace tolerated.
+    /// `None` on non-numeric parts (a bad tag never compares equal).
+    pub fn parse(tag: &str) -> Option<Self> {
+        let t = tag.trim().strip_prefix('v').unwrap_or(tag.trim());
+        let mut parts = t.split('.');
+        let num = |p: Option<&str>| -> Option<u64> {
+            match p {
+                None => Some(0),
+                Some(s) if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() => {
+                    s.parse().ok()
+                }
+                _ => None,
+            }
+        };
+        let v = Self {
+            major: num(parts.next())?,
+            minor: num(parts.next())?,
+            patch: num(parts.next())?,
+        };
+        // No fourth part: `1.2.3.4` is not our scheme.
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(v)
+    }
+
+    /// Canonical tag (`vX.Y.Z`).
+    pub fn tag(&self) -> String {
+        format!("v{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Release asset for this platform (`app-os-arch.tar.gz`, mirroring
+/// `install.sh`). `None` on unsupported OS/arch — refusing beats
+/// downloading the wrong binary.
+pub fn release_asset_name() -> Option<String> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    Some(format!("pump-sentry-{os}-{arch}.tar.gz"))
+}
+
+/// `tag_name` out of a `releases/latest` JSON body. `None` when the
+/// shape is wrong (no releases, API error page) — never guess a tag.
+pub fn latest_tag_from_json(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value.get("tag_name")?.as_str().map(str::to_string)
+}
+
+/// GET bytes via `curl` (same dependency `install.sh` requires).
+fn curl_fetch(url: &str) -> std::io::Result<Vec<u8>> {
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", "--retry", "3", url])
+        .output()
+        .map_err(|e| {
+            std::io::Error::other(format!("need 'curl' for upgrade ({e}); install.sh requires it too"))
+        })?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "download failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// `upgrade`: install the newest release over this binary, else say so.
+/// Refuses while the daemon runs (replacing a live trader's binary is
+/// never safe) and on unsupported platforms.
+pub fn cmd_upgrade() -> ! {
+    let current = ReleaseVersion::current();
+    let body = match curl_fetch(RELEASE_API_URL) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(_) => {
+            eprintln!("cannot reach release info (network/API down?)");
+            std::process::exit(1);
+        }
+    };
+    let tag = match latest_tag_from_json(&body) {
+        Some(t) => t,
+        None => {
+            eprintln!("no releases published yet");
+            std::process::exit(1);
+        }
+    };
+    let latest = match ReleaseVersion::parse(&tag) {
+        Some(v) => v,
+        None => {
+            eprintln!("latest tag '{tag}' is not a version; refusing to guess");
+            std::process::exit(1);
+        }
+    };
+    if latest <= current {
+        if latest == current {
+            println!("already on the latest version ({})", current.tag());
+        } else {
+            println!(
+                "this build ({}) is ahead of the latest release ({}); nothing to do",
+                current.tag(),
+                latest.tag()
+            );
+        }
+        std::process::exit(0);
+    }
+    let (pid_file, _) = resolve_paths();
+    if let Some(info) = running_daemon(&pid_file) {
+        eprintln!(
+            "bot is running (pid {}); stop it first (`stop`), then upgrade",
+            info.pid
+        );
+        std::process::exit(1);
+    }
+    let asset = match release_asset_name() {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "unsupported platform {}-{}; install from source",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
+            std::process::exit(1);
+        }
+    };
+    let base = format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}");
+    println!("upgrading {} → {} ...", current.tag(), latest.tag());
+    let bytes = match curl_fetch(&format!("{base}/{asset}")) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("download failed: {e} (no asset for this platform yet?)");
+            std::process::exit(1);
+        }
+    };
+    let sha = curl_fetch(&format!("{base}/{asset}.sha256")).ok();
+    let dir = std::env::temp_dir().join(format!("pump-upgrade-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("cannot stage upgrade: {e}");
+        std::process::exit(1);
+    }
+    let tgz = dir.join(&asset);
+    if let Err(e) = std::fs::write(&tgz, &bytes) {
+        eprintln!("cannot stage upgrade: {e}");
+        std::process::exit(1);
+    }
+    match sha.as_deref() {
+        Some(body) => {
+            let want = String::from_utf8_lossy(body)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if want.len() != 64 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
+                eprintln!("warning: checksum file malformed; installing unverified");
+            } else {
+                match sha256_of_file(&tgz) {
+                    Some(have) if have != want => {
+                        eprintln!("checksum mismatch for {asset}; refusing to install");
+                        let _ = std::fs::remove_dir_all(&dir);
+                        std::process::exit(1);
+                    }
+                    Some(_) => {}
+                    None => {
+                        eprintln!("warning: no sha256 tool; installing unverified");
+                    }
+                }
+            }
+        }
+        None => {
+            eprintln!("warning: no checksum file published; installing unverified");
+        }
+    }
+    match std::process::Command::new("tar")
+        .args(["-xzf"])
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&dir)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("extract failed (need 'tar')");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::process::exit(1);
+        }
+    }
+    let staged = dir.join("pump-sentry");
+    if !staged.is_file() {
+        eprintln!("archive has no pump-sentry binary");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::process::exit(1);
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("cannot locate this binary: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = std::fs::copy(&staged, &exe) {
+        eprintln!("cannot replace {}: {e}", exe.display());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    println!(
+        "upgraded {} → {} (restart the bot to run it)",
+        current.tag(),
+        latest.tag()
+    );
+    std::process::exit(0);
+}
+
+/// SHA-256 hex of a file via system tooling (`sha256sum`, else
+/// `shasum`), mirroring `install.sh`. `None` when neither exists.
+fn sha256_of_file(path: &Path) -> Option<String> {
+    for tool in [["sha256sum"].as_slice(), ["shasum", "-a", "256"].as_slice()] {
+        let arg = path.as_os_str();
+        let out = std::process::Command::new(tool[0])
+            .args(&tool[1..])
+            .arg(arg)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            continue;
+        }
+        let hex = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(hex);
+        }
+    }
+    None
+}
+
 /// Spawn detached `run`, returning the daemon pid.
 fn spawn_background(
     log: &Path,
@@ -1003,6 +1277,10 @@ mod tests {
             CliAction::InitConfig
         );
         assert_eq!(
+            parse_cli(&argv(&["bot", "upgrade"])),
+            CliAction::Upgrade
+        );
+        assert_eq!(
             parse_cli(&argv(&["bot", "run", "--live"])),
             CliAction::Run { live: true }
         );
@@ -1088,6 +1366,43 @@ mod tests {
                 follow: false
             }
         );
+    }
+
+    #[test]
+    fn release_versions_parse_and_compare_numerically() {
+        assert_eq!(
+            ReleaseVersion::parse("v1.2.3"),
+            Some(ReleaseVersion { major: 1, minor: 2, patch: 3 })
+        );
+        assert_eq!(
+            ReleaseVersion::parse("1.2"),
+            Some(ReleaseVersion { major: 1, minor: 2, patch: 0 })
+        );
+        assert_eq!(ReleaseVersion::parse("  v0.2.0  ").map(|v| v.tag()), Some("v0.2.0".to_string()));
+        // Numeric, never lexicographic: 1.10 beats 1.9.
+        assert!(
+            ReleaseVersion::parse("v1.10.0").unwrap() > ReleaseVersion::parse("v1.9.0").unwrap()
+        );
+        for bad in ["", "v", "latest", "v1.x.3", "1.2.3.4", "v-1.2.3"] {
+            assert_eq!(ReleaseVersion::parse(bad), None, "{bad}");
+        }
+        assert_eq!(ReleaseVersion::current().tag(), format!("v{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn release_asset_matches_installer_naming() {
+        let asset = release_asset_name().expect("tier-1 platform");
+        assert!(asset.starts_with("pump-sentry-"), "{asset}");
+        assert!(asset.ends_with(".tar.gz"), "{asset}");
+    }
+
+    #[test]
+    fn latest_tag_comes_from_tag_name_only() {
+        let body = r#"{"tag_name":"v0.3.0","name":"x","body":"... v9.9.9 ..."}"#;
+        assert_eq!(latest_tag_from_json(body), Some("v0.3.0".to_string()));
+        assert_eq!(latest_tag_from_json("{}"), None);
+        assert_eq!(latest_tag_from_json("not json"), None);
+        assert_eq!(latest_tag_from_json(r#"{"tag_name":42}"#), None);
     }
 
     #[test]
@@ -1306,8 +1621,8 @@ mod tests {
     #[test]
     fn usage_lists_all_commands() {
         for cmd in [
-            "start", "stop", "restart", "status", "logs", "run", "sell", "init-config", "help",
-            "--live",
+            "start", "stop", "restart", "status", "logs", "run", "sell", "init-config", "upgrade",
+            "help", "--live",
         ] {
             assert!(USAGE.contains(cmd), "usage missing {cmd}");
         }

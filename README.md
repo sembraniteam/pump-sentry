@@ -21,6 +21,7 @@ pump-sentry status|logs|stop # inspect / tail (+--follow) / stop with drain+snap
 pump-sentry restart --live   # live mode (needs SOLANA_PRIVATE_KEY)
 pump-sentry sell <mint>      # manual full exit, no restart
 pump-sentry run              # foreground (debugging)
+pump-sentry upgrade          # install latest release (says so when behind nothing)
 ```
 
 State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.

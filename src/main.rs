@@ -39,6 +39,7 @@ async fn main() {
         cli::CliAction::Status => cli::cmd_status(),
         cli::CliAction::Logs { lines, follow } => cli::cmd_logs(lines, follow).await,
         cli::CliAction::Sell { mint } => cli::cmd_sell(&mint),
+        cli::CliAction::Upgrade => cli::cmd_upgrade(),
         cli::CliAction::InitConfig => {
             let path = config::resolve_config_path();
             match config::ensure_config_file(&path) {
