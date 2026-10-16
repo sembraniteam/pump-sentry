@@ -17,8 +17,8 @@ Needs: mainnet RPC (dedicated recommended); Rust 1.99+ for source builds; option
 
 ```sh
 pump-sentry stop            # stop the daemon first (the script won't)
-bash uninstall.sh           # remove the binary, keep ~/.pump-sentry state
-bash uninstall.sh --purge   # also remove ~/.pump-sentry (config, logs, WAL, snapshots)
+curl -fsSL https://raw.githubusercontent.com/sembraniteam/pump-sentry/main/uninstall.sh | bash
+# curl -fsSL .../uninstall.sh | bash -s -- --purge   # also remove ~/.pump-sentry (config, logs, WAL, snapshots)
 ```
 
 The script removes the binary from `/usr/local/bin`, `~/.local/bin`, and `~/.pump-sentry/bin` (`INSTALL_DIR` overrides the search path). It never touches your shell profile: unset `SOLANA_PRIVATE_KEY` / `INFERENCE_API_KEY` / RPC URL vars there yourself, and delete the repo clone if you built from source. Reinstalling without `--purge` resumes from the kept state — the WAL replays live custody on next live boot, so verify bags on-chain first (see `ops/RUNBOOK.md` §4).
