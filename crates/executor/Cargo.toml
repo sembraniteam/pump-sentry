@@ -21,6 +21,7 @@ solana-pubkey = "4.4"
 solana-signature = "3"
 solana-signer = "3.0"
 solana-transaction = "4.3"
+solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }
 ids = { path = "../ids" }
 curve = { path = "../curve" }
 migration = { path = "../migration" }
@@ -43,6 +44,5 @@ listener = { path = "../listener" }
 migration = { path = "../migration" }
 solana-message = "4"
 solana-rpc-client-api = "4.3.0"
-solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }
 solana-instruction-error = "2"
 tokio = { version = "1", features = ["full"] }

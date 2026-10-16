@@ -13,7 +13,7 @@ pub mod wallet;
 
 pub use executor::{
     BuyOrder, ConfirmOutcome, ExecutorError, JitoReceipt,
-    LiveFundingReport, SellOrder, SellPumpSwapOrder, SellRaydiumOrder, SwapExecutor,
+    LiveFundingReport, ObservedBuyFill, SellOrder, SellPumpSwapOrder, SellRaydiumOrder, SwapExecutor,
 };
 pub use instructions::{BuyV3Accounts, PumpAmmSellV2Accounts, PumpBuyV3Args, PumpSellV3Args, PumpBuyExactQuoteInV3Args, PumpSwapBuilder, SellV3Accounts, parse_pubkey, user_ata_with_program};
 pub use quote::{CurveView, FeeSchedule, FeesBps, QuoteError, QuoteKind};

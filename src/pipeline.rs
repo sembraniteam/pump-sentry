@@ -15,7 +15,7 @@ use simulator::{ExitReason, Mark, PaperPortfolio};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams};
+use crate::live::{BuyFill, LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams};
 #[cfg(test)]
 use crate::live::escalated_tip;
 use crate::live_mirror::{LiveExecution, breaker_headline, live_base_mint};
@@ -94,7 +94,7 @@ impl ReserveFeed for CurveTicker {
 /// Live buy dispatch. Only used with `--live`.
 pub trait BuySink {
     /// Buy per params. Returns position plus bundle.
-    async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String), LiveError>;
+    async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String, Option<BuyFill>), LiveError>;
 }
 
 /// Live sell dispatch: curve plus both pool venues. One trait (not
@@ -167,7 +167,7 @@ pub trait LiveSink: BuySink + SellSink + PendingStore + CostLedger + WalSink {}
 impl<T: BuySink + SellSink + PendingStore + CostLedger + WalSink> LiveSink for T {}
 
 impl BuySink for LiveTrader {
-    async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String), LiveError> {
+    async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String, Option<BuyFill>), LiveError> {
         self.buy(req).await
     }
 }

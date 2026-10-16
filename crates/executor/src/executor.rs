@@ -1,10 +1,15 @@
 //! Swap dispatch: solvency check, then build, sim, send.
 //! RPC (`buy`/`sell`) or Jito bundle (`*_jito`).
 
-use solana_client::{client_error::ClientError, nonblocking::rpc_client::RpcClient};
+use solana_client::{
+    client_error::ClientError, nonblocking::rpc_client::RpcClient, rpc_config::RpcTransactionConfig,
+};
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
+use solana_transaction_status::{
+    EncodedTransaction, UiMessage, UiTransactionEncoding, option_serializer::OptionSerializer,
+};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -349,6 +354,52 @@ impl LiveFundingReport {
     }
 }
 
+/// Observed buy fill in chain units (entry-gap calibration input).
+/// Priced by the caller (it owns `sol_usd` + mint decimals); this type
+/// carries no USD so the executor stays chain-pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedBuyFill {
+    /// Base tokens credited across the buyer's accounts for the mint.
+    pub tokens_base_units: u64,
+    /// Lamports that went into the swap leg: buyer SOL delta minus
+    /// tip, priority, base fee, and created-account rent.
+    pub swap_sol_lamports: u64,
+}
+
+/// Fill fetch deadline. One attempt, no retry: gap data is
+/// calibration, not custody — a wedged RPC must not stall exits.
+const FILL_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Buy-fill math from observed balance deltas. Pure (unit-pinned):
+/// `None` on zero tokens, a non-positive swap leg, or any overflow —
+/// calibration skips instead of fabricating a price. `created_atas`
+/// counts buyer+mint token accounts with no pre balance (each paid one
+/// rent-exempt reserve).
+fn buy_fill_from_deltas(
+    buyer_sol_spent_lamports: u64,
+    tokens_base_units: u64,
+    created_atas: u64,
+    tip_lamports: u64,
+    priority_lamports: u64,
+) -> Option<ObservedBuyFill> {
+    if tokens_base_units == 0 {
+        return None;
+    }
+    let rent = created_atas.checked_mul(ids::ATA_RENT_LAMPORTS)?;
+    let overhead = tip_lamports
+        .checked_add(priority_lamports)?
+        .checked_add(ids::BASE_TX_FEE_LAMPORTS)?
+        .checked_add(rent)?;
+    let swap_sol_lamports = buyer_sol_spent_lamports.checked_sub(overhead)?;
+    if swap_sol_lamports == 0 {
+        return None;
+    }
+    Some(ObservedBuyFill {
+        tokens_base_units,
+        swap_sol_lamports,
+    })
+}
+
 impl SwapExecutor {
     /// Build against an HTTP RPC URL with explicit commitment.
     pub fn new(
@@ -589,6 +640,99 @@ impl SwapExecutor {
     async fn read_curve_state(&self, curve: &Pubkey) -> Option<CurveState> {
         let account = rpc_timeout(RPC_READ_TIMEOUT, self.rpc.get_account(curve)).await?;
         parse_curve_state(&account.owner, &account.data)
+    }
+
+    /// Observe a landed buy fill from its confirmed transaction
+    /// (entry-gap calibration). Sums token credits across ALL buyer+mint
+    /// accounts (canonical or aux — no ATA derivation needed) and nets
+    /// the buyer SOL delta against the known overhead (tip, priority,
+    /// base fee, created-account rent). `None` on any failure or
+    /// ambiguity: single attempt under `FILL_FETCH_TIMEOUT`, no retry —
+    /// calibration skips, custody never waits on it. Call only for
+    /// confirmed fills; a failed tx has no meaningful fill.
+    pub async fn observe_buy_fill(
+        &self,
+        signature_str: &str,
+        mint_str: &str,
+        tip_lamports: u64,
+    ) -> Option<ObservedBuyFill> {
+        let signature = solana_signature::Signature::from_str(signature_str).ok()?;
+        let fetched = tokio::time::timeout(
+            FILL_FETCH_TIMEOUT,
+            self.rpc.get_transaction_with_config(
+                &signature,
+                RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::Json),
+                    commitment: None,
+                    max_supported_transaction_version: Some(1),
+                },
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let meta = fetched.transaction.meta.as_ref()?;
+        if meta.err.is_some() {
+            return None;
+        }
+        let EncodedTransaction::Json(ui_tx) = &fetched.transaction.transaction else {
+            return None;
+        };
+        let UiMessage::Raw(raw) = &ui_tx.message else {
+            return None;
+        };
+        let buyer = self.wallet.pubkey().to_string();
+        let buyer_idx = raw.account_keys.iter().position(|k| k == &buyer)?;
+        let pre_sol = meta.pre_balances.get(buyer_idx)?;
+        let post_sol = meta.post_balances.get(buyer_idx)?;
+        let buyer_sol_spent = pre_sol.checked_sub(*post_sol)?;
+        let pre_by_account: std::collections::HashMap<u8, u64> = match &meta.pre_token_balances {
+            OptionSerializer::Some(list) => list
+                .iter()
+                .filter_map(|b| {
+                    (b.mint == mint_str
+                        && matches!(&b.owner, OptionSerializer::Some(o) if o == &buyer))
+                    .then(|| {
+                        b.ui_token_amount.amount.parse::<u64>().ok().map(|a| (b.account_index, a))
+                    })?
+                })
+                .collect(),
+            _ => Default::default(),
+        };
+        let mut tokens_base_units = 0u64;
+        let mut created_atas = 0u64;
+        let mut matched = false;
+        if let OptionSerializer::Some(list) = &meta.post_token_balances {
+            for b in list {
+                if b.mint != mint_str
+                    || !matches!(&b.owner, OptionSerializer::Some(o) if o == &buyer)
+                {
+                    continue;
+                }
+                matched = true;
+                let post: u64 = b.ui_token_amount.amount.parse().ok()?;
+                match pre_by_account.get(&b.account_index) {
+                    Some(pre) => {
+                        tokens_base_units =
+                            tokens_base_units.checked_add(post.checked_sub(*pre)?)?;
+                    }
+                    None => {
+                        created_atas = created_atas.checked_add(1)?;
+                        tokens_base_units = tokens_base_units.checked_add(post)?;
+                    }
+                }
+            }
+        }
+        if !matched {
+            return None;
+        }
+        buy_fill_from_deltas(
+            buyer_sol_spent,
+            tokens_base_units,
+            created_atas,
+            tip_lamports,
+            self.priority_fee_lamports(),
+        )
     }
 
     /// Attach a compute budget. Zeros disable; default builds identical txs.
@@ -1625,6 +1769,42 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(matches!(err, ExecutorError::BadSignature { .. }));
+    }
+
+    #[test]
+    fn buy_fill_math_nets_known_overhead() {
+        // Hand-computed: spent 10M, 2000 tokens (6dp), 1 created ATA,
+        // tip 100k, priority 200. Overhead = 100_000 + 200 + 5_000 +
+        // 2_039_280 = 2_144_480; swap = 7_855_520.
+        assert_eq!(
+            buy_fill_from_deltas(10_000_000, 2_000_000_000, 1, 100_000, 200),
+            Some(ObservedBuyFill {
+                tokens_base_units: 2_000_000_000,
+                swap_sol_lamports: 7_855_520,
+            })
+        );
+        // No created ATA: no rent leg.
+        assert_eq!(
+            buy_fill_from_deltas(1_000_000, 500_000_000, 0, 100_000, 200)
+                .expect("fill")
+                .swap_sol_lamports,
+            1_000_000 - 100_000 - 200 - 5_000
+        );
+    }
+
+    #[test]
+    fn buy_fill_rejects_degenerate() {
+        // Zero tokens: nothing to price.
+        assert_eq!(buy_fill_from_deltas(10_000_000, 0, 1, 100_000, 200), None);
+        // Exact overhead: zero swap leg (would divide by zero downstream).
+        assert_eq!(buy_fill_from_deltas(2_144_480, 1_000, 1, 100_000, 200), None);
+        // Underfunded: spent below overhead.
+        assert_eq!(buy_fill_from_deltas(100_000, 1_000, 1, 100_000, 200), None);
+        // Overflow: absurd created count.
+        assert_eq!(
+            buy_fill_from_deltas(u64::MAX, 1_000, u64::MAX, 100_000, 200),
+            None
+        );
     }
 
     #[test]

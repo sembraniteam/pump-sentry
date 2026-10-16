@@ -6,10 +6,9 @@ use std::collections::{HashMap, VecDeque};
 /// `settle_price_usd` is the tick price when live settled (the same feed
 /// paper uses) — NOT the intra-bundle fill, which is unknowable without
 /// parsing the landed tx. The gap therefore measures timing + tip drag
-/// and never pretends to measure bundle slippage. It also excludes the
-/// entry leg entirely (paper entry quote vs live fill price is never
-/// noted — the fill price is unknowable the same way). Read averages
-/// as a LOWER BOUND on live drag, never the total.
+/// and never pretends to measure bundle slippage. Entry legs have
+/// their own record (`EntryGap`, from landed balances — strictly more
+/// direct). Read averages as a LOWER BOUND on live drag, never the total.
 #[derive(Debug, Clone)]
 pub struct FillGap {
     pub mint: String,
@@ -22,6 +21,30 @@ pub struct FillGap {
     pub gap_usd: f64,
 }
 
+/// One settled entry gap: paper-booked entry vs landed fill.
+/// Recorded directly at buy confirm (no pending matching — paper open
+/// and live fill share one flow). Fill price comes from real pre/post
+/// balances, so this leg is strictly more direct than exit gaps (which
+/// proxy the settle via tick); only the USD conversion rides the feed.
+#[derive(Debug, Clone)]
+pub struct EntryGap {
+    pub mint: String,
+    pub paper_price_usd: f64,
+    pub fill_price_usd: f64,
+    pub qty_tokens: f64,
+    /// `(fill - paper) * qty`: negative means live paid more.
+    pub gap_usd: f64,
+}
+
+/// `(count, avg, total)` over a retained window; zero-count yields zeros.
+/// Single owner for both exit and entry aggregates.
+fn summarize(count: usize, total_gap_usd: f64) -> (usize, f64, f64) {
+    if count == 0 {
+        (0, 0.0, 0.0)
+    } else {
+        (count, total_gap_usd / count as f64, total_gap_usd)
+    }
+}
 /// Bounded execution-gap log with aggregates for heartbeat calibration.
 /// At most `FILL_GAP_CAP` entries; oldest shed first. This is a
 /// calibration signal, not custody: shedding loses precision, never
@@ -31,6 +54,8 @@ pub struct FillGapTracker {
     pending: HashMap<String, VecDeque<(f64, u64)>>,
     gaps: VecDeque<FillGap>,
     total_gap_usd: f64,
+    entry_gaps: VecDeque<EntryGap>,
+    entry_total_gap_usd: f64,
 }
 
 /// Pending notes kept per mint. Moonbag scale-outs close twice per
@@ -49,6 +74,8 @@ impl FillGapTracker {
             pending: HashMap::new(),
             gaps: VecDeque::new(),
             total_gap_usd: 0.0,
+            entry_gaps: VecDeque::new(),
+            entry_total_gap_usd: 0.0,
         }
     }
 
@@ -108,11 +135,51 @@ impl FillGapTracker {
     /// `(settled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
     /// Average over the retained window; zero-count yields zeros.
     pub fn stats(&self) -> (usize, f64, f64) {
-        let n = self.gaps.len();
-        if n == 0 {
-            return (0, 0.0, 0.0);
+        summarize(self.gaps.len(), self.total_gap_usd)
+    }
+
+    /// Record a landed entry gap. Single owner of entry gap math:
+    /// callers pass observation + paper quote, never a precomputed gap.
+    /// `None` (returned as no record) on any non-finite input or
+    /// non-positive price/qty — calibration skips, never fabricates.
+    pub fn note_entry_gap(
+        &mut self,
+        mint: &str,
+        paper_price_usd: f64,
+        fill_price_usd: f64,
+        qty_tokens: f64,
+    ) -> Option<EntryGap> {
+        if !paper_price_usd.is_finite()
+            || !fill_price_usd.is_finite()
+            || !qty_tokens.is_finite()
+            || paper_price_usd <= 0.0
+            || fill_price_usd <= 0.0
+            || qty_tokens <= 0.0
+        {
+            return None;
         }
-        (n, self.total_gap_usd / n as f64, self.total_gap_usd)
+        let gap_usd = (fill_price_usd - paper_price_usd) * qty_tokens;
+        if !gap_usd.is_finite() {
+            return None;
+        }
+        let gap = EntryGap {
+            mint: mint.to_string(),
+            paper_price_usd,
+            fill_price_usd,
+            qty_tokens,
+            gap_usd,
+        };
+        self.entry_total_gap_usd += gap_usd;
+        self.entry_gaps.push_back(gap.clone());
+        while self.entry_gaps.len() > FILL_GAP_CAP {
+            self.entry_gaps.pop_front();
+        }
+        Some(gap)
+    }
+
+    /// `(filled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
+    pub fn entry_stats(&self) -> (usize, f64, f64) {
+        summarize(self.entry_gaps.len(), self.entry_total_gap_usd)
     }
 
     /// Drop a pending note without settling (lifecycle eviction).
@@ -138,9 +205,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::live::{
-    BPS_DENOMINATOR, LAMPORTS_PER_SOL, LiveBuyParams, LiveError, LivePosition, LiveSellParams,
-    LiveTrader, PumpSwapSellParams, RaydiumSellParams, RecheckOutcome, SELL_MAX_ATTEMPTS,
-    SELL_RETRY_COOLDOWN,
+    BPS_DENOMINATOR, LAMPORTS_PER_SOL, LiveBuyParams, LiveError, LivePosition,
+    LiveSellParams, LiveTrader, PumpSwapSellParams, RaydiumSellParams, RecheckOutcome,
+    SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN,
 };
 use crate::pipeline::{
     AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener, CURVE_TICK_STALE_SECS,
@@ -400,6 +467,33 @@ impl<L> LiveExecution<L> {
         self.gaps.lock().await.stats()
     }
 
+    /// Record a landed entry gap. Single call site per buy confirm;
+    /// logs the gap, silent `None` on degenerate input.
+    pub async fn note_entry_gap(
+        &self,
+        mint: &str,
+        paper_price_usd: f64,
+        fill_price_usd: f64,
+        qty_tokens: f64,
+    ) {
+        let gap = self
+            .gaps
+            .lock()
+            .await
+            .note_entry_gap(mint, paper_price_usd, fill_price_usd, qty_tokens);
+        if let Some(gap) = gap {
+            info!(mint = %gap.mint, paper = gap.paper_price_usd, fill = gap.fill_price_usd,
+                qty = gap.qty_tokens,
+                gap_usd = format!("{:+.4}", gap.gap_usd),
+                "entry gap settled (paper model vs landed fill)");
+        }
+    }
+
+    /// `(filled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
+    pub async fn entry_gap_stats(&self) -> (usize, f64, f64) {
+        self.gaps.lock().await.entry_stats()
+    }
+
     /// Pending-buy count for the heartbeat (unconfirmed fills).
     pub fn live_pending_count(&self) -> usize
     where
@@ -614,7 +708,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             })
             .await
         {
-            Ok((position, bundle)) => {
+            Ok((position, bundle, entry_fill)) => {
                 // Second fill is real custody: park it.
                 if self.is_live_tracked(trader, mint).await {
                     warn!(%mint, %bundle, amount = position.amount_tokens, "LIVE buy landed for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
@@ -630,6 +724,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 trader.acknowledge_buy(&position, &bundle);
                 self.exec.insert_tracked(position).await;
                 self.exec.clear_diverged(mint).await;
+                // Entry-gap calibration: paper model vs landed fill.
+                // Skipped when unobservable (late-confirm path never
+                // carries one either) — absence is documented, not hidden.
+                if let Some(fill) = entry_fill {
+                    self.exec
+                        .note_entry_gap(mint, entry_quote, fill.fill_price_usd, fill.tokens)
+                        .await;
+                }
                 // First-touch cost feeds the day-loss gate.
                 let buy_tip_usd =
                     trader.first_touch_cost_lamports() as f64 / LAMPORTS_PER_SOL * sol_usd;
@@ -1164,6 +1266,27 @@ mod tests {
         assert_eq!(t.gaps.len(), FILL_GAP_CAP);
         let (n, _, _) = t.stats();
         assert_eq!(n, FILL_GAP_CAP);
+    }
+
+    #[test]
+    fn entry_gap_records_landed_fill() {
+        let mut t = FillGapTracker::new();
+        assert_eq!(t.entry_stats(), (0, 0.0, 0.0));
+        // Degenerate inputs record nothing.
+        assert!(t.note_entry_gap("M", f64::NAN, 1.0, 10.0).is_none());
+        assert!(t.note_entry_gap("M", 1.0, 0.0, 10.0).is_none());
+        assert!(t.note_entry_gap("M", 1.0, 1.0, 0.0).is_none());
+        assert_eq!(t.entry_stats(), (0, 0.0, 0.0));
+        // Paper 0.0000042, landed 0.0000045 over 2.35M tokens:
+        // (0.0000045 - 0.0000042) * 2_350_000 = +0.705.
+        let gap = t
+            .note_entry_gap("M", 0.000_004_2, 0.000_004_5, 2_350_000.0)
+            .expect("gap");
+        assert!((gap.gap_usd - 0.705).abs() < 1e-9, "gap={}", gap.gap_usd);
+        let (n, avg, total) = t.entry_stats();
+        assert_eq!(n, 1);
+        assert!((avg - 0.705).abs() < 1e-9);
+        assert!((total - 0.705).abs() < 1e-9);
     }
 
     #[test]

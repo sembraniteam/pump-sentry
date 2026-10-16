@@ -1,5 +1,5 @@
 use crate::pipeline::*;
-use crate::live::{LAMPORTS_PER_SOL, PoolLeg, PoolVenue};
+use crate::live::{BuyFill, LAMPORTS_PER_SOL, PoolLeg, PoolVenue};
 use crate::live::{TEST_ASSOC as ASSOC, TEST_CURVE as CURVE, TEST_MINT as MINT, TEST_MINT_A as MINT_A, TEST_MINT_B as MINT_B};
 use migration::PoolTick;
 use simulator::Side;
@@ -132,7 +132,7 @@ impl StubLive {
 }
 
 impl BuySink for StubLive {
-    async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String), LiveError> {
+    async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String, Option<BuyFill>), LiveError> {
         let mint = req.mint;
         let curve = req.curve;
         let assoc_curve = req.assoc_curve;
@@ -159,6 +159,8 @@ impl BuySink for StubLive {
                 creator: None,
             },
             "bundle-stub".to_string(),
+            // Stubs never observe fills: no fill, no entry gap.
+            None,
         ))
     }
 }

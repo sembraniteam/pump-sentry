@@ -690,6 +690,10 @@ async fn run_pipeline(live_arg: bool) {
                 if gap_n > 0 {
                     info!("execution gap: n={gap_n} avg={gap_avg:+.4} total={gap_total:+.4} USD (paper model vs live settle + tips)");
                 }
+                let (egap_n, egap_avg, egap_total) = pipeline.exec.entry_gap_stats().await;
+                if egap_n > 0 {
+                    info!("entry gap: n={egap_n} avg={egap_avg:+.4} total={egap_total:+.4} USD (paper quote vs landed fill)");
+                }
                 // Burn-in thresholds (all 0 = off): log-only, never cards.
                 let thresholds = &pipeline.settings;
                 if thresholds.alert_diverged_warn_n > 0 && diverged as u64 >= thresholds.alert_diverged_warn_n {

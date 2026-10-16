@@ -257,6 +257,41 @@ pub fn paper_dispatch_legs_usd(
     )
 }
 
+/// Observed buy fill priced in USD (entry-gap calibration reading).
+/// Pure observation — no judgment. The tracker computes the signed
+/// gap vs the paper quote (single owner of gap math, like exits).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BuyFill {
+    pub fill_price_usd: f64,
+    pub tokens: f64,
+}
+
+/// Price a chain-observed fill in USD. Pure (unit-pinned): `None` on
+/// zero inputs, non-finite/positive rates, or absurd decimals —
+/// calibration skips, never divides by zero.
+fn buy_fill_price_usd(
+    swap_sol_lamports: u64,
+    tokens_base_units: u64,
+    decimals: u8,
+    sol_usd: f64,
+) -> Option<f64> {
+    if swap_sol_lamports == 0 || tokens_base_units == 0 {
+        return None;
+    }
+    if !sol_usd.is_finite() || sol_usd <= 0.0 {
+        return None;
+    }
+    if decimals > 18 {
+        return None;
+    }
+    let tokens = tokens_base_units as f64 / 10f64.powi(decimals as i32);
+    if !tokens.is_finite() || tokens <= 0.0 {
+        return None;
+    }
+    let price = swap_sol_lamports as f64 / LAMPORTS_PER_SOL * sol_usd / tokens;
+    if price.is_finite() { Some(price) } else { None }
+}
+
 /// Guard over a fee-inclusive quote: quote plus `slippage_bps`, up.
 /// `None` on zero or overflow (fail-closed).
 pub fn apply_slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option<u64> {
@@ -780,8 +815,52 @@ impl LiveTrader {
         }
     }
 
-    /// Buy `notional_usd` at `price_usd` via Jito.
-    pub async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String), LiveError> {
+    /// Observe the landed buy fill for entry-gap calibration. Returns
+    /// the fill priced against the paper quote, or `None` when
+    /// unobservable (fetch/parse failure — calibration skips, custody
+    /// unaffected). Single bounded fetch; no retry.
+    async fn observe_entry_fill(
+        &self,
+        signature: &str,
+        mint_str: &str,
+        decimals: u8,
+        tip_lamports: u64,
+        sol_usd: f64,
+    ) -> Option<BuyFill> {
+        let fill = match self
+            .executor
+            .observe_buy_fill(signature, mint_str, tip_lamports)
+            .await
+        {
+            Some(fill) => fill,
+            None => {
+                tracing::debug!(%mint_str, "buy fill unobservable; entry gap skipped");
+                return None;
+            }
+        };
+        let fill_price_usd = buy_fill_price_usd(
+            fill.swap_sol_lamports,
+            fill.tokens_base_units,
+            decimals,
+            sol_usd,
+        )?;
+        let tokens = fill.tokens_base_units as f64 / 10f64.powi(decimals as i32);
+        if !tokens.is_finite() || tokens <= 0.0 {
+            return None;
+        }
+        Some(BuyFill {
+            fill_price_usd,
+            tokens,
+        })
+    }
+
+    /// Buy `notional_usd` at `price_usd` via Jito. The fill observation
+    /// rides the return triple (`None` when unobservable); late-confirm
+    /// pending buys skip it (no price context travels with them).
+    pub async fn buy(
+        &self,
+        req: &LiveBuyParams,
+    ) -> Result<(LivePosition, String, Option<BuyFill>), LiveError> {
         let (mint, curve, assoc_curve, notional_usd, price_usd, sol_usd) = (
             req.mint, req.curve, req.assoc_curve, req.notional_usd, req.price_usd, req.sol_usd,
         );
@@ -802,6 +881,9 @@ impl LiveTrader {
             LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
         })?;
         self.note_mark(&mint_str, price_usd, now_secs());
+        // Bound once: the order and the gap math must agree on the tip
+        // paid (a second oracle read could drift between the two).
+        let tip_lamports = self.effective_tip(0).await;
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.buy_jito(&BuyOrder {
@@ -810,7 +892,7 @@ impl LiveTrader {
                 associated_bonding_curve: assoc_curve,
                 amount_tokens: plan.amount_tokens,
                 max_sol_cost: plan.max_sol_cost,
-                tip_lamports: self.effective_tip(0).await,
+                tip_lamports,
                 creator,
                 slippage_bps: self.effective_slippage_bps(&mint_str, now_secs()),
             }),
@@ -854,6 +936,15 @@ impl LiveTrader {
         {
             Ok(ConfirmOutcome::Confirmed) => {
                 Self::untrack_pending(&self.pending, &mint_str);
+                let entry_fill = self
+                    .observe_entry_fill(
+                        &receipt.signature,
+                        &mint_str,
+                        req.decimals,
+                        tip_lamports,
+                        sol_usd,
+                    )
+                    .await;
                 Ok((
                     Self::pending_position(
                         mint,
@@ -863,6 +954,7 @@ impl LiveTrader {
                         creator,
                     ),
                     receipt.bundle_id,
+                    entry_fill,
                 ))
             }
             Ok(ConfirmOutcome::FailedOnChain) => {
@@ -888,6 +980,18 @@ impl LiveTrader {
                     }
                     BundleStatus::Landed => {
                         Self::untrack_pending(&self.pending, &mint_str);
+                        // Landed verdict, same fill observation: the tx
+                        // exists on-chain regardless of which confirmer
+                        // noticed first.
+                        let entry_fill = self
+                            .observe_entry_fill(
+                                &receipt.signature,
+                                &mint_str,
+                                req.decimals,
+                                tip_lamports,
+                                sol_usd,
+                            )
+                            .await;
                         Ok((
                             Self::pending_position(
                                 mint,
@@ -897,6 +1001,7 @@ impl LiveTrader {
                                 creator,
                             ),
                             receipt.bundle_id,
+                            entry_fill,
                         ))
                     }
                     BundleStatus::Pending | BundleStatus::Unknown => {
@@ -1332,6 +1437,21 @@ mod tests {
         // Fee-inclusive cost 67_500_001 (single-ceil 67_500_000 plus the
         // double-ceil cover lamport), guarded at +200bps.
         assert_eq!(plan.max_sol_cost, 68_850_002);
+    }
+
+    #[test]
+    fn buy_fill_price_math() {
+        // 7_855_520 lamports for 2000 tokens (6dp) at SOL $150:
+        // 0.00785552 * 150 / 2000 = 0.000589164 $/token.
+        let price =
+            buy_fill_price_usd(7_855_520, 2_000_000_000, 6, 150.0).expect("price");
+        assert!((price - 0.000_589_164).abs() < 1e-12, "price={price}");
+        // Degenerate inputs never divide by zero.
+        assert_eq!(buy_fill_price_usd(0, 2_000_000_000, 6, 150.0), None);
+        assert_eq!(buy_fill_price_usd(7_855_520, 0, 6, 150.0), None);
+        assert_eq!(buy_fill_price_usd(7_855_520, 2_000_000_000, 6, 0.0), None);
+        assert_eq!(buy_fill_price_usd(7_855_520, 2_000_000_000, 6, f64::NAN), None);
+        assert_eq!(buy_fill_price_usd(7_855_520, 2_000_000_000, 19, 150.0), None);
     }
 
     #[test]
