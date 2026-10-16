@@ -374,7 +374,7 @@ async fn run_pipeline(live_arg: bool) {
         // arrive inline. REST stays for ticks/screens/sim. The x-token
         // is env-only (secret, never the config file, never logged).
         let token = std::env::var(listener::YELLOWSTONE_TOKEN_ENV).ok();
-        match listener::GeyserSubscriber::subscribe(
+        match listener::GeyserSubscriber::subscribe_with_rpc(
             ListenerConfig {
                 ws_url: settings.ws_url.clone(),
                 http_url: settings.http_url.clone(),
@@ -382,6 +382,7 @@ async fn run_pipeline(live_arg: bool) {
                 commitment: settings.commitment.clone(),
             },
             token,
+            Some(Arc::clone(&shared_rpc)),
         )
         .await
         {

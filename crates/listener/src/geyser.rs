@@ -3,9 +3,10 @@
 //! Selected when `ListenerConfig.geyser_url` is non-empty; WS is used
 //! otherwise — never both at once (two feeds would double-parse the
 //! same chain). Full transactions arrive inline, so there is no
-//! `getTransaction` fetch, no fetch semaphore, and no saturation
-//! drops on this path. Gap replay rides `from_slot` (parse-only cost,
-//! no REST burn); the channel stays drop-on-full like the WS path.
+//! per-candidate `getTransaction` fetch and no saturation drops on
+//! this path. Gap coverage rides a bounded REST `getBlock` backfill
+//! (`from_slot` replay is server-rejected below `processed`); the
+//! channel stays drop-on-full like the WS path.
 
 use crate::parser::{
     PUMP_PROGRAM_ID_STR, is_pump_create_ix, is_pump_create_v2_ix, parse_pump_create,
@@ -14,8 +15,10 @@ use crate::parser::{
 use crate::stream::backoff_duration;
 use crate::types::{EVENT_CHANNEL_CAPACITY, ListenerConfig, ListenerEvent, ListenerStats};
 use futures_util::{SinkExt, StreamExt};
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -54,6 +57,9 @@ pub struct GeyserSubscriber {
     /// reconnect — including after errors — so the gap replays instead
     /// of going blind (dedup bounds the redelivery).
     last_slot: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared REST pool for gap backfill (`getBlock` scans). `None`
+    /// skips backfill — never open a private pool here.
+    rpc: Option<Arc<RpcClient>>,
 }
 
     /// Rate-limit cooldown: hammering a 429 every 5s sustains the ban
@@ -98,7 +104,16 @@ impl GeyserSubscriber {
             stats: Arc::new(ListenerStats::new()),
             seen: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             last_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rpc: None,
         })
+    }
+
+    /// Build around the shared REST pool (gap backfill scans ride it).
+    /// Mirrors `PumpFunListener::with_rpc`: `None` means no backfill,
+    /// never a private pool.
+    pub fn with_rpc(mut self, rpc: Arc<RpcClient>) -> Self {
+        self.rpc = Some(rpc);
+        self
     }
 
     /// Shared stats handle.
@@ -112,7 +127,21 @@ impl GeyserSubscriber {
         token: Option<String>,
     ) -> Result<(mpsc::Receiver<ListenerEvent>, Arc<ListenerStats>, JoinHandle<()>), GeyserError>
     {
-        let sub = GeyserSubscriber::new(config, token)?;
+        Self::subscribe_with_rpc(config, token, None).await
+    }
+
+    /// Spawn the subscriber around a shared REST pool (`None` = no gap
+    /// backfill). Returns receiver, stats, and task handle.
+    pub async fn subscribe_with_rpc(
+        config: ListenerConfig,
+        token: Option<String>,
+        rpc: Option<Arc<RpcClient>>,
+    ) -> Result<(mpsc::Receiver<ListenerEvent>, Arc<ListenerStats>, JoinHandle<()>), GeyserError>
+    {
+        let sub = match rpc {
+            Some(shared) => GeyserSubscriber::new(config, token)?.with_rpc(shared),
+            None => GeyserSubscriber::new(config, token)?,
+        };
         let stats = sub.stats();
         let stats_out = Arc::clone(&stats);
         let (tx, rx) = mpsc::channel::<ListenerEvent>(EVENT_CHANNEL_CAPACITY.max(1));
@@ -133,13 +162,39 @@ fn reconnect_wait(attempt: u32, rate_limited: bool) -> Duration {
     })
 }
 
+/// Max slots backfilled per reconnect (~25s of chain). Older gaps are
+/// unactionable for a sniper (those launches already ran or rugged) —
+/// skip them with a warn stating the missed range instead of burning
+/// RPC budget pretending to be whole.
+pub const MAX_BACKFILL_SLOTS: u64 = 64;
+
+/// Per-block fetch deadline inside backfill. A wedged block must not
+/// stall the resubscribe behind it.
+const BACKFILL_BLOCK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Backfill window over a missed range: `(scan_from, scan_to, skipped)`.
+/// `scan_from..=scan_to` is scanned; the `skipped` older slots are left
+/// behind (logged, never silently dropped). `(0, 0, 0)` means caught up.
+/// Pure for unit pinning.
+fn backfill_window(since_slot: u64, tip_slot: u64) -> (u64, u64, u64) {
+    if tip_slot <= since_slot {
+        return (0, 0, 0);
+    }
+    let want_from = since_slot.saturating_add(1);
+    let cap_from = tip_slot
+        .saturating_sub(MAX_BACKFILL_SLOTS)
+        .saturating_add(1);
+    let scan_from = want_from.max(cap_from);
+    (scan_from, tip_slot, scan_from.saturating_sub(want_from))
+}
+
 /// Replay slot actually sent: the server honors `from_slot` only at
 /// `processed` commitment and rejects it otherwise ("available only
 /// for `processed`"), so non-processed reconnects must subscribe
 /// clean — sending it anyway fails every cycle deterministically on
-/// our own parameter. Consequence, stated plainly: on confirmed /
-/// finalized, downtime gaps have no redelivery and are missed (no
-/// backfill exists on this path, unlike WS). Pure for unit pinning.
+/// our own parameter. Gap coverage on those commitments comes from
+/// the REST backfill in `run`, not from this parameter (which stays
+/// live for `processed`). Pure for unit pinning.
 fn effective_replay_slot(commitment: CommitmentLevel, from_slot: Option<u64>) -> Option<u64> {
     match commitment {
         CommitmentLevel::Processed => from_slot,
@@ -161,6 +216,22 @@ impl GeyserSubscriber {
             if tx.is_closed() {
                 info!("downstream closed; geyser subscriber shutting down");
                 return;
+            }
+            // Gap backfill before the live session: from_slot replay is
+            // unavailable below processed, so without this every
+            // confirmed downtime is a permanent hole. First boot has no
+            // baseline (skip); without a shared pool there is nothing
+            // to scan with (skip — never open a private pool here).
+            // Runs before the subscribe so the range is exact; the scan
+            // itself extends blindness by its own duration (same
+            // tradeoff the WS path accepts).
+            let baseline = self.last_slot.load(std::sync::atomic::Ordering::Relaxed);
+            if baseline > 0 {
+                if let Some(rpc) = &self.rpc {
+                    self.backfill_gap(rpc, &tx, baseline).await;
+                } else {
+                    debug!("no shared rpc; geyser gap backfill skipped");
+                }
             }
             let seen_before = self.stats.logs_seen();
             let session_start = std::time::Instant::now();
@@ -302,6 +373,154 @@ impl GeyserSubscriber {
         Ok(last_slot)
     }
 
+    /// One-shot REST backfill over a missed range after reconnect.
+    /// `from_slot` replay is unavailable below `processed`, so without
+    /// this every confirmed downtime is a permanent hole. Sequential
+    /// `getBlock` scans (no spawn storms — the saturation pathology the
+    /// WS path taught us); dedup via the seen set; drop-on-full holds
+    /// the line; wedged blocks time out instead of stalling the
+    /// resubscribe behind them.
+    async fn backfill_gap(
+        &self,
+        rpc: &Arc<RpcClient>,
+        tx: &mpsc::Sender<ListenerEvent>,
+        since_slot: u64,
+    ) {
+        use solana_client::rpc_config::RpcBlockConfig;
+        use solana_transaction_status::{
+            EncodedTransaction, TransactionDetails, UiMessage, UiTransactionEncoding,
+            option_serializer::OptionSerializer,
+        };
+        let tip = match rpc.get_slot().await {
+            Ok(tip) => tip,
+            Err(e) => {
+                warn!(
+                    error = %ids::redact_urls_in_text(&e.to_string()),
+                    "geyser backfill: tip unreadable; gap stays"
+                );
+                return;
+            }
+        };
+        let (from, to, skipped) = backfill_window(since_slot, tip);
+        if to == 0 {
+            return;
+        }
+        if skipped > 0 {
+            warn!(
+                skipped,
+                from,
+                to,
+                "geyser gap older than backfill cap; scanning newest only (stale launches unactionable)"
+            );
+        }
+        let mut scanned = 0u32;
+        let mut emitted = 0u32;
+        for slot in from..=to {
+            if tx.is_closed() {
+                return;
+            }
+            let block = match tokio::time::timeout(
+                BACKFILL_BLOCK_TIMEOUT,
+                rpc.get_block_with_config(
+                    slot,
+                    RpcBlockConfig {
+                        encoding: Some(UiTransactionEncoding::Json),
+                        transaction_details: Some(TransactionDetails::Full),
+                        rewards: Some(false),
+                        commitment: None,
+                        max_supported_transaction_version: Some(1),
+                    },
+                ),
+            )
+            .await
+            {
+                Ok(Ok(block)) => block,
+                _ => continue, // Pruned, missing, or throttled: skip the slot.
+            };
+            scanned += 1;
+            let empty = Vec::new();
+            for tx_meta in block.transactions.as_ref().unwrap_or(&empty) {
+                if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
+                    continue;
+                }
+                let EncodedTransaction::Json(ui_tx) = &tx_meta.transaction else {
+                    continue;
+                };
+                let UiMessage::Raw(raw) = &ui_tx.message else {
+                    continue;
+                };
+                let sig = match ui_tx.signatures.first() {
+                    Some(sig) if !sig.is_empty() => sig,
+                    _ => continue,
+                };
+                if !self.mark_seen_new(sig) {
+                    continue;
+                }
+                let mut keys: Vec<Pubkey> = Vec::with_capacity(raw.account_keys.len() + 8);
+                let mut keys_ok = true;
+                for k in &raw.account_keys {
+                    match Pubkey::from_str(k) {
+                        Ok(p) => keys.push(p),
+                        Err(_) => {
+                            keys_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !keys_ok {
+                    continue;
+                }
+                if let Some(meta) = tx_meta.meta.as_ref()
+                    && let OptionSerializer::Some(loaded) = &meta.loaded_addresses
+                {
+                    for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
+                        match Pubkey::from_str(k) {
+                            Ok(p) => keys.push(p),
+                            Err(_) => {
+                                keys_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !keys_ok {
+                        continue;
+                    }
+                }
+                let pump_idx = match keys
+                    .iter()
+                    .position(|k| k.to_string() == PUMP_PROGRAM_ID_STR)
+                {
+                    Some(i) => i,
+                    None => continue,
+                };
+                for cix in &raw.instructions {
+                    if usize::from(cix.program_id_index) != pump_idx {
+                        continue;
+                    }
+                    let Ok(data) = bs58::decode(&cix.data).into_vec() else {
+                        continue;
+                    };
+                    if Self::emit_if_create(
+                        &keys,
+                        usize::from(cix.program_id_index),
+                        &cix.accounts,
+                        &data,
+                        sig,
+                        slot,
+                        tx,
+                    ) {
+                        emitted += 1;
+                    }
+                }
+            }
+        }
+        if emitted > 0 {
+            warn!(missed = emitted, scanned, "backfilled geyser-gap launches");
+        } else {
+            debug!(scanned, "geyser backfill: no missed launches in range");
+        }
+    }
+
     /// Decode one transaction update and emit every `create` found.
     /// Skips votes, failures, and key tables that do not resolve fully
     /// (a partial table proves nothing — same rule as the WS path).
@@ -417,21 +636,30 @@ impl GeyserSubscriber {
     }
 
     /// Mark a signature seen (bounded memory, same policy as WS).
-    fn mark_seen(&self, sig: &str) {
+    /// Returns false when already known (poisoned lock counts as new:
+    /// dropping a candidate on lock trouble would blind the feed).
+    fn mark_seen_new(&self, sig: &str) -> bool {
         match self.seen.lock() {
             Ok(mut guard) => {
                 if guard.len() >= SEEN_SIG_CAP {
                     let drop_n = guard.len() / 2;
-                    let victims: Vec<String> =
-                        guard.iter().take(drop_n).cloned().collect();
+                    let victims: Vec<String> = guard.iter().take(drop_n).cloned().collect();
                     for v in victims {
                         guard.remove(&v);
                     }
                 }
-                guard.insert(sig.to_string());
+                guard.insert(sig.to_string())
             }
-            Err(_) => debug!("seen-set lock poisoned; dedup skipped"),
+            Err(_) => {
+                debug!("seen-set lock poisoned; dedup skipped");
+                true
+            }
         }
+    }
+
+    /// Mark a signature seen (bounded memory, same policy as WS).
+    fn mark_seen(&self, sig: &str) {
+        let _ = self.mark_seen_new(sig);
     }
 }
 
@@ -545,6 +773,25 @@ mod tests {
             assert_eq!(effective_replay_slot(level, Some(123)), None);
             assert_eq!(effective_replay_slot(level, None), None);
         }
+    }
+
+    #[test]
+    fn backfill_window_caps_and_reports_skips() {
+        // Caught up (or time running backwards): nothing to scan.
+        assert_eq!(backfill_window(100, 100), (0, 0, 0));
+        assert_eq!(backfill_window(100, 90), (0, 0, 0));
+        // Short gap: scan it whole, nothing skipped.
+        assert_eq!(backfill_window(100, 110), (101, 110, 0));
+        // Exactly at the cap: still whole, still nothing skipped.
+        assert_eq!(
+            backfill_window(100, 100 + MAX_BACKFILL_SLOTS),
+            (101, 100 + MAX_BACKFILL_SLOTS, 0)
+        );
+        // Long gap: newest cap-sized slice, older slots reported.
+        let (from, to, skipped) = backfill_window(100, 100 + MAX_BACKFILL_SLOTS + 50);
+        assert_eq!((to - from + 1), MAX_BACKFILL_SLOTS);
+        assert_eq!(skipped, 50);
+        assert_eq!(to, 100 + MAX_BACKFILL_SLOTS + 50);
     }
 
     #[test]
