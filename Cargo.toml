@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 toml = "1.1.8"
 solana-client = "4.3.0"
+solana-pubkey = "4.4"
 solana-commitment-config = "3.1"
 
 [dev-dependencies]

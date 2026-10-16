@@ -3043,6 +3043,7 @@ dependencies = [
  "solana-client",
  "solana-commitment-config",
  "solana-keypair 3.1.2",
+ "solana-pubkey 4.4.0",
  "thiserror 2.0.21",
  "tokio",
  "toml",

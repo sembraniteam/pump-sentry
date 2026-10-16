@@ -18,7 +18,7 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 493 tests; live probes stay ignored
+cargo test --workspace            # 490 tests; live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
@@ -33,7 +33,8 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - `crates/ids` is the single source of truth for on-chain constants (program IDs, discriminators, fee/volume addresses).
   A program upgrade
   edits exactly one file there — never duplicate a constant elsewhere.
-- `src/pipeline.rs` (~4200 lines, ~3/4 of it `mod tests`) is the orchestrator:
+- `src/pipeline.rs` (~770 lines prod; tests live in `src/pipeline_tests.rs`
+  via `#[path]`, same crate so `pub(crate)` stays private) is the orchestrator:
   gate → risk → paper ledger → live mirror. `LiveExecution`/`live_mirror` (live
   dispatch + `FillGapTracker` calibration), `gate` (watchlist + opens), and `DailyBreaker` are split
   out; method bodies live on `Pipeline` via those modules. Do NOT split
@@ -41,8 +42,13 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   testability trade-off, not tech debt to "fix").
 - `src/live.rs` sizes/orders live trades; `crates/executor` builds and
   sends them. Paper ledger is authoritative; live legs only mirror it.
-  `LiveBuyParams`/`LiveSellParams` carry explicit `decimals: u8` — the
-  calc path reads no hidden constant; new constructors must set it.
+  Custody types are `Pubkey`, not `String` (`LivePosition`, `PoolLeg`,
+  `LiveBuyParams`/`LiveSellParams`): parse ONCE at the caller boundary
+  (`live_buy`, `follow_pool`, WAL replay), never re-validate downstream.
+  `String` survives only at RPC/feed boundaries (`ReserveFeed`,
+  map keys, logs). `LiveBuyParams` carries explicit `decimals: u8` too.
+  Test addresses: `crate::live::TEST_*` consts (+ `test_pubkey(seed)`);
+  new test fixtures must use them, never arbitrary strings.
 - Paper quantities are `u64` whole tokens (absolute; direction from
   `side`), and the ledger debits/invests the floored size, never the
   nominal ticket. Tests asserting quantities use integers; paper↔live

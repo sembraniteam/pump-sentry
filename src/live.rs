@@ -2,10 +2,11 @@
 
 use crate::settings::now_secs;
 use crate::wal;
-use executor::{BuyOrder, BundleStatus, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor, parse_pubkey};
+use executor::{BuyOrder, BundleStatus, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor};
 use futures_util::stream::StreamExt;
 use ids::{ATA_RENT_LAMPORTS, BASE_TX_FEE_LAMPORTS};
 use simulator::{FillModel, Side};
+use solana_pubkey::Pubkey;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -71,37 +72,40 @@ pub enum PoolVenue {
 }
 
 /// Pool leg for one mint. Vault orientation is WSOL-side-first on
-/// both venues (BASE holds WSOL, QUOTE the token).
+/// both venues (BASE holds WSOL, QUOTE the token). Validated addresses
+/// (parsed once at the follow boundary), never re-validated strings.
 #[derive(Debug, Clone)]
 pub struct PoolLeg {
-    pub mint: String,
-    pub amm: String,
+    pub mint: Pubkey,
+    pub amm: Pubkey,
     /// Coin vault (WSOL).
-    pub base_vault: String,
+    pub base_vault: Pubkey,
     /// Pc vault (token).
-    pub quote_vault: String,
+    pub quote_vault: Pubkey,
     /// Routing venue.
     pub venue: PoolVenue,
 }
 
-/// Tracked fill (base units).
+/// Tracked fill (base units). Validated addresses: custody code never
+/// re-parses strings to tell its own holdings apart.
 #[derive(Debug, Clone)]
 pub struct LivePosition {
-    pub mint: String,
-    pub curve: String,
-    pub assoc_curve: String,
+    pub mint: Pubkey,
+    pub curve: Pubkey,
+    pub assoc_curve: Pubkey,
     /// Bought units (for full exits).
     pub amount_tokens: u64,
     /// Creator. `None` fails v3 dispatch.
-    pub creator: Option<String>,
+    pub creator: Option<Pubkey>,
 }
 
-/// Buy request.
+/// Buy request. All addresses validated (`Pubkey` is `Copy`, so no
+/// lifetime); parsing happens once at the caller boundary.
 #[derive(Debug, Clone, Copy)]
-pub struct LiveBuyParams<'a> {
-    pub mint: &'a str,
-    pub curve: &'a str,
-    pub assoc_curve: &'a str,
+pub struct LiveBuyParams {
+    pub mint: Pubkey,
+    pub curve: Pubkey,
+    pub assoc_curve: Pubkey,
     /// Exposure in USD.
     pub notional_usd: f64,
     /// Price in USD per token.
@@ -112,7 +116,7 @@ pub struct LiveBuyParams<'a> {
     pub liquidity_usd: f64,
     /// Fee tier. `None` is standard.
     pub venue_fee_bps: Option<f64>,
-    pub creator: Option<&'a str>,
+    pub creator: Option<Pubkey>,
     /// Mint decimals (confirm gate drops non-6; explicit so sizing
     /// never reads a hidden constant).
     pub decimals: u8,
@@ -159,6 +163,28 @@ pub struct PumpSwapSellParams<'a> {
     pub pool: &'a PoolLeg,
     /// Jito tip (congestion-aware; caller computes via `effective_tip`).
     pub tip_lamports: u64,
+}
+
+/// Canonical test addresses: valid base58 `Pubkey`s shared by every
+/// test module that touches custody types (which parse at boundaries).
+/// Distinct from dev (7) and buyer (11-15) fixture wallets.
+/// `*_A`/`*_B` serve multi-mint tests.
+#[cfg(test)]
+pub(crate) const TEST_MINT: &str = "32ZsJ2yJjwuoBiWE5xnZjG9tKmK3CubbmEzgkQLyQzgD";
+#[cfg(test)]
+pub(crate) const TEST_CURVE: &str = "36VASLSKLFD2KokjXG7V28veZvXEsyHRKefLonPaAKzv";
+#[cfg(test)]
+pub(crate) const TEST_ASSOC: &str = "3AQTaduKvYWFTu1ExZSQK1hQp5jSZ2yEt4KzsASAufKd";
+#[cfg(test)]
+pub(crate) const TEST_MINT_A: &str = "3mg7sM6RFEBHiiFotFNfvteH1WdFcc9cujKuPaqZdfDz";
+#[cfg(test)]
+pub(crate) const TEST_MINT_B: &str = "3qbR1eZRqXUWroWKKYhbDmR3FfqTHfqSU8zZSxtANzYh";
+
+/// Deterministic test key (pool legs, vaults — anything not compared
+/// against the shared mints above). Seed-distinct from fixture wallets.
+#[cfg(test)]
+pub(crate) fn test_pubkey(seed: u8) -> Pubkey {
+    Pubkey::new_from_array([seed; 32])
 }
 
 /// Max tip multiplier on sell retries. Congestion response is bounded:
@@ -699,9 +725,9 @@ impl LiveTrader {
                                 }
                             }
                         } else {
-                            let mint = entry.position.mint.clone();
+                            let mint = entry.position.mint.to_string();
                             self.with_pending("recheck-bump", (), |guard| {
-                                if let Some(stored) = guard.get_mut(&mint) {
+                                if let Some(stored) = guard.get_mut(mint.as_str()) {
                                     stored.attempts = attempts;
                                 }
                             });
@@ -721,9 +747,9 @@ impl LiveTrader {
                 // Terminal verdicts retire the WAL line.
                 _ => {
                     self.write_wal_settled(&entry.bundle_id);
-                    let mint = entry.position.mint.clone();
+                    let mint = entry.position.mint.to_string();
                     self.with_pending("recheck-settle", (), |guard| {
-                        guard.remove(&mint);
+                        guard.remove(mint.as_str());
                     });
                 }
             }
@@ -739,37 +765,35 @@ impl LiveTrader {
 
     /// Build a tracked position (one constructor).
     fn pending_position(
-        mint: &str,
-        curve: &str,
-        assoc_curve: &str,
+        mint: Pubkey,
+        curve: Pubkey,
+        assoc_curve: Pubkey,
         amount_tokens: u64,
-        creator: Option<String>,
+        creator: Option<Pubkey>,
     ) -> LivePosition {
         LivePosition {
-            mint: mint.to_string(),
-            curve: curve.to_string(),
-            assoc_curve: assoc_curve.to_string(),
+            mint,
+            curve,
+            assoc_curve,
             amount_tokens,
             creator,
         }
     }
 
     /// Buy `notional_usd` at `price_usd` via Jito.
-    pub async fn buy(&self, req: &LiveBuyParams<'_>) -> Result<(LivePosition, String), LiveError> {
+    pub async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String), LiveError> {
         let (mint, curve, assoc_curve, notional_usd, price_usd, sol_usd) = (
             req.mint, req.curve, req.assoc_curve, req.notional_usd, req.price_usd, req.sol_usd,
         );
-        let creator = match req.creator {
-            Some(c) => {
-                Some(parse_pubkey(c).map_err(|e| LiveError::BadOrder(format!("bad creator '{c}': {e}")))?)
-            }
-            None => None,
-        };
+        let creator = req.creator;
+        // String-boundary uses (marks, pending map, logs) derive once
+        // from the validated key; dispatch uses the `Pubkey` directly.
+        let mint_str = mint.to_string();
         let plan = plan_buy(
             notional_usd,
             price_usd,
             sol_usd,
-            self.effective_slippage_bps(mint, now_secs()),
+            self.effective_slippage_bps(&mint_str, now_secs()),
             req.liquidity_usd,
             req.venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
             req.decimals,
@@ -777,21 +801,18 @@ impl LiveTrader {
         .ok_or_else(|| {
             LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
         })?;
-        self.note_mark(mint, price_usd, now_secs());
+        self.note_mark(&mint_str, price_usd, now_secs());
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.buy_jito(&BuyOrder {
-                mint: parse_pubkey(mint)
-                    .map_err(|e| LiveError::BadOrder(format!("bad mint '{mint}': {e}")))?,
-                bonding_curve: parse_pubkey(curve)
-                    .map_err(|e| LiveError::BadOrder(format!("bad curve '{curve}': {e}")))?,
-                associated_bonding_curve: parse_pubkey(assoc_curve)
-                    .map_err(|e| LiveError::BadOrder(format!("bad assoc_curve '{assoc_curve}': {e}")))?,
+                mint,
+                bonding_curve: curve,
+                associated_bonding_curve: assoc_curve,
                 amount_tokens: plan.amount_tokens,
                 max_sol_cost: plan.max_sol_cost,
                 tip_lamports: self.effective_tip(0).await,
                 creator,
-                slippage_bps: self.effective_slippage_bps(mint, now_secs()),
+                slippage_bps: self.effective_slippage_bps(&mint_str, now_secs()),
             }),
         )
         .await
@@ -804,7 +825,7 @@ impl LiveTrader {
                     curve,
                     assoc_curve,
                     plan.amount_tokens,
-                    req.creator.map(|c| c.to_string()),
+                    creator,
                 );
                 return Err(LiveError::UnknownDispatch {
                     position: Box::new(position),
@@ -822,9 +843,9 @@ impl LiveTrader {
             curve,
             assoc_curve,
             plan.amount_tokens,
-            creator.map(|c| c.to_string()),
+            creator,
         );
-        Self::track_pending(&self.pending, mint, intended.clone(), &receipt);
+        Self::track_pending(&self.pending, &mint_str, intended.clone(), &receipt);
         self.write_wal_pending(&intended, &receipt.signature, &receipt.bundle_id);
         match self
             .executor
@@ -832,20 +853,20 @@ impl LiveTrader {
             .await
         {
             Ok(ConfirmOutcome::Confirmed) => {
-                Self::untrack_pending(&self.pending, mint);
+                Self::untrack_pending(&self.pending, &mint_str);
                 Ok((
                     Self::pending_position(
                         mint,
                         curve,
                         assoc_curve,
                         plan.amount_tokens,
-                        creator.map(|c| c.to_string()),
+                        creator,
                     ),
                     receipt.bundle_id,
                 ))
             }
             Ok(ConfirmOutcome::FailedOnChain) => {
-                Self::untrack_pending(&self.pending, mint);
+                Self::untrack_pending(&self.pending, &mint_str);
                 // Proven no-fill: retire the line so boot skips it.
                 self.write_wal_settled(&receipt.bundle_id);
                 Err(LiveError::Unconfirmed(format!(
@@ -858,7 +879,7 @@ impl LiveTrader {
                 // Invalid is terminal (no fill), Landed confirms.
                 match self.executor.bundle_status(&receipt.bundle_id).await {
                     BundleStatus::Failed | BundleStatus::Invalid => {
-                        Self::untrack_pending(&self.pending, mint);
+                        Self::untrack_pending(&self.pending, &mint_str);
                         self.write_wal_settled(&receipt.bundle_id);
                         Err(LiveError::Unconfirmed(format!(
                             "buy bundle {} Confirmed failure: engine reports bundle failed/invalid; no fill",
@@ -866,14 +887,14 @@ impl LiveTrader {
                         )))
                     }
                     BundleStatus::Landed => {
-                        Self::untrack_pending(&self.pending, mint);
+                        Self::untrack_pending(&self.pending, &mint_str);
                         Ok((
                             Self::pending_position(
                                 mint,
                                 curve,
                                 assoc_curve,
                                 plan.amount_tokens,
-                                creator.map(|c| c.to_string()),
+                                creator,
                             ),
                             receipt.bundle_id,
                         ))
@@ -882,13 +903,13 @@ impl LiveTrader {
                         // May land late: keep for recheck.
                         Self::track_pending(
                             &self.pending,
-                            mint,
+                            &mint_str,
                             Self::pending_position(
                                 mint,
                                 curve,
                                 assoc_curve,
                                 plan.amount_tokens,
-                                creator.map(|c| c.to_string()),
+                                creator,
                             ),
                             &receipt,
                         );
@@ -903,13 +924,13 @@ impl LiveTrader {
                 // Transport failure: same as timeout.
                 Self::track_pending(
                     &self.pending,
-                    mint,
+                    &mint_str,
                     Self::pending_position(
                         mint,
                         curve,
                         assoc_curve,
                         plan.amount_tokens,
-                        creator.map(|c| c.to_string()),
+                        creator,
                     ),
                     &receipt,
                 );
@@ -990,7 +1011,7 @@ impl LiveTrader {
     }
 
     /// JSON creator (`null` when unknown).
-    fn wal_creator(creator: Option<&String>) -> String {
+    fn wal_creator(creator: Option<&Pubkey>) -> String {
         creator
             .map(|c| format!("\"{c}\""))
             .unwrap_or_else(|| "null".to_string())
@@ -1086,7 +1107,7 @@ impl LiveTrader {
         self.with_pending("wal-import", 0, |guard| {
             let mut n = 0usize;
             for item in items {
-                let mint = item.position.mint.clone();
+                let mint = item.position.mint.to_string();
                 guard.entry(mint).or_insert_with(|| {
                     n += 1;
                     PendingBuy {
@@ -1104,7 +1125,9 @@ impl LiveTrader {
     /// Sell the full tracked amount via Jito.
     pub async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
         let position = req.position;
-        let slip = self.effective_slippage_bps(&position.mint, now_secs());
+        // String-boundary uses derive once; dispatch uses `Pubkey`s.
+        let mint_str = position.mint.to_string();
+        let slip = self.effective_slippage_bps(&mint_str, now_secs());
         let floor = plan_sell_floor(
             position.amount_tokens,
             req.price_usd,
@@ -1115,27 +1138,18 @@ impl LiveTrader {
             req.decimals,
         )
         .ok_or_else(|| LiveError::BadOrder(format!("cannot floor sell of {}", position.mint)))?;
-        self.note_mark(&position.mint, req.price_usd, now_secs());
+        self.note_mark(&mint_str, req.price_usd, now_secs());
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.sell_jito(&SellOrder {
-                mint: parse_pubkey(&position.mint)
-                    .map_err(|e| LiveError::BadOrder(format!("bad mint '{}': {e}", position.mint)))?,
-                bonding_curve: parse_pubkey(&position.curve)
-                    .map_err(|e| LiveError::BadOrder(format!("bad curve '{}': {e}", position.curve)))?,
-                associated_bonding_curve: parse_pubkey(&position.assoc_curve)
-                    .map_err(|e| LiveError::BadOrder(format!("bad assoc_curve '{}': {e}", position.assoc_curve)))?,
+                mint: position.mint,
+                bonding_curve: position.curve,
+                associated_bonding_curve: position.assoc_curve,
                 amount_tokens: position.amount_tokens,
                 min_sol_output: floor,
                 slippage_bps: slip,
                 tip_lamports: req.tip_lamports,
-                creator: match &position.creator {
-                    Some(c) => Some(
-                        parse_pubkey(c)
-                            .map_err(|e| LiveError::BadOrder(format!("bad creator '{c}': {e}")))?,
-                    ),
-                    None => None,
-                },
+                creator: position.creator,
             }),
         )
         .await
@@ -1149,8 +1163,8 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE sell dispatched");
-        self.note_sell_bundle(&position.mint, &receipt.bundle_id);
-        self.confirm_pool_sell(&position.mint, &receipt, "sell").await
+        self.note_sell_bundle(&mint_str, &receipt.bundle_id);
+        self.confirm_pool_sell(&mint_str, &receipt, "sell").await
     }
 
     /// Confirm a pool-leg sell bundle. Shared by every venue (`label`
@@ -1207,19 +1221,16 @@ impl LiveTrader {
     pub async fn sell_raydium(&self, req: &RaydiumSellParams<'_>) -> Result<String, LiveError> {
         let position = req.position;
         let pool = req.pool;
+        let mint_str = position.mint.to_string();
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.sell_raydium_jito(&executor::SellRaydiumOrder {
-                mint: parse_pubkey(&position.mint)
-                    .map_err(|e| LiveError::BadOrder(format!("bad mint '{}': {e}", position.mint)))?,
-                amm: parse_pubkey(&pool.amm)
-                    .map_err(|e| LiveError::BadOrder(format!("bad amm '{}': {e}", pool.amm)))?,
-                base_vault: parse_pubkey(&pool.base_vault)
-                    .map_err(|e| LiveError::BadOrder(format!("bad base_vault '{e}")))?,
-                quote_vault: parse_pubkey(&pool.quote_vault)
-                    .map_err(|e| LiveError::BadOrder(format!("bad quote_vault '{e}")))?,
+                mint: position.mint,
+                amm: pool.amm,
+                base_vault: pool.base_vault,
+                quote_vault: pool.quote_vault,
                 amount_tokens: position.amount_tokens,
-                slippage_bps: self.effective_slippage_bps(&position.mint, now_secs()),
+                slippage_bps: self.effective_slippage_bps(&mint_str, now_secs()),
                 tip_lamports: req.tip_lamports,
             }),
         )
@@ -1234,8 +1245,8 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE raydium sell dispatched");
-        self.note_sell_bundle(&position.mint, &receipt.bundle_id);
-        self.confirm_pool_sell(&position.mint, &receipt, "raydium sell").await
+        self.note_sell_bundle(&mint_str, &receipt.bundle_id);
+        self.confirm_pool_sell(&mint_str, &receipt, "raydium sell").await
     }
 
     /// PumpSwap sell at `pool` via Jito. Floor quotes from live
@@ -1243,19 +1254,16 @@ impl LiveTrader {
     pub async fn sell_pumpswap(&self, req: &PumpSwapSellParams<'_>) -> Result<String, LiveError> {
         let position = req.position;
         let pool = req.pool;
+        let mint_str = position.mint.to_string();
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.sell_pumpswap_jito(&executor::SellPumpSwapOrder {
-                mint: parse_pubkey(&position.mint)
-                    .map_err(|e| LiveError::BadOrder(format!("bad mint '{}': {e}", position.mint)))?,
-                pool: parse_pubkey(&pool.amm)
-                    .map_err(|e| LiveError::BadOrder(format!("bad pool '{}': {e}", pool.amm)))?,
-                base_vault: parse_pubkey(&pool.base_vault)
-                    .map_err(|e| LiveError::BadOrder(format!("bad base_vault '{e}")))?,
-                quote_vault: parse_pubkey(&pool.quote_vault)
-                    .map_err(|e| LiveError::BadOrder(format!("bad quote_vault '{e}")))?,
+                mint: position.mint,
+                pool: pool.amm,
+                base_vault: pool.base_vault,
+                quote_vault: pool.quote_vault,
                 amount_tokens: position.amount_tokens,
-                slippage_bps: self.effective_slippage_bps(&position.mint, now_secs()),
+                slippage_bps: self.effective_slippage_bps(&mint_str, now_secs()),
                 tip_lamports: req.tip_lamports,
             }),
         )
@@ -1270,8 +1278,8 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE pumpswap sell dispatched");
-        self.note_sell_bundle(&position.mint, &receipt.bundle_id);
-        self.confirm_pool_sell(&position.mint, &receipt, "pumpswap sell").await
+        self.note_sell_bundle(&mint_str, &receipt.bundle_id);
+        self.confirm_pool_sell(&mint_str, &receipt, "pumpswap sell").await
     }
 }
 
@@ -1554,25 +1562,27 @@ mod tests {
 
     #[test]
     fn wal_replay_folds_pending_settled_positions_sells() {
+        // `DEAD` retires via its settled tombstone; `BROKEN` (missing
+        // fields) and the non-JSON line are the two skips.
         let lines = [
-            r#"{"t":"pending","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}"#,
-            r#"{"t":"pending","mint":"DEAD","curve":"CURVE","assoc":"ASSOC","amount":500,"creator":null,"sig":"SIG2","bundle":"B2","ts":2}"#,
-            r#"{"t":"settled","bundle":"B2","ts":3}"#,
-            r#"{"t":"position","mint":"HELD","curve":"CURVE","assoc":"ASSOC","amount":700,"creator":null,"bundle":"B3","ts":4}"#,
-            r#"{"t":"sell","mint":"HELD","amount":200,"bundle":"B4","ts":5}"#,
-            r#"{"t":"manual","mint":"STUCK","curve":"CURVE","assoc":"ASSOC","amount":300,"creator":null,"ts":6}"#,
-            "not json at all",
-            r#"{"t":"pending","mint":"BROKEN","ts":7}"#,
+            format!(r#"{{"t":"pending","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}}"#),
+            format!(r#"{{"t":"pending","mint":"{TEST_MINT_A}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":500,"creator":null,"sig":"SIG2","bundle":"B2","ts":2}}"#),
+            r#"{"t":"settled","bundle":"B2","ts":3}"#.to_string(),
+            format!(r#"{{"t":"position","mint":"{TEST_MINT_B}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":700,"creator":null,"bundle":"B3","ts":4}}"#),
+            format!(r#"{{"t":"sell","mint":"{TEST_MINT_B}","amount":200,"bundle":"B4","ts":5}}"#),
+            format!(r#"{{"t":"manual","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":300,"creator":null,"ts":6}}"#),
+            "not json at all".to_string(),
+            r#"{"t":"pending","mint":"BROKEN","ts":7}"#.to_string(),
         ];
-        let replay = wal::replay_lines(lines.into_iter());
+        let replay = wal::replay_lines(lines.iter().map(String::as_str));
         assert_eq!(replay.pending.len(), 1);
         assert_eq!(replay.pending[0].bundle_id, "B1");
         assert_eq!(replay.pending[0].signature, "SIG1");
         assert_eq!(replay.positions.len(), 1);
-        assert_eq!(replay.positions[0].mint, "HELD");
+        assert_eq!(replay.positions[0].mint.to_string(), TEST_MINT_B);
         assert_eq!(replay.positions[0].amount_tokens, 500);
         assert_eq!(replay.manual.len(), 1);
-        assert_eq!(replay.manual[0].position.mint, "STUCK");
+        assert_eq!(replay.manual[0].position.mint.to_string(), TEST_MINT);
         assert_eq!(replay.manual[0].note, "");
         assert_eq!(replay.skipped, 2);
     }
@@ -1580,14 +1590,14 @@ mod tests {
     #[test]
     fn wal_replay_settled_retires_pending_beside_manual() {
         let retired = [
-            r#"{"t":"pending","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}"#,
-            r#"{"t":"manual","mint":"MINT","curve":"CURVE","assoc":"ASSOC","amount":1000,"creator":null,"note":"dispatch-unknown","ts":2}"#,
-            r#"{"t":"settled","bundle":"B1","ts":3}"#,
+            format!(r#"{{"t":"pending","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}}"#),
+            format!(r#"{{"t":"manual","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"note":"dispatch-unknown","ts":2}}"#),
+            r#"{"t":"settled","bundle":"B1","ts":3}"#.to_string(),
         ];
-        let replay = wal::replay_lines(retired.into_iter());
+        let replay = wal::replay_lines(retired.iter().map(String::as_str));
         assert!(replay.pending.is_empty(), "tombstone retires the poll");
         assert_eq!(replay.manual.len(), 1);
-        assert_eq!(replay.manual[0].position.mint, "MINT");
+        assert_eq!(replay.manual[0].position.mint.to_string(), TEST_MINT);
     }
 
     fn cost_trader(tip_lamports: u64, unit_limit: u32, unit_price: u64) -> LiveTrader {

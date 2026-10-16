@@ -88,7 +88,7 @@ async fn replay_live_wal(
     let mut n_positions = 0usize;
     let mut n_manual = 0usize;
     for p in &replay.pending {
-        watched.push((p.position.mint.clone(), p.position.curve.clone()));
+        watched.push((p.position.mint.to_string(), p.position.curve.to_string()));
     }
     wal::compact_file(&path, &replay);
     if let Some(trader) = pipeline.exec.live.as_ref() {
@@ -97,12 +97,13 @@ async fn replay_live_wal(
     {
         let mut guard = pipeline.exec.live_positions.lock().await;
         for pos in replay.positions {
-            watched.push((pos.mint.clone(), pos.curve.clone()));
-            if guard.contains_key(&pos.mint) {
-                let key = format!("{}#wal-{n_positions}", pos.mint);
+            watched.push((pos.mint.to_string(), pos.curve.to_string()));
+            let key = pos.mint.to_string();
+            if guard.contains_key(key.as_str()) {
+                let key = format!("{key}#wal-{n_positions}");
                 guard.insert(key, pos);
             } else {
-                guard.insert(pos.mint.clone(), pos);
+                guard.insert(key, pos);
             }
             n_positions += 1;
         }
@@ -111,13 +112,14 @@ async fn replay_live_wal(
         let mut guard = pipeline.exec.live_manual.lock().await;
         for item in replay.manual {
             let pos = item.position;
-            watched.push((pos.mint.clone(), pos.curve.clone()));
+            watched.push((pos.mint.to_string(), pos.curve.to_string()));
             warn!(mint = %pos.mint, note = %item.note, "WAL replay: manual bag needs human exit (lookup above on explorer)");
-            if guard.contains_key(&pos.mint) {
-                let key = format!("{}#wal-{n_manual}", pos.mint);
+            let key = pos.mint.to_string();
+            if guard.contains_key(key.as_str()) {
+                let key = format!("{key}#wal-{n_manual}");
                 guard.insert(key, pos);
             } else {
-                guard.insert(pos.mint.clone(), pos);
+                guard.insert(key, pos);
             }
             n_manual += 1;
         }

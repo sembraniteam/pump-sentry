@@ -129,11 +129,28 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             MigrationDestination::PumpSwap => crate::live::PoolVenue::PumpSwap,
             MigrationDestination::RaydiumV4 => crate::live::PoolVenue::RaydiumV4,
         };
+        // Follow boundary: parse once, fail closed. Downstream routing
+        // never re-validates these legs.
+        let parse = |label: &str, v: &str| match executor::parse_pubkey(v) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(%mint, %label, error = %e, "unparseable pool leg; not following (fail-closed)");
+                None
+            }
+        };
+        let (Some(mint_key), Some(amm_key), Some(base_key), Some(quote_key)) = (
+            parse("mint", mint),
+            parse("amm", &amm),
+            parse("base_vault", &base_vault),
+            parse("quote_vault", &quote_vault),
+        ) else {
+            return;
+        };
         let pool = Some(crate::live::PoolLeg {
-            mint: mint.to_string(),
-            amm: amm.clone(),
-            base_vault: base_vault.clone(),
-            quote_vault: quote_vault.clone(),
+            mint: mint_key,
+            amm: amm_key,
+            base_vault: base_key,
+            quote_vault: quote_key,
             venue,
         });
         self.followed

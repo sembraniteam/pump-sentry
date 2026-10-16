@@ -109,6 +109,7 @@ use alert::Alerter;
 use curve::CurveError;
 use executor::ExecutorError;
 use simulator::ExitReason;
+use solana_pubkey::Pubkey;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -222,10 +223,8 @@ impl<L> LiveExecution<L> {
 
     /// Insert (or replace) the fill.
     pub async fn insert_tracked(&self, position: LivePosition) {
-        self.live_positions
-            .lock()
-            .await
-            .insert(position.mint.clone(), position);
+        let key = position.mint.to_string();
+        self.live_positions.lock().await.insert(key, position);
     }
 
     /// Remove and return the fill, if any.
@@ -272,12 +271,12 @@ impl<L> LiveExecution<L> {
     }
 
     /// Curve of the exact-key bag, if any.
-    pub async fn manual_curve(&self, mint: &str) -> Option<String> {
+    pub async fn manual_curve(&self, mint: &str) -> Option<Pubkey> {
         self.live_manual
             .lock()
             .await
             .get(mint)
-            .map(|held| held.curve.clone())
+            .map(|held| held.curve)
     }
 
     /// True when any parked bag belongs to the base mint.
@@ -533,18 +532,49 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return;
             }
         };
+        // Parse once at the boundary: downstream custody and dispatch
+        // take validated keys and never re-parse strings.
+        let parsed = |label: &str, v: &str| match executor::parse_pubkey(v) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(%mint, %label, error = %e, "unparseable address; live buy skipped (fail-closed)");
+                None
+            }
+        };
+        let (Some(mint_key), Some(curve_key), Some(assoc_key)) =
+            (parsed("mint", mint), parsed("curve", curve), parsed("assoc_curve", assoc_curve))
+        else {
+            self.exec
+                .mark_diverged(mint, "live buy skipped: unparseable address".to_string())
+                .await;
+            self.emit(format!("LIVE buy skipped on {mint} (bad address); paper open WITHOUT live cover"));
+            return;
+        };
+        let creator_key = match creator {
+            Some(c) => match parsed("creator", c) {
+                Some(p) => Some(p),
+                None => {
+                    self.exec
+                        .mark_diverged(mint, "live buy skipped: bad creator".to_string())
+                        .await;
+                    self.emit(format!("LIVE buy skipped on {mint} (bad creator); paper open WITHOUT live cover"));
+                    return;
+                }
+            },
+            None => None,
+        };
         match trader
             .buy(&LiveBuyParams {
-                mint,
-                curve,
-                assoc_curve,
+                mint: mint_key,
+                curve: curve_key,
+                assoc_curve: assoc_key,
                 notional_usd: self.settings.notional_usd,
                 price_usd: entry_quote,
                 sol_usd,
                 liquidity_usd,
                 // Same tier as paper: sizing matches booked fills.
                 venue_fee_bps: Some(self.portfolio.lock().await.venue_fee_for(mint)),
-                creator,
+                creator: creator_key,
                 decimals,
             })
             .await
@@ -610,7 +640,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         }
         for recheck in trader.recheck_pending().await {
-            let mint = recheck.position.mint.clone();
+            // String-boundary key derived once; custody holds `Pubkey`s.
+            let mint = recheck.position.mint.to_string();
             match recheck.outcome {
                 RecheckOutcome::Confirmed => {
                     // Late confirm never clobbers a newer bag.
@@ -739,11 +770,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return false;
             }
             LivePosition {
-                mint: tracked.mint.clone(),
-                curve: tracked.curve.clone(),
-                assoc_curve: tracked.assoc_curve.clone(),
+                mint: tracked.mint,
+                curve: tracked.curve,
+                assoc_curve: tracked.assoc_curve,
                 amount_tokens: sell_amount,
-                creator: tracked.creator.clone(),
+                creator: tracked.creator,
             }
         };
         // Validated pool leg means curve is gone: route Raydium.
@@ -914,7 +945,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 parked_dups.join(", ")
             ));
         }
-        let tick = match self.reserves.fetch_tick(mint, &curve).await {
+        // Feed boundary: the reserve feed keys on strings; custody holds
+        // the validated key (converted once here, not re-parsed).
+        let curve_str = curve.to_string();
+        let tick = match self.reserves.fetch_tick(mint, &curve_str).await {
             Ok(tick) => tick,
             Err(CurveError::BadMintKey(_)) | Err(CurveError::BadCurveKey(_)) => {
                 warn!(%mint, "manual sell request unroutable; dropping request");
@@ -1003,11 +1037,24 @@ mod tests {
     use super::*;
     use crate::live::LivePosition;
 
+    /// Deterministic custody key for a test name: production keys are
+    /// base58 `Pubkey`s, so tests derive from the name instead of
+    /// pretending arbitrary strings are addresses.
+    fn key_of(name: &str) -> (Pubkey, String) {
+        let b = name.bytes().fold(0u8, |a, x| a.wrapping_add(x));
+        let key = Pubkey::new_from_array([b; 32]);
+        let s = key.to_string();
+        (key, s)
+    }
+
     fn bag(mint: &str, amount: u64) -> LivePosition {
+        let (mint_key, _) = key_of(mint);
+        let (curve_key, _) = key_of(&format!("{mint}-curve"));
+        let (assoc_key, _) = key_of(&format!("{mint}-assoc"));
         LivePosition {
-            mint: mint.to_string(),
-            curve: "CURVE".to_string(),
-            assoc_curve: "ASSOC".to_string(),
+            mint: mint_key,
+            curve: curve_key,
+            assoc_curve: assoc_key,
             amount_tokens: amount,
             creator: None,
         }
@@ -1085,32 +1132,35 @@ mod tests {
     #[tokio::test]
     async fn tracked_lifecycle_insert_subtract_remove() {
         let exec = exec();
-        assert!(!exec.is_tracked("MINT").await);
+        let m = key_of("MINT").1;
+        assert!(!exec.is_tracked(&m).await);
         exec.insert_tracked(bag("MINT", 1_000)).await;
-        assert!(exec.is_tracked("MINT").await);
-        assert_eq!(exec.tracked("MINT").await.expect("bag").amount_tokens, 1_000);
-        assert!(!exec.subtract_fill("MINT", 400).await);
-        assert_eq!(exec.tracked("MINT").await.expect("bag").amount_tokens, 600);
-        assert!(exec.subtract_fill("MINT", 600).await);
-        assert!(!exec.is_tracked("MINT").await);
-        assert!(exec.subtract_fill("MINT", 1).await);
-        assert!(exec.remove_tracked("MINT").await.is_none());
+        assert!(exec.is_tracked(&m).await);
+        assert_eq!(exec.tracked(&m).await.expect("bag").amount_tokens, 1_000);
+        assert!(!exec.subtract_fill(&m, 400).await);
+        assert_eq!(exec.tracked(&m).await.expect("bag").amount_tokens, 600);
+        assert!(exec.subtract_fill(&m, 600).await);
+        assert!(!exec.is_tracked(&m).await);
+        assert!(exec.subtract_fill(&m, 1).await);
+        assert!(exec.remove_tracked(&m).await.is_none());
     }
 
     #[tokio::test]
     async fn manual_park_resurrect_keeps_duplicates() {
         let exec = exec();
-        exec.park_manual("MINT".to_string(), bag("MINT", 100)).await;
-        exec.park_manual("MINT#2-abcdef12".to_string(), bag("MINT", 50)).await;
-        assert!(exec.manual_holds("MINT").await);
-        assert!(exec.manual_holds_base("MINT").await);
+        let m = key_of("MINT").1;
+        let dup = format!("{m}#2-abcdef12");
+        exec.park_manual(m.clone(), bag("MINT", 100)).await;
+        exec.park_manual(dup.clone(), bag("MINT", 50)).await;
+        assert!(exec.manual_holds(&m).await);
+        assert!(exec.manual_holds_base(&m).await);
         assert!(!exec.manual_holds("OTHER").await);
-        assert_eq!(exec.manual_curve("MINT").await.as_deref(), Some("CURVE"));
-        let held = exec.take_manual_exact("MINT").await.expect("bag");
+        assert_eq!(exec.manual_curve(&m).await, Some(key_of("MINT-curve").0));
+        let held = exec.take_manual_exact(&m).await.expect("bag");
         assert_eq!(held.amount_tokens, 100);
-        assert!(!exec.manual_holds("MINT").await);
-        assert!(exec.manual_holds_base("MINT").await);
-        assert_eq!(exec.manual_keys().await, vec!["MINT#2-abcdef12".to_string()]);
+        assert!(!exec.manual_holds(&m).await);
+        assert!(exec.manual_holds_base(&m).await);
+        assert_eq!(exec.manual_keys().await, vec![dup]);
     }
 
     #[tokio::test]
@@ -1161,23 +1211,27 @@ mod tests {
     #[tokio::test]
     async fn exposure_counts_parked_duplicates_once() {
         let exec = exec();
+        let (a, b) = (key_of("A").1, key_of("B").1);
         exec.insert_tracked(bag("B", 10)).await;
         exec.insert_tracked(bag("A", 10)).await;
-        exec.park_manual("A#2-abcdef12".to_string(), bag("A", 5)).await;
-        exec.park_manual("C#late-12345678".to_string(), bag("C", 5)).await;
+        exec.park_manual(format!("{a}#2-abcdef12"), bag("A", 5)).await;
+        exec.park_manual(format!("{}#late-12345678", key_of("C").1), bag("C", 5)).await;
         let exposure = exec
-            .exposure_mints(vec!["C".to_string(), "D".to_string()])
+            .exposure_mints(vec![key_of("C").1, "D".to_string()])
             .await;
-        assert_eq!(exposure, vec!["A", "B", "C", "D"]);
+        let mut want = vec![a, b, key_of("C").1, "D".to_string()];
+        want.sort();
+        assert_eq!(exposure, want);
     }
 
     #[tokio::test]
     async fn tracked_and_manual_key_listings() {
         let exec = exec();
+        let m = key_of("MINT").1;
         assert!(exec.tracked_keys().await.is_empty());
         exec.insert_tracked(bag("MINT", 1)).await;
-        assert_eq!(exec.tracked_keys().await, vec!["MINT".to_string()]);
-        assert!(exec.remove_tracked("MINT").await.is_some());
+        assert_eq!(exec.tracked_keys().await, vec![m.clone()]);
+        assert!(exec.remove_tracked(&m).await.is_some());
         assert!(exec.tracked_keys().await.is_empty());
     }
 }

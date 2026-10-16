@@ -818,14 +818,14 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
     // reds the gate, loudly either way.
     match common::sim_ix_green(&rpc, &buyer, ixs, "MAYHEM-BUY").await {
         Ok(()) => {}
-        Err(e) if e.contains("insufficient funds") => {
+        Err(common::SimVerdict::Layout(logs)) if logs.contains("insufficient funds") => {
             eprintln!("FLAKY SAMPLE (funds moved between hunt and sim); hunting a fresh sample");
             if _round >= 2 {
-                panic!("FLAKY SAMPLE on the final round; rerun for a fresh launch: {e}");
+                panic!("FLAKY SAMPLE on the final round; rerun for a fresh launch: {logs}");
             }
             continue '_rounds;
         }
-        Err(e) => panic!("mayhem extended buy simulation failed: {e}"),
+        Err(e) => panic!("mayhem extended buy simulation failed: {e:?}"),
     }
     println!("MAYHEM BUY GREEN mint={}", ev.mint);
     return;

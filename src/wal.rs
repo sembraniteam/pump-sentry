@@ -54,12 +54,19 @@ fn num(line: &str, key: &str) -> Option<u64> {
 }
 
 fn position_from(line: &str) -> Option<LivePosition> {
+    // Corrupt addresses skip the line (counted): the writer only emits
+    // canonical base58 or null, so unparseable means a damaged file —
+    // never half-adopted custody.
+    let parse = |key: &str| field(line, key).and_then(|s| executor::parse_pubkey(&s).ok());
     Some(LivePosition {
-        mint: field(line, "mint")?,
-        curve: field(line, "curve")?,
-        assoc_curve: field(line, "assoc")?,
+        mint: parse("mint")?,
+        curve: parse("curve")?,
+        assoc_curve: parse("assoc")?,
         amount_tokens: num(line, "amount")?,
-        creator: field(line, "creator"),
+        creator: match field(line, "creator") {
+            None => None,
+            Some(s) => Some(executor::parse_pubkey(&s).ok()?),
+        },
     })
 }
 
@@ -75,7 +82,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     let mut seen_sells: HashSet<String> = HashSet::new();
     let mut skipped = 0usize;
     let add = |map: &mut HashMap<String, LivePosition>, p: LivePosition| {
-        map.entry(p.mint.clone())
+        map.entry(p.mint.to_string())
             .and_modify(|e| {
                 e.amount_tokens = e.amount_tokens.saturating_add(p.amount_tokens);
             })
@@ -151,7 +158,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 // Old lines lack note; keep bag.
                 let note = field(line, "note").unwrap_or_default();
                 manual
-                    .entry(pos.mint.clone())
+                    .entry(pos.mint.to_string())
                     .and_modify(|e: &mut WalManual| {
                         e.position.amount_tokens =
                             e.position.amount_tokens.saturating_add(pos.amount_tokens);
@@ -247,9 +254,15 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
 mod tests {
     use super::*;
 
+    /// Valid-address test mint (live boundaries parse; the writer only
+    /// ever emits canonical base58, so replay tests must too).
+    const TMINT: &str = "32ZsJ2yJjwuoBiWE5xnZjG9tKmK3CubbmEzgkQLyQzgD";
+    const TCURVE: &str = "36VASLSKLFD2KokjXG7V28veZvXEsyHRKefLonPaAKzv";
+    const TASSOC: &str = "3AQTaduKvYWFTu1ExZSQK1hQp5jSZ2yEt4KzsASAufKd";
+
     fn position_line(mint: &str, amount: u64, bundle: &str) -> String {
         format!(
-            "{{\"t\":\"position\",\"mint\":\"{mint}\",\"curve\":\"C\",\"assoc\":\"A\",\"amount\":{amount},\"creator\":null,\"bundle\":\"{bundle}\",\"ts\":1}}"
+            "{{\"t\":\"position\",\"mint\":\"{mint}\",\"curve\":\"{TCURVE}\",\"assoc\":\"{TASSOC}\",\"amount\":{amount},\"creator\":null,\"bundle\":\"{bundle}\",\"ts\":1}}"
         )
     }
 
@@ -264,9 +277,9 @@ mod tests {
         // The same fill recorded twice (two writers pre-fix, or a
         // retried append): replay must not double-subtract.
         let lines = [
-            position_line("MINT", 1000, "B1"),
-            sell_line("MINT", 1000, "B1"),
-            sell_line("MINT", 1000, "B1"),
+            position_line(TMINT, 1000, "B1"),
+            sell_line(TMINT, 1000, "B1"),
+            sell_line(TMINT, 1000, "B1"),
         ];
         let replay = replay_lines(lines.iter().map(String::as_str));
         assert!(replay.positions.is_empty());
@@ -278,9 +291,9 @@ mod tests {
         // Partial exit recorded twice: the held remainder survives
         // replay with exit automation intact.
         let lines = [
-            position_line("MINT", 1000, "B1"),
-            sell_line("MINT", 600, "B2"),
-            sell_line("MINT", 600, "B2"),
+            position_line(TMINT, 1000, "B1"),
+            sell_line(TMINT, 600, "B2"),
+            sell_line(TMINT, 600, "B2"),
         ];
         let replay = replay_lines(lines.iter().map(String::as_str));
         assert_eq!(replay.positions.len(), 1);
@@ -291,9 +304,9 @@ mod tests {
     fn distinct_bundles_each_settle() {
         // Different bundle ids are different fills: both subtract.
         let lines = [
-            position_line("MINT", 1000, "B1"),
-            sell_line("MINT", 600, "B2"),
-            sell_line("MINT", 400, "B3"),
+            position_line(TMINT, 1000, "B1"),
+            sell_line(TMINT, 600, "B2"),
+            sell_line(TMINT, 400, "B3"),
         ];
         let replay = replay_lines(lines.iter().map(String::as_str));
         assert!(replay.positions.is_empty());
@@ -304,8 +317,8 @@ mod tests {
         // Legacy lines may lack the id: fall back to plain subtract
         // rather than dropping the fill.
         let lines = [
-            position_line("MINT", 1000, "B1"),
-            "{\"t\":\"sell\",\"mint\":\"MINT\",\"amount\":1000,\"ts\":2}".to_string(),
+            position_line(TMINT, 1000, "B1"),
+            format!(r#"{{"t":"sell","mint":"{TMINT}","amount":1000,"ts":2}}"#),
         ];
         let replay = replay_lines(lines.iter().map(String::as_str));
         assert!(replay.positions.is_empty());

@@ -58,16 +58,26 @@ pub async fn sim_skeleton_green(
 ) -> bool {
     match sim_ix_green(rpc, payer, ixs, label).await {
         Ok(()) => true,
-        Err(e) if e.starts_with("transport:") => {
-            eprintln!("{label}: {e}; resampling");
+        Err(SimVerdict::Transport(_)) => {
+            eprintln!("{label}: transport trouble; resampling");
             false
         }
-        Err(e) => panic!("{label} simulation failed: {e}"),
+        Err(SimVerdict::Layout(logs)) => panic!("{label} simulation failed: {logs}"),
     }
 }
 
-/// Simulate and return the verdict. `Err("transport: ...")` means the
-/// RPC/blockhash failed (resample); any other `Err` carries sim logs
+/// Simulation verdict: transport (resample) vs layout (fail the gate).
+/// A `String` used to carry both; the split forces callers to decide.
+#[derive(Debug)]
+pub enum SimVerdict {
+    /// RPC/blockhash failure (resample, never a verdict).
+    Transport(String),
+    /// Sim logs of a layout failure (panics with logs, guards funds).
+    Layout(String),
+}
+
+/// Simulate and return the verdict. `Transport` means the
+/// RPC/blockhash failed (resample); `Layout` carries sim logs
 /// (layout failure). Fresh blockhash per call: a stale hash proves
 /// nothing about layout.
 pub async fn sim_ix_green(
@@ -75,11 +85,11 @@ pub async fn sim_ix_green(
     payer: &Pubkey,
     ixs: Vec<Instruction>,
     label: &str,
-) -> Result<(), String> {
+) -> Result<(), SimVerdict> {
     let blockhash = rpc
         .get_latest_blockhash()
         .await
-        .map_err(|e| format!("transport: blockhash failed ({e})"))?;
+        .map_err(|e| SimVerdict::Transport(format!("blockhash failed ({e})")))?;
     let message = solana_message::Message::new_with_blockhash(&ixs, Some(payer), &blockhash);
     let tx = Transaction {
         signatures: vec![
@@ -97,7 +107,7 @@ pub async fn sim_ix_green(
             },
         )
         .await
-        .map_err(|e| format!("transport: simulate RPC failed ({e})"))?;
+        .map_err(|e| SimVerdict::Transport(format!("simulate RPC failed ({e})")))?;
     let logs = res
         .value
         .logs
@@ -110,9 +120,11 @@ pub async fn sim_ix_green(
         // surface it as transport so the caller resamples.
         let err_str = format!("{err:?}");
         if err_str.contains("BlockhashNotFound") && logs.is_empty() {
-            return Err("transport: stale blockhash under load".to_string());
+            return Err(SimVerdict::Transport(
+                "stale blockhash under load".to_string(),
+            ));
         }
-        return Err(format!("{err:?}\n{logs}"));
+        return Err(SimVerdict::Layout(format!("{err:?}\n{logs}")));
     }
     println!("{label} GREEN");
     Ok(())

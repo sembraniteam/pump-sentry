@@ -257,7 +257,7 @@ async fn raydium_authority_and_bundle_simulate() {
                     println!("RAYDIUM BUNDLE GREEN");
                 }
                 Err(e) => {
-                    failures.push(format!("{csig}: {e}"));
+                    failures.push(format!("{csig}: {e:?}"));
                     continue;
                 }
             }
@@ -304,7 +304,7 @@ async fn raydium_authority_and_bundle_simulate() {
                     println!("RAYDIUM SELL GREEN");
                 }
                 Err(e) => {
-                    failures.push(format!("{csig}: {e}"));
+                    failures.push(format!("{csig}: {e:?}"));
                     continue;
                 }
             }

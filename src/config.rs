@@ -60,7 +60,6 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("risk", "inference_endpoint", "INFERENCE_ENDPOINT"),
     ("risk", "inference_model", "INFERENCE_MODEL"),
     ("risk", "inference_timeout_ms", "INFERENCE_TIMEOUT_MS"),
-    ("risk", "speculative_inference", "SPECULATIVE_INFERENCE"),
     ("execution", "slippage_bps", "SLIPPAGE_BPS"),
     ("execution", "slippage_vol_window_secs", "SLIPPAGE_VOL_WINDOW_SECS"),
     ("execution", "slippage_vol_extra_cap_bps", "SLIPPAGE_VOL_EXTRA_CAP_BPS"),
@@ -135,7 +134,6 @@ inference_endpoint = "http://127.0.0.1:11434/v1/chat/completions"  #
 inference_model = "llama3.2:1b"  # 
 inference_timeout_ms = 300  # (raising past 300ms costs entry price)
 # INFERENCE_API_KEY stays in env (bearer token; secret, never written here).
-speculative_inference = false  # (overlap re-audit with model call)
 
 [execution]
 slippage_bps = 200          # (static buy guard / sell floor)
