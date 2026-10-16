@@ -59,6 +59,56 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 
 Outside config (env-only, never in the file): `IS_LIVE` (safety-critical, exact `true` per invocation, same as `--live`), `SOLANA_PRIVATE_KEY` (moves money, live only), `INFERENCE_API_KEY` (bearer, scrubbed after boot), `YELLOWSTONE_TOKEN` (geyser x-token, auth+billing), `CONFIG_FILE` / `PID_FILE` / `LOG_FILE` (path overrides), `BOT_DAEMON` / `BOT_INVOCATION` / `BOT_FIRST_RUN` (daemon markers), `HERMES_BIN` (alert binary override), `*_ACCEPTANCE` (`JITO_ACCEPTANCE`, `MAINNET_LAYOUT`, `RAYDIUM_ACCEPTANCE` test gates, ignored by default).
 
+## Recommended config
+
+Defaults are paper-safe. For live, change only these — each value below
+traces to observed behavior, not taste. Run paper 1–2 weeks first and
+read the heartbeat (diverged count, fallback rate, execution gap,
+watchlist→open ratio) before funding anything.
+
+```toml
+[network]
+mainnet_rpc_url = "https://..."      # dedicated (Helius): public RPC drops
+                                     # candidates and truncates quorum reads (observed)
+mainnet_wss_rpc_url = ""             # unused while Yellowstone is set
+yellowstone_endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
+                                     # x-token via YELLOWSTONE_TOKEN env, never here
+commitment = "confirmed"             # processed is refused live
+
+[trading]
+notional_usd = 20.0                  # $10 tickets drown in ~6% fixed bleed;
+                                     # $20 halves the fixed share
+max_open_positions = 2               # fewer concurrent mouths (~$40 exposure + costs)
+max_daily_loss_usd = 5.0             # breaker is a live boot requirement;
+                                     # ~12% of exposure; raise only from burn-in data
+
+[gate]
+gate_window_secs = 15                # default 10 loses to RugCheck indexing
+                                     # latency (observed 400 streaks); +50% time, modest
+# buyers/dev/liquidity: keep defaults (5 buyers, 3600s age, max 1 prior —
+# the rejections in live logs prove these filters earn their keep)
+
+[risk]
+strategy_mode = "adaptive"           # verbatim profile; scalp/runner reshape edge
+inference_timeout_ms = 800           # ONLY for a remote gateway (opencode-go);
+                                     # localhost Ollama keeps 300 (slower entries cost price)
+# inference_endpoint/model point at the gateway's /v1/chat/completions
+
+[execution]
+slippage_bps = 200                   # keep; widen only from execution-gap data
+jito_tip_lamports = 100000           # keep; priority/adaptive stay 0 until congestion data
+sim_strict = true                    # boot-enforced live; non-negotiable
+
+[alerts]
+# keep all defaults ON (3/50/3): silencing them is accepting blindness
+```
+
+Live env (all env-only): `SOLANA_PRIVATE_KEY` on a **dedicated** wallet,
+`YELLOWSTONE_TOKEN`, optional `INFERENCE_API_KEY`. Fund native SOL per
+`ops/RUNBOOK.md` §2 (trade + fees + tips + 0.05 reserve), verify Discord
+cards actually arrive (Hermes timeouts observed), and keep `notional_usd`
+small until the execution gap line says otherwise.
+
 ## Safety
 
 - Paper-only without `--live`/`IS_LIVE=true`. Live needs a dedicated wallet, small `notional_usd`, `max_daily_loss_usd>0`, `sim_strict=true`.
