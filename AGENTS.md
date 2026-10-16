@@ -143,6 +143,11 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   are used and required.
 - Long RPC-bound commands: run in background, don't poll; prefer bulk
   `getBlock` scans over per-signature loops (rate limits).
+- Geyser 429s trip a circuit breaker at 30 consecutive (~30 min):
+  retries drop to hourly, a Discord card fires, the heartbeat re-logs
+  while banned. Never "fix" the hourly cadence or delete the breaker —
+  hammering a ban sustains it. Recovery is automatic on a working
+  subscribe; the operator procedure lives in `ops/RUNBOOK.md` §7.
 - Commits in this repo are authored as the project owner; if `git commit`
   fails on gpg signing, retry with `-c commit.gpgsign=false`. Never push
   unless asked.

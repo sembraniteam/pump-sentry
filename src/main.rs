@@ -12,6 +12,7 @@ mod settings;
 mod wal;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use alert::Alerter;
@@ -584,6 +585,11 @@ async fn run_pipeline(live_arg: bool) {
     /// Manual-sell drain cadence in gate rounds.
     const MANUAL_SELL_DRAIN_EVERY: u64 = 15;
     let mut gate_rounds: u64 = 0;
+    // Ingestion-ban edge mirror: the listener trips the latch, this
+    // loop owns the Discord card (the listener owns no Alerter).
+    // Polled here — not in the 6h heartbeat — so a fresh ban pages
+    // within seconds instead of next heartbeat.
+    let mut ingestion_banned_seen = false;
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let stats_task = Arc::clone(&stats);
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
@@ -684,6 +690,11 @@ async fn run_pipeline(live_arg: bool) {
                 });
                 info!("heartbeat: logs={} candidates={} watchlist={} open={} manual={} diverged={} pending_buys={} equity={:.2}",
                     snap.logs_seen, snap.candidates, pending, open, manual, diverged, pending_buys, equity);
+                // A ban must never be discoverable only from a weeks-old
+                // edge card: re-log every heartbeat while it holds.
+                if stats_task.ingestion_banned.load(Ordering::Relaxed) {
+                    warn!("ingestion STILL BANNED on geyser: bot is blind, retries hourly; check token/quota or fall back to WS mode");
+                }
                 // Execution-gap calibration: paper model vs live reality
                 // over the retained window (negative avg = live trails).
                 let (gap_n, gap_avg, gap_total) = pipeline.exec.gap_stats().await;
@@ -721,6 +732,20 @@ async fn run_pipeline(live_arg: bool) {
                 }
             }
             _ = gate_timer.tick() => {
+                // Ingestion-ban edges: card on trip (stop hammering,
+                // check token/quota, or clear yellowstone_endpoint for
+                // WS mode), note on recovery. The latch lives in the
+                // listener; this loop owns the cards.
+                let banned = stats_task.ingestion_banned.load(Ordering::Relaxed);
+                if banned && !ingestion_banned_seen {
+                    ingestion_banned_seen = true;
+                    warn!("INGESTION BANNED: geyser 429 trip — retries hourly; check token/quota or fall back to WS mode");
+                    pipeline.emit("INGESTION BANNED on geyser (consecutive 429s): bot is blind, retries hourly. Check Yellowstone token/quota, or clear yellowstone_endpoint to fall back to WS ingestion.".to_string());
+                } else if !banned && ingestion_banned_seen {
+                    ingestion_banned_seen = false;
+                    warn!("ingestion ban lifted: geyser subscription accepted again");
+                    pipeline.emit("Ingestion recovered: geyser subscription accepted again.".to_string());
+                }
                 // Manual-sell drain every 15th round.
                 gate_rounds = gate_rounds.wrapping_add(1);
                 if gate_rounds.is_multiple_of(MANUAL_SELL_DRAIN_EVERY) {

@@ -89,6 +89,7 @@ The supervisor also rotates ≥50 MB logs at start time as a backstop.
 | `diverged` alerts             | Live buy skipped/failed, paper uncovered                             | Review, fund, or accept paper-only                                |
 | Exits stalled, SOL/USD stale  | Price feed down (DexScreener; Jupiter retired)                           | By design (no static fallback); exits resume on recovery          |
 | `MANUAL REVIEW REQUIRED`      | Unknown fill / retries exhausted                                     | Explorer first, then `sell <mint>`                                |
+| `INGESTION BANNED` card       | Geyser 429s for ~30 min straight (quota/exhaustion, not burst)       | **Stop the bot.** Check token/quota/dashboard; wait out the cycle or upgrade tier. To keep running blind-free: clear `yellowstone_endpoint` (WS mode) and restart. Retries hourly on its own; backfill covers only the newest ~25s after recovery |
 | Negative execution-gap avg    | Live trails paper (congestion tips, landing latency, stale exits)     | Widen slippage, lower notional, or accept the haircut explicitly  |
 | Duplicate cards after restart | Crash between dispatch and WAL                                       | WAL replay is conservative; verify on-chain, exit dups via `sell` |
 

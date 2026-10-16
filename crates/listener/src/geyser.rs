@@ -68,6 +68,60 @@ pub struct GeyserSubscriber {
 /// still failing after that is quota/exhaustion, not burst.
 pub const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Ban trip point: this many consecutive 429s (~30 min at the 60s
+/// 429 cadence) is quota/exhaustion, not burst — far past any
+/// token-bucket recovery. Below it, isolated 429s keep the fast path.
+pub const BANNED_AFTER_CONSECUTIVE_429: u32 = 30;
+
+/// Banned retry cadence. Hourly probes bound the RPC burn while keeping
+/// recovery detection; anything faster sustains the ban it measures.
+pub const BANNED_RETRY_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// Consecutive-429 circuit breaker. Trips once past the threshold;
+/// any healthy subscribe resets fully. Pure so the trip policy is
+/// unit-pinned: the run loop only wires its edges to backoff, the ban
+/// latch, and logs.
+#[derive(Debug, Default)]
+pub struct Consecutive429Ban {
+    consec: u32,
+    banned: bool,
+}
+
+impl Consecutive429Ban {
+    /// Record a 429. Returns true on the rising edge (trip now).
+    /// Already-banned stays banned without re-firing.
+    pub fn note_429(&mut self) -> bool {
+        self.consec = self.consec.saturating_add(1);
+        if !self.banned && self.consec >= BANNED_AFTER_CONSECUTIVE_429 {
+            self.banned = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a non-429 outcome: the streak breaks, but a live ban
+    /// stays slow until a subscribe actually succeeds (a lone h2 reset
+    /// proves nothing about the limiter).
+    pub fn note_other(&mut self) {
+        self.consec = 0;
+    }
+
+    /// Record a working subscribe (clean stream end counts: the server
+    /// accepted us). Returns true on the recovery edge.
+    pub fn note_healthy(&mut self) -> bool {
+        let was = self.banned;
+        self.consec = 0;
+        self.banned = false;
+        was
+    }
+
+    /// Whether reconnects must crawl.
+    pub fn banned(&self) -> bool {
+        self.banned
+    }
+}
+
 /// True when the failure is an explicit 429 (never a transport guess).
 /// Word-boundary match: "4290" (counters, slots) must not trigger
 /// minute-waits.
@@ -212,6 +266,7 @@ impl GeyserSubscriber {
     async fn run(self, tx: mpsc::Sender<ListenerEvent>) {
         let mut attempt: u32 = 0;
         let mut from_slot: Option<u64> = None;
+        let mut ban = Consecutive429Ban::default();
         loop {
             if tx.is_closed() {
                 info!("downstream closed; geyser subscriber shutting down");
@@ -220,13 +275,15 @@ impl GeyserSubscriber {
             // Gap backfill before the live session: from_slot replay is
             // unavailable below processed, so without this every
             // confirmed downtime is a permanent hole. First boot has no
-            // baseline (skip); without a shared pool there is nothing
-            // to scan with (skip — never open a private pool here).
+            // baseline (skip); banned or pool-less runs skip too — the
+            // ban exists to stop RPC burn, backfilling through it would
+            // defeat the purpose, and there is nothing to scan with
+            // without a shared pool (never open a private one here).
             // Runs before the subscribe so the range is exact; the scan
             // itself extends blindness by its own duration (same
             // tradeoff the WS path accepts).
             let baseline = self.last_slot.load(std::sync::atomic::Ordering::Relaxed);
-            if baseline > 0 {
+            if baseline > 0 && !ban.banned() {
                 if let Some(rpc) = &self.rpc {
                     self.backfill_gap(rpc, &tx, baseline).await;
                 } else {
@@ -244,12 +301,22 @@ impl GeyserSubscriber {
                     // blind. Parse-only cost; dedup + drop-on-full hold
                     // the line on long outages.
                     from_slot = last_slot;
+                    if ban.note_healthy() {
+                        self.stats.ingestion_banned.store(false, std::sync::atomic::Ordering::Relaxed);
+                        warn!("geyser ban lifted: subscription accepted again");
+                    }
                 }
                 Err(e) => {
                     rate_limited = is_rate_limited(&e);
                     if rate_limited {
-                        warn!(error = %e, attempt, "geyser rate limited (429); yielding a full minute");
+                        if ban.note_429() {
+                            self.stats.ingestion_banned.store(true, std::sync::atomic::Ordering::Relaxed);
+                            warn!(attempt, "geyser BANNED: {BANNED_AFTER_CONSECUTIVE_429} consecutive 429s — quota/exhaustion, not burst; retrying hourly, check token/quota or fall back to WS mode");
+                        } else {
+                            warn!(error = %e, attempt, "geyser rate limited (429); yielding a full minute");
+                        }
                     } else {
+                        ban.note_other();
                         warn!(error = %e, attempt, "geyser error; backing off");
                     }
                     // Error resets must replay too: `last_slot` tracks
@@ -264,7 +331,11 @@ impl GeyserSubscriber {
             let healthy = self.stats.logs_seen().saturating_sub(seen_before) > 1000
                 || session_start.elapsed() > Duration::from_secs(30);
             attempt = if healthy { 0 } else { attempt.saturating_add(1) };
-            let wait = reconnect_wait(attempt, rate_limited);
+            let wait = if ban.banned() {
+                BANNED_RETRY_INTERVAL
+            } else {
+                reconnect_wait(attempt, rate_limited)
+            };
             debug!(?wait, attempt, "geyser reconnect backoff");
             tokio::time::sleep(wait).await;
         }
@@ -825,6 +896,39 @@ mod tests {
         assert_eq!((to - from + 1), MAX_BACKFILL_SLOTS);
         assert_eq!(skipped, 50);
         assert_eq!(to, 100 + MAX_BACKFILL_SLOTS + 50);
+    }
+
+    #[test]
+    fn rate_ban_trips_once_and_recovers() {
+        let mut ban = Consecutive429Ban::default();
+        assert!(!ban.banned());
+        // Below the threshold: fast path, no edge.
+        for _ in 0..BANNED_AFTER_CONSECUTIVE_429 - 1 {
+            assert!(!ban.note_429());
+        }
+        assert!(!ban.banned());
+        // Threshold: single rising edge, then sticky without refire.
+        assert!(ban.note_429());
+        assert!(ban.banned());
+        assert!(!ban.note_429());
+        assert!(ban.banned());
+        // A lone other error breaks the streak but keeps the crawl:
+        // it proves nothing about the limiter.
+        ban.note_other();
+        assert!(ban.banned());
+        assert!(!ban.note_429());
+        // A working subscribe recovers with an edge for the log.
+        assert!(ban.note_healthy());
+        assert!(!ban.banned());
+        assert!(!ban.note_healthy());
+    }
+
+    #[test]
+    fn rate_ban_counter_saturates() {
+        let mut ban = Consecutive429Ban::default();
+        ban.consec = u32::MAX;
+        assert!(ban.note_429());
+        assert!(ban.banned());
     }
 
     #[test]

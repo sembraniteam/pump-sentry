@@ -3,7 +3,7 @@
 use crate::parser::PumpTokenLaunchEvent;
 use solana_commitment_config::CommitmentConfig;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use thiserror::Error;
 
 /// Bounded event queue capacity.
@@ -131,6 +131,12 @@ pub struct ListenerStats {
     pub dropped_full: AtomicU64,
     /// Candidates dropped with no free fetch permit.
     pub dropped_throttled: AtomicU64,
+    /// Ingestion-ban latch: the consecutive-429 circuit breaker tripped
+    /// (geyser). Set on trip, cleared on recovery; the binary watches
+    /// the rising edge (Discord card) because the listener owns no
+    /// Alerter. Heartbeat re-logs while set — a ban must never be
+    /// discoverable only from a weeks-old log line.
+    pub ingestion_banned: AtomicBool,
 }
 
 /// Point-in-time counters for logs and metrics.
