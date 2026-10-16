@@ -88,9 +88,10 @@ impl ListenerConfig {
         }
         // Split hosts warn only: providers may differ.
         if ws.host_str() != http.host_str() {
+            // Redacted: both URLs carry API keys (query or path).
             tracing::warn!(
-                ws = %self.ws_url,
-                http = %self.http_url,
+                ws = %ids::redact_endpoint(&self.ws_url),
+                http = %ids::redact_endpoint(&self.http_url),
                 "listener WS and HTTP hosts differ; ensure both serve the same cluster"
             );
         }

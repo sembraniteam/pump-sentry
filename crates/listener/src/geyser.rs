@@ -925,8 +925,10 @@ mod tests {
 
     #[test]
     fn rate_ban_counter_saturates() {
-        let mut ban = Consecutive429Ban::default();
-        ban.consec = u32::MAX;
+        let mut ban = Consecutive429Ban {
+            consec: u32::MAX,
+            ..Default::default()
+        };
         assert!(ban.note_429());
         assert!(ban.banned());
     }
