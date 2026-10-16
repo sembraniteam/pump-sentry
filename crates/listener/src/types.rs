@@ -29,6 +29,12 @@ pub struct ListenerConfig {
     pub geyser_url: String,
     /// Commitment as string: `processed`, `confirmed`, or `finalized`.
     pub commitment: String,
+    /// Concurrent `getTransaction` fetches (shared semaphore).
+    pub fetch_concurrency: usize,
+    /// Signatures per reconnect backfill (`0` = backfill off).
+    pub backfill_sig_limit: usize,
+    /// Reconnect backoff cap in ms.
+    pub reconnect_backoff_max_ms: u64,
 }
 
 impl Default for ListenerConfig {
@@ -38,6 +44,9 @@ impl Default for ListenerConfig {
             http_url: DEFAULT_HTTP_RPC_URL.to_string(),
             geyser_url: String::new(),
             commitment: "confirmed".to_string(),
+            fetch_concurrency: 32,
+            backfill_sig_limit: 100,
+            reconnect_backoff_max_ms: 5000,
         }
     }
 }
@@ -252,6 +261,7 @@ mod tests {
             http_url: DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
             geyser_url: String::new(),
+            ..ListenerConfig::default()
         };
         assert!(cfg.validate().is_err());
 
@@ -260,6 +270,7 @@ mod tests {
             http_url: "notaurl".to_string(),
             commitment: "confirmed".to_string(),
             geyser_url: String::new(),
+            ..ListenerConfig::default()
         };
         assert!(cfg2.validate().is_err());
 
@@ -268,6 +279,7 @@ mod tests {
             http_url: DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "bogus".to_string(),
             geyser_url: String::new(),
+            ..ListenerConfig::default()
         };
         assert!(cfg3.validate().is_err());
     }

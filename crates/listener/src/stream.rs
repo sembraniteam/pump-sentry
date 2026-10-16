@@ -31,12 +31,6 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-/// Max parallel `getTransaction` workers.
-const MAX_CONCURRENT_FETCHES: usize = 32;
-
-/// Backfill page per reconnect (newest-first, replayed oldest-first).
-const BACKFILL_SIG_LIMIT: usize = 100;
-
 /// Seen-signature cap. Past it, half is evicted.
 const SEEN_SIG_CAP: usize = 4_000;
 
@@ -87,10 +81,13 @@ pub enum ListenerError {
     Terminated(String),
 }
 
-/// Backoff with jitter: 100ms base, doubles, caps at 5s.
-pub fn backoff_duration(attempt: u32) -> Duration {
-    let exp_ms = 100u64.saturating_mul(1u64 << attempt.min(6)).min(5_000);
-    let total = exp_ms.saturating_add(jitter_ms(100)).min(5_000);
+/// Backoff with jitter: 100ms base, doubles, caps at `cap_ms`.
+/// The cap is config (`reconnect_backoff_max_ms`): flaky free-tier
+/// sockets need spacing wider than the 5s default.
+pub fn backoff_duration(attempt: u32, cap_ms: u64) -> Duration {
+    let cap = cap_ms.max(100);
+    let exp_ms = 100u64.saturating_mul(1u64 << attempt.min(6)).min(cap);
+    let total = exp_ms.saturating_add(jitter_ms(100)).min(cap);
     Duration::from_millis(total)
 }
 
@@ -222,6 +219,10 @@ impl PumpFunListener {
         rpc: &Arc<RpcClient>,
         semaphore: &Arc<Semaphore>,
     ) {
+        if self.config.backfill_sig_limit == 0 {
+            debug!("backfill disabled by config; gap stays");
+            return;
+        }
         let Some(commitment) = self.config.commitment_config() else {
             debug!("unknown commitment; skipping backfill");
             return;
@@ -237,7 +238,7 @@ impl PumpFunListener {
                 solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
                     before: None,
                     until: None,
-                    limit: Some(BACKFILL_SIG_LIMIT),
+                    limit: Some(self.config.backfill_sig_limit.max(1)),
                     commitment: Some(commitment),
                 },
             ),
@@ -306,7 +307,7 @@ impl PumpFunListener {
                 ))
             }
         };
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+        let semaphore = Arc::new(Semaphore::new(self.config.fetch_concurrency.max(1)));
         let mut attempt: u32 = 0;
         // First session starts live-only; later sessions backfill the gap.
         let mut first_session = true;
@@ -344,7 +345,7 @@ impl PumpFunListener {
                 info!("shutdown requested; not reconnecting");
                 return Ok(());
             }
-            let wait = backoff_duration(attempt);
+            let wait = backoff_duration(attempt, self.config.reconnect_backoff_max_ms);
             debug!(?wait, attempt, "reconnect backoff");
             tokio::time::sleep(wait).await;
         }
@@ -898,15 +899,27 @@ mod tests {
     use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
 
     #[test]
-    fn backoff_caps_at_5s() {
+    fn backoff_caps_at_config() {
         for attempt in [0u32, 1, 5, 10, 100] {
-            let d = backoff_duration(attempt);
+            let d = backoff_duration(attempt, 5_000);
             assert!(d <= Duration::from_millis(5_000), "cap exceeded: {d:?}");
             assert!(d >= Duration::from_millis(100), "below base: {d:?}");
         }
         // Attempt 0 ≈ 100ms + jitter(<100ms).
-        let d0 = backoff_duration(0);
+        let d0 = backoff_duration(0, 5_000);
         assert!(d0 <= Duration::from_millis(200));
+        // Custom cap widens spacing for flaky sockets; floor stays 100ms.
+        for attempt in [0u32, 1, 10, 100] {
+            let d = backoff_duration(attempt, 30_000);
+            assert!(d <= Duration::from_millis(30_000), "cap exceeded: {d:?}");
+            assert!(d >= Duration::from_millis(100), "below base: {d:?}");
+        }
+        let d = backoff_duration(100, 30_000);
+        assert!(
+            d > Duration::from_millis(5_000),
+            "custom cap must exceed default: {d:?}"
+        );
+        assert_eq!(backoff_duration(0, 0), Duration::from_millis(100));
     }
 
     #[test]
@@ -941,6 +954,7 @@ mod tests {
             http_url: crate::types::DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
             geyser_url: String::new(),
+            ..ListenerConfig::default()
         };
         assert!(PumpFunListener::new(cfg).is_err());
     }
@@ -952,6 +966,7 @@ mod tests {
             http_url: crate::types::DEFAULT_HTTP_RPC_URL.to_string(),
             commitment: "confirmed".to_string(),
             geyser_url: String::new(),
+            ..ListenerConfig::default()
         };
         let listener = PumpFunListener::new(cfg).expect("config");
         listener.mark_seen("sig-a");

@@ -381,6 +381,9 @@ async fn run_pipeline(live_arg: bool) {
                 http_url: settings.http_url.clone(),
                 geyser_url: settings.yellowstone_endpoint.clone(),
                 commitment: settings.commitment.clone(),
+                fetch_concurrency: settings.fetch_concurrency,
+                backfill_sig_limit: settings.backfill_sig_limit,
+                reconnect_backoff_max_ms: settings.reconnect_backoff_max_ms,
             },
             token,
             Some(Arc::clone(&shared_rpc)),
@@ -400,6 +403,9 @@ async fn run_pipeline(live_arg: bool) {
                 http_url: settings.http_url.clone(),
                 geyser_url: String::new(),
                 commitment: settings.commitment.clone(),
+                fetch_concurrency: settings.fetch_concurrency,
+                backfill_sig_limit: settings.backfill_sig_limit,
+                reconnect_backoff_max_ms: settings.reconnect_backoff_max_ms,
             },
             Some(Arc::clone(&shared_rpc)),
         )
@@ -419,7 +425,8 @@ async fn run_pipeline(live_arg: bool) {
     let mut engine_builder = RiskEngine::builder()
         .endpoint(&settings.inference_endpoint)
         .model(&settings.inference_model)
-        .timeout(Duration::from_millis(settings.inference_timeout_ms));
+        .timeout(Duration::from_millis(settings.inference_timeout_ms))
+        .headers(settings.inference_headers.clone());
     if let Some(key) = &settings.inference_api_key {
         engine_builder = engine_builder.api_key(key);
     }

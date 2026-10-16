@@ -206,10 +206,12 @@ impl GeyserSubscriber {
     }
 }
 
-/// Reconnect wait: normal backoff, floored at a full minute on
-/// explicit 429s. Pure so the 429 policy is unit-pinned, not log lore.
-fn reconnect_wait(attempt: u32, rate_limited: bool) -> Duration {
-    backoff_duration(attempt).max(if rate_limited {
+/// Reconnect wait: normal backoff (cap from
+/// `ListenerConfig::reconnect_backoff_max_ms`), floored at a full
+/// minute on explicit 429s. Pure so the 429 policy is unit-pinned,
+/// not log lore.
+fn reconnect_wait(attempt: u32, rate_limited: bool, cap_ms: u64) -> Duration {
+    backoff_duration(attempt, cap_ms).max(if rate_limited {
         RATE_LIMIT_COOLDOWN
     } else {
         Duration::ZERO
@@ -334,7 +336,7 @@ impl GeyserSubscriber {
             let wait = if ban.banned() {
                 BANNED_RETRY_INTERVAL
             } else {
-                reconnect_wait(attempt, rate_limited)
+                reconnect_wait(attempt, rate_limited, self.config.reconnect_backoff_max_ms)
             };
             debug!(?wait, attempt, "geyser reconnect backoff");
             tokio::time::sleep(wait).await;
@@ -850,15 +852,26 @@ mod tests {
     #[test]
     fn reconnect_wait_floors_429_at_a_minute() {
         // backoff carries jitter, so pin bounds, not exact values: the
-        // normal path never exceeds its 5s cap, the 429 path never
+        // normal path never exceeds its cap, the 429 path never
         // returns sooner than a minute, at any attempt.
         for attempt in [0, 1, 7, u32::MAX] {
             assert!(
-                reconnect_wait(attempt, false) <= Duration::from_secs(5),
+                reconnect_wait(attempt, false, 5_000) <= Duration::from_secs(5),
                 "attempt={attempt}"
             );
             assert!(
-                reconnect_wait(attempt, true) >= Duration::from_secs(60),
+                reconnect_wait(attempt, true, 5_000) >= Duration::from_secs(60),
+                "attempt={attempt}"
+            );
+        }
+        // Custom cap widens the normal path but never undercuts the 429 floor.
+        for attempt in [0, 1, 7, u32::MAX] {
+            assert!(
+                reconnect_wait(attempt, false, 30_000) <= Duration::from_secs(30),
+                "attempt={attempt}"
+            );
+            assert!(
+                reconnect_wait(attempt, true, 30_000) >= Duration::from_secs(60),
                 "attempt={attempt}"
             );
         }

@@ -58,6 +58,14 @@ pub struct Settings {
     pub tick_interval_ms: u64,
     /// Pool poll interval in ms.
     pub vault_tick_interval_ms: u64,
+    /// Concurrent `getTransaction` fetches (listener semaphore).
+    /// `0` refuses at boot (a zero semaphore blinds ingestion).
+    pub fetch_concurrency: usize,
+    /// Signatures per reconnect backfill (`0` = backfill off).
+    pub backfill_sig_limit: usize,
+    /// Reconnect backoff cap in ms (flaky sockets: raise to space out
+    /// reconnect storms; floor 100ms keeps shutdown responsive).
+    pub reconnect_backoff_max_ms: u64,
     /// Chat-completions endpoint.
     pub inference_endpoint: String,
     /// Model id for inference.
@@ -66,6 +74,13 @@ pub struct Settings {
     pub inference_timeout_ms: u64,
     /// Bearer token, if the provider needs one.
     pub inference_api_key: Option<String>,
+    /// Optional extra headers sent on every inference request, as
+    /// `"Name: value, ..."` (e.g. OpenCode Go `x-opencode-session`).
+    /// Empty (default) sends none. `authorization`/`user-agent` and
+    /// framing headers are refused at parse with a note (auth stays
+    /// in `INFERENCE_API_KEY` env, the user agent is owned). Values
+    /// never appear in logs.
+    pub inference_headers: Vec<(String, String)>,
     /// Slippage guard in bps.
     pub slippage_bps: u64,
     /// Volatility window for adaptive slippage, secs (`0` = off).
@@ -128,6 +143,9 @@ impl std::fmt::Debug for Settings {
             .field("quote_usd", &self.quote_usd)
             .field("tick_interval_ms", &self.tick_interval_ms)
             .field("vault_tick_interval_ms", &self.vault_tick_interval_ms)
+            .field("fetch_concurrency", &self.fetch_concurrency)
+            .field("backfill_sig_limit", &self.backfill_sig_limit)
+            .field("reconnect_backoff_max_ms", &self.reconnect_backoff_max_ms)
             .field("inference_endpoint", &self.inference_endpoint)
             .field("inference_model", &self.inference_model)
             .field("inference_timeout_ms", &self.inference_timeout_ms)
@@ -135,6 +153,7 @@ impl std::fmt::Debug for Settings {
                 "inference_api_key",
                 &self.inference_api_key.as_ref().map(|_| "<redacted>"),
             )
+            .field("inference_headers", &self.inference_header_names())
             .field("slippage_bps", &self.slippage_bps)
             .field("slippage_vol_window_secs", &self.slippage_vol_window_secs)
             .field("slippage_vol_extra_cap_bps", &self.slippage_vol_extra_cap_bps)
@@ -203,10 +222,14 @@ impl Settings {
             quote_usd: parse_quote_usd(vars, &mut notes),
             tick_interval_ms: get_int(vars, "TICK_INTERVAL_MS", 1000, &mut notes),
             vault_tick_interval_ms: get_int(vars, "VAULT_TICK_INTERVAL_MS", 5000, &mut notes),
+            fetch_concurrency: get_int(vars, "FETCH_CONCURRENCY", 32, &mut notes),
+            backfill_sig_limit: get_int(vars, "BACKFILL_SIG_LIMIT", 100, &mut notes),
+            reconnect_backoff_max_ms: get_int(vars, "RECONNECT_BACKOFF_MAX_MS", 5000, &mut notes),
             inference_endpoint: get_string(vars, "INFERENCE_ENDPOINT", DEFAULT_INFERENCE_ENDPOINT),
             inference_model: get_string(vars, "INFERENCE_MODEL", "llama3.2:1b"),
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300, &mut notes),
             inference_api_key: vars.get("INFERENCE_API_KEY").cloned(),
+            inference_headers: parse_inference_headers(vars, &mut notes),
             slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200, &mut notes),
             slippage_vol_window_secs: get_int(vars, "SLIPPAGE_VOL_WINDOW_SECS", 0, &mut notes),
             slippage_vol_extra_cap_bps: get_int(vars, "SLIPPAGE_VOL_EXTRA_CAP_BPS", 0, &mut notes),
@@ -361,10 +384,20 @@ impl Settings {
         crate::money::Percent::new(self.runner_moonbag_percent)
     }
 
+    /// Extra header names only (values may carry routing secrets and
+    /// must never reach logs; Debug prints this, not the pairs).
+    pub fn inference_header_names(&self) -> Vec<&str> {
+        self.inference_headers
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect()
+    }
+
     /// Fatal misconfig: values that guarantee no-opens or unguarded
     /// spend. Called at boot in every mode (paper must not run blind
     /// either); `warnings` keeps the soft advisories.
-    pub fn validate(&self) -> Result<(), String> {        if !self.notional_usd.is_finite() || self.notional_usd <= 0.0 {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.notional_usd.is_finite() || self.notional_usd <= 0.0 {
             return Err(format!(
                 "NOTIONAL_USD={} is not positive; no position can open",
                 self.notional_usd
@@ -380,6 +413,11 @@ impl Settings {
                 "SLIPPAGE_BPS={} (>=100%): buys would authorize 2x spend while every sell fails closed",
                 self.slippage_bps
             ));
+        }
+        if self.fetch_concurrency == 0 {
+            return Err(
+                "FETCH_CONCURRENCY=0 blinds ingestion (zero fetch permits drop every candidate)".to_string(),
+            );
         }
         Ok(())
     }
@@ -511,6 +549,98 @@ fn parse_yellowstone_url(vars: &HashMap<String, String>, notes: &mut Vec<String>
     }
 }
 
+/// RFC 7230 token: the name side of a header.
+fn is_header_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| matches!(
+            b,
+            b'0'..=b'9'
+                | b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'!'
+                | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        ))
+}
+
+/// Header value: non-empty, no controls or DEL (obs-text allowed).
+/// The engine re-validates strictly at build; this stays permissive
+/// so parse never rejects what the transport would accept.
+fn is_header_value(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b >= 32 && b != 127)
+}
+
+/// Optional extra inference headers (`INFERENCE_HEADERS`) as
+/// `"Name: value, ..."` (first-colon split, so values may contain
+/// `:`; values must not contain `,`). Empty/unset sends none —
+/// providers that need no headers are unaffected. Unparseable and
+/// transport-owned entries are skipped with a note naming the header
+/// only (never the value). Duplicates resolve last-wins.
+fn parse_inference_headers(
+    vars: &HashMap<String, String>,
+    notes: &mut Vec<String>,
+) -> Vec<(String, String)> {
+    let raw = match vars.get("INFERENCE_HEADERS") {
+        None => return Vec::new(),
+        Some(raw) if raw.trim().is_empty() => return Vec::new(),
+        Some(raw) => raw.clone(),
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (idx, item) in raw.split(',').enumerate() {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (name, value) = match item.split_once(':') {
+            Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
+            None => {
+                notes.push(format!(
+                    "INFERENCE_HEADERS entry #{} ignored (want 'Name: value')",
+                    idx + 1
+                ));
+                continue;
+            }
+        };
+        if name.is_empty() || !is_header_name(&name) {
+            notes.push(format!(
+                "INFERENCE_HEADERS header '{name}' has an invalid name; ignoring"
+            ));
+            continue;
+        }
+        // Single source lives in `risk_engine` (same list the
+        // builder enforces); auth stays in `INFERENCE_API_KEY` env.
+        if risk_engine::is_owned_inference_header(&name) {
+            notes.push(format!(
+                "INFERENCE_HEADERS header '{name}' refused (transport-owned; auth stays in INFERENCE_API_KEY env, the user agent is owned)"
+            ));
+            continue;
+        }
+        if !is_header_value(&value) {
+            notes.push(format!(
+                "INFERENCE_HEADERS header '{name}' has an invalid value; ignoring"
+            ));
+            continue;
+        }
+        if let Some(pos) = out.iter().position(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            out.remove(pos);
+        }
+        out.push((name, value));
+    }
+    out
+}
+
 /// Manual entry quote: only positive finite is honored.
 fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Option<f64> {
     let raw = vars.get("QUOTE_USD")?;
@@ -596,6 +726,10 @@ mod tests {
         assert_eq!(s.strategy_mode, "adaptive");
         assert_eq!(s.runner_moonbag_percent, 20.0);
         assert_eq!(s.runner_trail_percent, 20.0);
+        assert_eq!(s.fetch_concurrency, 32);
+        assert_eq!(s.backfill_sig_limit, 100);
+        assert_eq!(s.reconnect_backoff_max_ms, 5000);
+        assert!(s.inference_headers.is_empty());
         assert!(!s.sim_strict);
         assert!(s.parse_notes.is_empty());
     }
@@ -632,6 +766,7 @@ mod tests {
             ("COMMITMENT", "finalized"),
             ("SLIPPAGE_BPS", "500"),
             ("JITO_TIP_LAMPORTS", "200000"),
+            ("FETCH_CONCURRENCY", "8"),
             ("INFERENCE_API_KEY", "secret"),
             ("SIM_STRICT", "true"),
         ]));
@@ -641,6 +776,9 @@ mod tests {
         assert_eq!(s.commitment, "finalized");
         assert_eq!(s.slippage_bps, 500);
         assert_eq!(s.tip_lamports, 200_000);
+        assert_eq!(s.fetch_concurrency, 8);
+        assert_eq!(s.backfill_sig_limit, 100);
+        assert_eq!(s.reconnect_backoff_max_ms, 5000);
         assert_eq!(s.inference_api_key.as_deref(), Some("secret"));
         assert!(s.sim_strict);
     }
@@ -822,6 +960,9 @@ mod tests {
         }
         let s = Settings::from_map(&vars(&[("SLIPPAGE_BPS", "10000")]));
         assert!(s.validate().is_err());
+        // Zero fetch permits drop every candidate: refuse, don't run blind.
+        let s = Settings::from_map(&vars(&[("FETCH_CONCURRENCY", "0")]));
+        assert!(s.validate().is_err());
         // Warnings still fire alongside (soft copy for logs).
         let s = Settings::from_map(&vars(&[("SLIPPAGE_BPS", "20000")]));
         assert!(s.validate().is_err());
@@ -879,6 +1020,82 @@ mod tests {
         assert_eq!(s.http_url, "https://mainnet.helius-rpc.com/?api-key=K1");
         assert_eq!(s.ws_url, "wss://mainnet.helius-rpc.com/?api-key=K2");
         assert_eq!(s.jito_endpoint, "https://jito.example/?key=K3");
+    }
+
+    #[test]
+    fn inference_headers_parse_routing_pair() {
+        // OpenCode Go shape: session routing header rides verbatim.
+        let s = Settings::from_map(&vars(&[(
+            "INFERENCE_HEADERS",
+            "x-opencode-session: sess-123, X-Custom-Flag: fast",
+        )]));
+        assert_eq!(
+            s.inference_headers,
+            vec![
+                ("x-opencode-session".to_string(), "sess-123".to_string()),
+                ("X-Custom-Flag".to_string(), "fast".to_string()),
+            ]
+        );
+        assert!(s.parse_notes.is_empty());
+        // Values may contain colons (first-colon split).
+        let s = Settings::from_map(&vars(&[("INFERENCE_HEADERS", "x-k: a:b")]));
+        assert_eq!(
+            s.inference_headers,
+            vec![("x-k".to_string(), "a:b".to_string())]
+        );
+    }
+
+    #[test]
+    fn inference_headers_refuse_auth_transport_and_malformed() {
+        let s = Settings::from_map(&vars(&[(
+            "INFERENCE_HEADERS",
+            "authorization: s3cr3t, User-Agent: spoof, content-type: x, no-colon-here, : novalue, bad name!: v, x-bad-value: a\nb, x-ok: good",
+        )]));
+        assert_eq!(
+            s.inference_headers,
+            vec![("x-ok".to_string(), "good".to_string())]
+        );
+        let w = s.warnings().join("\n");
+        assert!(w.contains("authorization"), "{w}");
+        assert!(w.contains("User-Agent"), "{w}");
+        // Entry numbers surface instead of echoing unparseable text.
+        assert!(w.contains("entry #4"), "{w}");
+        assert!(!w.contains("no-colon-here"), "{w}");
+        assert!(w.contains("x-bad-value"), "{w}");
+        // Values never reach logs, even in refusal notes.
+        assert!(!w.contains("s3cr3t"), "{w}");
+        assert!(!w.contains("good"), "{w}");
+    }
+
+    #[test]
+    fn inference_headers_dedupe_last_wins() {
+        let s = Settings::from_map(&vars(&[("INFERENCE_HEADERS", "x-sess: first, X-Sess: second")]));
+        assert_eq!(s.inference_headers.len(), 1);
+        assert_eq!(s.inference_headers[0].1, "second");
+    }
+
+    #[test]
+    fn inference_headers_from_file_table() {
+        // End-to-end: KEYMAP carries the key from [risk] into the map.
+        let file: toml::Table = "[risk]\ninference_headers = \"x-opencode-session: sess-9\"\n"
+            .parse()
+            .expect("test toml");
+        let s = Settings::from_file(Some(&file));
+        assert_eq!(
+            s.inference_headers,
+            vec![("x-opencode-session".to_string(), "sess-9".to_string())]
+        );
+    }
+
+    #[test]
+    fn debug_redacts_header_values() {
+        let s = Settings::from_map(&vars(&[(
+            "INFERENCE_HEADERS",
+            "x-opencode-session: sess-secret",
+        )]));
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("x-opencode-session"), "{dbg}");
+        assert!(!dbg.contains("sess-secret"), "{dbg}");
     }
 
     #[test]

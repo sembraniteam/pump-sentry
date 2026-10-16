@@ -6,7 +6,10 @@ pub mod fallback;
 pub mod schema;
 pub mod strategy;
 
-pub use engine::{DecisionSource, RiskDecision, RiskEngine, RiskEngineBuilder, RiskEngineError};
+pub use engine::{
+    DecisionSource, RiskDecision, RiskEngine, RiskEngineBuilder, RiskEngineError,
+    is_owned_inference_header,
+};
 pub use fallback::evaluate_heuristic_fallback;
 pub use fallback::evaluate_metrics_fallback;
 pub use schema::{Action, RiskProfile, TokenMetrics, build_prompt};

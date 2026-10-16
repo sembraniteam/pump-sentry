@@ -38,6 +38,9 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("network", "commitment", "COMMITMENT"),
     ("network", "tick_interval_ms", "TICK_INTERVAL_MS"),
     ("network", "vault_tick_interval_ms", "VAULT_TICK_INTERVAL_MS"),
+    ("network", "fetch_concurrency", "FETCH_CONCURRENCY"),
+    ("network", "backfill_sig_limit", "BACKFILL_SIG_LIMIT"),
+    ("network", "reconnect_backoff_max_ms", "RECONNECT_BACKOFF_MAX_MS"),
     ("trading", "start_balance", "START_BALANCE"),
     ("trading", "fee_bps", "FEE_BPS"),
     ("trading", "notional_usd", "NOTIONAL_USD"),
@@ -60,6 +63,7 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("risk", "inference_endpoint", "INFERENCE_ENDPOINT"),
     ("risk", "inference_model", "INFERENCE_MODEL"),
     ("risk", "inference_timeout_ms", "INFERENCE_TIMEOUT_MS"),
+    ("risk", "inference_headers", "INFERENCE_HEADERS"),
     ("execution", "slippage_bps", "SLIPPAGE_BPS"),
     ("execution", "slippage_vol_window_secs", "SLIPPAGE_VOL_WINDOW_SECS"),
     ("execution", "slippage_vol_extra_cap_bps", "SLIPPAGE_VOL_EXTRA_CAP_BPS"),
@@ -103,6 +107,9 @@ yellowstone_endpoint = ""   # Yellowstone gRPC (https URL); non-empty REPLACES w
 commitment = "confirmed"    # (confirmed|finalized; processed is refused live)
 tick_interval_ms = 1000     # (curve polls)
 vault_tick_interval_ms = 5000  # (migration pool polls)
+fetch_concurrency = 32      # (concurrent getTransaction fetches; lower on metered RPC)
+backfill_sig_limit = 100    # (sigs per reconnect backfill; 0 = disable backfill)
+reconnect_backoff_max_ms = 5000  # (reconnect backoff cap; raise on flaky free-tier sockets)
 
 [trading]
 start_balance = 100.0       # (virtual paper cash, USD)
@@ -133,6 +140,7 @@ runner_moonbag_percent = 20.0  # (runner share kept, 0-100)
 inference_endpoint = "http://127.0.0.1:11434/v1/chat/completions"  # 
 inference_model = "llama3.2:1b"  # 
 inference_timeout_ms = 300  # (raising past 300ms costs entry price)
+inference_headers = ""  # (optional extra headers, comma-separated when more than one: "Name: value, Other: value", e.g. "x-opencode-session: sess-123, X-Custom-Flag: fast"; empty = none; auth never here — INFERENCE_API_KEY stays in env)
 # INFERENCE_API_KEY stays in env (bearer token; secret, never written here).
 
 [execution]
