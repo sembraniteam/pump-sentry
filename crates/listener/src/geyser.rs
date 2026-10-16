@@ -144,7 +144,29 @@ impl GeyserSubscriber {
             .map_err(|e| GeyserError::Connect(format!("bad x-token: {e}")))?
             .connect()
             .await
-            .map_err(|e| GeyserError::Connect(e.to_string()))?;
+            .map_err(|e| {
+                // Flatten the tonic source chain: bare `transport error`
+                // hides TLS/DNS/refused/auth-reset underneath, and the
+                // operator cannot tell those apart from the log line.
+                // Token presence (never the value) separates "no auth
+                // offered" from "auth rejected or unreachable".
+                let mut chain = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    chain.push_str("; caused by: ");
+                    chain.push_str(&s.to_string());
+                    src = s.source();
+                }
+                let token = if self.token.as_deref().is_some_and(|t| !t.is_empty()) {
+                    "set"
+                } else {
+                    "unset"
+                };
+                GeyserError::Connect(format!(
+                    "{chain} (endpoint={}, x-token={token})",
+                    ids::redact_endpoint(&self.config.geyser_url),
+                ))
+            })?;
         let request = subscribe_request(commitment, from_slot);
         let (mut sink, mut stream) = client
             .subscribe_with_request(Some(request))
