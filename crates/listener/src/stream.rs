@@ -336,7 +336,7 @@ impl PumpFunListener {
                     warn!("log subscription ended; reconnecting");
                 }
                 Err(e) => {
-                    warn!(error = %e, attempt, "subscription error; backing off");
+                    warn!(error = %ids::redact_urls_in_text(&e.to_string()), attempt, "subscription error; backing off");
                 }
             }
             attempt = if healthy { 0 } else { attempt.saturating_add(1) };
@@ -492,7 +492,7 @@ impl PumpFunListener {
         let (tx, rx) = mpsc::channel::<ListenerEvent>(EVENT_CHANNEL_CAPACITY.max(1));
         let handle: JoinHandle<()> = tokio::spawn(async move {
             if let Err(e) = listener.run(tx).await {
-                warn!(error = %e, "listener exited with error");
+                warn!(error = %ids::redact_urls_in_text(&e.to_string()), "listener exited with error");
             }
         });
         Ok((rx, stats_out, handle))

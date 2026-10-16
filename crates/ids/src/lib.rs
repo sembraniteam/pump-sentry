@@ -83,9 +83,59 @@ pub fn strip_error_url(msg: &str) -> String {
     out
 }
 
+/// Redact every endpoint URL inside free text down to `scheme://host`.
+/// `strip_error_url` covers the reqwest ` for url (...)` span; this covers
+/// everything else that smuggles a URL into logs: config-validation
+/// errors (`invalid rpc url: https://...key...`), pubsub failures, and
+/// any future error that embeds the endpoint bare. Both query-style
+/// (`?api-key=`) and path-style (`/123xxx`) keys collapse, as does
+/// `user:pass@` userinfo. Only http/https/ws/wss spans are touched;
+/// everything else passes through byte-identical.
+pub fn redact_urls_in_text(msg: &str) -> String {
+    const SCHEMES: [&str; 4] = ["http://", "https://", "ws://", "wss://"];
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    loop {
+        let found = SCHEMES
+            .iter()
+            .filter_map(|s| rest.find(s).map(|i| (i, *s)))
+            .min_by_key(|(i, _)| *i);
+        let Some((i, scheme)) = found else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..i + scheme.len()]);
+        let after = &rest[i + scheme.len()..];
+        // Host ends at path/query/fragment; userinfo (if any) is dropped.
+        let host_part = after
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("");
+        let host = host_part.rsplit('@').next().unwrap_or("");
+        if host.is_empty() {
+            // Not really a URL (e.g. sentence ending in "https://"):
+            // keep the scheme text and continue after it.
+            rest = after;
+            continue;
+        }
+        out.push_str(host);
+        // Drop the rest of the span (path/query/fragment are where keys
+        // live) up to whitespace: over-redact, never leak. A bare host
+        // with no secret-shaped tail still round-trips identical when
+        // nothing follows it but whitespace.
+        let bytes = after.as_bytes();
+        let mut j = host_part.len();
+        while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        rest = &after[j..];
+    }
+    out
+}
+
 #[cfg(test)]
 mod test {
-    use super::{redact_endpoint, strip_error_url};
+    use super::{redact_endpoint, redact_urls_in_text, strip_error_url};
 
     #[test]
     fn endpoint_keeps_host_only() {
@@ -132,5 +182,30 @@ mod test {
     fn unbalanced_parens_are_left_alone() {
         let msg = "weird for url (https://x never closed";
         assert_eq!(strip_error_url(msg), msg);
+    }
+
+    #[test]
+    fn redact_urls_in_text_collapses_bare_endpoints() {
+        // The exact leak class: a path-style key with no reqwest marker.
+        assert_eq!(
+            redact_urls_in_text("invalid rpc url: https://solana-rpc.publicnode.com/123xxx"),
+            "invalid rpc url: https://solana-rpc.publicnode.com"
+        );
+        assert_eq!(
+            redact_urls_in_text("bad wss://solana-mainnet.core.chainstack.com/eeb0e908secret here"),
+            "bad wss://solana-mainnet.core.chainstack.com here"
+        );
+        assert_eq!(
+            redact_urls_in_text("key https://mainnet.helius-rpc.com/?api-key=K1 end"),
+            "key https://mainnet.helius-rpc.com end"
+        );
+        assert_eq!(
+            redact_urls_in_text("auth https://user:pass@host.example/x gone"),
+            "auth https://host.example gone"
+        );
+        // Non-URLs and secret-free text pass through identical.
+        for msg in ["timeout", "", "rpc error: connection closed", "see https:// please"] {
+            assert_eq!(redact_urls_in_text(msg), msg, "{msg}");
+        }
     }
 }

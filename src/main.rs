@@ -341,7 +341,7 @@ async fn run_pipeline(live_arg: bool) {
     match url::Url::parse(&settings.http_url) {
         Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
         _ => {
-            eprintln!("bad MAINNET_RPC_URL: {}", settings.http_url);
+            eprintln!("bad MAINNET_RPC_URL: {}", ids::redact_endpoint(&settings.http_url));
             std::process::exit(1);
         }
     }
@@ -381,7 +381,7 @@ async fn run_pipeline(live_arg: bool) {
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("failed to subscribe (geyser): {e}");
+                eprintln!("failed to subscribe (geyser): {}", ids::redact_urls_in_text(&e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -399,7 +399,7 @@ async fn run_pipeline(live_arg: bool) {
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("failed to subscribe: {e}");
+                eprintln!("failed to subscribe: {}", ids::redact_urls_in_text(&e.to_string()));
                 std::process::exit(1);
             }
         }

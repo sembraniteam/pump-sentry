@@ -413,7 +413,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 None
             }
             Err(e) => {
-                warn!(%mint, %role, error = %e, "insider screen error; skipping (fail-closed)");
+                warn!(%mint, %role, error = %ids::redact_urls_in_text(&e.to_string()), "insider screen error; skipping (fail-closed)");
                 None
             }
         }
@@ -580,7 +580,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, allow_live: true, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
                     }
                     Err(e) => {
-                        warn!(%mint, error = %e, "bundle screen error; dropping (fail-closed)");
+                        warn!(%mint, error = %ids::redact_urls_in_text(&e.to_string()), "bundle screen error; dropping (fail-closed)");
                     }
                 }
             }))
@@ -936,7 +936,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.emit(card);
                 // No feed means no live leg: exits would be manual.
                 if let Err(e) = self.reserves.watch(mint, curve).await {
-                    warn!(%mint, error = %e, "ticker watch failed; paper-only, live mirror skipped");
+                    warn!(%mint, error = %ids::redact_urls_in_text(&e.to_string()), "ticker watch failed; paper-only, live mirror skipped");
                     if allow_live {
                         self.exec
                             .mark_diverged(mint, "live buy skipped: ticker watch failed".to_string())
