@@ -9,7 +9,12 @@ Guarded wallet, exact instruction builders, Jito bundles. Not wired into paper p
 
 ```sh
 cargo test -p executor
-JITO_ACCEPTANCE=1 cargo test -p executor --test jito_acceptance -- --ignored --nocapture  # $0 probe
+JITO_ACCEPTANCE=1 cargo test -p executor --test jito_acceptance -- --ignored --nocapture  # $0 bundle proof
+MAINNET_LAYOUT=1 cargo test -p executor --test mainnet_layout_acceptance -- --ignored --nocapture  # $0 v3 sim proof
+RAYDIUM_ACCEPTANCE=1 cargo test -p executor --test raydium_authority_acceptance -- --ignored --nocapture  # $0 exit proof
 ```
+
+All three probes are simulation-only ($0 by construction: unfunded
+payers, nothing sent); rerun on throttled/stale samples.
 
 Fund before live: native SOL for trade+fees+tips; WSOL float only for token-paired quotes.

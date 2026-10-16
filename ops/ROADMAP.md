@@ -1,4 +1,12 @@
-# Roadmap — next release (post-0.3.0)
+# Roadmap — next release (post-0.3.1)
+
+## Shared RPC pool — DONE
+
+One `Arc<RpcClient>` built in `main` and injected via `with_rpc`
+constructors (`CurveTicker`, `VaultTicker`, `RpcScreener`,
+`SwapExecutor`, `PumpFunListener::subscribe_with_rpc`). Retry/backoff
+is now coordinated instead of five uncoordinated pools hammering the
+rate limit from different corners.
 
 ## Yellowstone gRPC ingestion — IMPLEMENTED, awaiting live proof
 
@@ -18,8 +26,8 @@ never blind dispatch resends).
 
 Why feasible here: single URL source (`config.rs` KEYMAP), an
 existing WS reconnect loop with backoff + gap backfill
-(`listener/src/stream.rs`), and 5 `RpcClient` construction sites
-that are all read/sim except dispatch.
+(`listener/src/stream.rs`), and one shared `RpcClient` for all
+read/sim paths (dispatch excluded by construction).
 
 Constraints (from audit):
 

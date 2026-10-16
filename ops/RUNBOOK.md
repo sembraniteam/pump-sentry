@@ -14,6 +14,12 @@ Tunables live in `~/.pump-sentry/config.toml` by category (auto-created; the fil
 - [ ] `quote_usd` unset — static fallback is paper-only and refused live.
 - [ ] `mainnet_v3_17_simulates` GREEN on this exact binary
   (`MAINNET_LAYOUT=1 cargo test -p executor --test mainnet_layout_acceptance -- --ignored`).
+- [ ] `mainnet_bundle_acceptance` GREEN (Jito base64 wire proof, $0 probe:
+  `JITO_ACCEPTANCE=1 cargo test -p executor --test jito_acceptance -- --ignored`).
+- [ ] `raydium_authority_and_bundle_simulate` GREEN (post-migration exit proof:
+  `RAYDIUM_ACCEPTANCE=1 cargo test -p executor --test raydium_authority_acceptance -- --ignored`).
+  All three are simulation-only ($0 by construction); rerun on router-dominated
+  samples — resampling is the procedure, not a failure.
 - [ ] RPC and Jito serve the same cluster (boot checks URL substrings;
   devnet RPC + mainnet Jito can never land).
 
@@ -80,26 +86,26 @@ The supervisor also rotates ≥50 MB logs at start time as a backstop.
 | `diverged` alerts             | Live buy skipped/failed, paper uncovered                             | Review, fund, or accept paper-only                                |
 | Exits stalled, SOL/USD stale  | Jupiter feed down                                                    | By design (no static fallback); exits resume on recovery          |
 | `MANUAL REVIEW REQUIRED`      | Unknown fill / retries exhausted                                     | Explorer first, then `sell <mint>`                                |
+| Negative execution-gap avg    | Live trails paper (congestion tips, landing latency, stale exits)     | Widen slippage, lower notional, or accept the haircut explicitly  |
 | Duplicate cards after restart | Crash between dispatch and WAL                                       | WAL replay is conservative; verify on-chain, exit dups via `sell` |
 
 ## 8. Burn-in observables (first live week)
 
-Thresholds below are `0` = off by default; all fire log-only, never
-Discord cards. Set them for the burn-in week, then tune from what you
-observe.
+Thresholds below are **on by default** (log-only, never Discord
+cards). Tune from what you observe; the heartbeat also prints the
+execution-gap line (`n/avg/total` USD, paper model vs live settle +
+tips) — a persistently negative avg is the live haircut made visible.
 
 | `[alerts]` key (default)                              | Fires when                                        | Meaning / action                                                                          |
 |-------------------------------------------------------|---------------------------------------------------|-------------------------------------------------------------------------------------------|
-| `alert_diverged_warn_n` (`0`)                         | Heartbeat diverged count ≥ N                      | Paper without live cover piles up: fund, fix dispatch, or accept paper-only               |
-| `alert_risk_fallback_warn_pct` (`0`)                  | LLM fallback share since boot ≥ pct               | Model down/degraded: entries run heuristic; check endpoint                                |
-| `alert_giveup_burst_n` (`0`) + `alert_giveup_window_secs` (`3600`) | N GiveUps in the trailing window    | Systemic dispatch trouble (RPC/Jito/congestion): stop funding more before cause found     |
+| `alert_diverged_warn_n` (`3`)                         | Heartbeat diverged count ≥ N                      | Paper without live cover piles up: fund, fix dispatch, or accept paper-only               |
+| `alert_risk_fallback_warn_pct` (`50`)                  | LLM fallback share since boot ≥ pct               | Model down/degraded: entries run heuristic; check endpoint                                |
+| `alert_giveup_burst_n` (`3`) + `alert_giveup_window_secs` (`3600`) | N GiveUps in the trailing window    | Systemic dispatch trouble (RPC/Jito/congestion): stop funding more before cause found     |
 | (always on) tip-floor fetch warn                      | Jito oracle unreachable (≤1 warn/60s TTL)         | Base tip rules unmodified: underland risk under congestion; check `tip_floor` vs landing  |
 
 The heartbeat card already carries `Diverged` and `Pending buys`
 counts every 6h, and listener `Dropped` proxies RPC 429 pressure.
-Starting points (tune after a week, not before):
-`alert_diverged_warn_n=3`, `alert_risk_fallback_warn_pct=50`,
-`alert_giveup_burst_n=3`. A week nominal with no burst exits burn-in.
+A week nominal with no burst exits burn-in.
 
 ## 9. Secrets handling (read once, follow always)
 

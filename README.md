@@ -21,7 +21,7 @@ pump-sentry status|logs|stop # inspect / tail (+--follow) / stop with drain+snap
 pump-sentry restart --live   # live mode (needs SOLANA_PRIVATE_KEY)
 pump-sentry sell <mint>      # manual full exit, no restart
 pump-sentry run              # foreground (debugging)
-pump-sentry upgrade          # install latest release (says so when behind nothing)
+pump-sentry upgrade          # install latest release
 ```
 
 State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.
@@ -42,7 +42,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 | `gate`      | `gate_window_secs`, `gate_min_buyers`, `gate_poll_ms`, `dev_min_age_secs`, `dev_max_prior_launches`, `dev_screen_sample_txs`, `dev_sig_limit`                                     | `10` / `5` / `2000` / `3600` / `1` / `20` / `100`           |
 | `risk`      | `strategy_mode`, `runner_moonbag_percent`, `inference_endpoint`, `inference_model`, `inference_timeout_ms`, `speculative_inference`                                               | `adaptive` / `20` / local / `llama3.2:1b` / `300` / `false` |
 | `execution` | `slippage_bps`, `slippage_vol_window_secs`, `slippage_vol_extra_cap_bps`, `priority_fee_micro_lamports`, `compute_unit_limit`, `jito_tip_lamports`, `jito_endpoint`, `sim_strict` | `200` / `0` / `0` / `0` / `0` / `100000` / global / `false` |
-| `alerts`    | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs`                                  | `true` / host default / `0` / `0` / `0` / `3600`            |
+| `alerts`    | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs`                                  | `true` / host default / `3` / `50` / `3` / `3600`            |
 
 \* test-only. \*`yellowstone_endpoint`: non-empty selects Yellowstone gRPC ingestion instead of WS (x-token via `YELLOWSTONE_TOKEN` env, never the file).
 `strategy_mode`: `adaptive` runs the profile verbatim; `scalp` clamps TP to +25…+35%; `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
@@ -55,12 +55,14 @@ Outside config (env-only, never in the file): `IS_LIVE` (safety-critical, exact 
 - Fail-closed everywhere: audit rejects, fresh/serial insiders, non-6-decimal mints, no-quorum timeouts, dev dumps, bundled supply monopolies, unconfirmed fills (re-polled, never assumed).
 - Post-migration exits route through the validated pool leg (Token-2022 vaults refuse fail-closed).
 - Exits never block: TP/SL/trailing/timeout + manual `sell`; the day-loss breaker halts entries only.
+- Paper is cost-honest, not live-identical: the ledger nets venue fees plus dispatch bleed (priority fee included, calm-weather floor), and the heartbeat reports the running paper-vs-live execution gap. Size live expectations from that gap, never from the paper equity curve alone.
 
 ## Layout
 
 ```
 src/               # cli (supervisor) / settings / pipeline (orchestrator) / live (sizing+dispatch)
                    # gate (watchlist+opens) / live_mirror (live dispatch) / follow (migration watch) / wal (custody log)
+                   # money (validated Bps/Percent units)
 crates/listener/   # WS ingestion + parser + screening + quorum gate
 crates/executor/   # live swaps via Jito (only with --live)
 crates/curve|auditor|risk-engine|simulator|ids|alert|migration/

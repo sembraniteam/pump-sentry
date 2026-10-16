@@ -7,8 +7,10 @@ This directory holds **no test targets**: `tests/` contains only
 Fixture inventory (each pinned by at least one replay test asserting
 wallet attribution + exact base-unit amounts):
 
-- `create_v2_mainnet.json` — `create_v2` launch + one `buy_v2`
-  (also reused by the executor `buy_v3`? no — buys only).
+- `create_v2_mainnet.json` — `create_v2` launch (v1 envelope) + one `buy_v2`.
+- `create_v2_v0_recent_mainnet.json` — fresh `create_v2` in a **v0** envelope:
+  launches ship both envelopes, so the fetch config must keep allowing both.
+- `create_v2_v1_recent_mainnet.json` — fresh `create_v2` in a **v1** envelope.
 - `buy_v2_second_mainnet.json` — second independent `buy_v2`.
 - `sell_v2_mainnet.json`, `sell_v2_second_mainnet.json` — two `sell_v2` samples.
 - `buy_v3_mainnet.json`, `sell_v3_mainnet.json`,
