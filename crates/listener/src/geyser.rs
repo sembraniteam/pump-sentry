@@ -512,6 +512,39 @@ impl GeyserSubscriber {
                         emitted += 1;
                     }
                 }
+                // Inner instructions ride the same classifier (parity
+                // with the live path, which scans both levels). JSON
+                // encodes inners as an enum: only Compiled legs carry
+                // index/account/data slots.
+                if let Some(meta) = tx_meta.meta.as_ref()
+                    && let OptionSerializer::Some(sets) = &meta.inner_instructions
+                {
+                    use solana_transaction_status::UiInstruction;
+                    for set in sets {
+                        for cix in &set.instructions {
+                            let UiInstruction::Compiled(cix) = cix else {
+                                continue;
+                            };
+                            if usize::from(cix.program_id_index) != pump_idx {
+                                continue;
+                            }
+                            let Ok(data) = bs58::decode(&cix.data).into_vec() else {
+                                continue;
+                            };
+                            if Self::emit_if_create(
+                                &keys,
+                                usize::from(cix.program_id_index),
+                                &cix.accounts,
+                                &data,
+                                sig,
+                                slot,
+                                tx,
+                            ) {
+                                emitted += 1;
+                            }
+                        }
+                    }
+                }
             }
         }
         if emitted > 0 {

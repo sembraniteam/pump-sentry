@@ -8,16 +8,17 @@ constructors (`CurveTicker`, `VaultTicker`, `RpcScreener`,
 is now coordinated instead of five uncoordinated pools hammering the
 rate limit from different corners.
 
-## Yellowstone gRPC ingestion — IMPLEMENTED, awaiting live proof
+## Yellowstone gRPC ingestion — LIVE-PROVEN (Oct-2026)
 
 `listener/src/geyser.rs` (`GeyserSubscriber`): selected automatically
 when `[network].yellowstone_endpoint` is non-empty, WS otherwise —
-never both. Full transactions arrive inline (no `getTransaction`
-fetch, no saturation drops); gap replay rides `from_slot`. Unit-proven
-against the frozen `create_v2` fixture (same name/symbol assertions as
-the WS path). Remaining: run against the real endpoint
-(`YELLOWSTONE_TOKEN` env) and confirm the first `subscribed to
-pump.fun transactions via geyser` line plus live events.
+never both. Full transactions arrive inline (no per-candidate
+`getTransaction` fetch, no saturation drops); gap coverage rides a
+bounded REST `getBlock` backfill per reconnect (`from_slot` replay is
+server-rejected below `processed`, so it is only sent there).
+Unit-proven against the frozen `create_v2` fixture (same name/symbol
+assertions as the WS path); live-proven against PublicNode (subscribe
+line, flowing launches, `parse_ok` 1:1, zero drops).
 
 ## RPC endpoint fallback (REST + WebSocket)
 
