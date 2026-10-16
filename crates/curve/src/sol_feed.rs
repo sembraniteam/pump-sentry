@@ -7,13 +7,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// WSOL mint (price key). Single source is `ids::WSOL_MINT`;
-/// this string twin exists because the Jupiter JSON key + URL need
+/// this string twin exists because the price-API JSON key + URL need
 /// strings. Drift is pinned by `sol_mint_matches_ids_wsol` below.
 pub static SOL_MINT: LazyLock<String> = LazyLock::new(|| ids::WSOL_MINT.to_string());
-/// Jupiter price endpoint. Built from `ids::WSOL_MINT` so a mint
-/// rotation updates both the key and the URL together.
-pub static DEFAULT_JUP_URL: LazyLock<String> =
-    LazyLock::new(|| format!("https://lite-api.jup.ag/price/v3?ids={}", ids::WSOL_MINT));
+/// DexScreener spot endpoint (free, keyless, no new deps). Built from
+/// `ids::WSOL_MINT` so a mint rotation updates the key and the URL
+/// together. Replaces the retired Jupiter Lite endpoint (gated with
+/// 403/525 in Oct-2026): same fail-closed stale contract, different
+/// vendor. Polls at 2 req/min, far inside public limits.
+pub static DEFAULT_DEX_URL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "https://api.dexscreener.com/latest/dex/tokens/{}",
+        ids::WSOL_MINT
+    )
+});
 /// Stale age cutoff.
 pub const DEFAULT_STALE_SECS: u64 = 120;
 /// Poll interval.
@@ -24,6 +31,41 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// First USDC-quoted SOL price from a DexScreener tokens response.
+/// Pure (unit-tested against the live shape): `None` on missing,
+/// unpriced, or unparseable legs — the caller fails closed.
+fn parse_dexscreener_sol_usd(body: &serde_json::Value) -> Option<f64> {
+    let pairs = body.get("pairs")?.as_array()?;
+    let price_of = |p: &serde_json::Value| -> Option<(bool, f64)> {
+        let raw = p.get("priceUsd")?;
+        // String today; accept a bare number without failing closed.
+        let price = raw
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| raw.as_f64())?;
+        let quote = p
+            .get("quoteToken")?
+            .get("symbol")?
+            .as_str()
+            .is_some_and(|s| s == "USDC");
+        Some((quote, price))
+    };
+    let mut fallback = None;
+    for p in pairs {
+        let Some((is_usdc, price)) = price_of(p) else {
+            continue;
+        };
+        if !price.is_finite() || price <= 0.0 {
+            continue;
+        }
+        if is_usdc {
+            return Some(price);
+        }
+        fallback = fallback.or(Some(price));
+    }
+    fallback
 }
 
 struct Inner {
@@ -71,12 +113,12 @@ impl SolUsdFeed {
 
     /// Production defaults.
     pub fn with_defaults() -> Arc<Self> {
-        Self::new(&DEFAULT_JUP_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH)
+        Self::new(&DEFAULT_DEX_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH)
     }
 
     /// Test feed seeded with `price`. No network.
     pub fn new_for_test(price: f64) -> Arc<Self> {
-        let feed = Self::new(&DEFAULT_JUP_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH);
+        let feed = Self::new(&DEFAULT_DEX_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH);
         if price.is_finite() && price > 0.0 {
             feed.inner.price_bits.store(price.to_bits(), Ordering::Relaxed);
             feed.inner.updated_at.store(now_secs(), Ordering::Relaxed);
@@ -138,31 +180,27 @@ impl SolUsdFeed {
         }
     }
 
-    /// One HTTP fetch. Parses `usdPrice` for SOL.
+    /// One HTTP fetch. Parses the first USDC-quoted SOL price.
+    /// Shape: `{pairs: [{quoteToken: {symbol}, priceUsd: "..."}]}`.
+    /// USDC-first (deepest SOL spot); any priced pair if none is USDC.
     pub async fn fetch_once(&self) -> Result<f64, String> {
         let resp = self
             .client
             .get(&self.url)
             .send()
             .await
-            .map_err(|e| format!("jup fetch failed: {e}"))?;
+            .map_err(|e| format!("dex fetch failed: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("jup status {}", resp.status()));
+            return Err(format!("dex status {}", resp.status()));
         }
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| format!("jup json failed: {e}"))?;
-        // Shape: {mint: {usdPrice, ...}}
-        let entry = body.get(SOL_MINT.as_str()).ok_or_else(|| {
-            format!("jup missing key {}", SOL_MINT.as_str())
-        })?;
-        let usd = entry
-            .get("usdPrice")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| "jup missing usdPrice".to_string())?;
+            .map_err(|e| format!("dex json failed: {e}"))?;
+        let usd = parse_dexscreener_sol_usd(&body)
+            .ok_or_else(|| "dex missing USDC-quoted SOL price".to_string())?;
         if !usd.is_finite() || usd <= 0.0 {
-            return Err(format!("jup bad price {usd}"));
+            return Err(format!("dex bad price {usd}"));
         }
         Ok(usd)
     }
@@ -221,7 +259,7 @@ mod tests {
     #[test]
     fn unset_and_stale_read_none() {
         // Fresh-but-empty and aged feeds both price None + stale.
-        let feed = SolUsdFeed::new(&DEFAULT_JUP_URL, 120, Duration::from_secs(30));
+        let feed = SolUsdFeed::new(&DEFAULT_DEX_URL, 120, Duration::from_secs(30));
         assert_eq!(feed.price(), None);
         assert!(feed.is_stale());
         let feed = SolUsdFeed::new_for_test(100.0);
@@ -234,7 +272,7 @@ mod tests {
 
     #[test]
     fn set_price_updates() {
-        let feed = SolUsdFeed::new(&DEFAULT_JUP_URL, 120, Duration::from_secs(30));
+        let feed = SolUsdFeed::new(&DEFAULT_DEX_URL, 120, Duration::from_secs(30));
         feed.set_price(200.0);
         assert_eq!(feed.price(), Some(200.0));
     }
@@ -244,6 +282,50 @@ mod tests {
         // String twin of `ids::WSOL_MINT` (JSON key + URL need strings):
         // drift breaks loudly here, not in prod.
         assert_eq!(SOL_MINT.as_str(), ids::WSOL_MINT.to_string());
-        assert!(DEFAULT_JUP_URL.ends_with(ids::WSOL_MINT.to_string().as_str()));
+        assert!(DEFAULT_DEX_URL.ends_with(ids::WSOL_MINT.to_string().as_str()));
+    }
+
+    /// Live DexScreener shape, trimmed to two legs (fetched 2026-10-16;
+    /// SOL ~$106 across USDC pairs). Proves the parser against the wire,
+    /// not a hand-invented schema.
+    const DEX_SAMPLE: &str = r#"{"pairs":[
+        {"chainId":"solana","dexId":"orca","quoteToken":{"symbol":"USDC"},"priceUsd":"106.21"},
+        {"chainId":"solana","dexId":"raydium","quoteToken":{"symbol":"SOL"},"priceUsd":"1.0"}
+    ]}"#;
+
+    #[test]
+    fn dex_parser_prefers_usdc_leg() {
+        let body: serde_json::Value = serde_json::from_str(DEX_SAMPLE).expect("json");
+        assert_eq!(parse_dexscreener_sol_usd(&body), Some(106.21));
+    }
+
+    #[test]
+    fn dex_parser_falls_back_to_any_priced_leg() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"pairs":[{"quoteToken":{"symbol":"XYZ"},"priceUsd":"99.5"}]}"#,
+        )
+        .expect("json");
+        assert_eq!(parse_dexscreener_sol_usd(&body), Some(99.5));
+        // Bare numbers parse too (schema drift must not fail closed).
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":106.5}]}"#,
+        )
+        .expect("json");
+        assert_eq!(parse_dexscreener_sol_usd(&body), Some(106.5));
+    }
+
+    #[test]
+    fn dex_parser_rejects_garbage() {
+        for raw in [
+            r#"{"pairs":[]}"#,
+            r#"{}"#,
+            r#"{"pairs":[{"quoteToken":{"symbol":"USDC"}}]}"#,
+            r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":"abc"}]}"#,
+            r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":"-3"}]}"#,
+            r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":"0"}]}"#,
+        ] {
+            let body: serde_json::Value = serde_json::from_str(raw).expect("json");
+            assert_eq!(parse_dexscreener_sol_usd(&body), None, "{raw}");
+        }
     }
 }

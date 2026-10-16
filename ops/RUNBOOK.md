@@ -87,7 +87,7 @@ The supervisor also rotates ≥50 MB logs at start time as a backstop.
 |-------------------------------|----------------------------------------------------------------------|-------------------------------------------------------------------|
 | No entries for hours          | Gate quorums unmet / day-loss tripped / public RPC throttled (drops) | `logs`, heartbeat card, use dedicated RPC                         |
 | `diverged` alerts             | Live buy skipped/failed, paper uncovered                             | Review, fund, or accept paper-only                                |
-| Exits stalled, SOL/USD stale  | Jupiter feed down                                                    | By design (no static fallback); exits resume on recovery          |
+| Exits stalled, SOL/USD stale  | Price feed down (DexScreener; Jupiter retired)                           | By design (no static fallback); exits resume on recovery          |
 | `MANUAL REVIEW REQUIRED`      | Unknown fill / retries exhausted                                     | Explorer first, then `sell <mint>`                                |
 | Negative execution-gap avg    | Live trails paper (congestion tips, landing latency, stale exits)     | Widen slippage, lower notional, or accept the haircut explicitly  |
 | Duplicate cards after restart | Crash between dispatch and WAL                                       | WAL replay is conservative; verify on-chain, exit dups via `sell` |

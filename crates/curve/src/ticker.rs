@@ -554,13 +554,13 @@ mod tests {
     fn feed_stale_fails_closed() {
         use std::time::{SystemTime, UNIX_EPOCH};
         let stale = SolUsdFeed::new(
-            &crate::sol_feed::DEFAULT_JUP_URL,
+            &crate::sol_feed::DEFAULT_DEX_URL,
             120,
             std::time::Duration::from_secs(30),
         );
         stale.set_price(150.0);
         let empty = SolUsdFeed::new(
-            &crate::sol_feed::DEFAULT_JUP_URL,
+            &crate::sol_feed::DEFAULT_DEX_URL,
             120,
             std::time::Duration::from_secs(30),
         );
