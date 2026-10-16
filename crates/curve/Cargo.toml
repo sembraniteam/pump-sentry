@@ -1,6 +1,6 @@
 [package]
 name = "curve"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 rust-version = "1.99.0"
 description = "Pump.fun bonding-curve reserve reader and price ticker"

@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "alert"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "tokio",
  "tracing",
@@ -384,7 +384,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auditor"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bs58",
  "reqwest 0.13.5",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "curve"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "futures-util",
  "ids",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "executor"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "base64 0.23.1",
  "bincode",
@@ -2128,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "ids"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "solana-pubkey 4.4.0",
  "spl-associated-token-account",
@@ -2356,7 +2356,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "listener"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "base64 0.23.1",
  "borsh",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "migration"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "curve",
  "ids",
@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "pump-sentry"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "alert",
  "auditor",
@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "risk-engine"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "reqwest 0.13.5",
  "serde",
@@ -3872,7 +3872,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simulator"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "serde",
  "serde_json",
