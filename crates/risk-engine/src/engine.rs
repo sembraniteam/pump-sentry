@@ -367,7 +367,17 @@ impl RiskEngine {
             }
         };
         if !response.status().is_success() {
-            warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, status = ?response.status(), "inference non-2xx status; using heuristic fallback");
+            // Non-2xx bodies carry the reason (unknown model, bad param,
+            // missing header): log it truncated. Error payloads echo the
+            // failure, never our secrets (bearer travels in the header,
+            // metrics are market data).
+            let status = response.status();
+            let detail = response
+                .text()
+                .await
+                .map(|b| truncate500(&b))
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
+            warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, status = ?status, detail = %detail, "inference non-2xx status; using heuristic fallback");
             return None;
         }
         let body: ChatResponse = match response.json().await {
@@ -451,11 +461,20 @@ struct ChatContent {
 
 /// Cap model output at 200 chars for logs.
 fn truncate200(s: &str) -> String {
-    const MAX: usize = 200;
-    if s.len() <= MAX {
+    truncate_chars(s, 200)
+}
+
+/// Cap error bodies at 500 chars for logs. Shared core so the two
+/// caps cannot drift apart.
+fn truncate500(s: &str) -> String {
+    truncate_chars(s, 500)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
         return s.to_string();
     }
-    let mut end = MAX;
+    let mut end = max;
     while !s.is_char_boundary(end) {
         end -= 1;
     }
