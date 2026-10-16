@@ -521,8 +521,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             self.exec.clear_diverged(&tick.mint).await;
             self.exec.clear_synthetic(&tick.mint).await;
             // Settle deferred PnL only when no live exposure remains.
+            // Manual check is base-wide: a suffixed parked dup is still
+            // held funds, even though only the exact key resurrects.
             let live_held = self.exec.is_tracked(&tick.mint).await
-                || self.exec.manual_holds(&tick.mint).await;
+                || self.exec.manual_holds_base(&tick.mint).await;
             if !live_held {
                 self.flush_deferred_pnl(&tick.mint).await;
             }
@@ -579,9 +581,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.reserves.unwatch(&tick.mint).await {
             info!(mint = %tick.mint, "unwatched (nothing left)");
         }
-        // Fee overrides die with the book.
+        // Fee overrides die with the book. The pending gap note
+        // survives while any parked manual bag remains (exact or dup):
+        // its eventual manual exit is the settle this note waits for.
+        // Post-migration eviction must not orphan it.
         self.portfolio.lock().await.clear_venue_fee_for_mint(&tick.mint);
-        self.exec.clear_gap(&tick.mint).await;
+        if !self.exec.manual_holds_base(&tick.mint).await {
+            self.exec.clear_gap(&tick.mint).await;
+        }
         self.last_marks.lock().await.remove(&tick.mint);
         self.tick_locks.lock().await.remove(&tick.mint);
         self.exec.live_sell_locks.lock().await.remove(&tick.mint);

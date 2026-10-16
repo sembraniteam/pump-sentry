@@ -6,7 +6,10 @@ use std::collections::{HashMap, VecDeque};
 /// `settle_price_usd` is the tick price when live settled (the same feed
 /// paper uses) — NOT the intra-bundle fill, which is unknowable without
 /// parsing the landed tx. The gap therefore measures timing + tip drag
-/// and never pretends to measure bundle slippage.
+/// and never pretends to measure bundle slippage. It also excludes the
+/// entry leg entirely (paper entry quote vs live fill price is never
+/// noted — the fill price is unknowable the same way). Read averages
+/// as a LOWER BOUND on live drag, never the total.
 #[derive(Debug, Clone)]
 pub struct FillGap {
     pub mint: String,
@@ -25,10 +28,16 @@ pub struct FillGap {
 /// funds. `None` settle (no pending paper note) records nothing —
 /// unmatched settles are orphan/manual legs, never fabricated gaps.
 pub struct FillGapTracker {
-    pending: HashMap<String, (f64, u64)>,
+    pending: HashMap<String, VecDeque<(f64, u64)>>,
     gaps: VecDeque<FillGap>,
     total_gap_usd: f64,
 }
+
+/// Pending notes kept per mint. Moonbag scale-outs close twice per
+/// position (plus re-entries after cooldown), so one slot per mint
+/// orphaned every second leg; a short FIFO covers the realistic
+/// depth while staying bounded.
+const MAX_PENDING_NOTES_PER_MINT: usize = 8;
 
 /// Gap history cap (calibration window, not a position limit).
 pub const FILL_GAP_CAP: usize = 128;
@@ -43,19 +52,25 @@ impl FillGapTracker {
         }
     }
 
-    /// Paper booked a close at the model price. Latest wins per mint:
-    /// multi-tick closes of one mint re-note, the settle matches the
-    /// newest (documented imprecision, bounded by one tick move).
+    /// Paper booked a close at the model price. Notes queue per mint
+    /// (FIFO): moonbag scale-outs and re-entries close the same mint
+    /// repeatedly, and each settle consumes the oldest unmatched note.
+    /// Past `MAX_PENDING_NOTES_PER_MINT` the oldest sheds (bounded
+    /// calibration data, documented imprecision).
     pub fn note_paper_close(&mut self, mint: &str, paper_price_usd: f64, qty_tokens: u64) {
         if paper_price_usd.is_finite() && paper_price_usd > 0.0 && qty_tokens > 0 {
-            self.pending
-                .insert(mint.to_string(), (paper_price_usd, qty_tokens));
+            let queue = self.pending.entry(mint.to_string()).or_default();
+            queue.push_back((paper_price_usd, qty_tokens));
+            while queue.len() > MAX_PENDING_NOTES_PER_MINT {
+                queue.pop_front();
+            }
         }
     }
 
     /// Live settled a sale. Returns the gap when a paper close was
-    /// pending; `None` settles nothing. Non-finite settles keep the
-    /// pending note for the next round instead of recording garbage.
+    /// pending; `None` settles nothing. Consumes the oldest unmatched
+    /// note (FIFO). Non-finite settles keep the pending notes for the
+    /// next round instead of recording garbage.
     pub fn note_live_settle(
         &mut self,
         mint: &str,
@@ -65,7 +80,11 @@ impl FillGapTracker {
         if !settle_price_usd.is_finite() || !tip_usd.is_finite() {
             return None;
         }
-        let (paper_price_usd, qty_tokens) = self.pending.remove(mint)?;
+        let queue = self.pending.get_mut(mint)?;
+        let (paper_price_usd, qty_tokens) = queue.pop_front()?;
+        if queue.is_empty() {
+            self.pending.remove(mint);
+        }
         let gap_usd = (settle_price_usd - paper_price_usd) * qty_tokens as f64 - tip_usd;
         if !gap_usd.is_finite() {
             return None;
@@ -335,12 +354,9 @@ impl<L> LiveExecution<L> {
         stamps.len()
     }
 
-    /// Paper booked a close at the model price. Latest wins per mint:
-    /// multi-tick closes of one mint re-note, the settle matches the
-    /// newest (documented imprecision, bounded by one tick move).
-    /// Paper-only mode records nothing (no settlement exists to match);
-    /// partial scale-outs settle once against the latest note, later
-    /// legs of the same mint are orphan-silenced by construction.
+    /// Paper booked a close at the model price. Notes queue per mint
+    /// (FIFO); each live settle consumes the oldest unmatched note.
+    /// Paper-only mode records nothing (no settlement exists to match).
     pub async fn note_gap_paper_close(&self, mint: &str, paper_price_usd: f64, qty_tokens: u64) {
         if self.live.is_none() {
             return;
@@ -768,7 +784,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         let probe = {
             let Some(tracked) = self.exec.tracked(mint).await else {
-                self.flush_deferred_pnl(mint).await;
+                // Nothing tracked: flush only when no manual bag
+                // remains either, else stashed paper PnL would feed
+                // the breaker while live still holds (the GiveUp
+                // double-count, one tick later).
+                if !self.exec.manual_holds_base(mint).await {
+                    self.flush_deferred_pnl(mint).await;
+                }
                 return true;
             };
             // Floored math (oversell is unauthorized).
@@ -853,10 +875,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Ok(bundle) => {
                 // WAL first.
                 trader.record_sell(mint, probe.amount_tokens, &bundle);
-                self.exec.subtract_fill(mint, probe.amount_tokens).await;
+                let emptied = self.exec.subtract_fill(mint, probe.amount_tokens).await;
                 // Success resets the budget.
                 self.exec.reset_retry(mint).await;
-                self.flush_deferred_pnl(mint).await;
+                // Feed stashed paper PnL only when live holds nothing
+                // anymore: a tracked remainder or a parked manual bag
+                // (exact or suffixed dup) is still exposure. The tail
+                // flushes at full clear instead.
+                if emptied && !self.exec.manual_holds_base(mint).await {
+                    self.flush_deferred_pnl(mint).await;
+                }
                 self.maybe_release_follow(mint).await;
                 // Dispatch cost at the ACTUAL tip: the day-loss gate
                 // sees live bleed, not paper-only profit.
@@ -897,11 +925,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         warn!(%mint, "LIVE sell gave up after retries; parked for manual exit (still HELD)");
                     }
                     self.emit(format!("LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"));
-                    // Parked manual = still held: never flush stashed
-                    // paper PnL here (it settles when the manual exit
-                    // clears). Auto-exit is over, so the caller treats
-                    // this tick as settled.
-                    true
+                    // Parked manual = still held: the caller must NOT treat
+                    // this as settled. Returning false routes this tick's
+                    // paper PnL through the normal stash path instead of
+                    // feeding the breaker for a bag that never exited —
+                    // the same deferral as the cooling/retry path. It
+                    // settles when the manual exit clears.
+                    false
                 } else if deterministic {
                     warn!(%mint, error = %ids::strip_error_url(&e.to_string()), attempts, "LIVE sell rejected before dispatch; holding, will re-probe");
                     false
@@ -1134,6 +1164,22 @@ mod tests {
         assert_eq!(t.gaps.len(), FILL_GAP_CAP);
         let (n, _, _) = t.stats();
         assert_eq!(n, FILL_GAP_CAP);
+    }
+
+    #[test]
+    fn fill_gap_tracker_settles_fifo_per_mint() {
+        // Moonbag shape: 0.8 scale-out then runner close. Each settle
+        // consumes the oldest unmatched note — no leg goes orphan.
+        let mut t = FillGapTracker::new();
+        t.note_paper_close("M", 2.0, 8);
+        t.note_paper_close("M", 3.0, 2);
+        let first = t.note_live_settle("M", 1.9, 0.0).expect("first leg");
+        assert_eq!((first.paper_price_usd, first.qty_tokens), (2.0, 8));
+        let second = t.note_live_settle("M", 2.9, 0.0).expect("second leg");
+        assert_eq!((second.paper_price_usd, second.qty_tokens), (3.0, 2));
+        assert!(t.note_live_settle("M", 2.9, 0.0).is_none());
+        let (n, _, _) = t.stats();
+        assert_eq!(n, 2);
     }
 
     #[test]

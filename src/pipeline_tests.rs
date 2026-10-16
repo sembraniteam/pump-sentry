@@ -3089,6 +3089,48 @@ async fn live_sell_retries_on_cooldown_then_gives_up() {
 }
 
 #[tokio::test]
+async fn giveup_on_close_tick_defers_breaker_feed() {
+    // G2 regression: when the paper close and the GiveUp land on the
+    // SAME tick, the breaker must still not see model PnL for a bag
+    // that never exited. Pre-seeded attempts push this tick's failing
+    // sell straight to GiveUp.
+    use std::sync::atomic::Ordering;
+    let live = StubLive::working();
+    live.inner.fail_sells_transient.store(true, Ordering::Relaxed);
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        screener,
+        Some(live.clone()),
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    {
+        let mut retry = pipe.exec.live_retry.lock().await;
+        retry.insert(MINT.to_string(), (4u32, 0u64));
+    }
+    // TP closes paper AND the sell exhausts the budget on this tick.
+    pipe.on_tick(&tick(MINT, 3.0)).await;
+    assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+    assert!(pipe.exec.live_manual.lock().await.contains_key(MINT));
+    assert!(pipe.exec.deferred_pnl.lock().await.contains_key(MINT));
+    assert_eq!(pipe.daily.lock().await.day_net, 0.0);
+}
+
+#[tokio::test]
 async fn deferred_pnl_flushes_when_live_settles_late() {
     // Paper closes while live still holds: the breaker must NOT see
     // the profit yet, and must see it once the late sell lands.
