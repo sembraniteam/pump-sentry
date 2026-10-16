@@ -50,6 +50,10 @@ pub struct GeyserSubscriber {
     token: Option<String>,
     stats: Arc<ListenerStats>,
     seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Newest fully-processed slot (0 = none). Carried into every
+    /// reconnect — including after errors — so the gap replays instead
+    /// of going blind (dedup bounds the redelivery).
+    last_slot: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl GeyserSubscriber {
@@ -72,6 +76,7 @@ impl GeyserSubscriber {
             token,
             stats: Arc::new(ListenerStats::new()),
             seen: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            last_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -118,6 +123,13 @@ impl GeyserSubscriber {
                 }
                 Err(e) => {
                     warn!(error = %e, attempt, "geyser error; backing off");
+                    // Error resets must replay too: `last_slot` tracks
+                    // every processed message, so the redelivered prefix
+                    // is pure dedup, never a blind gap.
+                    let seen = self.last_slot.load(std::sync::atomic::Ordering::Relaxed);
+                    if seen > 0 {
+                        from_slot = Some(seen);
+                    }
                 }
             }
             let healthy = self.stats.logs_seen().saturating_sub(seen_before) > 1000
@@ -207,6 +219,8 @@ impl GeyserSubscriber {
                         continue;
                     };
                     last_slot = Some(slot);
+                    self.last_slot
+                        .store(slot, std::sync::atomic::Ordering::Relaxed);
                     self.handle_transaction(info, slot, tx).await;
                 }
                 subscribe_update::UpdateOneof::Ping(_) => {
