@@ -1,6 +1,6 @@
 [package]
 name = "executor"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 rust-version = "1.99.0"
 description = "Live Pump.fun buy/sell executor with wallet guards"
