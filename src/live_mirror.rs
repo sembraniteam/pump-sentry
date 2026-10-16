@@ -95,6 +95,11 @@ impl FillGapTracker {
         }
         (n, self.total_gap_usd / n as f64, self.total_gap_usd)
     }
+
+    /// Drop a pending note without settling (lifecycle eviction).
+    pub fn pending_remove(&mut self, mint: &str) {
+        self.pending.remove(mint);
+    }
 }
 
 impl Default for FillGapTracker {
@@ -330,8 +335,16 @@ impl<L> LiveExecution<L> {
         stamps.len()
     }
 
-    /// Paper booked a close at the model price (call per paper close).
+    /// Paper booked a close at the model price. Latest wins per mint:
+    /// multi-tick closes of one mint re-note, the settle matches the
+    /// newest (documented imprecision, bounded by one tick move).
+    /// Paper-only mode records nothing (no settlement exists to match);
+    /// partial scale-outs settle once against the latest note, later
+    /// legs of the same mint are orphan-silenced by construction.
     pub async fn note_gap_paper_close(&self, mint: &str, paper_price_usd: f64, qty_tokens: u64) {
+        if self.live.is_none() {
+            return;
+        }
         self.gaps
             .lock()
             .await
@@ -358,6 +371,12 @@ impl<L> LiveExecution<L> {
                 gap_usd = format!("{:+.4}", gap.gap_usd),
                 "execution gap settled (paper model vs live reality)");
         }
+    }
+
+    /// Drop a pending gap note (mint lifecycle ended with no settle:
+    /// diverged paper, drained book). Calibration data, not custody.
+    pub async fn clear_gap(&self, mint: &str) {
+        self.gaps.lock().await.pending_remove(mint);
     }
 
     /// `(settled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.

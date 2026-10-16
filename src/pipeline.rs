@@ -581,6 +581,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         // Fee overrides die with the book.
         self.portfolio.lock().await.clear_venue_fee_for_mint(&tick.mint);
+        self.exec.clear_gap(&tick.mint).await;
         self.last_marks.lock().await.remove(&tick.mint);
         self.tick_locks.lock().await.remove(&tick.mint);
         self.exec.live_sell_locks.lock().await.remove(&tick.mint);
