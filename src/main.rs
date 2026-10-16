@@ -330,6 +330,16 @@ async fn run_pipeline(live_arg: bool) {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
         std::process::exit(1);
     });
+    // The shared pool constructors don't validate (single pool, five
+    // consumers): refuse a malformed RPC URL here instead of degrading
+    // silently into failed reads mid-run.
+    match url::Url::parse(&settings.http_url) {
+        Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
+        _ => {
+            eprintln!("bad MAINNET_RPC_URL: {}", settings.http_url);
+            std::process::exit(1);
+        }
+    }
     // One RPC connection pool per process: ticker, screener, vaults,
     // executor, and the WS backfill/fetch share this instead of opening
     // five uncoordinated pools (rate-limit pressure + retry storms).

@@ -50,6 +50,9 @@ pump-sentry sell <mint>     # manual full exit now (only way parked bags leave)
 pump-sentry stop            # SIGTERM, 30s drain, snapshot, SIGKILL past 45s
 ```
 
+`sell` follows daemon mode: it exits the live bag in live mode, and
+closes the paper position in paper mode (cards always state the mode).
+
 `sell <mint>` files drain every 15 gate rounds; the request file is
 deleted only after the live leg settles (sold / manual-parked /
 nothing held). A kept file is normal while the live leg still holds.

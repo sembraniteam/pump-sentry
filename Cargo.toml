@@ -45,6 +45,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 toml = "1.1.8"
 solana-client = "4.3.0"
 solana-pubkey = "4.4"
+url = "2"
 solana-commitment-config = "3.1"
 
 [dev-dependencies]
