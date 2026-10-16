@@ -1,6 +1,6 @@
 [package]
 name = "risk-engine"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.99.0"
 description = "LLM-driven TP/SL risk engine with deterministic 300ms-timeout heuristic fallback"
