@@ -1,6 +1,6 @@
 [package]
 name = "alert"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.99.0"
 description = "Non-blocking Discord trade alerts via Hermes CLI"
