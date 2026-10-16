@@ -355,7 +355,17 @@ impl RiskEngine {
 
     /// One inference attempt. `None` means fall back.
     async fn infer(&self, request: ChatRequest) -> Option<RiskProfile> {
-        let mut req = self.client.post(&self.endpoint).json(&request);
+        // Own user agent (never the generic SDK default): providers
+        // that front multiple models (e.g. OpenCode Go) require callers
+        // to identify themselves for routing/abuse monitoring.
+        let mut req = self
+            .client
+            .post(&self.endpoint)
+            .header(
+                reqwest::header::USER_AGENT,
+                format!("pump-sentry/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .json(&request);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
