@@ -11,7 +11,7 @@ use listener::{
 };
 use risk_engine::{
     Action, DecisionSource, RiskDecision, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
-    evaluate_heuristic_fallback, resolve_strategy,
+    evaluate_metrics_fallback, resolve_strategy,
 };
 use simulator::Side;
 use tracing::{debug, info, warn};
@@ -34,7 +34,11 @@ const GATE_FANOUT_MIN: usize = 1;
 const SLOW_GATE_ROUND_SECS: u64 = 10;
 
 
-/// Dev history to 0.4–1.0 trust. Floor 0.4 is the PASS cutoff.
+/// Dev history to 0.0–1.0 trust. Scores below the 0.40 fallback
+/// cutoff PASS there: the floor must not mask the prior-launch
+/// penalty, or serial launchers saturate exactly at the cutoff and
+/// stay buy-eligible (see `fallback::RUGCHECK_SCORE_CAP` note for the
+/// layered-cap convention).
 pub fn dev_reputation_score(
     age_secs: Option<u64>,
     prior_launches: usize,
@@ -45,7 +49,7 @@ pub fn dev_reputation_score(
         (Some(_), _) => 1.0,
         (None, _) => 0.0,
     };
-    (0.6 + 0.4 * age_factor - 0.05 * prior_launches as f64).clamp(0.4, 1.0)
+    (0.6 + 0.4 * age_factor - 0.05 * prior_launches as f64).clamp(0.0, 1.0)
 }
 
 /// Entry price and sizing liquidity from a reserve read, plus paper-only flag.
@@ -90,18 +94,42 @@ pub fn resolve_entry_with_flag(
 
 /// Stop-loss floor for a tier: 2x fee + 4pt margin, negated,
 /// clamped to [-100, 0) so absurd tiers can't print an invalid SL.
-pub(crate) fn fee_aware_sl_floor(sl_percent: f64, venue_fee_bps: f64) -> f64 {
-    let floored = sl_percent.min(-(2.0 * venue_fee_bps / 100.0 + 4.0));
+///
+/// Units: `per_side_total_bps` is the PER-SIDE total (venue tier plus
+/// extra commission); the function doubles it internally to a
+/// round-trip percent (`2 * bps / 100`) plus a 4-point margin.
+/// Callers must pass the summed per-side total, never an
+/// already-doubled round-trip figure.
+pub(crate) fn fee_aware_sl_floor(sl_percent: f64, per_side_total_bps: f64) -> f64 {
+    debug_assert!(sl_percent.is_finite(), "sl_percent must be finite");
+    debug_assert!(per_side_total_bps.is_finite(), "per-side bps must be finite");
+    if !per_side_total_bps.is_finite() {
+        warn!(sl = sl_percent, bps = per_side_total_bps,
+            "non-finite fee tier; holding the requested stop");
+        return sl_percent;
+    }
+    let floored = sl_percent.min(-(2.0 * per_side_total_bps / 100.0 + 4.0));
     let clamped = floored.clamp(-100.0, 0.0);
     if clamped != floored {
-        warn!(sl = sl_percent, bps = venue_fee_bps, "absurd fee tier clamped the stop; check the schedule");
+        warn!(sl = sl_percent, bps = per_side_total_bps, "absurd fee tier clamped the stop; check the schedule");
     }
     clamped
 }
 
-/// Watchlist size that pages ops (no cap: entries die by deadline, and
-/// dropping signals under load would miss the exact trades we want).
+/// Watchlist size that pages ops (entries die by deadline; the hard
+/// cap below only sheds under flood).
 const WATCHLIST_WARN_SIZE: usize = 64;
+
+/// Watchlist hard cap: intake sheds the oldest entry past this so a
+/// launch flood can't grow memory without bound. Shed entries drop
+/// from both the gate and the meta map together (half-watched is
+/// worse than none). Fanout stays capped separately (`GATE_FANOUT`).
+const WATCHLIST_HARD_CAP: usize = 512;
+
+// TODO(settings, outside gate ownership): alert `0`=off defaults live
+// in config/settings. Every fallback/diverged/giveup path here must
+// keep its `warn!` so ops still sees it when alerts are silenced.
+// Do not gate logs on alert presence: logs are the fallback channel.
 
 /// Launch identity for watchlist intake: everything `on_launch` needs
 /// in one value, mirroring `OpenRequest` below. Eight flat params
@@ -169,8 +197,10 @@ pub struct PendingSignal {
     pub creation_slot: u64,
     /// Watermark for incremental reads.
     pub last_sig: Option<String>,
-    /// Dev trust (0.4–1.0); worst wins on v2.
-    pub dev_trust: f64,
+    /// Launcher address for confirm-time re-screen. Intake screens for
+    /// admission only; confirm re-screens this (plus creator) and takes
+    /// the worst trust there — no stored score ever crosses the wait.
+    pub dev: String,
 }
 
 /// Gate plus signal context under one lock.
@@ -188,13 +218,20 @@ pub struct GateState {
 pub const STALE_POLL_SECS: u64 = 30;
 
 /// Speculative-inference counters (opt-in overlap; all zero when off).
+/// Accounting: `hit` = the spawned bet priced the final metrics and
+/// was used; `stale` = the bet was discarded but the decision was
+/// still made synchronously (score drift, or a dead spawned task);
+/// `wasted` = the bet was discarded with no decision at all (the
+/// confirm itself dropped, e.g. the re-audit failed fail-closed).
+/// `stale` costs a call, `wasted` costs a call plus the signal.
 #[derive(Debug, Default)]
 pub struct SpecCounters {
     /// Spawned bet priced the final metrics and was used.
     pub hit: AtomicU64,
-    /// Bet aborted on score mismatch (re-evaluated synchronously).
+    /// Bet discarded, decision recovered synchronously (score mismatch
+    /// or dead task — never a wrong profile, just a redundant call).
     pub stale: AtomicU64,
-    /// Bet aborted because the re-audit itself failed.
+    /// Bet discarded with no decision (confirm dropped fail-closed).
     pub wasted: AtomicU64,
 }
 
@@ -321,24 +358,33 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         };
 
-        // 2. Dev history, fail closed.
-        let dev_trust = match self.screen_wallet(mint, dev, "dev").await {
-            Some(trust) => trust,
-            None => return,
-        };
+        // 2. Dev history, fail closed. Admission only: the score is
+        // NOT stored — confirm re-screens both wallets fresh (worst
+        // wins there), so nothing here can go stale across the wait.
+        if self.screen_wallet(mint, dev, "dev").await.is_none() {
+            return;
+        }
 
-        // 2b. v2 creator: worst trust wins.
-        let mut trust = dev_trust;
+        // 2b. v2 creator: screened too, worst wins at confirm.
         let distinct_creator = req.creator.filter(|c| *c != dev);
-        if let Some(creator) = distinct_creator {
-            match self.screen_wallet(mint, creator, "creator").await {
-                Some(creator_trust) => trust = trust.min(creator_trust),
-                None => return,
-            }
+        if let Some(creator) = distinct_creator
+            && self.screen_wallet(mint, creator, "creator").await.is_none()
+        {
+            return;
         }
 
         // 3. Watchlist; confirms happen in poll_gates.
         let mut state = self.gate_state.lock().await;
+        // Hard cap: shed oldest past the cap (refreshes of a known
+        // mint never shed). Gate and meta drop together.
+        if !state.meta.contains_key(mint)
+            && state.meta.len() >= WATCHLIST_HARD_CAP
+            && let Some(oldest) = state.meta.keys().next().cloned()
+        {
+            state.gate.remove(&oldest);
+            state.meta.remove(&oldest);
+            warn!(mint = %oldest, cap = WATCHLIST_HARD_CAP, "watchlist at hard cap; shedding oldest");
+        }
         if !state.gate.submit(mint, dev, now_secs()) {
             warn!(%mint, "bad dev address; skipping");
             return;
@@ -361,7 +407,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 creation_slot: slot,
                 last_sig: None,
                 creator: req.creator.map(|c| c.to_string()),
-                dev_trust: trust,
+                dev: dev.to_string(),
             },
         );
         match audit_score {
@@ -404,8 +450,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .collect();
             (mints, state.fanout.clamp(GATE_FANOUT_MIN, GATE_FANOUT))
         };
-        // Watermark only (never a cap): a flood means peak opportunity,
-        // and each entry dies by deadline. Ops tunes RPC headroom here.
+        // Watermark (ops signal only): the hard cap is enforced at
+        // intake (`WATCHLIST_HARD_CAP`); entries otherwise die by
+        // deadline. Ops tunes RPC headroom here; fanout stays capped.
         if mints.len() > WATCHLIST_WARN_SIZE {
             warn!(watchlist = mints.len(), "watchlist above watermark; RPC burn follows launch rate");
         }
@@ -480,6 +527,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     current.curve != signal.curve
                         || current.assoc_curve != signal.assoc_curve
                         || current.creator != signal.creator
+                        || current.dev != signal.dev
                         || current.audit_score != audit_at_snapshot
                         || current.creation_slot != signal.creation_slot
                 });
@@ -620,14 +668,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
         // Live ticks must carry positive liquidity: zero liquidity
         // prices fee-only (synthetic-grade). Fail closed.
-        // Note: `venue_fee=None` keeps the standard tier (see
-        // `fetch_tick_with_fee`); custom-tier mints whose fee read
-        // fails therefore book slightly cheap — accepted residual
-        // (widened only when the tier is known below).
         if !priced_via_override
             && (!liquidity_usd.is_finite() || liquidity_usd <= 0.0)
         {
             warn!(%mint, liq = liquidity_usd, "non-positive curve liquidity; dropping signal (fail-closed)");
+            return;
+        }
+        // Venue fee must be readable on live ticks: an unreadable tier
+        // would book the standard tier while live pays the custom one
+        // (fail-cheap). Synthetic (override-priced) registers no tier,
+        // so it stays `None` by construction below.
+        if !priced_via_override && venue_fee.is_none() {
+            warn!(%mint, "venue fee unreadable; dropping (fail-closed)");
             return;
         }
         const _: () = assert!(crate::live::TOKEN_DECIMALS == 6);
@@ -640,6 +692,30 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Err(e) => {
                 warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "mint decimals unreadable; dropping signal (fail-closed)");
                 return;
+            }
+        }
+
+        // Confirm-time insider re-screen: dev history goes stale
+        // between watchlist intake and quorum (serial launchers, fresh
+        // rugs). Reuses nothing from intake — worst trust wins again —
+        // and fails closed on any screen failure.
+        let dev_trust = match self.screen_wallet(mint, &signal.dev, "dev").await {
+            Some(trust) => trust,
+            None => {
+                warn!(%mint, "confirm-time dev re-screen failed; dropping (fail-closed)");
+                return;
+            }
+        };
+        let mut trust = dev_trust;
+        if let Some(creator) = signal.creator.as_deref()
+            && creator != signal.dev.as_str()
+        {
+            match self.screen_wallet(mint, creator, "creator").await {
+                Some(creator_trust) => trust = trust.min(creator_trust),
+                None => {
+                    warn!(%mint, "confirm-time creator re-screen failed; dropping (fail-closed)");
+                    return;
+                }
             }
         }
 
@@ -657,6 +733,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // liquidity, and bundle stats are unknowable before confirm, so
         // a placeholder bet could never hash-match — pure waste plus
         // 429 pressure on the inference budget.
+        // Accounting: hit = bet used; stale = bet discarded but the
+        // decision recovered synchronously; wasted = bet discarded with
+        // no decision (confirm dropped below).
         let spec_bet: Option<(TokenMetrics, tokio::task::JoinHandle<RiskDecision>)> = match (
             &self.engine,
             stale_snapshot,
@@ -667,10 +746,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 let bet_metrics = TokenMetrics {
                     liquidity_usd,
                     buy_velocity_5s: buyers,
-                    dev_reputation: signal.dev_trust,
+                    dev_reputation: trust,
                     rugcheck_score: snap_score,
+                    venue_fee_bps: venue_fee,
                     creation_slot_buys: req.creation_slot_buys,
                     cluster_pct: req.cluster_pct,
+                    // Unmeasured: no reserve field carries curve
+                    // progress; the prompt assumes its spread prior.
                     curve_progress: None,
                 };
                 let engine_c = engine.clone();
@@ -704,10 +786,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let metrics = TokenMetrics {
             liquidity_usd,
             buy_velocity_5s: buyers,
-            dev_reputation: signal.dev_trust,
+            dev_reputation: trust,
             rugcheck_score: score,
+            venue_fee_bps: venue_fee,
             creation_slot_buys: req.creation_slot_buys,
             cluster_pct: req.cluster_pct,
+            // Unmeasured: no reserve field carries curve progress; the
+            // prompt assumes its spread prior when absent.
             curve_progress: None,
         };
         // Model call timed: entry latency is sniper budget (raise
@@ -724,7 +809,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             d
                         }
                         Err(_) => {
-                            // Spawned task died: serial path, same decision.
+                            // Spawned task died: stale (recovered
+                            // synchronously), same decision.
                             self.spec_counters.stale.fetch_add(1, Ordering::Relaxed);
                             engine.evaluate(&metrics).await
                         }
@@ -738,24 +824,29 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 None => engine.evaluate(&metrics).await,
             },
             None => RiskDecision {
-                profile: evaluate_heuristic_fallback(
-                    metrics.liquidity_usd,
-                    metrics.buy_velocity_5s,
-                    metrics.dev_reputation,
-                    metrics.rugcheck_score,
-                ),
+                profile: evaluate_metrics_fallback(&metrics),
                 source: DecisionSource::Fallback,
             },
         };
         let profile = decision.profile;
-        if let Some(engine) = &self.engine {
-            info!(%mint, source = ?decision.source, latency_ms = started.elapsed().as_millis(),
-                fallbacks = engine.fallback_count(), timeouts = engine.timeout_count(),
-                invalid = engine.invalid_count(),
-                spec_hit = self.spec_counters.hit.load(Ordering::Relaxed),
-                spec_stale = self.spec_counters.stale.load(Ordering::Relaxed),
-                spec_wasted = self.spec_counters.wasted.load(Ordering::Relaxed),
-                "risk decided at confirm");
+        // Always log the decision (source + latency): heuristic-only
+        // operation (`engine: None`) must be as visible as model calls.
+        // Logs stay on when alerts are silenced (see the settings TODO
+        // above): the warn below is the fallback channel, not the card.
+        match &self.engine {
+            Some(engine) => {
+                info!(%mint, source = ?decision.source, latency_ms = started.elapsed().as_millis(),
+                    fallbacks = engine.fallback_count(), timeouts = engine.timeout_count(),
+                    invalid = engine.invalid_count(),
+                    spec_hit = self.spec_counters.hit.load(Ordering::Relaxed),
+                    spec_stale = self.spec_counters.stale.load(Ordering::Relaxed),
+                    spec_wasted = self.spec_counters.wasted.load(Ordering::Relaxed),
+                    "risk decided at confirm");
+            }
+            None => {
+                warn!(%mint, source = ?decision.source, latency_ms = started.elapsed().as_millis(),
+                    "risk heuristic fallback (no engine)");
+            }
         }
         if profile.action != Action::Buy {
             info!(%mint, buyers, score, "risk PASS at confirm");
@@ -870,10 +961,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         // Widen stops past round-trip costs on custom tiers (venue +
         // commission): a stop inside total costs is a guaranteed loss.
+        // Both inputs are per-side; `fee_aware_sl_floor` doubles to
+        // round-trip internally.
         let mut profile = *profile;
         if let Some(bps) = req.venue_fee_bps {
-            let total_bps = bps + self.settings.fee_bps;
-            let widened = fee_aware_sl_floor(profile.sl_percent, total_bps);
+            let per_side_total_bps = bps + self.settings.fee_bps;
+            let widened = fee_aware_sl_floor(profile.sl_percent, per_side_total_bps);
             if widened < profile.sl_percent {
                 info!(%mint, sl = profile.sl_percent, widened, bps,
                     "custom-tier stop widened past round-trip costs");
@@ -886,8 +979,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.exec.live.is_none()
             && let Some((sol_usd, _)) = sol
         {
-            let (open_leg, close_leg) =
-                crate::live::paper_dispatch_legs_usd(self.settings.tip_lamports, sol_usd);
+            let (open_leg, close_leg) = crate::live::paper_dispatch_legs_usd(
+                self.settings.tip_lamports,
+                crate::live::priority_fee_lamports(
+                    self.settings.compute_unit_limit,
+                    self.settings.priority_fee_micro_lamports,
+                ),
+                sol_usd,
+            );
             portfolio.set_paper_dispatch_legs(open_leg, close_leg);
         }
         match portfolio.open_position_params(&simulator::OpenPositionParams {

@@ -100,21 +100,34 @@ impl VaultTicker {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             _ => return Err(VaultError::BadUrl(http_url.to_string())),
         }
-        Ok(Self {
-            rpc: Arc::new(RpcClient::new_with_commitment(
+        Ok(Self::with_rpc(
+            Arc::new(RpcClient::new_with_commitment(
                 http_url.to_string(),
                 commitment,
             )),
+            interval,
+            sol_feed,
+        ))
+    }
+
+    /// Build around a shared RPC client (one connection pool per process).
+    pub fn with_rpc(rpc: Arc<RpcClient>, interval: Duration, sol_feed: Arc<SolUsdFeed>) -> Self {
+        Self {
+            rpc,
             subs: Arc::new(RwLock::new(HashMap::new())),
             interval,
             sol_feed,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             backoff: Arc::new(RoundBackoff::new()),
-        })
+        }
     }
 
     /// Watch a pool (idempotent per mint).
     /// Base vault holds WSOL (9dp), quote the token (6dp).
+    /// Non-standard decimals fail closed unless `allow_nonstandard`
+    /// is set (explicit override for exotic mints; a 1000x misprice
+    /// hides where base/quote are swapped).
+    #[allow(clippy::too_many_arguments)]
     pub async fn watch(
         &self,
         mint: &str,
@@ -123,13 +136,24 @@ impl VaultTicker {
         quote_vault: &str,
         base_decimals: u8,
         quote_decimals: u8,
+        allow_nonstandard: bool,
     ) -> Result<(), VaultError> {
-        self.watch_inner(mint, amm_id, None, base_vault, quote_vault, base_decimals, quote_decimals)
-            .await
+        self.watch_inner(
+            mint,
+            amm_id,
+            None,
+            base_vault,
+            quote_vault,
+            base_decimals,
+            quote_decimals,
+            allow_nonstandard,
+        )
+        .await
     }
 
     /// Watch a PumpSwap pool: same vault orientation, plus the pool
     /// account for per-round virtual reserves (effective-quote pricing).
+    /// Non-standard decimals fail closed unless `allow_nonstandard`.
     #[allow(clippy::too_many_arguments)]
     pub async fn watch_pumpswap(
         &self,
@@ -140,6 +164,7 @@ impl VaultTicker {
         quote_vault: &str,
         base_decimals: u8,
         quote_decimals: u8,
+        allow_nonstandard: bool,
     ) -> Result<(), VaultError> {
         let pool = Pubkey::from_str(pool).map_err(|_| VaultError::BadAddress(pool.to_string()))?;
         self.watch_inner(
@@ -150,6 +175,7 @@ impl VaultTicker {
             quote_vault,
             base_decimals,
             quote_decimals,
+            allow_nonstandard,
         )
         .await
     }
@@ -164,14 +190,24 @@ impl VaultTicker {
         quote_vault: &str,
         base_decimals: u8,
         quote_decimals: u8,
+        allow_nonstandard: bool,
     ) -> Result<(), VaultError> {
         if base_decimals > 18 || quote_decimals > 18 {
             return Err(VaultError::BadConfig(base_decimals, quote_decimals));
         }
-        if base_decimals != WSOL_DECIMALS_DEFAULT || quote_decimals != PUMP_TOKEN_DECIMALS_DEFAULT {
+        let nonstandard = base_decimals != WSOL_DECIMALS_DEFAULT
+            || quote_decimals != PUMP_TOKEN_DECIMALS_DEFAULT;
+        if nonstandard && !allow_nonstandard {
             warn!(
                 mint = %mint, base_decimals, quote_decimals,
-                "non-standard vault decimals (expected 9/6): a 1000x misprice hides here when base/quote are swapped"
+                "non-standard vault decimals (expected 9/6): refusing fail-closed (pass allow_nonstandard for exotic mints)"
+            );
+            return Err(VaultError::BadConfig(base_decimals, quote_decimals));
+        }
+        if nonstandard {
+            warn!(
+                mint = %mint, base_decimals, quote_decimals,
+                "non-standard vault decimals override (expected 9/6): a 1000x misprice hides here when base/quote are swapped"
             );
         }
         let parse =
@@ -205,6 +241,7 @@ impl VaultTicker {
             quote_vault,
             WSOL_DECIMALS_DEFAULT,
             PUMP_TOKEN_DECIMALS_DEFAULT,
+            false,
         )
         .await
     }
@@ -226,6 +263,7 @@ impl VaultTicker {
             quote_vault,
             WSOL_DECIMALS_DEFAULT,
             PUMP_TOKEN_DECIMALS_DEFAULT,
+            false,
         )
         .await
     }
@@ -423,6 +461,9 @@ fn is_token_program(owner: &Pubkey) -> bool {
 /// BASE holds WSOL, QUOTE the token. `wsol_adj_lamports` is the signed
 /// PumpSwap virtual-reserve adjustment to the WSOL side (0 elsewhere).
 /// `None` on wrong owner, wrong mint, or bad amount.
+/// Money note: this ticker is display-only f64 (gates/metrics).
+/// Funds-moving sizing/quotes stay integer u128 (`executor::quote`);
+/// never branch dispatch on these floats.
 fn price_tick(
     pool: &WatchedPool,
     base_data: &[u8],
@@ -451,16 +492,26 @@ fn price_tick(
     if base_eff <= 0 {
         return None;
     }
-    let base_ui = base_eff as f64 / 10f64.powi(i32::from(pool.base_decimals));
+    // Price uses effective reserves (vault plus signed virtual reserves);
+    // liquidity uses real vault lamports only. Virtual reserves reprice
+    // the pool but are not withdrawable, so valuing them overstates depth.
+    let base_eff_ui = base_eff as f64 / 10f64.powi(i32::from(pool.base_decimals));
+    let base_real_ui = base_raw as f64 / 10f64.powi(i32::from(pool.base_decimals));
     let quote_ui = token_amount(quote_data)? as f64 / 10f64.powi(i32::from(pool.quote_decimals));
-    if !base_ui.is_finite() || base_ui <= 0.0 || !quote_ui.is_finite() || quote_ui <= 0.0 {
+    if !base_eff_ui.is_finite()
+        || base_eff_ui <= 0.0
+        || !base_real_ui.is_finite()
+        || base_real_ui <= 0.0
+        || !quote_ui.is_finite()
+        || quote_ui <= 0.0
+    {
         return None;
     }
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
         return None;
     }
-    let price_usd = base_ui / quote_ui * sol_usd;
-    let liquidity_usd = base_ui * sol_usd;
+    let price_usd = base_eff_ui / quote_ui * sol_usd;
+    let liquidity_usd = base_real_ui * sol_usd;
     if !price_usd.is_finite() || price_usd <= 0.0 || !liquidity_usd.is_finite() {
         return None;
     }
@@ -639,13 +690,17 @@ mod tests {
     #[test]
     fn virtual_reserves_adjust_effective_price() {
         // 30 SOL vault + 15 SOL virtual vs 1M tokens: effective 45
-        // SOL prices $0.00675, not the raw $0.0045.
+        // SOL prices $0.00675, not the raw $0.0045. Liquidity stays
+        // real (30 SOL -> $4500): virtual reserves reprice but are
+        // not withdrawable, so they must not inflate depth.
         let tick = tick_adj(30_000_000_000, 1_000_000_000_000, 15_000_000_000).expect("tick");
         assert!((tick.price_usd - 0.00675).abs() < 1e-9, "price={}", tick.price_usd);
-        assert!((tick.liquidity_usd - 6750.0).abs() < 1e-9);
-        // Negative virtual within the vault still prices.
+        assert!((tick.liquidity_usd - 4500.0).abs() < 1e-9, "liq={}", tick.liquidity_usd);
+        // Negative virtual within the vault still prices (20 SOL
+        // effective -> $0.003) while liquidity stays real ($4500).
         let tick = tick_adj(30_000_000_000, 1_000_000_000_000, -10_000_000_000).expect("tick");
         assert!((tick.price_usd - 0.003).abs() < 1e-12, "price={}", tick.price_usd);
+        assert!((tick.liquidity_usd - 4500.0).abs() < 1e-9, "liq={}", tick.liquidity_usd);
         // Virtual at or past the vault empties effective reserves: no tick.
         assert!(tick_adj(30_000_000_000, 1_000_000_000_000, -30_000_000_000).is_none());
         assert!(tick_adj(30_000_000_000, 1_000_000_000_000, -31_000_000_000).is_none());
@@ -679,17 +734,24 @@ mod tests {
         // SPL mints cap at 18 decimals: fail closed, never misprice.
         for (base, quote) in [(19, 6), (9, 19), (u8::MAX, u8::MAX)] {
             let err = ticker
-                .watch(mint, mint, mint, mint, base, quote)
+                .watch(mint, mint, mint, mint, base, quote, false)
                 .await
                 .expect_err("must fail");
             assert!(matches!(err, VaultError::BadConfig(b, q) if b == base && q == quote));
         }
         assert_eq!(ticker.watched_count().await, 0);
-        // Non-standard but plausible decimals are accepted with a warn.
-        ticker
-            .watch(mint, mint, mint, mint, 6, 9)
+        // Non-standard but plausible decimals fail closed by default.
+        let err = ticker
+            .watch(mint, mint, mint, mint, 6, 9, false)
             .await
-            .expect("plausible custom decimals accepted");
+            .expect_err("non-standard must fail without override");
+        assert!(matches!(err, VaultError::BadConfig(6, 9)));
+        assert_eq!(ticker.watched_count().await, 0);
+        // Explicit override accepts them (warned, for exotic mints).
+        ticker
+            .watch(mint, mint, mint, mint, 6, 9, true)
+            .await
+            .expect("override accepts plausible custom decimals");
         assert_eq!(ticker.watched_count().await, 1);
     }
 
@@ -737,6 +799,7 @@ mod tests {
                     "11111111111111111111111111111111",
                     6,
                     9,
+                    true,
                 )
                 .await
                 .is_err()

@@ -40,29 +40,9 @@ pub enum QuoteError {
 }
 
 /// Fee triple in bps (IDL order: lp, protocol, creator).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FeesBps {
-    /// LP fee (unused on curves; parsed for completeness).
-    pub lp: u64,
-    pub protocol: u64,
-    pub creator: u64,
-}
-
-/// One fee tier: mcap threshold (lamports) + fees above it.
-pub type FeeTierRow = (u128, FeesBps);
-
-/// Fee schedule from the FeeConfig account.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct FeeSchedule {
-    /// SOL-like tiers.
-    pub tiers: Vec<FeeTierRow>,
-    /// USDC tiers.
-    pub stable: Vec<FeeTierRow>,
-    /// Flat fallback.
-    pub flat: FeesBps,
-    /// Exotic flat (all-zero = unset -> flat).
-    pub exotic: FeesBps,
-}
+/// Canonical single source: [`curve::fee::FeesBps`], re-exported here
+/// so dispatch and the paper ledger share one schedule type.
+pub use curve::fee::{FeeSchedule, FeeTierRow, FeesBps};
 
 /// Curve inputs for quoting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,8 +124,15 @@ fn parse_tier_vec(data: &[u8], off: usize) -> Result<(Vec<FeeTierRow>, usize), Q
     }
     let mut out = Vec::with_capacity(n.min(16));
     let mut at = off + 4;
+    // Thresholds must ascend (tier selection assumes it; mirrors the
+    // paper-ledger parser in `curve::fee`). Anything else fails closed.
+    let mut prev = 0u128;
     for _ in 0..n {
         let threshold = u128le(data, at)?;
+        if threshold < prev {
+            return Err(QuoteError::BadAccount);
+        }
+        prev = threshold;
         let fees = FeesBps {
             lp: u64le(data, at + 16)?,
             protocol: u64le(data, at + 24)?,
@@ -239,12 +226,15 @@ pub fn slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option
 }
 
 /// Bonding-curve mcap in lamports.
+/// Canonical implementation lives in [`curve::fee::market_cap`]; this
+/// wrapper only converts the `None` (zero-`vt` or overflow) into the
+/// dispatch [`QuoteError`] (no duplicated formula).
 #[inline]
 pub fn market_cap(vq: u64, vt: u64, supply: u64) -> Result<u128, QuoteError> {
     if vt == 0 {
         return Err(QuoteError::EmptyReserves);
     }
-    mul_div(u128::from(vq), u128::from(supply), u128::from(vt))
+    curve::fee::market_cap(vq, vt, supply).ok_or(QuoteError::MathOverflow)
 }
 
 /// Highest tier at or below `mcap`, else the first. `None` when empty.
@@ -435,9 +425,9 @@ pub fn pumpswap_sell_out(view: &PoolView, amount: u64) -> Result<u64, QuoteError
     u64::try_from(net).map_err(|_| QuoteError::MathOverflow)
 }
 
-/// Slippage floor over a PumpSwap net quote (rounds down).
+/// Slippage floor over a net quote (rounds down).
 /// `None` on degenerate input or zero floor.
-pub fn pumpswap_sell_floor(net_quote: u64, slippage_bps: u64) -> Option<u64> {
+fn slip_floor(net_quote: u64, slippage_bps: u64) -> Option<u64> {
     if net_quote == 0 || u128::from(slippage_bps) >= BPS_DENOMINATOR {
         return None;
     }
@@ -445,6 +435,19 @@ pub fn pumpswap_sell_floor(net_quote: u64, slippage_bps: u64) -> Option<u64> {
         .checked_mul(BPS_DENOMINATOR - u128::from(slippage_bps))?
         .checked_div(BPS_DENOMINATOR)?;
     u64::try_from(floor).ok().filter(|f| *f > 0)
+}
+
+/// Slippage floor over a PumpSwap net quote (rounds down).
+/// `None` on degenerate input or zero floor.
+pub fn pumpswap_sell_floor(net_quote: u64, slippage_bps: u64) -> Option<u64> {
+    slip_floor(net_quote, slippage_bps)
+}
+
+/// Slippage floor over a curve net quote (rounds down).
+/// Same formula as [`pumpswap_sell_floor`]; venue-explicit name.
+/// `None` on degenerate input or zero floor.
+pub fn curve_sell_floor(net_quote: u64, slippage_bps: u64) -> Option<u64> {
+    slip_floor(net_quote, slippage_bps)
 }
 
 /// `(lp, protocol, creator)` bps for a PumpSwap sell: SOL-like tiers
@@ -615,6 +618,21 @@ mod tests {
     }
 
     #[test]
+    fn curve_floor_matches_pumpswap_formula() {
+        // One formula, two venue names: the fresh curve leg carries
+        // the same tolerance as the sized floor.
+        for (net, slip) in [(295_396_037, 200), (1_668_970, 100), (1, 0), (10_000, 1)] {
+            assert_eq!(
+                curve_sell_floor(net, slip),
+                pumpswap_sell_floor(net, slip),
+                "net={net} slip={slip}"
+            );
+        }
+        assert_eq!(curve_sell_floor(0, 200), None);
+        assert_eq!(curve_sell_floor(1_000_000, 10_000), None);
+    }
+
+    #[test]
     fn pumpswap_fee_bps_follows_tiers_and_gate() {
         let sched = FeeSchedule {
             tiers: vec![
@@ -739,6 +757,21 @@ mod tests {
         let mut hostile = bytes[..177].to_vec();
         hostile[65..69].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(parse_fee_schedule(&hostile), Err(QuoteError::BadAccount));
+    }
+
+    #[test]
+    fn descending_tiers_fail_closed() {
+        // Thresholds must ascend (tier selection assumes it; mirrors
+        // the paper-ledger parser). Duplicate the single live row and
+        // force a descent at the second row.
+        let bytes: &[u8] = include_bytes!("../../listener/tests/fixtures/fee_config_live.bin");
+        let mut bad = bytes.to_vec();
+        let row: Vec<u8> = bad[69..109].to_vec();
+        bad.splice(109..109, row.iter().cloned());
+        bad[65..69].copy_from_slice(&2u32.to_le_bytes());
+        bad[69..85].copy_from_slice(&5u128.to_le_bytes());
+        bad[109..125].copy_from_slice(&0u128.to_le_bytes());
+        assert_eq!(parse_fee_schedule(&bad), Err(QuoteError::BadAccount));
     }
 
     #[test]

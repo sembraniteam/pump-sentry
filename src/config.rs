@@ -150,9 +150,9 @@ sim_strict = false          # (unproven sims refuse; required live)
 [alerts]
 discord_alerts = true       # (trade cards via Hermes CLI)
 discord_channel = ""        # (empty = host default)
-alert_diverged_warn_n = 0   # (0 = off; burn-in threshold)
-alert_risk_fallback_warn_pct = 0  # (0 = off)
-alert_giveup_burst_n = 0    # (0 = off)
+alert_diverged_warn_n = 3   # (0 = off; 3 paper-without-cover mints page ops)
+alert_risk_fallback_warn_pct = 50  # (0 = off; 50% heuristic rate pages ops)
+alert_giveup_burst_n = 3    # (0 = off; 3 GiveUps per window pages ops)
 alert_giveup_window_secs = 3600  # (trailing window, secs)
 "#;
 

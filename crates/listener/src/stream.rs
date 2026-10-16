@@ -118,6 +118,43 @@ pub struct PumpFunListener {
     stats: Arc<ListenerStats>,
     /// Recently seen signatures (bounded dedup).
     seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Cooperative shutdown flag: [`Self::shutdown`] sets it, the
+    /// reconnect loop and sessions stop spawning and unsubscribe.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared RPC pool (backfill/fetch). `None` opens a private pool
+    /// with the configured commitment (tests/back-compat).
+    rpc: Option<Arc<RpcClient>>,
+}
+
+/// Owned `logsSubscribe` handle: the unsubscribe closure must be held
+/// for the session and explicitly awaited on shutdown (dropping the
+/// stream alone leaves the server-side subscription lingering until
+/// timeout). `None` after [`Self::shutdown`] runs (FnOnce).
+struct LogSubscription {
+    unsub: Option<Box<dyn FnOnce() -> futures_util::future::BoxFuture<'static, ()> + Send>>,
+}
+
+impl LogSubscription {
+    fn new(
+        unsub: Box<dyn FnOnce() -> futures_util::future::BoxFuture<'static, ()> + Send>,
+    ) -> Self {
+        Self { unsub: Some(unsub) }
+    }
+
+    /// Unsubscribe once; subsequent calls are no-ops.
+    async fn shutdown(&mut self) {
+        if let Some(unsub) = self.unsub.take() {
+            unsub().await;
+        }
+    }
+}
+
+impl Drop for LogSubscription {
+    fn drop(&mut self) {
+        if self.unsub.is_some() {
+            debug!("log subscription dropped without explicit shutdown; server sub lingers until timeout");
+        }
+    }
 }
 
 impl PumpFunListener {
@@ -130,12 +167,33 @@ impl PumpFunListener {
             config,
             stats: Arc::new(ListenerStats::new()),
             seen: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rpc: None,
         })
+    }
+
+    /// Build around a shared RPC client (one connection pool per process).
+    /// `run` uses this for backfill/fetch instead of opening its own pool.
+    pub fn with_rpc(mut self, rpc: Arc<RpcClient>) -> Self {
+        self.rpc = Some(rpc);
+        self
     }
 
     /// Shared stats handle.
     pub fn stats(&self) -> Arc<ListenerStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Request shutdown: the reconnect loop stops after the current
+    /// session and sessions unsubscribe instead of lingering.
+    pub fn shutdown(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True after [`Self::shutdown`].
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Mark a signature seen (bounded memory).
@@ -238,20 +296,29 @@ impl PumpFunListener {
 
     /// Run the reconnect loop. Drop-on-full channel.
     pub async fn run(self, tx: mpsc::Sender<ListenerEvent>) -> Result<(), ListenerError> {
-        let rpc = Arc::new(RpcClient::new(self.config.http_url.clone()));
+        let rpc = match self.rpc.clone() {
+            Some(shared) => shared,
+            None => {
+                let commitment = self.config.commitment_config().unwrap_or_default();
+                Arc::new(RpcClient::new_with_commitment(
+                    self.config.http_url.clone(),
+                    commitment,
+                ))
+            }
+        };
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
         let mut attempt: u32 = 0;
         // First session starts live-only; later sessions backfill the gap.
         let mut first_session = true;
 
         loop {
-            if tx.is_closed() {
+            if tx.is_closed() || self.is_shutdown() {
                 info!("downstream closed; listener shutting down");
                 return Ok(());
             }
             if !first_session {
                 self.backfill_gap(&tx, &rpc, &semaphore).await;
-                if tx.is_closed() {
+                if tx.is_closed() || self.is_shutdown() {
                     info!("downstream closed during backfill; listener shutting down");
                     return Ok(());
                 }
@@ -273,6 +340,10 @@ impl PumpFunListener {
                 }
             }
             attempt = if healthy { 0 } else { attempt.saturating_add(1) };
+            if self.is_shutdown() {
+                info!("shutdown requested; not reconnecting");
+                return Ok(());
+            }
             let wait = backoff_duration(attempt);
             debug!(?wait, attempt, "reconnect backoff");
             tokio::time::sleep(wait).await;
@@ -311,7 +382,7 @@ impl PumpFunListener {
                 ));
             }
         };
-        let (mut sub, _unsub) = match tokio::time::timeout(
+        let (mut sub, unsub) = match tokio::time::timeout(
             WS_HANDSHAKE_TIMEOUT,
             client.logs_subscribe(filter, sub_config),
         )
@@ -323,6 +394,9 @@ impl PumpFunListener {
                 return Err(ListenerError::Terminated("logsSubscribe timed out".to_string()));
             }
         };
+        // Held for the session: `shutdown()` unsubscribes instead of
+        // leaving the server sub to time out.
+        let mut subscription = LogSubscription::new(unsub);
         info!(
             ws = %ids::redact_endpoint(&self.config.ws_url),
             commitment = %self.config.commitment,
@@ -331,7 +405,7 @@ impl PumpFunListener {
 
         while let Some(response) = sub.next().await {
             // Stop spawning workers for a dead channel.
-            if tx.is_closed() {
+            if tx.is_closed() || self.is_shutdown() {
                 info!("downstream closed mid-session; ending subscription");
                 break;
             }
@@ -379,6 +453,7 @@ impl PumpFunListener {
                 .await;
             });
         }
+        subscription.shutdown().await;
         Ok(())
     }
 
@@ -393,7 +468,25 @@ impl PumpFunListener {
         ),
         ListenerError,
     > {
-        let listener = PumpFunListener::new(config)?;
+        Self::subscribe_with_rpc(config, None).await
+    }
+
+    /// Spawn a listener around a shared RPC pool (`None` = private pool).
+    pub async fn subscribe_with_rpc(
+        config: ListenerConfig,
+        rpc: Option<Arc<RpcClient>>,
+    ) -> Result<
+        (
+            mpsc::Receiver<ListenerEvent>,
+            Arc<ListenerStats>,
+            JoinHandle<()>,
+        ),
+        ListenerError,
+    > {
+        let listener = match rpc {
+            Some(shared) => PumpFunListener::new(config)?.with_rpc(shared),
+            None => PumpFunListener::new(config)?,
+        };
         let stats = listener.stats();
         let stats_out = Arc::clone(&stats);
         let (tx, rx) = mpsc::channel::<ListenerEvent>(EVENT_CHANNEL_CAPACITY.max(1));

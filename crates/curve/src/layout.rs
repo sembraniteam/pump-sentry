@@ -4,8 +4,8 @@
 use solana_sdk::pubkey::Pubkey;
 use thiserror::Error;
 
-/// sha256(`"account:BondingCurve"`)[..8].
-pub const BONDING_CURVE_DISCRIMINATOR: [u8; 8] = [23, 183, 248, 55, 96, 216, 172, 96];
+/// Re-exported single source (see `ids::BONDING_CURVE_DISCRIMINATOR`).
+pub use ids::BONDING_CURVE_DISCRIMINATOR;
 
 /// Min data length: 8 + 5x8 + 1.
 pub const BONDING_CURVE_MIN_LEN: usize = 49;
@@ -26,6 +26,10 @@ pub const PUMP_TOKEN_DECIMALS: u8 = 6;
 
 /// Lamports per SOL.
 pub const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+
+/// Integer lamports per SOL for [`BondingCurveReserves::price_ratio_u128`].
+/// Funds move in u128 lamports/base-units; the f64 above is display-only.
+const LAMPORTS_PER_SOL_U128: u128 = 1_000_000_000;
 
 /// Reserve parse failures.
 #[derive(Error, Debug, PartialEq)]
@@ -52,24 +56,29 @@ pub struct BondingCurveReserves {
 
 impl BondingCurveReserves {
     /// Parse raw account data.
-    pub fn parse(data: &[u8]) -> Result<Self, CurveParseError> {        if data.len() < BONDING_CURVE_MIN_LEN {
+    pub fn parse(data: &[u8]) -> Result<Self, CurveParseError> {
+        if data.len() < BONDING_CURVE_MIN_LEN {
             return Err(CurveParseError::DataTooShort(data.len()));
         }
         if data[..8] != BONDING_CURVE_DISCRIMINATOR {
             return Err(CurveParseError::BadDiscriminator);
         }
-        let u64le = |at: usize| -> u64 {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(&data[at..at + 8]);
-            u64::from_le_bytes(buf)
+        // `.get()` even behind the length gate: offsets and the gate
+        // must never drift apart silently.
+        let short = || CurveParseError::DataTooShort(data.len());
+        let u64le = |at: usize| -> Result<u64, CurveParseError> {
+            data.get(at..at + 8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_le_bytes)
+                .ok_or_else(short)
         };
         Ok(Self {
-            virtual_token_reserves: u64le(8),
-            virtual_sol_reserves: u64le(16),
-            real_token_reserves: u64le(24),
-            real_sol_reserves: u64le(32),
-            token_total_supply: u64le(40),
-            complete: data[48] != 0,
+            virtual_token_reserves: u64le(8)?,
+            virtual_sol_reserves: u64le(16)?,
+            real_token_reserves: u64le(24)?,
+            real_sol_reserves: u64le(32)?,
+            token_total_supply: u64le(40)?,
+            complete: data.get(COMPLETE_FLAG_OFFSET).copied().unwrap_or(0) != 0,
         })
     }
 
@@ -83,6 +92,9 @@ impl BondingCurveReserves {
     }
 
     /// Spot price, SOL per whole token.
+    /// Display-only f64: funds-moving paths must use integer math
+    /// ([`Self::price_ratio_u128`] or `executor::quote`) and never
+    /// branch on this float.
     pub fn price_sol(&self, decimals: u8) -> Option<f64> {
         if self.virtual_token_reserves == 0 {
             return None;
@@ -97,7 +109,26 @@ impl BondingCurveReserves {
         }
     }
 
+    /// Integer price ratio: SOL per whole token equals
+    /// `numer / denom` (both u128, no float). Funds-moving code uses
+    /// this shape (`mul_div`-style) while [`Self::price_sol`] stays
+    /// display-only. `None` on zero reserves or overflow.
+    pub fn price_ratio_u128(&self, decimals: u8) -> Option<(u128, u128)> {
+        if self.virtual_token_reserves == 0 {
+            return None;
+        }
+        let scale = 10u128.checked_pow(u32::from(decimals))?;
+        let numer = u128::from(self.virtual_sol_reserves).checked_mul(scale)?;
+        let denom =
+            u128::from(self.virtual_token_reserves).checked_mul(LAMPORTS_PER_SOL_U128)?;
+        if denom == 0 {
+            return None;
+        }
+        Some((numer, denom))
+    }
+
     /// Spot price in USD per whole token.
+    /// Display-only (see [`Self::price_sol`]): sizing/quotes stay integer.
     pub fn price_usd(&self, decimals: u8, sol_usd: f64) -> Option<f64> {
         self.price_sol(decimals).and_then(|p| {
             let usd = p * sol_usd;
@@ -110,6 +141,8 @@ impl BondingCurveReserves {
     }
 
     /// Liquidity proxy in USD (SOL side).
+    /// Display-only f64 for gates/metrics; dispatch sizing is integer
+    /// (`executor::quote` u128 math).
     pub fn liquidity_usd(&self, sol_usd: f64) -> f64 {
         let liq = self.virtual_sol_reserves as f64 / LAMPORTS_PER_SOL * sol_usd;
         if liq.is_finite() && liq > 0.0 {
@@ -186,6 +219,13 @@ mod tests {
         assert!((r.liquidity_usd(150.0) - 4500.0).abs() < 1e-9);
         let mcap = r.market_cap_usd(PUMP_TOKEN_DECIMALS, 150.0).expect("mcap");
         assert!((mcap - 1e9 * usd).abs() < 1e-3, "mcap={mcap}");
+        // Integer ratio agrees with the display float (funds paths use
+        // the ratio, never the float).
+        let (numer, denom) = r.price_ratio_u128(PUMP_TOKEN_DECIMALS).expect("ratio");
+        assert_eq!(numer, 30_000_000_000u128 * 1_000_000u128);
+        assert_eq!(denom, 1_073_000_000_000_000u128 * 1_000_000_000u128);
+        let ratio = numer as f64 / denom as f64;
+        assert!((ratio - sol).abs() < 1e-18, "ratio={ratio} sol={sol}");
     }
 
     #[test]

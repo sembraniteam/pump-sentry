@@ -436,18 +436,31 @@ impl RpcScreener {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             _ => return Err(ScreenError::BadUrl(http_url.to_string())),
         }
-        Ok(Self {
-            rpc: Arc::new(RpcClient::new_with_commitment(
+        Ok(Self::with_rpc(
+            Arc::new(RpcClient::new_with_commitment(
                 http_url.to_string(),
                 commitment,
             )),
+            commitment,
+            dev_cfg,
+        ))
+    }
+
+    /// Build around a shared RPC client (one connection pool per process).
+    pub fn with_rpc(
+        rpc: Arc<RpcClient>,
+        commitment: CommitmentConfig,
+        dev_cfg: DevScreenConfig,
+    ) -> Self {
+        Self {
+            rpc,
             commitment,
             dev_cfg,
             funder_cache: Arc::new(tokio::sync::Mutex::new(TimedCache::new(
                 FUNDER_CACHE_TTL_SECS,
             ))),
             dev_cache: Arc::new(tokio::sync::Mutex::new(TimedCache::new(DEV_CACHE_TTL_SECS))),
-        })
+        }
     }
 
     /// Dev verdict. Fails closed on transport errors.

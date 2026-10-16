@@ -47,7 +47,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 \* test-only. \*`yellowstone_endpoint`: non-empty selects Yellowstone gRPC ingestion instead of WS (x-token via `YELLOWSTONE_TOKEN` env, never the file).
 `strategy_mode`: `adaptive` runs the profile verbatim; `scalp` clamps TP to +25…+35%; `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
 
-Outside config: `HERMES_BIN`, `BOT_DAEMON` (daemon marker), `PID_FILE` / `LOG_FILE` / `CONFIG_FILE` (path overrides), `YELLOWSTONE_TOKEN` (geyser x-token, secret).
+Outside config (env-only, never in the file): `IS_LIVE` (safety-critical, exact `true` per invocation, same as `--live`), `SOLANA_PRIVATE_KEY` (moves money, live only), `INFERENCE_API_KEY` (bearer, scrubbed after boot), `YELLOWSTONE_TOKEN` (geyser x-token, auth+billing), `CONFIG_FILE` / `PID_FILE` / `LOG_FILE` (path overrides), `BOT_DAEMON` / `BOT_INVOCATION` / `BOT_FIRST_RUN` (daemon markers), `HERMES_BIN` (alert binary override), `*_ACCEPTANCE` (`JITO_ACCEPTANCE`, `MAINNET_LAYOUT`, `RAYDIUM_ACCEPTANCE` test gates, ignored by default).
 
 ## Safety
 

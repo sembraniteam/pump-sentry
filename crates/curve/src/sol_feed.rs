@@ -2,14 +2,18 @@
 //! `None` when stale; no fallback price.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// WSOL mint (price key).
-pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-/// Jupiter price endpoint.
-pub const DEFAULT_JUP_URL: &str =
-    "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112";
+/// WSOL mint (price key). Single source is `ids::WSOL_MINT`;
+/// this string twin exists because the Jupiter JSON key + URL need
+/// strings. Drift is pinned by `sol_mint_matches_ids_wsol` below.
+pub static SOL_MINT: LazyLock<String> = LazyLock::new(|| ids::WSOL_MINT.to_string());
+/// Jupiter price endpoint. Built from `ids::WSOL_MINT` so a mint
+/// rotation updates both the key and the URL together.
+pub static DEFAULT_JUP_URL: LazyLock<String> =
+    LazyLock::new(|| format!("https://lite-api.jup.ag/price/v3?ids={}", ids::WSOL_MINT));
 /// Stale age cutoff.
 pub const DEFAULT_STALE_SECS: u64 = 120;
 /// Poll interval.
@@ -67,12 +71,12 @@ impl SolUsdFeed {
 
     /// Production defaults.
     pub fn with_defaults() -> Arc<Self> {
-        Self::new(DEFAULT_JUP_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH)
+        Self::new(&DEFAULT_JUP_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH)
     }
 
     /// Test feed seeded with `price`. No network.
     pub fn new_for_test(price: f64) -> Arc<Self> {
-        let feed = Self::new(DEFAULT_JUP_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH);
+        let feed = Self::new(&DEFAULT_JUP_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH);
         if price.is_finite() && price > 0.0 {
             feed.inner.price_bits.store(price.to_bits(), Ordering::Relaxed);
             feed.inner.updated_at.store(now_secs(), Ordering::Relaxed);
@@ -150,9 +154,9 @@ impl SolUsdFeed {
             .await
             .map_err(|e| format!("jup json failed: {e}"))?;
         // Shape: {mint: {usdPrice, ...}}
-        let entry = body
-            .get(SOL_MINT)
-            .ok_or_else(|| format!("jup missing key {SOL_MINT}"))?;
+        let entry = body.get(SOL_MINT.as_str()).ok_or_else(|| {
+            format!("jup missing key {}", SOL_MINT.as_str())
+        })?;
         let usd = entry
             .get("usdPrice")
             .and_then(|v| v.as_f64())
@@ -217,7 +221,7 @@ mod tests {
     #[test]
     fn unset_and_stale_read_none() {
         // Fresh-but-empty and aged feeds both price None + stale.
-        let feed = SolUsdFeed::new(DEFAULT_JUP_URL, 120, Duration::from_secs(30));
+        let feed = SolUsdFeed::new(&DEFAULT_JUP_URL, 120, Duration::from_secs(30));
         assert_eq!(feed.price(), None);
         assert!(feed.is_stale());
         let feed = SolUsdFeed::new_for_test(100.0);
@@ -230,7 +234,7 @@ mod tests {
 
     #[test]
     fn set_price_updates() {
-        let feed = SolUsdFeed::new(DEFAULT_JUP_URL, 120, Duration::from_secs(30));
+        let feed = SolUsdFeed::new(&DEFAULT_JUP_URL, 120, Duration::from_secs(30));
         feed.set_price(200.0);
         assert_eq!(feed.price(), Some(200.0));
     }
@@ -239,7 +243,7 @@ mod tests {
     fn sol_mint_matches_ids_wsol() {
         // String twin of `ids::WSOL_MINT` (JSON key + URL need strings):
         // drift breaks loudly here, not in prod.
-        assert_eq!(SOL_MINT, ids::WSOL_MINT.to_string());
-        assert!(DEFAULT_JUP_URL.ends_with(&ids::WSOL_MINT.to_string()));
+        assert_eq!(SOL_MINT.as_str(), ids::WSOL_MINT.to_string());
+        assert!(DEFAULT_JUP_URL.ends_with(ids::WSOL_MINT.to_string().as_str()));
     }
 }

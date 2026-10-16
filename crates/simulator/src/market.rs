@@ -295,7 +295,7 @@ mod tests {
             mint: "MINT".to_string(),
             side: Side::Long,
             entry_price: 1.0,
-            quantity: 100.0,
+            quantity: 100,
             entry_notional: 100.0,
             entry_fee: 0.0,
             tp_percent: tp,

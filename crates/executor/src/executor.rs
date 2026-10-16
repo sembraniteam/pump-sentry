@@ -79,6 +79,10 @@ pub struct SellOrder {
     pub min_sol_output: u64,
     /// Jito tip (see [`BuyOrder::tip_lamports`]).
     pub tip_lamports: u64,
+    /// Slippage tolerance (bps) applied to the re-quoted fresh floor.
+    /// Mirrors the sizing floor: an exact-net fresh leg fails on
+    /// 1-lamport drift and burns the retry budget for nothing.
+    pub slippage_bps: u64,
     /// Required: checked vs curve state. `None` fails closed.
     pub creator: Option<Pubkey>,
 }
@@ -144,14 +148,19 @@ pub struct CurveState {
     pub coin_creator_fee_bps: u64,
 }
 
-/// Decode [`CurveState`]. Pure. `None` on wrong owner or short data.
+/// Decode [`CurveState`]. Pure. `None` on wrong owner, wrong
+/// discriminator, or short data: a pump-owned non-curve account must
+/// refuse here, not produce garbage quotes for the sim to catch.
 pub fn parse_curve_state(owner: &Pubkey, data: &[u8]) -> Option<CurveState> {
     use crate::instructions::{
         CURVE_CASHBACK_FLAG_OFFSET, CURVE_COIN_CREATOR_FEE_END, CURVE_COMPLETE_OFFSET,
         CURVE_CREATOR_END, CURVE_CREATOR_OFFSET, CURVE_MAYHEM_FLAG_OFFSET, CURVE_QUOTE_MINT_END,
         CURVE_QUOTE_MINT_OFFSET,
     };
-    if *owner != crate::instructions::PUMP_PROGRAM_ID || data.len() < CURVE_COIN_CREATOR_FEE_END {
+    if *owner != crate::instructions::PUMP_PROGRAM_ID
+        || !data.starts_with(&ids::BONDING_CURVE_DISCRIMINATOR)
+        || data.len() < CURVE_COIN_CREATOR_FEE_END
+    {
         return None;
     }
     let creator = Pubkey::new_from_array(
@@ -174,6 +183,25 @@ pub fn parse_curve_state(owner: &Pubkey, data: &[u8]) -> Option<CurveState> {
         real_tokens: u64at(24)?,
         coin_creator_fee_bps: u64at(115)?,
     })
+}
+
+/// [`crate::quote::CurveView`] from dispatch state. One constructor
+/// so the buy guard and the sell floor quote the same curve.
+fn curve_view_from_state(state: &CurveState) -> crate::quote::CurveView {
+    crate::quote::CurveView {
+        vt: state.vt,
+        vq: state.vq,
+        real_tokens: state.real_tokens,
+        coin_creator_fee_bps: state.coin_creator_fee_bps,
+        creator_is_default: state.creator == Pubkey::default(),
+        quote: if state.quote_mint == crate::instructions::WSOL_MINT {
+            crate::quote::QuoteKind::SolLike
+        } else if state.quote_mint == crate::instructions::USDC_MINT {
+            crate::quote::QuoteKind::Usdc
+        } else {
+            crate::quote::QuoteKind::Other
+        },
+    }
 }
 
 /// Deadline for single read RPCs on the hot path.
@@ -279,7 +307,8 @@ pub struct SwapExecutor {
     jito: Option<JitoClient>,
     compute_unit_limit: u32,
     compute_unit_price: u64,
-    /// Strict preflight: sim transport failure rejects. Off by default.
+    /// Strict preflight: sim transport failure rejects. On by default;
+    /// paper paths opt out explicitly via [`Self::with_strict_sim`](false).
     strict_sim: bool,
     /// Curve fee-input cache: (gate_on, schedule, fetched_at).
     fee_cache: Arc<tokio::sync::Mutex<Option<(bool, crate::quote::FeeSchedule, std::time::Instant)>>>,
@@ -331,19 +360,27 @@ impl SwapExecutor {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             _ => return Err(ExecutorError::BadUrl(http_url.to_string())),
         }
-        Ok(Self {
-            rpc: Arc::new(RpcClient::new_with_commitment(
+        Ok(Self::with_rpc(
+            Arc::new(RpcClient::new_with_commitment(
                 http_url.to_string(),
                 commitment,
             )),
+            wallet,
+        ))
+    }
+
+    /// Build around a shared RPC client (one connection pool per process).
+    pub fn with_rpc(rpc: Arc<RpcClient>, wallet: WalletGuard) -> Self {
+        Self {
+            rpc,
             wallet: Arc::new(wallet),
             jito: None,
             compute_unit_limit: 0,
             compute_unit_price: 0,
-            strict_sim: false,
+            strict_sim: true,
             fee_cache: Arc::new(tokio::sync::Mutex::new(None)),
             supply_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        })
+        }
     }
 
     /// Attach a Jito bundle client for protected dispatch.
@@ -353,7 +390,8 @@ impl SwapExecutor {
     }
 
     /// Strict preflight: sim transport/timeout failures reject (`SimFailed`).
-    /// Off by default; turn on for live funds.
+    /// On by default; pass `false` explicitly for paper paths that may
+    /// proceed unproven.
     pub fn with_strict_sim(mut self, strict: bool) -> Self {
         self.strict_sim = strict;
         self
@@ -430,16 +468,18 @@ impl SwapExecutor {
     }
 
     /// Fee-aware sell floor. Re-quotes the net from live state and
-    /// takes the tighter (higher) of the sized floor and the fresh net:
-    /// a stale floor in a rising market offers no sandwich tightening.
-    /// Refuses on quote failure (exits retry next tick; a loose floor
-    /// is real money, a missed sell is not).
+    /// takes the tighter (higher) of the sized floor and the fresh net
+    /// with slippage applied: a stale floor in a rising market offers
+    /// no sandwich tightening, and an exact-net fresh leg fails on
+    /// 1-lamport drift. Refuses on quote failure (exits retry next
+    /// tick; a loose floor is real money, a missed sell is not).
     async fn quote_sell_floor(
         &self,
         mint: &Pubkey,
         state: &CurveState,
         amount: u64,
         fallback_min: u64,
+        slippage_bps: u64,
     ) -> Result<u64, ExecutorError> {
         let refuse = |why: &str| {
             warn!(mint = %mint, "sell re-quote failed ({why}); refusing loose floor (fail-closed)");
@@ -452,23 +492,12 @@ impl SwapExecutor {
         let (Some((gate_on, schedule)), Some(supply)) = (fees, supply) else {
             return Err(refuse("fee inputs unreadable"));
         };
-        let view = crate::quote::CurveView {
-            vt: state.vt,
-            vq: state.vq,
-            real_tokens: state.real_tokens,
-            coin_creator_fee_bps: state.coin_creator_fee_bps,
-            creator_is_default: state.creator == Pubkey::default(),
-            quote: if state.quote_mint == crate::instructions::WSOL_MINT {
-                crate::quote::QuoteKind::SolLike
-            } else if state.quote_mint == crate::instructions::USDC_MINT {
-                crate::quote::QuoteKind::Usdc
-            } else {
-                crate::quote::QuoteKind::Other
-            },
-        };
+        let view = curve_view_from_state(state);
         match crate::quote::sell_out_after_fees(&schedule, gate_on, &view, supply, amount) {
             Ok(net) => {
-                let floor = net.max(fallback_min);
+                let fresh = crate::quote::curve_sell_floor(net, slippage_bps)
+                    .ok_or_else(|| refuse("fresh floor unguardable"))?;
+                let floor = fresh.max(fallback_min);
                 if floor != fallback_min {
                     info!(mint = %mint, quoted = net, floor, fallback = fallback_min,
                         "fee-aware sell floor recomputed");
@@ -528,20 +557,7 @@ impl SwapExecutor {
             warn!(mint = %mint, "fee inputs unreadable; keeping sized guard (sim decides)");
             return (fallback_max, None);
         };
-        let view = crate::quote::CurveView {
-            vt: state.vt,
-            vq: state.vq,
-            real_tokens: state.real_tokens,
-            coin_creator_fee_bps: state.coin_creator_fee_bps,
-            creator_is_default: state.creator == Pubkey::default(),
-            quote: if state.quote_mint == crate::instructions::WSOL_MINT {
-                crate::quote::QuoteKind::SolLike
-            } else if state.quote_mint == crate::instructions::USDC_MINT {
-                crate::quote::QuoteKind::Usdc
-            } else {
-                crate::quote::QuoteKind::Other
-            },
-        };
+        let view = curve_view_from_state(state);
         match crate::quote::buy_cost_incl_fees(&schedule, gate_on, &view, supply, amount) {
             Ok(cost) => match crate::quote::slippage_ceiling(cost, slippage_bps) {
                 Some(guard) => {
@@ -1373,7 +1389,13 @@ impl SwapExecutor {
         let buyback = buyback_account(&buyback_wallet, &quote_mint, &quote_program);
         // Tighten the floor against live reserves (see `quote_sell_floor`).
         let floor = self
-            .quote_sell_floor(&order.mint, state, order.amount_tokens, order.min_sol_output)
+            .quote_sell_floor(
+                &order.mint,
+                state,
+                order.amount_tokens,
+                order.min_sol_output,
+                order.slippage_bps,
+            )
             .await?;
         let mut ixs = Vec::new();
         // Quote ATA [10] must exist; prefix is idempotent. SOL pairs
@@ -1546,11 +1568,11 @@ impl SwapExecutor {
                 Ok(())
             }
             Ok(Err(e)) => {
-                warn!(%label, error = %ids::strip_error_url(&e.to_string()), "simulation RPC failed; proceeding without preflight");
+                warn!(%label, error = %ids::strip_error_url(&e.to_string()), "UNPROVEN-DISPATCH simulation RPC failed; strict refuses, non-strict proceeds without preflight");
                 sim_transport_outcome(self.strict_sim, "RPC failure")
             }
             Err(_) => {
-                warn!(%label, "simulation timed out; proceeding without preflight");
+                warn!(%label, "UNPROVEN-DISPATCH simulation timed out; strict refuses, non-strict proceeds without preflight");
                 sim_transport_outcome(self.strict_sim, "timeout")
             }
         }
@@ -1628,7 +1650,7 @@ mod tests {
 
     #[test]
     fn strict_preflight_rejects_unproven_dispatch() {
-        // Default off preserves behavior; strict refuses unproven.
+        // Default on protects live funds; paper opts out explicitly.
         assert!(sim_transport_outcome(false, "timeout").is_ok());
         // Strict: transport/timeout failures refuse to dispatch unproven.
         for cause in ["timeout", "RPC failure"] {
@@ -1637,8 +1659,9 @@ mod tests {
                 other => panic!("expected SimFailed, got {other:?}"),
             }
         }
-        // Builder plumbing enables the policy.
-        assert!(!executor().strict_sim);
+        // Builder plumbing enables the policy (default strict, paper opts out).
+        assert!(executor().strict_sim);
+        assert!(!executor().with_strict_sim(false).strict_sim);
         assert!(executor().with_strict_sim(true).strict_sim);
     }
 
@@ -1664,6 +1687,7 @@ mod tests {
         let creator = Pubkey::from_str("DC4X9szDJk2wVm2NAGsshGFydKAahBg6sAAjmxvSJZGh")
             .expect("creator");
         let mut data = vec![0u8; 166];
+        data[..8].copy_from_slice(&ids::BONDING_CURVE_DISCRIMINATOR);
         data[8..16].copy_from_slice(&1_073_000_000_000_000u64.to_le_bytes());
         data[16..24].copy_from_slice(&30_000_000_000u64.to_le_bytes());
         data[24..32].copy_from_slice(&793_100_000_000_000u64.to_le_bytes());
@@ -1699,6 +1723,11 @@ mod tests {
         let stranger = Pubkey::from_str("11111111111111111111111111111111").expect("key");
         assert!(parse_curve_state(&stranger, &data).is_none());
         assert!(parse_curve_state(&pump, &data[..114]).is_none());
+        // Pump-owned non-curve account (bad discriminator) refuses
+        // instead of quoting garbage.
+        let mut impostor = data.clone();
+        impostor[0] ^= 0xff;
+        assert!(parse_curve_state(&pump, &impostor).is_none());
         // Quote rule + buyback rule.
         assert_eq!(resolve_quote_mint(&Pubkey::default()), WSOL_MINT);
         assert_eq!(resolve_quote_mint(&quote), quote);

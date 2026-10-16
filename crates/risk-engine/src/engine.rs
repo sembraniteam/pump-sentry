@@ -246,9 +246,12 @@ impl RiskEngine {
         self.invalid_count.load(Ordering::Relaxed)
     }
 
+    /// Transport/model-trouble fallback (unreachable, over budget,
+    /// non-2xx, undecodable body): counts the fallback only. Invalid
+    /// model OUTPUT is separate (`note_noncompliant`, fail-closed to
+    /// PASS) and must never inflate this rate.
     fn note_fallback(&self) {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
-        self.invalid_count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn note_noncompliant(&self) {
@@ -491,6 +494,7 @@ mod tests {
             buy_velocity_5s: 40,
             dev_reputation: 0.8,
             rugcheck_score: 100,
+            venue_fee_bps: None,
             creation_slot_buys: None,
             cluster_pct: None,
             curve_progress: None,
@@ -748,6 +752,10 @@ mod tests {
         let decision = engine.evaluate(&metrics()).await;
         assert_eq!(decision.source, DecisionSource::Fallback);
         assert_eq!(engine.fallback_count(), 1);
+        // Transport trouble is not model non-compliance: the invalid
+        // counter stays put (only `note_noncompliant` moves it).
+        assert_eq!(engine.invalid_count(), 0);
+        assert_eq!(engine.timeout_count(), 0);
     }
 
     #[test]

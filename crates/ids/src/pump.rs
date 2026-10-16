@@ -20,6 +20,11 @@ pub const EVENT_AUTHORITY: Pubkey =
 pub const PUMP_MIGRATION_AUTHORITY: Pubkey =
     Pubkey::from_str_const("39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg");
 
+/// Bonding-curve account discriminator: sha256(`"account:BondingCurve"`)[..8].
+/// Single source for every curve-state parser (paper ledger and dispatch
+/// must agree on what a curve account is).
+pub const BONDING_CURVE_DISCRIMINATOR: [u8; 8] = [23, 183, 248, 55, 96, 216, 172, 96];
+
 /// `create` instruction discriminator (skill solana-geyser-pumpfun).
 pub const PUMP_CREATE_DISCRIMINATOR: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
 /// `create_v2` discriminator (creator/mayhem fields, 14-account layout).
@@ -40,6 +45,10 @@ pub const PUMP_SELL_V3_DISCRIMINATOR: [u8; 8] = [28, 146, 222, 119, 38, 196, 105
 pub const PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR: [u8; 8] =
     [225, 247, 80, 30, 213, 179, 132, 136];
 /// `sell_v2`: 26 accounts, 24-byte payload like legacy `sell`.
+/// Intentional discriminator collision with
+/// `ids::PUMP_AMM_SELL_V2_DISCRIMINATOR` (same 8 bytes): never merge —
+/// the two are disambiguated by program-id (Pump vs PumpSwap AMM).
+/// See the cross-crate const-assert in `ids::lib`.
 pub const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 /// `migrate` instruction discriminator (skill solana-raydium-migration).
 pub const PUMP_MIGRATE_DISCRIMINATOR: [u8; 8] = [155, 234, 231, 146, 236, 158, 162, 30];

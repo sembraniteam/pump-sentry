@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, warn};
@@ -73,8 +73,10 @@ pub struct CurveTicker {
     interval: Duration,
     sol_feed: Arc<SolUsdFeed>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
-    /// Mint decimals cache (immutable; evicted past cap).
-    decimals: Arc<Mutex<HashMap<String, u8>>>,
+    /// Mint decimals cache: (decimals, first-seen). Immutable on-chain;
+    /// eviction past the cap drops the oldest first-seen entry (not a
+    /// random key) so hot mints are not evicted by insertion luck.
+    decimals: Arc<Mutex<HashMap<String, (u8, Instant)>>>,
     /// FeeConfig/Global cache.
     fee_inputs: crate::fee::FeeInputsCache,
     /// Mint supply cache (immutable on curves; evicted past cap).
@@ -108,11 +110,21 @@ impl CurveTicker {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             _ => return Err(CurveError::BadUrl(http_url.to_string())),
         }
-        Ok(Self {
-            rpc: Arc::new(RpcClient::new_with_commitment(
+        Ok(Self::with_rpc(
+            Arc::new(RpcClient::new_with_commitment(
                 http_url.to_string(),
                 commitment,
             )),
+            interval,
+            sol_feed,
+        ))
+    }
+
+    /// Build around a shared RPC client (one connection pool per process).
+    /// Prefer this in `main`; `new` above is a test/back-compat wrapper.
+    pub fn with_rpc(rpc: Arc<RpcClient>, interval: Duration, sol_feed: Arc<SolUsdFeed>) -> Self {
+        Self {
+            rpc,
             subs: Arc::new(RwLock::new(HashMap::new())),
             interval,
             sol_feed,
@@ -121,7 +133,7 @@ impl CurveTicker {
             fee_inputs: Arc::new(Mutex::new(None)),
             supply: Arc::new(Mutex::new(HashMap::new())),
             backoff: Arc::new(RoundBackoff::new()),
-        })
+        }
     }
 
     /// Watch a curve for a mint.
@@ -169,7 +181,7 @@ impl CurveTicker {
 
     /// Mint decimals (cached). Fail-closed.
     pub async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError> {
-        if let Some(hit) = self.decimals.lock().await.get(mint) {
+        if let Some((hit, _)) = self.decimals.lock().await.get(mint) {
             return Ok(*hit);
         }
         let key = Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
@@ -187,12 +199,18 @@ impl CurveTicker {
                 account.data.len(),
             )))?;
         let mut cache = self.decimals.lock().await;
-        if cache.len() >= DECIMALS_CACHE_CAP
-            && let Some(oldest) = cache.keys().next().cloned()
-        {
-            cache.remove(&oldest);
+        if cache.len() >= DECIMALS_CACHE_CAP {
+            // Evict the oldest first-seen entry (deterministic LRU-ish;
+            // `keys().next()` would evict at random hash order).
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
         }
-        cache.insert(mint.to_string(), decimals);
+        cache.insert(mint.to_string(), (decimals, Instant::now()));
         Ok(decimals)
     }
 
@@ -536,13 +554,13 @@ mod tests {
     fn feed_stale_fails_closed() {
         use std::time::{SystemTime, UNIX_EPOCH};
         let stale = SolUsdFeed::new(
-            crate::sol_feed::DEFAULT_JUP_URL,
+            &crate::sol_feed::DEFAULT_JUP_URL,
             120,
             std::time::Duration::from_secs(30),
         );
         stale.set_price(150.0);
         let empty = SolUsdFeed::new(
-            crate::sol_feed::DEFAULT_JUP_URL,
+            &crate::sol_feed::DEFAULT_JUP_URL,
             120,
             std::time::Duration::from_secs(30),
         );

@@ -50,24 +50,27 @@ pub struct RaydiumV4Pool {
 }
 
 impl RaydiumV4Pool {
-    /// Parse address slots. Never panics.
+    /// Parse address slots. Never panics: every slot read is
+    /// bounds-checked, so a short buffer errors instead of trapping.
     /// Slot reads only. Call [`Self::validate`] before routing.
     pub fn parse(amm_id: &Pubkey, data: &[u8]) -> Result<Self, MigrationError> {
         if data.len() < RAYDIUM_V4_MIN_PREFIX {
             return Err(MigrationError::DataTooShort(data.len()));
         }
-        let slot = |at: usize| -> Pubkey {
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(&data[at..at + 32]);
-            Pubkey::new_from_array(buf)
+        let short = || MigrationError::DataTooShort(data.len());
+        let slot = |at: usize| -> Result<Pubkey, MigrationError> {
+            data.get(at..at + 32)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .map(Pubkey::new_from_array)
+                .ok_or_else(short)
         };
         Ok(Self {
             amm_id: *amm_id,
-            base_vault: slot(OFF_BASE_VAULT),
-            quote_vault: slot(OFF_QUOTE_VAULT),
-            base_mint: slot(OFF_BASE_MINT),
-            quote_mint: slot(OFF_QUOTE_MINT),
-            lp_mint: slot(OFF_LP_MINT),
+            base_vault: slot(OFF_BASE_VAULT)?,
+            quote_vault: slot(OFF_QUOTE_VAULT)?,
+            base_mint: slot(OFF_BASE_MINT)?,
+            quote_mint: slot(OFF_QUOTE_MINT)?,
+            lp_mint: slot(OFF_LP_MINT)?,
         })
     }
 

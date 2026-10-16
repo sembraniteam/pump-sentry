@@ -80,26 +80,10 @@ pub struct BuyV3Accounts<'a> {
     pub buyback_recipient: &'a Pubkey,
 }
 
-/// v3 sell accounts (17). Same shape, drain direction.
-#[derive(Debug, Clone, Copy)]
-pub struct SellV3Accounts<'a> {
-    /// Payer and signer (position 8).
-    pub payer: &'a Pubkey,
-    /// Token mint (position 1).
-    pub mint: &'a Pubkey,
-    /// Quote mint (position 2; WSOL on SOL pairs).
-    pub quote_mint: &'a Pubkey,
-    /// Curve PDA (position 5).
-    pub bonding_curve: &'a Pubkey,
-    /// Curve base ATA (position 6).
-    pub associated_bonding_curve: &'a Pubkey,
-    /// Token program owning `mint`.
-    pub base_token_program: &'a Pubkey,
-    /// Token program owning `quote_mint`.
-    pub quote_token_program: &'a Pubkey,
-    /// Buyback recipient (position 13).
-    pub buyback_recipient: &'a Pubkey,
-}
+/// v3 sell accounts (17). Same shape as [`BuyV3Accounts`], drain
+/// direction: one definition, two names (alias keeps call sites
+/// and tests reading naturally).
+pub type SellV3Accounts<'a> = BuyV3Accounts<'a>;
 
 /// User volume PDA: `["user_volume_accumulator", user]` (v3 [11]).
 pub fn user_volume_accumulator_pda(user: &Pubkey) -> Pubkey {

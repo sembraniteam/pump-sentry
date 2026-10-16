@@ -1,6 +1,108 @@
 //! Live mirror: dispatch, rechecks, sells, manual exits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+/// One settled execution gap: paper-booked close vs live reality.
+/// `settle_price_usd` is the tick price when live settled (the same feed
+/// paper uses) — NOT the intra-bundle fill, which is unknowable without
+/// parsing the landed tx. The gap therefore measures timing + tip drag
+/// and never pretends to measure bundle slippage.
+#[derive(Debug, Clone)]
+pub struct FillGap {
+    pub mint: String,
+    pub paper_price_usd: f64,
+    pub settle_price_usd: f64,
+    pub qty_tokens: u64,
+    pub tip_usd: f64,
+    /// `(settle - paper) * qty - tip`: negative means live did worse.
+    /// Long-only pipeline, so the sign needs no side adjustment.
+    pub gap_usd: f64,
+}
+
+/// Bounded execution-gap log with aggregates for heartbeat calibration.
+/// At most `FILL_GAP_CAP` entries; oldest shed first. This is a
+/// calibration signal, not custody: shedding loses precision, never
+/// funds. `None` settle (no pending paper note) records nothing —
+/// unmatched settles are orphan/manual legs, never fabricated gaps.
+pub struct FillGapTracker {
+    pending: HashMap<String, (f64, u64)>,
+    gaps: VecDeque<FillGap>,
+    total_gap_usd: f64,
+}
+
+/// Gap history cap (calibration window, not a position limit).
+pub const FILL_GAP_CAP: usize = 128;
+
+impl FillGapTracker {
+    /// Empty tracker.
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            gaps: VecDeque::new(),
+            total_gap_usd: 0.0,
+        }
+    }
+
+    /// Paper booked a close at the model price. Latest wins per mint:
+    /// multi-tick closes of one mint re-note, the settle matches the
+    /// newest (documented imprecision, bounded by one tick move).
+    pub fn note_paper_close(&mut self, mint: &str, paper_price_usd: f64, qty_tokens: u64) {
+        if paper_price_usd.is_finite() && paper_price_usd > 0.0 && qty_tokens > 0 {
+            self.pending
+                .insert(mint.to_string(), (paper_price_usd, qty_tokens));
+        }
+    }
+
+    /// Live settled a sale. Returns the gap when a paper close was
+    /// pending; `None` settles nothing. Non-finite settles keep the
+    /// pending note for the next round instead of recording garbage.
+    pub fn note_live_settle(
+        &mut self,
+        mint: &str,
+        settle_price_usd: f64,
+        tip_usd: f64,
+    ) -> Option<FillGap> {
+        if !settle_price_usd.is_finite() || !tip_usd.is_finite() {
+            return None;
+        }
+        let (paper_price_usd, qty_tokens) = self.pending.remove(mint)?;
+        let gap_usd = (settle_price_usd - paper_price_usd) * qty_tokens as f64 - tip_usd;
+        if !gap_usd.is_finite() {
+            return None;
+        }
+        let gap = FillGap {
+            mint: mint.to_string(),
+            paper_price_usd,
+            settle_price_usd,
+            qty_tokens,
+            tip_usd,
+            gap_usd,
+        };
+        self.total_gap_usd += gap_usd;
+        self.gaps.push_back(gap.clone());
+        while self.gaps.len() > FILL_GAP_CAP {
+            self.gaps.pop_front();
+        }
+        Some(gap)
+    }
+
+    /// `(settled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
+    /// Average over the retained window; zero-count yields zeros.
+    pub fn stats(&self) -> (usize, f64, f64) {
+        let n = self.gaps.len();
+        if n == 0 {
+            return (0, 0.0, 0.0);
+        }
+        (n, self.total_gap_usd / n as f64, self.total_gap_usd)
+    }
+}
+
+impl Default for FillGapTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 use std::sync::Arc;
 
 use alert::Alerter;
@@ -29,6 +131,36 @@ pub fn live_base_mint(key: &str) -> &str {
 fn short_tag(s: &str) -> String {
     s.chars().take(8).collect()
 }
+
+/// Breaker headline: paper net less dispatch bleed. A non-finite
+/// dispatch leg never poisons the gate; falls back to raw net.
+/// Single owner for the `net - dispatch` convention used by both
+/// the tick path and manual sells.
+pub(crate) fn breaker_headline(net_pnl: f64, dispatch_usd: f64) -> f64 {
+    if dispatch_usd.is_finite() {
+        net_pnl - dispatch_usd
+    } else {
+        net_pnl
+    }
+}
+
+/// Probe WAL writability without writing: an existing file must
+/// open for append; a missing file needs a live parent dir.
+/// Startup-probe API for the binary entrypoint (outside this
+/// module's scope); used in tests until wired there.
+#[allow(dead_code)]
+pub fn wal_writable(path: &std::path::Path) -> bool {
+    if path.exists() {
+        std::fs::OpenOptions::new().append(true).open(path).is_ok()
+    } else {
+        match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(dir) => dir.is_dir(),
+            // Bare filename: current dir must exist.
+            None => std::path::Path::new(".").is_dir(),
+        }
+    }
+}
+
 /// Live state, split from [`Pipeline`]. Owns the live generic (`L`).
 pub struct LiveExecution<L = LiveTrader> {
     /// Dispatcher; `None` is paper-only.
@@ -49,6 +181,8 @@ pub struct LiveExecution<L = LiveTrader> {
     pub live_sell_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// GiveUp timestamps (secs) for burst alerting. Pruned on read.
     pub giveup_stamps: Mutex<Vec<u64>>,
+    /// Paper-vs-live execution gaps (calibration signal).
+    pub gaps: Mutex<FillGapTracker>,
 }
 
 impl<L> LiveExecution<L> {
@@ -64,6 +198,7 @@ impl<L> LiveExecution<L> {
             deferred_pnl: Mutex::new(HashMap::new()),
             live_sell_locks: Mutex::new(HashMap::new()),
             giveup_stamps: Mutex::new(Vec::new()),
+            gaps: Mutex::new(FillGapTracker::new()),
         }
     }
 
@@ -194,6 +329,41 @@ impl<L> LiveExecution<L> {
         let mut stamps = self.giveup_stamps.lock().await;
         stamps.retain(|ts| *ts >= cutoff);
         stamps.len()
+    }
+
+    /// Paper booked a close at the model price (call per paper close).
+    pub async fn note_gap_paper_close(&self, mint: &str, paper_price_usd: f64, qty_tokens: u64) {
+        self.gaps
+            .lock()
+            .await
+            .note_paper_close(mint, paper_price_usd, qty_tokens);
+    }
+
+    /// Live settled a sale (call on every confirmed sell AND settled
+    /// manual exit). Logs the gap when a paper close was pending; silent
+    /// `None` otherwise (orphan legs record nothing).
+    pub async fn note_gap_live_settle(
+        &self,
+        mint: &str,
+        settle_price_usd: f64,
+        tip_usd: f64,
+    ) {
+        let gap = self
+            .gaps
+            .lock()
+            .await
+            .note_live_settle(mint, settle_price_usd, tip_usd);
+        if let Some(gap) = gap {
+            info!(mint = %gap.mint, paper = gap.paper_price_usd, settle = gap.settle_price_usd,
+                qty = gap.qty_tokens, tip = format!("{:.4}", gap.tip_usd),
+                gap_usd = format!("{:+.4}", gap.gap_usd),
+                "execution gap settled (paper model vs live reality)");
+        }
+    }
+
+    /// `(settled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
+    pub async fn gap_stats(&self) -> (usize, f64, f64) {
+        self.gaps.lock().await.stats()
     }
 
     /// Pending-buy count for the heartbeat (unconfirmed fills).
@@ -341,6 +511,28 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             self.emit(format!("LIVE buy skipped on already-tracked {mint}; no dispatch"));
             return;
         }
+        // Decimals explicit (cached read): sizing assumes per-mint units.
+        // Gate drops non-6; live re-verifies so a 9-decimal mint can
+        // never size 1000x wrong here.
+        let decimals = match self.reserves.token_decimals(mint).await {
+            Ok(6) => 6u8,
+            Ok(other) => {
+                warn!(%mint, decimals = other, "non-6-decimal mint; live buy skipped (fail-closed)");
+                self.exec
+                    .mark_diverged(mint, "live buy skipped: non-6 decimals".to_string())
+                    .await;
+                self.emit(format!("LIVE buy skipped on {mint} (non-6 decimals); paper open WITHOUT live cover"));
+                return;
+            }
+            Err(e) => {
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "mint decimals unreadable; live buy skipped (fail-closed)");
+                self.exec
+                    .mark_diverged(mint, "live buy skipped: decimals unreadable".to_string())
+                    .await;
+                self.emit(format!("LIVE buy skipped on {mint} (decimals unreadable); paper open WITHOUT live cover"));
+                return;
+            }
+        };
         match trader
             .buy(&LiveBuyParams {
                 mint,
@@ -353,6 +545,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // Same tier as paper: sizing matches booked fills.
                 venue_fee_bps: Some(self.portfolio.lock().await.venue_fee_for(mint)),
                 creator,
+                decimals,
             })
             .await
         {
@@ -508,6 +701,21 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         // Floor at the mint tier (paper parity).
         let venue_fee_bps = self.portfolio.lock().await.venue_fee_for(mint);
+        // Decimals explicit (cached): floor math needs per-mint units.
+        // Unreadable retries next tick; non-6 counts toward the retry
+        // budget like dust (gate never opens those, so this is drift).
+        let decimals = match self.reserves.token_decimals(mint).await {
+            Ok(6) => 6u8,
+            Ok(other) => {
+                let attempts = self.exec.note_failure(mint, now).await;
+                warn!(%mint, decimals = other, attempts, "non-6-decimal mint; live sell refused (fail-closed)");
+                return false;
+            }
+            Err(e) => {
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "mint decimals unreadable; live sell deferred");
+                return false;
+            }
+        };
         let probe = {
             let Some(tracked) = self.exec.tracked(mint).await else {
                 self.flush_deferred_pnl(mint).await;
@@ -552,10 +760,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let tip = trader.effective_tip(attempts).await;
         // Never compete with our own inflight bundle: a resend while
         // the prior sell is still engine-pending risks two live
-        // bundles for one bag. Unknown status proceeds (exits must
-        // not stall on a status outage).
+        // bundles for one bag. Both Pending and Unknown hold the
+        // resend (status outage must not fork exits).
         if attempts > 0 && trader.prior_sell_pending(mint).await {
-            warn!(%mint, "prior sell bundle still inflight-pending; holding resend");
+            warn!(%mint, attempts, "prior sell bundle still inflight (Pending/Unknown); holding resend");
             return false;
         }
         let sell_result = match &pool {
@@ -586,6 +794,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         liquidity_usd,
                         venue_fee_bps: Some(venue_fee_bps),
                         tip_lamports: tip,
+                        decimals,
                     })
                     .await
             }
@@ -606,6 +815,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.daily.lock().await.record(-tip_usd, now_secs());
                     self.portfolio.lock().await.debit_dispatch_cost(tip_usd);
                 }
+                // Execution-gap calibration: pool legs settle at vault
+                // prices, curve legs near this tick; the tick is the
+                // shared proxy (see `FillGap` docs for what this omits).
+                self.exec.note_gap_live_settle(mint, price_usd, tip_usd).await;
                 warn!(%mint, %bundle, "LIVE sell dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_sell(&self.card_ctx(), mint, &bundle));
                 true
@@ -634,8 +847,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         warn!(%mint, "LIVE sell gave up after retries; parked for manual exit (still HELD)");
                     }
                     self.emit(format!("LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"));
-                    // Auto-exit over (human owns it): paper PnL may settle.
-                    self.flush_deferred_pnl(mint).await;
+                    // Parked manual = still held: never flush stashed
+                    // paper PnL here (it settles when the manual exit
+                    // clears). Auto-exit is over, so the caller treats
+                    // this tick as settled.
                     true
                 } else if deterministic {
                     warn!(%mint, error = %ids::strip_error_url(&e.to_string()), attempts, "LIVE sell rejected before dispatch; holding, will re-probe");
@@ -721,11 +936,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let ids: Vec<u64> = portfolio.positions_for_mint(&tick.mint);
         let mut closed_pnls: Vec<f64> = Vec::new();
         let mut closed_cards: Vec<(String, f64, f64, f64, bool)> = Vec::new();
+        // Gap notes flush after unlock (never nest the gaps lock inside
+        // the portfolio guard; same discipline as the card emits below).
+        let mut gap_notes: Vec<(f64, u64)> = Vec::new();
         let now = now_secs();
         for id in ids {
             match portfolio.close_position(id, tick.price_usd, tick.liquidity_usd, ExitReason::Manual, tick.observed_at) {
                 Ok(trade) => {
-                    closed_pnls.push(trade.net_pnl);
+                    let headline = breaker_headline(trade.net_pnl, trade.dispatch_usd);
+                    closed_pnls.push(headline);
+                    gap_notes.push((trade.exit_price, trade.quantity));
                     let mut marks: HashMap<String, simulator::Mark> = HashMap::new();
                     marks.insert(
                         tick.mint.clone(),
@@ -736,10 +956,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     );
                     let equity = portfolio.snapshot(&marks).equity;
                     info!(mint = %tick.mint, id, reason = ?trade.reason,
-                        net = format!("{:+.2}", trade.net_pnl), "paper position closed (manual sell)");
+                        net = format!("{:+.2}", headline), "paper position closed (manual sell)");
                     closed_cards.push((
                         format!("{:?}", trade.reason),
-                        trade.net_pnl,
+                        headline,
                         trade.net_pnl_percent,
                         equity,
                         false,
@@ -754,6 +974,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 &self.card_ctx(),
                 &tick.mint, &reason, pnl, pct, equity, moonbag,
             ));
+        }
+        for (paper_price, qty) in gap_notes {
+            self.exec.note_gap_paper_close(&tick.mint, paper_price, qty).await;
         }
         // Live first, breaker second.
         let live_settled = self.live_sell(&tick.mint, tick.price_usd, tick.liquidity_usd, 1.0).await;
@@ -792,6 +1015,71 @@ mod tests {
 
     fn exec() -> LiveExecution<LiveTrader> {
         LiveExecution::paper().with_live(None)
+    }
+
+    #[test]
+    fn breaker_headline_nets_dispatch_bleed() {
+        assert_eq!(breaker_headline(10.0, 0.5), 9.5);
+        assert_eq!(breaker_headline(-3.0, 0.0), -3.0);
+        // Non-finite dispatch never poisons the gate.
+        assert_eq!(breaker_headline(10.0, f64::NAN), 10.0);
+        assert_eq!(breaker_headline(10.0, f64::INFINITY), 10.0);
+    }
+
+    #[test]
+    fn fill_gap_tracker_matches_paper_to_live_settle() {
+        let mut t = FillGapTracker::new();
+        assert_eq!(t.stats(), (0, 0.0, 0.0));
+        // Unmatched settle records nothing (orphan legs, never fabricated).
+        assert!(t.note_live_settle("M", 1.0, 0.05).is_none());
+        assert_eq!(t.stats(), (0, 0.0, 0.0));
+        // Degenerate paper notes are ignored.
+        t.note_paper_close("M", f64::NAN, 10);
+        t.note_paper_close("M", 0.0, 10);
+        t.note_paper_close("M", 1.0, 0);
+        assert!(t.note_live_settle("M", 1.0, 0.05).is_none());
+        // Paper 2.0 x 10 tokens, live settles 1.9 + 0.05 tip:
+        // (1.9 - 2.0) * 10 - 0.05 = -1.05.
+        t.note_paper_close("M", 2.0, 10);
+        let gap = t.note_live_settle("M", 1.9, 0.05).expect("gap");
+        assert_eq!(gap.qty_tokens, 10);
+        assert!((gap.gap_usd + 1.05).abs() < 1e-9, "gap={}", gap.gap_usd);
+        // Consumed: a second settle without a new paper note is orphan.
+        assert!(t.note_live_settle("M", 1.9, 0.05).is_none());
+        let (n, avg, total) = t.stats();
+        assert_eq!(n, 1);
+        assert!((avg + 1.05).abs() < 1e-9);
+        assert!((total + 1.05).abs() < 1e-9);
+        // Non-finite settle keeps the pending note for the next round.
+        t.note_paper_close("N", 3.0, 5);
+        assert!(t.note_live_settle("N", f64::NAN, 0.05).is_none());
+        let gap = t.note_live_settle("N", 3.0, 0.05).expect("kept");
+        assert!((gap.gap_usd + 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fill_gap_tracker_sheds_oldest_past_cap() {
+        let mut t = FillGapTracker::new();
+        for _ in 0..(FILL_GAP_CAP + 10) {
+            t.note_paper_close("M", 1.0, 1);
+            t.note_live_settle("M", 1.0, 0.0).expect("gap");
+        }
+        // Bounded history; totals still accumulate (windowed avg, full sum).
+        assert_eq!(t.gaps.len(), FILL_GAP_CAP);
+        let (n, _, _) = t.stats();
+        assert_eq!(n, FILL_GAP_CAP);
+    }
+
+    #[test]
+    fn wal_probe_detects_missing_parent() {
+        use std::path::Path;
+        // Bare filename: no file touched, current dir lives.
+        assert!(wal_writable(Path::new("definitely-a-wal-probe-name.log")));
+        assert!(!wal_writable(Path::new("/no/such/dir/ever/wal.log")));
+        let probe = std::env::temp_dir().join("pump-sentry-wal-probe.tmp");
+        std::fs::write(&probe, "x").expect("probe write");
+        assert!(wal_writable(&probe));
+        std::fs::remove_file(&probe).ok();
     }
 
     #[tokio::test]

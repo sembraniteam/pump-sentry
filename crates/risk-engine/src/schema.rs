@@ -24,13 +24,20 @@ pub struct TokenMetrics {
     pub dev_reputation: f64,
     /// RugCheck risk score.
     pub rugcheck_score: u32,
+    /// Venue fee tier in bps per side (`None` = unknown, assume the
+    /// standard 125bps tier). Carried so the model prices round-trip
+    /// costs from a number instead of guessing the tier blind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue_fee_bps: Option<f64>,
     /// Bundle buys in the creation slot (`None` = unknown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_slot_buys: Option<u32>,
     /// Largest insider-cluster supply share in percent (`None` = unknown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_pct: Option<f64>,
-    /// Bonding-curve progress in percent (`None` = unknown).
+    /// Bonding-curve progress in percent (`None` = unknown, currently
+    /// always unmeasured at confirm — no reserve field carries it; the
+    /// prompt assumes the static 2–4% spread prior when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curve_progress: Option<f64>,
 }
@@ -85,6 +92,7 @@ impl RiskProfile {
                     && self.tp_percent <= MAX_TP_PERCENT
                     && self.sl_percent <= -MIN_STOP_MAGNITUDE_PCT
                     && self.sl_percent >= MIN_SL_PERCENT
+                    && self.timeout_seconds >= MIN_TIMEOUT_SECS
                     && self.timeout_seconds <= MAX_TIMEOUT_SECS
             }
             Action::Pass => {
@@ -113,9 +121,12 @@ pub const MIN_SL_PERCENT: f64 = -100.0;
 pub const MIN_STOP_MAGNITUDE_PCT: f64 = 8.0;
 /// Max exit timeout in seconds (one hour).
 pub const MAX_TIMEOUT_SECS: u64 = 3600;
+/// Min exit timeout in seconds. A BUY with no timeout holds until
+/// TP/SL forever, pinning a heat slot; only PASS is timeless.
+pub const MIN_TIMEOUT_SECS: u64 = 1;
 
 /// System instruction sent to the model.
-pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. On high-fee tiers, widen SL past round-trip costs instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout at most 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.";
+pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.";
 
 impl TokenMetrics {
     /// Render the skill's `INPUT PAYLOAD` as a compact JSON string.
@@ -125,6 +136,7 @@ impl TokenMetrics {
             "buy_velocity_5s": self.buy_velocity_5s,
             "dev_reputation": self.dev_reputation,
             "rugcheck_score": self.rugcheck_score,
+            "venue_fee_bps": self.venue_fee_bps,
             "creation_slot_buys": self.creation_slot_buys,
             "cluster_pct": self.cluster_pct,
             "curve_progress": self.curve_progress,
@@ -149,6 +161,7 @@ mod tests {
             buy_velocity_5s: 40,
             dev_reputation: 0.8,
             rugcheck_score: 120,
+            venue_fee_bps: Some(125.0),
             creation_slot_buys: None,
             cluster_pct: None,
             curve_progress: None,
@@ -159,6 +172,7 @@ mod tests {
         assert_eq!(value["buy_velocity_5s"], 40);
         assert_eq!(value["dev_reputation"], 0.8);
         assert_eq!(value["rugcheck_score"], 120);
+        assert_eq!(value["venue_fee_bps"], 125.0);
     }
 
     #[test]

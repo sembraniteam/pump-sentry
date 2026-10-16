@@ -91,6 +91,16 @@ pub const TIP_FLOOR_TTL_SECS: u64 = 60;
 /// Lamports per SOL (floor conversion).
 const LAMPORTS_PER_SOL_F: f64 = 1_000_000_000.0;
 
+/// Consecutive schema failures parsing the tip-floor oracle (metric:
+/// a rising count means the oracle shape drifted, not just blipped).
+static TIP_FLOOR_PARSE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Schema-failure count for [`parse_tip_floor_lamports`].
+pub fn tip_floor_parse_failures() -> u64 {
+    TIP_FLOOR_PARSE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Seconds since epoch (0 on clock trouble).
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -197,11 +207,7 @@ impl JitoClient {
     /// callers fall back to the configured tip.
     pub async fn tip_floor_lamports(&self) -> u64 {
         let now = unix_secs();
-        let stale = self
-            .floor
-            .lock()
-            .map(|g| now.saturating_sub(g.1) >= TIP_FLOOR_TTL_SECS)
-            .unwrap_or(true);
+        let stale = self.tip_floor_stale_at(now);
         if stale {
             let fresh = self.fetch_tip_floor().await.unwrap_or(0);
             if fresh == 0 {
@@ -218,6 +224,24 @@ impl JitoClient {
             }
         }
         self.floor.lock().map(|g| g.0).unwrap_or(0)
+    }
+
+    /// Last floor-fetch unix seconds (0 = never).
+    pub fn tip_floor_last_update(&self) -> u64 {
+        self.floor.lock().map(|g| g.1).unwrap_or(0)
+    }
+
+    /// True when the cached floor is past [`TIP_FLOOR_TTL_SECS`]
+    /// (or never fetched): the next `tip_floor_lamports` refetches.
+    pub fn tip_floor_stale(&self) -> bool {
+        self.tip_floor_stale_at(unix_secs())
+    }
+
+    fn tip_floor_stale_at(&self, now: u64) -> bool {
+        self.floor
+            .lock()
+            .map(|g| now.saturating_sub(g.1) >= TIP_FLOOR_TTL_SECS)
+            .unwrap_or(true)
     }
 
     /// GET the floor oracle. `None` on any trouble.
@@ -237,7 +261,9 @@ impl JitoClient {
     }
 }
 
-/// Pure: median landed tip (SOL) → lamports. 0 on any schema trouble.
+/// Pure: median landed tip (SOL) → lamports. 0 on any schema trouble
+/// (counted in [`tip_floor_parse_failures`], warned: a silent 0 would
+/// hide oracle-shape drift as "no congestion").
 fn parse_tip_floor_lamports(body: &serde_json::Value) -> u64 {
     let sol = body
         .as_array()
@@ -246,9 +272,27 @@ fn parse_tip_floor_lamports(body: &serde_json::Value) -> u64 {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
     if !sol.is_finite() || sol <= 0.0 {
+        TIP_FLOOR_PARSE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!("jito tip-floor schema unparsable; treating floor as 0 (unknown)");
         return 0;
     }
     (sol * LAMPORTS_PER_SOL_F) as u64
+}
+
+/// Max of the configured base tip and the landed-tip floor.
+/// Warns when the floor is unknown (0) while a positive base tip
+/// rules: landing under congestion is then unproven.
+pub fn apply_tip_floor(base_tip_lamports: u64, floor_lamports: u64) -> u64 {
+    if floor_lamports == 0 {
+        if base_tip_lamports > 0 {
+            tracing::warn!(
+                base = base_tip_lamports,
+                "tip floor 0 with positive base tip; congestion underland risk unmeasured"
+            );
+        }
+        return base_tip_lamports;
+    }
+    base_tip_lamports.max(floor_lamports)
 }
 
 /// Build the `sendBundle` payload (pure). `params[1]` picks base64.
@@ -492,6 +536,25 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert_eq!(params[0][0], "dGVzdA==");
         assert_eq!(params[1]["encoding"], "base64");
+    }
+
+    #[test]
+    fn bundle_payload_preserves_all_txs_with_encoding() {
+        // Multi-tx bundles must keep order and still carry the mandatory
+        // base64 marker (the skill doc once omitted it for every bundle).
+        let txs = vec!["eDE=".to_string(), "eDI=".to_string(), "eDM=".to_string()];
+        let payload = bundle_payload(txs.clone());
+        let params = payload["params"].as_array().expect("params array");
+        assert_eq!(params.len(), 2);
+        let wire = params[0].as_array().expect("tx array");
+        assert_eq!(wire.len(), 3);
+        for (i, tx) in txs.iter().enumerate() {
+            assert_eq!(&wire[i], tx, "tx order must survive payload build");
+        }
+        assert_eq!(params[1]["encoding"], "base64");
+        // Empty bundle keeps the shape (dispatch rejects empty upstream).
+        let empty = bundle_payload(Vec::new());
+        assert_eq!(empty["params"][1]["encoding"], "base64");
     }
 
     #[test]

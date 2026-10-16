@@ -1,4 +1,4 @@
-//! Runtime knobs, all overridable via env.
+//! Runtime knobs, all tunable via config.toml (secrets stay in env).
 
 use risk_engine::StrategyMode;
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ pub struct Settings {
     /// Virtual balance in USD.
     pub start_balance: f64,
     /// Extra commission per side in bps (stacks on the venue fee).
+    /// Future: migrate to `crate::money::Bps` (see money.rs TODO).
     pub fee_bps: f64,
     /// Paper notional per trade in USD.
     pub notional_usd: f64,
@@ -53,8 +54,6 @@ pub struct Settings {
     pub dev_sig_limit: usize,
     /// Manual entry quote (tests).
     pub quote_usd: Option<f64>,
-    /// Retired `SOL_USD`: parsed to warn, unused.
-    pub _sol_usd_retired: f64,
     /// Curve poll interval in ms.
     pub tick_interval_ms: u64,
     /// Pool poll interval in ms.
@@ -130,7 +129,6 @@ impl std::fmt::Debug for Settings {
             .field("dev_screen_sample_txs", &self.dev_screen_sample_txs)
             .field("dev_sig_limit", &self.dev_sig_limit)
             .field("quote_usd", &self.quote_usd)
-            .field("_sol_usd_retired", &self._sol_usd_retired)
             .field("tick_interval_ms", &self.tick_interval_ms)
             .field("vault_tick_interval_ms", &self.vault_tick_interval_ms)
             .field("inference_endpoint", &self.inference_endpoint)
@@ -207,7 +205,6 @@ impl Settings {
             dev_screen_sample_txs: get_int(vars, "DEV_SCREEN_SAMPLE_TXS", 20, &mut notes),
             dev_sig_limit: get_int(vars, "DEV_SIG_LIMIT", 100, &mut notes),
             quote_usd: parse_quote_usd(vars, &mut notes),
-            _sol_usd_retired: parse_retired_sol_usd(vars, &mut notes),
             tick_interval_ms: get_int(vars, "TICK_INTERVAL_MS", 1000, &mut notes),
             vault_tick_interval_ms: get_int(vars, "VAULT_TICK_INTERVAL_MS", 5000, &mut notes),
             inference_endpoint: get_string(vars, "INFERENCE_ENDPOINT", DEFAULT_INFERENCE_ENDPOINT),
@@ -230,9 +227,9 @@ impl Settings {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             sim_strict: get_bool(vars, "SIM_STRICT", false, &mut notes),
-            alert_diverged_warn_n: get_int(vars, "ALERT_DIVERGED_WARN_N", 0, &mut notes),
-            alert_risk_fallback_warn_pct: get_int(vars, "ALERT_RISK_FALLBACK_WARN_PCT", 0, &mut notes),
-            alert_giveup_burst_n: get_int(vars, "ALERT_GIVEUP_BURST_N", 0, &mut notes),
+            alert_diverged_warn_n: get_int(vars, "ALERT_DIVERGED_WARN_N", 3, &mut notes),
+            alert_risk_fallback_warn_pct: get_int(vars, "ALERT_RISK_FALLBACK_WARN_PCT", 50, &mut notes),
+            alert_giveup_burst_n: get_int(vars, "ALERT_GIVEUP_BURST_N", 3, &mut notes),
             alert_giveup_window_secs: get_int(vars, "ALERT_GIVEUP_WINDOW_SECS", 3600, &mut notes),
             parse_notes: notes,
         }
@@ -241,7 +238,7 @@ impl Settings {
     /// Warnings for bad values. Empty when sane.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.parse_notes.clone();
-        if self.slippage_bps > crate::live::BPS_DENOMINATOR {
+        if self.slippage().is_none() {
             out.push(format!(
                 "SLIPPAGE_BPS={} exceeds 100%; quotes fail closed (no guard can cover it — check the value, likely a typo)",
                 self.slippage_bps
@@ -264,10 +261,7 @@ impl Settings {
                 "INFERENCE_API_KEY is set with a non-local plain-http INFERENCE_ENDPOINT: the bearer token travels in cleartext — use https or keep inference on localhost".to_string(),
             );
         }
-        if !self.runner_moonbag_percent.is_finite()
-            || self.runner_moonbag_percent < 0.0
-            || self.runner_moonbag_percent > 100.0
-        {
+        if self.runner_moonbag().is_none() {
             out.push(format!(
                 "RUNNER_MOONBAG_PERCENT={} outside 0–100; clamped at resolve time",
                 self.runner_moonbag_percent
@@ -304,12 +298,6 @@ impl Settings {
         }
         if self.gate_min_buyers == 0 {
             out.push("GATE_MIN_BUYERS=0 behaves as 1 (quorum floor)".to_string());
-        }
-        if self._sol_usd_retired > 0.0 && self._sol_usd_retired.is_finite() {
-            out.push(format!(
-                "SOL_USD={} is retired: pricing now uses a live Jupiter feed (dynamic, stale-gated); this env value is ignored",
-                self._sol_usd_retired
-            ));
         }
         if self.commitment == "processed" {
             out.push(
@@ -365,17 +353,34 @@ impl Settings {
         out
     }
 
+    /// Typed slippage guard (`None` when >=100% or unrepresentable).
+    /// Prefer this over raw `slippage_bps` in new code.
+    pub fn slippage(&self) -> Option<crate::money::Bps> {
+        u32::try_from(self.slippage_bps)
+            .ok()
+            .and_then(crate::money::Bps::new)
+    }
+
+    /// Typed runner moonbag share (`None` when outside 0–100).
+    pub fn runner_moonbag(&self) -> Option<crate::money::Percent> {
+        crate::money::Percent::new(self.runner_moonbag_percent)
+    }
+
     /// Fatal misconfig: values that guarantee no-opens or unguarded
     /// spend. Called at boot in every mode (paper must not run blind
     /// either); `warnings` keeps the soft advisories.
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.notional_usd.is_finite() || self.notional_usd <= 0.0 {
+    pub fn validate(&self) -> Result<(), String> {        if !self.notional_usd.is_finite() || self.notional_usd <= 0.0 {
             return Err(format!(
                 "NOTIONAL_USD={} is not positive; no position can open",
                 self.notional_usd
             ));
         }
-        if self.slippage_bps >= crate::live::BPS_DENOMINATOR {
+        // Refuse at or above 100%: `Bps` admits `0..=10_000` and
+        // `is_full` marks the 100% edge, so anything else (over the
+        // edge or unrepresentable as u32) refuses — exactly the old
+        // `>= BPS_DENOMINATOR` gate, message unchanged.
+        let slippage_ok = self.slippage().is_some_and(|b| !b.is_full());
+        if !slippage_ok {
             return Err(format!(
                 "SLIPPAGE_BPS={} (>=100%): buys would authorize 2x spend while every sell fails closed",
                 self.slippage_bps
@@ -449,30 +454,7 @@ fn get_bool(
     }
 }
 
-/// Retired static price: positive finite or 0 when unset.
-fn parse_retired_sol_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> f64 {
-    match vars.get("SOL_USD") {
-        None => 0.0,
-        Some(raw) => match raw.parse::<f64>() {
-            Ok(v) if v.is_finite() && v > 0.0 => {
-                notes.push(format!(
-                    "SOL_USD={v} is retired: pricing uses the live Jupiter feed; ignoring"
-                ));
-                v
-            }
-            Ok(_) => {
-                notes.push("SOL_USD is retired and not a positive price; ignoring".to_string());
-                0.0
-            }
-            Err(_) => {
-                notes.push(format!("SOL_USD='{raw}' is not a number; ignoring"));
-                0.0
-            }
-        },
-    }
-}
-
-/// Canonical WebSocket URL. Legacy `WS_URL` honored once with a note.
+/// Canonical WebSocket URL (`MAINNET_WSS_RPC_URL`; empty = public default).
 fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
     if vars.contains_key("MAINNET_WSS_RPC_URL")
@@ -484,19 +466,11 @@ fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
     }
     match vars.get("MAINNET_WSS_RPC_URL").map(clean).filter(|v| !v.is_empty()) {
         Some(url) => url,
-        None => match vars.get("WS_URL").map(clean).filter(|v| !v.is_empty()) {
-            Some(legacy) => {
-                notes.push(
-                    "WS_URL is retired: rename it to MAINNET_WSS_RPC_URL (honored this run)".to_string(),
-                );
-                legacy
-            }
-            None => listener::types::DEFAULT_WS_RPC_URL.to_string(),
-        },
+        None => listener::types::DEFAULT_WS_RPC_URL.to_string(),
     }
 }
 
-/// Canonical HTTP RPC URL. Legacy `HTTP_URL` honored once with a note.
+/// Canonical HTTP RPC URL (`MAINNET_RPC_URL`; empty = public default).
 fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
     // Blank set var is a typo, not unset.
@@ -509,15 +483,7 @@ fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
     }
     match vars.get("MAINNET_RPC_URL").map(clean).filter(|v| !v.is_empty()) {
         Some(url) => url,
-        None => match vars.get("HTTP_URL").map(clean).filter(|v| !v.is_empty()) {
-            Some(legacy) => {
-                notes.push(
-                    "HTTP_URL is retired: rename it to MAINNET_RPC_URL (honored this run)".to_string(),
-                );
-                legacy
-            }
-            None => listener::types::DEFAULT_HTTP_RPC_URL.to_string(),
-        },
+        None => listener::types::DEFAULT_HTTP_RPC_URL.to_string(),
     }
 }
 
@@ -640,34 +606,26 @@ mod tests {
     }
 
     #[test]
-    fn rpc_urls_prefer_mainnet_vars_strip_escapes_and_retire_legacy() {
-        // Canonical var wins.
-        let s = Settings::from_map(&vars(&[
-            ("MAINNET_RPC_URL", "https://helius/abc"),
-            ("HTTP_URL", "https://legacy/xyz"),
-        ]));
+    fn rpc_urls_prefer_mainnet_vars_and_strip_escapes() {
+        // Canonical var wins; retired aliases are ignored entirely.
+        let s = Settings::from_map(&vars(&[("MAINNET_RPC_URL", "https://helius/abc")]));
         assert_eq!(s.http_url, "https://helius/abc");
         assert!(s.parse_notes.is_empty());
         // Backslash escapes stripped.
         let s = Settings::from_map(&vars(&[("MAINNET_RPC_URL", "https:\\\\/\\\\/helius")]));
         assert_eq!(s.http_url, "https://helius");
-        // Legacy honored once, loudly.
+        // Retired aliases no longer honored: unset = public default.
         let s = Settings::from_map(&vars(&[("HTTP_URL", "https://legacy/xyz")]));
-        assert_eq!(s.http_url, "https://legacy/xyz");
-        assert!(s.warnings().iter().any(|w| w.contains("HTTP_URL is retired")), "{:?}", s.warnings());
+        assert_eq!(s.http_url, listener::types::DEFAULT_HTTP_RPC_URL);
+        let s = Settings::from_map(&vars(&[("WS_URL", "wss://legacy/xyz")]));
+        assert_eq!(s.ws_url, listener::types::DEFAULT_WS_RPC_URL);
         // Unset = public default.
         let s = Settings::from_map(&HashMap::new());
         assert_eq!(s.http_url, listener::types::DEFAULT_HTTP_RPC_URL);
         assert_eq!(s.ws_url, listener::types::DEFAULT_WS_RPC_URL);
-        // WSS mirrors the HTTP rule: canonical wins, legacy warns.
-        let s = Settings::from_map(&vars(&[
-            ("MAINNET_WSS_RPC_URL", "wss://helius/abc"),
-            ("WS_URL", "wss://legacy/xyz"),
-        ]));
+        // Canonical WSS wins.
+        let s = Settings::from_map(&vars(&[("MAINNET_WSS_RPC_URL", "wss://helius/abc")]));
         assert_eq!(s.ws_url, "wss://helius/abc");
-        let s = Settings::from_map(&vars(&[("WS_URL", "wss://legacy/xyz")]));
-        assert_eq!(s.ws_url, "wss://legacy/xyz");
-        assert!(s.warnings().iter().any(|w| w.contains("WS_URL is retired")), "{:?}", s.warnings());
     }
 
     #[test]

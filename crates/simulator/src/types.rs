@@ -29,7 +29,12 @@ pub struct Position {
     pub mint: String,
     pub side: Side,
     pub entry_price: f64,
-    pub quantity: f64,
+    /// Whole tokens held (absolute; direction comes from `side`).
+    /// Integer by construction: base-unit chain amounts are integers,
+    /// so float accumulation here would drift from live custody.
+    /// Sub-token dust floors to zero at open (rejected) and at partial
+    /// closes (rejected), matching live dust handling.
+    pub quantity: u64,
     pub entry_notional: f64,
     pub entry_fee: f64,
     pub tp_percent: f64,
@@ -50,7 +55,9 @@ pub struct ClosedTrade {
     pub side: Side,
     pub entry_price: f64,
     pub exit_price: f64,
-    pub quantity: f64,
+    /// Whole tokens closed (absolute; direction comes from `side`).
+    /// Integer like `Position::quantity`: partial-close math stays exact.
+    pub quantity: u64,
     pub gross_pnl: f64,
     pub fees: f64,
     pub net_pnl: f64,

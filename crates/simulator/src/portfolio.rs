@@ -43,7 +43,7 @@ struct CloseSlice {
     mint: String,
     side: Side,
     entry_price: f64,
-    quantity: f64,
+    quantity: u64,
     entry_notional: f64,
     entry_fee: f64,
     opened_at: u64,
@@ -71,7 +71,9 @@ impl CloseSlice {
             mint: position.mint.clone(),
             side: position.side,
             entry_price: position.entry_price,
-            quantity: position.quantity * fraction,
+            // Floor, never round: overselling is unauthorized, and a
+            // zero-sized slice is rejected by `settle` (live dust parity).
+            quantity: (position.quantity as f64 * fraction).floor() as u64,
             entry_notional: position.entry_notional * fraction,
             entry_fee: position.entry_fee * fraction,
             opened_at: position.opened_at,
@@ -281,39 +283,6 @@ impl PaperPortfolio {
         notional * self.fee_bps / 10_000.0
     }
 
-    /// Open a position.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_position(
-        &mut self,
-        mint: &str,
-        side: Side,
-        quote: f64,
-        notional_usd: f64,
-        liquidity_usd: f64,
-        tp_percent: f64,
-        sl_percent: f64,
-        trailing: bool,
-        trail_percent: f64,
-        timeout_seconds: u64,
-        moonbag_percent: f64,
-        now_secs: u64,
-    ) -> Result<PositionId, PortfolioError> {
-        self.open_position_params(&OpenPositionParams {
-            mint,
-            side,
-            quote,
-            notional_usd,
-            liquidity_usd,
-            tp_percent,
-            sl_percent,
-            trailing,
-            trail_percent,
-            timeout_seconds,
-            moonbag_percent,
-            now_secs,
-        })
-    }
-
     /// Open from params.
     pub fn open_position_params(
         &mut self,
@@ -347,16 +316,22 @@ impl PaperPortfolio {
                 notional: notional_usd,
                 liquidity: p.liquidity_usd,
             })?;
-        let entry_fee = self.fee_for(notional_usd);
-
-        let quantity = match p.side {
-            Side::Long => notional_usd / entry_price,
-            Side::Short => -(notional_usd / entry_price),
-        };
+        // Whole tokens, floored: sub-token dust cannot open (live sizes
+        // zero dust to a retry, never to a fill).
+        let quantity = (notional_usd / entry_price).floor();
+        if !quantity.is_finite() || quantity < 1.0 || quantity >= u64::MAX as f64 {
+            return Err(PortfolioError::InvalidNotional(notional_usd));
+        }
+        let quantity = quantity as u64;
+        // Debit what is actually invested (floored size at the filled
+        // price), never the nominal ticket: the old f64 size made them
+        // identical, the integer size leaves up to one token unspent.
+        let invested = quantity as f64 * entry_price;
+        let entry_fee = self.fee_for(invested);
 
         match p.side {
             Side::Long => {
-                let need = notional_usd + entry_fee;
+                let need = invested + entry_fee;
                 if need > self.cash {
                     return Err(PortfolioError::InsufficientFunds {
                         need,
@@ -372,7 +347,7 @@ impl PaperPortfolio {
                         have: self.cash,
                     });
                 }
-                self.cash += notional_usd - entry_fee;
+                self.cash += invested - entry_fee;
             }
         }
         let id = self.next_id;
@@ -388,7 +363,9 @@ impl PaperPortfolio {
                 side: p.side,
                 entry_price,
                 quantity,
-                entry_notional: notional_usd,
+                // Actually invested (floored size at fill), not the nominal
+                // ticket: basis, percents, and cash all agree on it.
+                entry_notional: invested,
                 entry_fee,
                 tp_percent,
                 sl_percent,
@@ -452,7 +429,7 @@ impl PaperPortfolio {
                 .positions
                 .get(&id)
                 .ok_or(PortfolioError::PositionNotFound(id))?;
-            let exit_size = (position.quantity.abs() * fraction).abs() * quote;
+            let exit_size = position.quantity as f64 * fraction * quote;
             let probe = self.fill_for_mint(&position.mint).try_fill_price(
                 flip_side(position.side),
                 quote,
@@ -488,6 +465,12 @@ impl PaperPortfolio {
                 .ok_or(PortfolioError::PositionNotFound(id))?;
             CloseSlice::part(position, fraction)
         };
+        // Partial slices that floor to zero tokens are dust, not fills:
+        // reject like live dust (retry budget) instead of booking a
+        // zero-size trade with bleed.
+        if slice.quantity == 0 {
+            return Err(PortfolioError::InvalidFraction(fraction));
+        }
         let trade = self.book(&slice, quote, liquidity_usd, reason, now_secs)?;
         if let Some(open) = self.positions.get_mut(&id) {
             open.quantity -= slice.quantity;
@@ -530,7 +513,7 @@ impl PaperPortfolio {
         // Execution pricing, uncapped: the settle probe above priced
         // the identical notional, so this agrees with the trigger by
         // construction and can only fail on buy-side exhaustion.
-        let exit_notional_probe = slice.quantity.abs() * quote;
+        let exit_notional_probe = slice.quantity as f64 * quote;
         let exit_price = self
             .fill_for_mint(&slice.mint)
             .try_fill_price(
@@ -543,10 +526,16 @@ impl PaperPortfolio {
                 notional: exit_notional_probe,
                 liquidity: liquidity_usd,
             })?;
-        let exit_notional = slice.quantity.abs() * exit_price;
+        let exit_notional = slice.quantity as f64 * exit_price;
         let exit_fee = self.fee_for(exit_notional);
 
-        let gross_pnl = (exit_price - slice.entry_price) * slice.quantity;
+        // Signed by side (quantity itself is absolute): shorts profit
+        // when the exit prints below entry.
+        let signed_qty = match slice.side {
+            Side::Long => slice.quantity as f64,
+            Side::Short => -(slice.quantity as f64),
+        };
+        let gross_pnl = (exit_price - slice.entry_price) * signed_qty;
         let fees = slice.entry_fee + exit_fee;
         let net_pnl = gross_pnl - fees;
         let net_pnl_percent = if slice.entry_notional > 0.0 {
@@ -602,7 +591,7 @@ impl PaperPortfolio {
         let mint = self.positions.get(&id)?.mint.clone();
         let fill = self.fill_for_mint(&mint);
         let position = self.positions.get_mut(&id)?;
-        let exit_notional = position.quantity.abs() * quote;
+        let exit_notional = position.quantity as f64 * quote;
         crate::market::check_exit_realizable(
             &fill,
             position,
@@ -630,7 +619,7 @@ impl PaperPortfolio {
             locked += basis;
             let value = match marks.get(&position.mint) {
                 Some(mark) if mark.price.is_finite() && mark.price > 0.0 => {
-                    let exit_size = position.quantity.abs() * mark.price;
+                    let exit_size = position.quantity as f64 * mark.price;
                     // Same uncapped execution pricing as settlement, so
                     // marks and books agree. Unpriceable (buy-side
                     // exhaustion) holds the basis instead of a fiction.
@@ -644,7 +633,7 @@ impl PaperPortfolio {
                                 Side::Long => mark.price * (1.0 - slip).max(0.0),
                                 Side::Short => mark.price * (1.0 + slip),
                             };
-                            let exit_notional = position.quantity.abs() * exit_price;
+                            let exit_notional = position.quantity as f64 * exit_price;
                             let exit_fee = self.fee_for(exit_notional);
                             match position.side {
                                 Side::Long => exit_notional - exit_fee,
@@ -738,68 +727,23 @@ mod tests {
     }
 
     #[test]
-    fn open_position_params_matches_shim() {
-        let mut via_shim = funded();
-        let mut via_struct = funded();
-        let params = OpenPositionParams {
-            mint: "MINT",
-            side: Side::Long,
-            quote: 1.0,
-            notional_usd: 40.0,
-            liquidity_usd: 1_000_000.0,
-            tp_percent: 75.0,
-            sl_percent: -8.0,
-            trailing: false,
-            trail_percent: 0.0,
-            timeout_seconds: 0,
-            moonbag_percent: 0.0,
-            now_secs: 1000,
-        };
-        let a = via_shim
-            .open_position(
-                params.mint,
-                params.side,
-                params.quote,
-                params.notional_usd,
-                params.liquidity_usd,
-                params.tp_percent,
-                params.sl_percent,
-                params.trailing,
-                params.trail_percent,
-                params.timeout_seconds,
-                params.moonbag_percent,
-                params.now_secs,
-            )
-            .expect("shim open");
-        let b = via_struct
-            .open_position_params(&params)
-            .expect("struct open");
-        assert_eq!(a, b);
-        assert_eq!(
-            via_shim.position(a).expect("a").entry_price,
-            via_struct.position(b).expect("b").entry_price
-        );
-        assert_eq!(via_shim.cash(), via_struct.cash());
-    }
-
-    #[test]
     fn open_debits_cash_and_close_credits_pnl() {
         let mut pf = funded();
         let id = pf
-            .open_position(
-                "MINT",
-                Side::Long,
-                1.0,
-                40.0,
-                1_000_000.0,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                1000,
-            )
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 40.0,
+                liquidity_usd: 1_000_000.0,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 1000,
+            })
             .expect("open");
         assert_eq!(pf.cash(), 60.0);
 
@@ -818,20 +762,20 @@ mod tests {
     fn fees_reduce_pnl_on_both_sides() {
         let mut pf = PaperPortfolio::new(100.0, 100.0).with_fill_model(FillModel::Exact);
         let id = pf
-            .open_position(
-                "MINT",
-                Side::Long,
-                1.0,
-                50.0,
-                1e9,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0,
-            )
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 50.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("open");
         assert!((pf.cash() - 49.50).abs() < 1e-9);
         let trade = pf
@@ -846,23 +790,23 @@ mod tests {
     fn short_roundtrip_flat_price_nets_minus_fees() {
         let mut pf = PaperPortfolio::new(100.0, 100.0).with_fill_model(FillModel::Exact);
         let id = pf
-            .open_position(
-                "MINT",
-                Side::Short,
-                1.0,
-                50.0,
-                1e9,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0,
-            )
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Short,
+                quote: 1.0,
+                notional_usd: 50.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("open");
         assert!((pf.cash() - 149.50).abs() < 1e-9, "cash={}", pf.cash());
-        assert_eq!(pf.position(id).expect("p").quantity, -50.0);
+        assert_eq!(pf.position(id).expect("p").quantity, 50);
         let trade = pf
             .close_position(id, 1.0, 1e9, ExitReason::Manual, 1)
             .expect("close");
@@ -872,20 +816,20 @@ mod tests {
         assert!((pf.cash() - 99.0).abs() < 1e-9, "cash={}", pf.cash());
         let mut pf2 = PaperPortfolio::new(100.0, 100.0).with_fill_model(FillModel::Exact);
         let id2 = pf2
-            .open_position(
-                "MINT",
-                Side::Short,
-                1.0,
-                50.0,
-                1e9,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0,
-            )
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Short,
+                quote: 1.0,
+                notional_usd: 50.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("open");
         let mut marks = HashMap::new();
         marks.insert("MINT".to_string(), Mark::price_only(1.0));
@@ -901,54 +845,54 @@ mod tests {
     fn rejects_oversize_and_bad_inputs() {
         let mut pf = funded();
         assert!(matches!(
-            pf.open_position(
-                "M",
-                Side::Long,
-                1.0,
-                200.0,
-                1e9,
-                1.0,
-                -1.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0
-            ),
+            pf.open_position_params(&OpenPositionParams {
+                mint: "M",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 200.0,
+                liquidity_usd: 1e9,
+                tp_percent: 1.0,
+                sl_percent: -1.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            }),
             Err(PortfolioError::InsufficientFunds { .. })
         ));
         assert!(matches!(
-            pf.open_position(
-                "M",
-                Side::Long,
-                0.0,
-                10.0,
-                1e9,
-                1.0,
-                -1.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0
-            ),
+            pf.open_position_params(&OpenPositionParams {
+                mint: "M",
+                side: Side::Long,
+                quote: 0.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 1.0,
+                sl_percent: -1.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            }),
             Err(PortfolioError::InvalidPrice(_))
         ));
         assert!(matches!(
-            pf.open_position(
-                "M",
-                Side::Long,
-                1.0,
-                -5.0,
-                1e9,
-                1.0,
-                -1.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0
-            ),
+            pf.open_position_params(&OpenPositionParams {
+                mint: "M",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: -5.0,
+                liquidity_usd: 1e9,
+                tp_percent: 1.0,
+                sl_percent: -1.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            }),
             Err(PortfolioError::InvalidNotional(_))
         ));
         assert!(matches!(
@@ -961,43 +905,43 @@ mod tests {
     fn slippage_shrinks_size() {
         let mut pf = PaperPortfolio::new(100.0, 0.0);
         let id = pf
-            .open_position(
-                "MINT",
-                Side::Long,
-                1.0,
-                50.0,
-                5_000.0,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0,
-            )
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 50.0,
+                liquidity_usd: 5_000.0,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("open");
         let position = pf.position(id).expect("position");
         assert!(position.entry_price > 1.0);
-        assert!(position.quantity < 50.0);
+        assert!(position.quantity < 50);
     }
 
     #[test]
     fn snapshot_marks_unrealized() {
         let mut pf = funded();
-        pf.open_position(
-            "A",
-            Side::Long,
-            1.0,
-            40.0,
-            1e9,
-            75.0,
-            -8.0,
-            false,
-            0.0,
-            0,
-            0.0,
-            0,
-        )
+        pf.open_position_params(&OpenPositionParams {
+            mint: "A",
+            side: Side::Long,
+            quote: 1.0,
+            notional_usd: 40.0,
+            liquidity_usd: 1e9,
+            tp_percent: 75.0,
+            sl_percent: -8.0,
+            trailing: false,
+            trail_percent: 0.0,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+            now_secs: 0,
+        })
         .expect("open");
         let mut marks = HashMap::new();
         marks.insert("A".to_string(), Mark { price: 1.5, liquidity_usd: 1e9 });
@@ -1013,23 +957,54 @@ mod tests {
     fn snapshot_matches_realizable_close() {
         let mut pf = PaperPortfolio::new(100.0, 100.0);
         let id = pf
-            .open_position("A", Side::Long, 1.0, 40.0, 5_000.0, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
+            .open_position_params(&OpenPositionParams {
+                mint: "A",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 40.0,
+                liquidity_usd: 5_000.0,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("open");
         let mut marks = HashMap::new();
         marks.insert("A".to_string(), Mark { price: 1.5, liquidity_usd: 5_000.0 });
         let snap = pf.snapshot(&marks);
         let naive = (1.5 - pf.position(id).expect("p").entry_price)
-            * pf.position(id).expect("p").quantity;
+            * pf.position(id).expect("p").quantity as f64;
         assert!(snap.unrealized_pnl < naive);
+        // Entry fee on the actually-invested size (100bps commission on
+        // `entry_notional`, the size this portfolio was built with), not
+        // the nominal ticket: integer sizing leaves up to one token unspent.
+        // Read before the close removes the position.
+        let entry_fee =
+            pf.position(id).expect("p").entry_notional * 100.0 / 10_000.0;
         let trade = pf
             .close_position(id, 1.5, 5_000.0, ExitReason::Manual, 1)
             .expect("close");
-        assert!((trade.net_pnl - (snap.unrealized_pnl - 0.4)).abs() < 1e-9);
+        assert!((trade.net_pnl - (snap.unrealized_pnl - entry_fee)).abs() < 1e-9);
         assert!((pf.cash() - snap.equity).abs() < 1e-9);
         let mut pf2 = PaperPortfolio::new(100.0, 0.0);
-        pf2
-            .open_position("B", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
-            .expect("open");
+        pf2.open_position_params(&OpenPositionParams {
+            mint: "B",
+            side: Side::Long,
+            quote: 1.0,
+            notional_usd: 10.0,
+            liquidity_usd: 1e9,
+            tp_percent: 75.0,
+            sl_percent: -8.0,
+            trailing: false,
+            trail_percent: 0.0,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+            now_secs: 0,
+        })
+        .expect("open");
         let empty: HashMap<String, Mark> = HashMap::new();
         assert_eq!(pf2.snapshot(&empty).unrealized_pnl, 0.0);
         let mut nan_marks = HashMap::new();
@@ -1041,20 +1016,20 @@ mod tests {
     fn full_poll_loop_tp_exit() {
         let mut pf = funded();
         let id = pf
-            .open_position(
-                "MINT",
-                Side::Long,
-                1.0,
-                50.0,
-                1e9,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0,
-            )
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 50.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("open");
         let reason = {
             let position = pf.position_mut(id).expect("position");
@@ -1074,20 +1049,20 @@ mod tests {
         let mut pf = funded();
         for i in 0..2 {
             let id = pf
-                .open_position(
-                    "M",
-                    Side::Long,
-                    1.0,
-                    10.0,
-                    1e9,
-                    75.0,
-                    -8.0,
-                    false,
-                    0.0,
-                    0,
-                    0.0,
-                    i,
-                )
+                .open_position_params(&OpenPositionParams {
+                    mint: "M",
+                    side: Side::Long,
+                    quote: 1.0,
+                    notional_usd: 10.0,
+                    liquidity_usd: 1e9,
+                    tp_percent: 75.0,
+                    sl_percent: -8.0,
+                    trailing: false,
+                    trail_percent: 0.0,
+                    timeout_seconds: 0,
+                    moonbag_percent: 0.0,
+                    now_secs: i,
+                })
                 .expect("open");
             pf.close_position(id, 0.9, 1e9, ExitReason::StopLoss, i + 1)
                 .expect("close");
@@ -1103,7 +1078,20 @@ mod tests {
         for (tp, sl) in [(0.0, -8.0), (-5.0, -8.0), (75.0, 0.0), (75.0, 5.0)] {
             assert!(
                 matches!(
-                    pf.open_position("M", Side::Long, 1.0, 10.0, 1e9, tp, sl, false, 0.0, 0, 0.0, 0),
+                    pf.open_position_params(&OpenPositionParams {
+                        mint: "M",
+                        side: Side::Long,
+                        quote: 1.0,
+                        notional_usd: 10.0,
+                        liquidity_usd: 1e9,
+                        tp_percent: tp,
+                        sl_percent: sl,
+                        trailing: false,
+                        trail_percent: 0.0,
+                        timeout_seconds: 0,
+                        moonbag_percent: 0.0,
+                        now_secs: 0,
+                    }),
                     Err(PortfolioError::InvalidTakeProfit(_))
                         | Err(PortfolioError::InvalidStopLoss(_))
                 ),
@@ -1119,20 +1107,20 @@ mod tests {
     }
 
     fn open_40_at_1(pf: &mut PaperPortfolio) -> PositionId {
-        pf.open_position(
-            "MINT",
-            Side::Long,
-            1.0,
-            40.0,
-            1e9,
-            75.0,
-            -8.0,
-            false,
-            0.0,
-            0,
-            0.0,
-            1000,
-        )
+        pf.open_position_params(&OpenPositionParams {
+            mint: "MINT",
+            side: Side::Long,
+            quote: 1.0,
+            notional_usd: 40.0,
+            liquidity_usd: 1e9,
+            tp_percent: 75.0,
+            sl_percent: -8.0,
+            trailing: false,
+            trail_percent: 0.0,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+            now_secs: 1000,
+        })
         .expect("open")
     }
 
@@ -1144,14 +1132,14 @@ mod tests {
             .close_partial_position(id, 0.8, 2.0, 1e9, ExitReason::TakeProfit, 1100)
             .expect("partial");
         assert_eq!(part.fraction_closed, 0.8);
-        assert_eq!(part.quantity, 32.0);
+        assert_eq!(part.quantity, 32);
         assert_eq!(part.gross_pnl, 32.0);
         assert_eq!(part.net_pnl, 32.0);
         assert_eq!(part.net_pnl_percent, 100.0);
         assert_eq!(pf.cash(), 60.0 + 32.0 + 32.0);
 
         let open = pf.position(id).expect("runner");
-        assert_eq!((open.quantity, open.entry_notional), (8.0, 8.0));
+        assert_eq!((open.quantity, open.entry_notional), (8, 8.0));
         assert_eq!((open.tp_percent, open.sl_percent), (75.0, 0.0));
 
         let rest = pf
@@ -1193,7 +1181,20 @@ mod tests {
     fn manual_partial_preserves_runner_terms() {
         let mut pf = funded();
         let id = pf
-            .open_position("M", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, true, 5.0, 90, 20.0, 0)
+            .open_position_params(&OpenPositionParams {
+                mint: "M",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: true,
+                trail_percent: 5.0,
+                timeout_seconds: 90,
+                moonbag_percent: 20.0,
+                now_secs: 0,
+            })
             .expect("open");
         pf.close_partial_position(id, 0.5, 1.5, 1e9, ExitReason::Manual, 1)
             .expect("partial");
@@ -1213,7 +1214,20 @@ mod tests {
     fn rejects_empty_mint() {
         let mut pf = funded();
         assert!(matches!(
-            pf.open_position("", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0),
+            pf.open_position_params(&OpenPositionParams {
+                mint: "",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            }),
             Err(PortfolioError::InvalidMint(_))
         ));
     }
@@ -1222,9 +1236,20 @@ mod tests {
     fn nan_trail_and_moonbag_normalize_to_zero() {
         let mut pf = funded();
         let id = pf
-            .open_position(
-                "M", Side::Long, 1.0, 10.0, 1e9, 75.0, -8.0, true, f64::NAN, 90, f64::NAN, 0,
-            )
+            .open_position_params(&OpenPositionParams {
+                mint: "M",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: true,
+                trail_percent: f64::NAN,
+                timeout_seconds: 90,
+                moonbag_percent: f64::NAN,
+                now_secs: 0,
+            })
             .expect("open");
         let p = pf.position(id).expect("p");
         assert_eq!(p.trail_percent, 0.0);
@@ -1238,10 +1263,36 @@ mod tests {
         assert!((pf.venue_fee_for("CUSTOM") - 345.0).abs() < 1e-9);
         assert!((pf.venue_fee_for("STD") - 125.0).abs() < 1e-9);
         let std_id = pf
-            .open_position("STD", Side::Long, 1.0, 100.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
+            .open_position_params(&OpenPositionParams {
+                mint: "STD",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 100.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("std open");
         let cus_id = pf
-            .open_position("CUSTOM", Side::Long, 1.0, 100.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, 0)
+            .open_position_params(&OpenPositionParams {
+                mint: "CUSTOM",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 100.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("custom open");
         let std_px = pf.position(std_id).expect("std").entry_price;
         let cus_px = pf.position(cus_id).expect("cus").entry_price;
@@ -1273,31 +1324,100 @@ mod tests {
     }
 
     #[test]
-    fn partial_short_splits_signed_quantity() {
+    fn partial_short_splits_absolute_quantity() {
         let mut pf = funded();
         let id = pf
-            .open_position(
-                "MINT",
-                Side::Short,
-                2.0,
-                40.0,
-                1e9,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                0,
-            )
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Short,
+                quote: 2.0,
+                notional_usd: 40.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
             .expect("open");
-        assert_eq!(pf.position(id).expect("p").quantity, -20.0);
+        assert_eq!(pf.position(id).expect("p").quantity, 20);
         let part = pf
             .close_partial_position(id, 0.5, 1.0, 1e9, ExitReason::TakeProfit, 1)
             .expect("partial");
-        assert_eq!(part.quantity, -10.0);
+        assert_eq!(part.quantity, 10);
         assert_eq!(part.gross_pnl, 10.0);
-        assert_eq!(pf.position(id).expect("p").quantity, -10.0);
+        assert_eq!(pf.position(id).expect("p").quantity, 10);
+    }
+
+    #[test]
+    fn integer_sizing_rejects_dust() {
+        // Sub-token opens cannot exist (live sizes zero dust to a retry,
+        // never to a fill): fail closed instead of booking a zero-size
+        // position that still bleeds dispatch.
+        let mut pf = funded();
+        assert!(matches!(
+            pf.open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 100.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            }),
+            Err(PortfolioError::InvalidNotional(_))
+        ));
+        // A partial that floors to zero tokens is dust, not a fill.
+        let id = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 1.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
+            .expect("one token opens");
+        assert_eq!(pf.position(id).expect("p").quantity, 1);
+        assert!(matches!(
+            pf.close_partial_position(id, 0.5, 1.0, 1e9, ExitReason::Manual, 1),
+            Err(PortfolioError::InvalidFraction(_))
+        ));
+        // Whole-token partials still settle exactly (no float remainder).
+        let id2 = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "M2",
+                side: Side::Long,
+                quote: 1.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 0,
+            })
+            .expect("ten tokens open");
+        let part = pf
+            .close_partial_position(id2, 0.3, 1.0, 1e9, ExitReason::Manual, 1)
+            .expect("partial");
+        assert_eq!(part.quantity, 3);
+        assert_eq!(pf.position(id2).expect("p").quantity, 7);
     }
 
     #[test]
@@ -1317,7 +1437,7 @@ mod tests {
             pf.close_partial_position(999, 0.5, 2.0, 1e9, ExitReason::Manual, 0),
             Err(PortfolioError::PositionNotFound(999))
         ));
-        assert_eq!(pf.position(id).expect("p").quantity, 40.0);
+        assert_eq!(pf.position(id).expect("p").quantity, 40);
         assert_eq!(pf.cash(), 60.0);
     }
 
@@ -1513,7 +1633,7 @@ mod tests {
                 now_secs: 0,
             })
             .expect("open");
-        let qty = pf.positions.get(&id).expect("open").quantity.abs();
+        let qty = pf.positions.get(&id).expect("open").quantity as f64;
         let trade = pf
             .close_position(id, 1.0, 200.0, ExitReason::Manual, 1)
             .expect("close");

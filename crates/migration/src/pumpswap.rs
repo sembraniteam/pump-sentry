@@ -196,6 +196,53 @@ mod tests {
     }
 
     #[test]
+    fn parses_frozen_wsol_executable_pool() {
+        // Live WSOL-quoted executable pool frozen from sell_v2 flow
+        // (slot ~457428741): parse plus the trust gate pass for its own
+        // base mint — the executable counterpart to the depth-2 fixture
+        // above, which pins the fail-closed path instead.
+        let raw = include_str!("../tests/fixtures/pumpswap_pool_wsol_mainnet.json");
+        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
+        assert_eq!(v["via"], "getAccountInfo");
+        let parse = |s: &str| {
+            Pubkey::from_str(v[s].as_str().expect("pubkey str")).expect("pubkey")
+        };
+        let (pool, owner) = (parse("amm"), parse("owner"));
+        let data: Vec<u8> = v["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|b| b.as_u64().expect("byte") as u8)
+            .collect();
+        assert_eq!(owner, PUMP_AMM_PROGRAM_ID);
+        let parsed = PumpSwapPool::parse(&pool, &data).expect("parse");
+        assert_eq!(parsed.pool, pool);
+        assert_eq!(
+            parsed.base_mint,
+            Pubkey::from_str("E8ZvySLWzHg2oDBPFyeDYzNzVdN7AA4zTC3tUYs9pump").expect("mint")
+        );
+        assert_eq!(parsed.quote_mint, WSOL_MINT);
+        assert_eq!(
+            parsed.base_vault,
+            Pubkey::from_str("4H5HnFB2S3fSGo5FX7TACgEVBAgN4usoFqVyxfYpzrn1").expect("vault")
+        );
+        assert_eq!(
+            parsed.quote_vault,
+            Pubkey::from_str("HGzWWJcVz3bKBhcoepaNJzhEjprDCmHTHcqxsYR5R14").expect("vault")
+        );
+        assert_eq!(parsed.virtual_quote_reserves, 12131835608);
+        assert!(!parsed.is_mayhem);
+        assert!(!parsed.is_cashback);
+        // Executable: WSOL-quoted and the gate passes for its base mint.
+        assert!(parsed.is_wsol_quoted());
+        let token = parsed.base_mint;
+        assert!(PumpSwapPool::validate(&parsed, &owner, &token));
+        assert!(PumpSwapPool::parse_validated(&pool, &data, &owner, &token).is_some());
+        // A distinct live pool, not the depth-2 fixture rewritten.
+        assert_ne!(pool, frozen_pool().0);
+    }
+
+    #[test]
     fn validates_wsol_quoted_pool() {
         let (pool, owner, mut data) = frozen_pool();
         data[POOL_QUOTE_MINT_OFFSET..POOL_QUOTE_MINT_OFFSET + 32]

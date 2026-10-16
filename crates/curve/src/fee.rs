@@ -20,8 +20,9 @@ pub type FeeInputsCache = Arc<Mutex<Option<(Vec<u8>, u8, Instant)>>>;
 
 /// Mint supply cache. Supplies never change on bonding curves (fixed at
 /// creation; gated mints have no live mint authority), so entries never
-/// expire — same bound discipline as the decimals cache.
-pub type SupplyCache = Arc<Mutex<HashMap<String, u64>>>;
+/// expire — same bound discipline as the decimals cache (oldest
+/// first-seen evicted past the cap, not a random key).
+pub type SupplyCache = Arc<Mutex<HashMap<String, (u64, Instant)>>>;
 
 /// Quote-mint class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +150,7 @@ fn curve_fee_inputs(data: &[u8]) -> Option<CurveFeeView> {
 /// Mint supply for fee-tier market caps (cached: immutable on curves).
 async fn mint_supply(rpc: &RpcClient, cache: &SupplyCache, mint: &Pubkey) -> Option<u64> {
     let key = mint.to_string();
-    if let Some(hit) = cache.lock().await.get(&key) {
+    if let Some((hit, _)) = cache.lock().await.get(&key) {
         return Some(*hit);
     }
     let supply = tokio::time::timeout(FEE_TIMEOUT, rpc.get_token_supply(mint))
@@ -159,16 +160,21 @@ async fn mint_supply(rpc: &RpcClient, cache: &SupplyCache, mint: &Pubkey) -> Opt
     let supply = supply.amount.parse::<u64>().ok()?;
     let mut guard = cache.lock().await;
     if guard.len() >= crate::ticker::DECIMALS_CACHE_CAP
-        && let Some(oldest) = guard.keys().next().cloned()
+        && let Some(oldest) = guard
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(k, _)| k.clone())
     {
         guard.remove(&oldest);
     }
-    guard.insert(key, supply);
+    guard.insert(key, (supply, Instant::now()));
     Some(supply)
 }
 
-/// Market cap, lamports: `vq * supply / vt`.
-fn market_cap(vq: u64, vt: u64, supply: u64) -> Option<u128> {
+/// Bonding-curve market cap in lamports: `vq * supply / vt`.
+/// Canonical single source: `executor::quote::market_cap` wraps this
+/// (converting `None` to `QuoteError`). `None` on zero `vt` or overflow.
+pub fn market_cap(vq: u64, vt: u64, supply: u64) -> Option<u128> {
     if vt == 0 {
         return None;
     }
@@ -177,16 +183,33 @@ fn market_cap(vq: u64, vt: u64, supply: u64) -> Option<u128> {
         .checked_div(u128::from(vt))
 }
 
-/// One fee tier: threshold (lamports) + (protocol, creator).
-type FeeTierRow = (u128, (u64, u64));
+/// Fee triple in bps (IDL order: lp, protocol, creator).
+/// Canonical single source: `executor::quote` re-exports this type
+/// (no duplicate struct). `lp` is unused on curves but kept so one
+/// schedule serves both the paper ledger and dispatch tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FeesBps {
+    /// LP fee (unused on curves; parsed for completeness).
+    pub lp: u64,
+    pub protocol: u64,
+    pub creator: u64,
+}
+
+/// One fee tier: threshold (lamports) + fees above it.
+pub type FeeTierRow = (u128, FeesBps);
 
 /// Full fee schedule, picked by market cap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FeeSchedule {
-    tiers: Vec<FeeTierRow>,
-    stable: Vec<FeeTierRow>,
-    flat: (u64, u64),
-    exotic: (u64, u64),
+/// Canonical single source (see [`FeesBps`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FeeSchedule {
+    /// SOL-like tiers.
+    pub tiers: Vec<FeeTierRow>,
+    /// USDC tiers.
+    pub stable: Vec<FeeTierRow>,
+    /// Flat fallback.
+    pub flat: FeesBps,
+    /// Exotic flat (all-zero = unset -> flat).
+    pub exotic: FeesBps,
 }
 
 /// Tier-table bound (DoS cap on hostile lengths; single source is
@@ -194,7 +217,7 @@ struct FeeSchedule {
 use ids::MAX_FEE_TIERS;
 
 /// Highest tier at or below mcap, else the first.
-fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<(u64, u64)> {
+fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<FeesBps> {
     let first = tiers.first()?;
     if mcap < first.0 {
         return Some(first.1);
@@ -210,29 +233,39 @@ fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<(u64, u64)> {
 
 /// (protocol, creator) for one quote kind at `mcap`.
 fn select_tier(schedule: &FeeSchedule, kind: QuoteKind, mcap: u128) -> Option<(u64, u64)> {
-    match kind {
-        QuoteKind::SolLike => tier_for(&schedule.tiers, mcap),
-        QuoteKind::Usdc => tier_for(&schedule.stable, mcap),
+    let fees = match kind {
+        QuoteKind::SolLike => tier_for(&schedule.tiers, mcap)?,
+        QuoteKind::Usdc => tier_for(&schedule.stable, mcap)?,
         QuoteKind::Other => {
-            if schedule.exotic == (0, 0) {
-                Some(schedule.flat)
+            let e = schedule.exotic;
+            if e.lp == 0 && e.protocol == 0 && e.creator == 0 {
+                schedule.flat
             } else {
-                Some(schedule.exotic)
+                e
             }
         }
-    }
+    };
+    Some((fees.protocol, fees.creator))
 }
 
 /// Decode the schedule from FeeConfig bytes.
 fn parse_schedule(data: &[u8]) -> Option<FeeSchedule> {
     const TIERS_OFF: usize = 8 + 1 + 32 + 24;
-    let flat = (u64le(data, 49)?, u64le(data, 57)?);
+    let flat = FeesBps {
+        lp: u64le(data, 41)?,
+        protocol: u64le(data, 49)?,
+        creator: u64le(data, 57)?,
+    };
     let (tiers, at) = parse_tier_vec(data, TIERS_OFF)?;
     let (stable, at) = parse_tier_vec(data, at)?;
     let exotic = if data.len() >= at + 24 {
-        (u64le(data, at + 8)?, u64le(data, at + 16)?)
+        FeesBps {
+            lp: u64le(data, at)?,
+            protocol: u64le(data, at + 8)?,
+            creator: u64le(data, at + 16)?,
+        }
     } else if data.len() == at {
-        (0, 0)
+        FeesBps::default()
     } else {
         return None;
     };
@@ -263,9 +296,12 @@ fn parse_tier_vec(data: &[u8], off: usize) -> Option<(Vec<FeeTierRow>, usize)> {
             return None;
         }
         prev = threshold;
-        let proto = u64le(data, at + 24)?;
-        let creator = u64le(data, at + 32)?;
-        out.push((threshold, (proto, creator)));
+        let fees = FeesBps {
+            lp: u64le(data, at + 16)?,
+            protocol: u64le(data, at + 24)?,
+            creator: u64le(data, at + 32)?,
+        };
+        out.push((threshold, fees));
         at += 40;
     }
     Some((out, at))
@@ -340,8 +376,8 @@ mod tests {
         let empty = FeeSchedule {
             tiers: vec![],
             stable: vec![],
-            flat: (95, 30),
-            exotic: (0, 0),
+            flat: FeesBps { lp: 0, protocol: 95, creator: 30 },
+            exotic: FeesBps::default(),
         };
         assert_eq!(select_tier(&empty, QuoteKind::SolLike, 0), None);
         assert_eq!(parse_schedule(&two_tier_bytes()[..72]), None);

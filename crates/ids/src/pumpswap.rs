@@ -31,6 +31,10 @@ pub const PUMP_AMM_GLOBAL_CREATOR_GATE_OFFSET: usize = 940;
 pub const PUMP_AMM_GLOBAL_LEN: usize = 949;
 /// `sell_v2` discriminator: 17-account PumpSwap sells, fees stay in
 /// the pool. `sha256("global:sell_v2")[..8]` reproduces these bytes.
+/// Intentional discriminator collision with
+/// `ids::PUMP_SELL_V2_DISCRIMINATOR` (same 8 bytes): never merge —
+/// the two are disambiguated by program-id (PumpSwap AMM vs Pump).
+/// See the cross-crate const-assert in `ids::lib`.
 pub const PUMP_AMM_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 /// `Pool` account discriminator (`sha256("account:Pool")[..8]`).
 pub const PUMP_AMM_POOL_DISCRIMINATOR: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];

@@ -11,6 +11,15 @@ pub use pumpswap::*;
 pub use raydium::*;
 pub use system::*;
 
+// Intentional discriminator collision, never merge — disambiguated by
+// program-id (Pump `sell_v2` vs PumpSwap AMM `sell_v2`). The assert
+// pins the equality so a one-side edit breaks loudly instead of
+// silently forking the two venues.
+const _: () = assert!(
+    u64::from_le_bytes(PUMP_SELL_V2_DISCRIMINATOR)
+        == u64::from_le_bytes(PUMP_AMM_SELL_V2_DISCRIMINATOR)
+);
+
 /// Reduce an endpoint URL to `scheme://host` for logs.
 ///
 /// Providers hide keys in different places — Helius in `?api-key=`,

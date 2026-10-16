@@ -492,6 +492,137 @@ mod tests {
     }
 
     #[test]
+    fn parse_v2_v0_envelope_recent_launch() {
+        // Fresh mainnet create_v2 in a version-0 envelope (slot 457429472,
+        // sig 2qSAjZs...NPzVPiBGkcHhx): launches ship BOTH v0 and v1
+        // envelopes, so the fetch config must allow both
+        // (`maxSupportedTransactionVersion: 1` covers 0 and 1). This test
+        // breaks if parsing ever assumes v1-only. v0 transactions use
+        // address lookup tables, so the key table includes loaded
+        // addresses (static-only indexing would dangle).
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/create_v2_v0_recent_mainnet.json"
+        ))
+        .expect("fixture");
+        assert_eq!(raw["result"]["version"], 0);
+        assert_eq!(raw["result"]["slot"], 457429472);
+        let msg = &raw["result"]["transaction"]["message"];
+        let mut keys: Vec<String> =
+            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        if let Some(loaded) = raw["result"]["meta"]["loadedAddresses"].as_object() {
+            for table in ["writable", "readonly"] {
+                for addr in loaded
+                    .get(table)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    keys.push(addr.as_str().expect("addr").to_string());
+                }
+            }
+        }
+        let pump = PUMP_PROGRAM_ID.to_string();
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            let pi = ix["programIdIndex"].as_u64().expect("pi") as usize;
+            if keys.get(pi) != Some(&pump) {
+                continue;
+            }
+            let data = decode_ix_data(ix["data"].as_str().expect("data")).expect("decode");
+            if !is_pump_create_v2_ix(&data) {
+                continue;
+            }
+            let idx: Vec<usize> =
+                serde_json::from_value(ix["accounts"].clone()).expect("accts");
+            assert_eq!(idx.len(), 16);
+            let accounts: Vec<Pubkey> = idx
+                .iter()
+                .map(|i| Pubkey::from_str(&keys[*i]).expect("key"))
+                .collect();
+            let ev = parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77)
+                .expect("parse");
+            assert_eq!(ev.name, "BYD AUTO");
+            assert_eq!(ev.symbol, "$BYD");
+            assert_eq!(
+                ev.mint.to_string(),
+                "7zxewCto2AFBbaaw7i1vKdmuDQ2gqvGYVfw8okf9pump"
+            );
+            assert_eq!(
+                ev.bonding_curve.to_string(),
+                "9LxGz5fnvUqW1jkKUxfAMPAsAMtCE6oa6LTyVDYVDGZs"
+            );
+            assert_eq!(ev.slot, 77);
+            assert!(ev.creator.is_some(), "v2 launch carries a creator");
+            return;
+        }
+        panic!("no create_v2 instruction in fixture");
+    }
+
+    #[test]
+    fn parse_v2_v1_envelope_recent_launch() {
+        // Fresh mainnet create_v2 in a version-1 envelope (slot 457431003,
+        // sig 4oZKh9Jg...): the v1 counterpart to the v0 fixture above.
+        // Together they pin that launches ship both envelopes and the
+        // fetch config must keep allowing both.
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/create_v2_v1_recent_mainnet.json"
+        ))
+        .expect("fixture");
+        assert_eq!(raw["result"]["version"], 1);
+        assert!(raw["result"]["slot"].as_u64().expect("slot") > 455573900);
+        let msg = &raw["result"]["transaction"]["message"];
+        let mut keys: Vec<String> =
+            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        if let Some(loaded) = raw["result"]["meta"]["loadedAddresses"].as_object() {
+            for table in ["writable", "readonly"] {
+                for addr in loaded
+                    .get(table)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    keys.push(addr.as_str().expect("addr").to_string());
+                }
+            }
+        }
+        let pump = PUMP_PROGRAM_ID.to_string();
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            let pi = ix["programIdIndex"].as_u64().expect("pi") as usize;
+            if keys.get(pi) != Some(&pump) {
+                continue;
+            }
+            let data = decode_ix_data(ix["data"].as_str().expect("data")).expect("decode");
+            if !is_pump_create_v2_ix(&data) {
+                continue;
+            }
+            let idx: Vec<usize> =
+                serde_json::from_value(ix["accounts"].clone()).expect("accts");
+            assert_eq!(idx.len(), 16);
+            let accounts: Vec<Pubkey> = idx
+                .iter()
+                .map(|i| Pubkey::from_str(&keys[*i]).expect("key"))
+                .collect();
+            let ev = parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77)
+                .expect("parse");
+            // Trailing space is on-chain data (attacker-controlled
+            // name), not a typo — assert exact.
+            assert_eq!(ev.name, "TRUMP STREAM ");
+            assert_eq!(ev.symbol, "TRUMPGOLD");
+            assert_eq!(
+                ev.mint.to_string(),
+                "E8c671gi75KXEkHWruLQAZFjBLXitqzj5HAfke4cpump"
+            );
+            assert_eq!(
+                ev.bonding_curve.to_string(),
+                "ByQMGnxewzv5sXDXyuC2ioq64BU4nCHL3PZsZZCcBpc9"
+            );
+            assert_eq!(ev.slot, 77);
+            assert!(ev.creator.is_some(), "v2 launch carries a creator");
+            return;
+        }
+        panic!("no create_v2 instruction in fixture");
+    }
+
+    #[test]
     fn parse_v2_rejects_short_accounts_and_v1_data() {
         let data = encode_create_v2("a", "b", "c", true);
         let few = vec![test_pubkey(1); 13];

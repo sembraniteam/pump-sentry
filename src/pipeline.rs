@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use crate::live::{LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams};
 #[cfg(test)]
 use crate::live::escalated_tip;
-use crate::live_mirror::{LiveExecution, live_base_mint};
+use crate::live_mirror::{LiveExecution, breaker_headline, live_base_mint};
 use crate::follow::FollowState;
 pub use crate::gate::{DailyBreaker, GateState, SpecCounters};
 #[cfg(test)]
@@ -433,14 +433,14 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         (snap.cash, snap.equity)
     }
 
-    /// Fresh marks (stale removed).
+    /// Fresh marks (stale evicted, never leaks).
     async fn fresh_marks(&self, now: u64) -> HashMap<String, Mark> {
-        // Only `on_tick` writes; stale never pins equity.
-        self.last_marks
-            .lock()
-            .await
+        // Only `on_tick` writes; stale never pins equity. Evict here
+        // so the map can't grow with dead mints.
+        let mut guard = self.last_marks.lock().await;
+        guard.retain(|_, (_, ts)| now.saturating_sub(*ts) < CURVE_TICK_STALE_SECS);
+        guard
             .iter()
-            .filter(|(_, (_, ts))| now.saturating_sub(*ts) < CURVE_TICK_STALE_SECS)
             .map(|(m, (mark, _))| (m.clone(), *mark))
             .collect()
     }
@@ -585,6 +585,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         // Fee overrides die with the book.
         self.portfolio.lock().await.clear_venue_fee_for_mint(&tick.mint);
+        self.last_marks.lock().await.remove(&tick.mint);
         self.tick_locks.lock().await.remove(&tick.mint);
         self.exec.live_sell_locks.lock().await.remove(&tick.mint);
         if tick.complete {
@@ -616,10 +617,21 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let card_marks = self.fresh_marks(now_secs()).await;
         let mut portfolio = self.portfolio.lock().await;
         let ids: Vec<u64> = portfolio.positions_for_mint(&tick.mint);
-        let mut closed_fraction = 0.0f64;
+        // Quantity-weighted close fraction: raw per-position fractions
+        // must never be summed (two half-closes of unequal size are
+        // not a full close). `trade.quantity` is the sold size.
+        let total_qty: u64 = ids
+            .iter()
+            .filter_map(|id| portfolio.position(*id))
+            .map(|p| p.quantity)
+            .sum();
+        let mut sold_qty = 0u64;
         // Breaker and cards flush after unlock.
         let mut closed_pnls: Vec<f64> = Vec::new();
         let mut closed_cards: Vec<(String, f64, f64, f64, bool)> = Vec::new();
+        // Gap notes flush after unlock (never nest the gaps lock inside
+        // the portfolio guard).
+        let mut gap_notes: Vec<(f64, u64)> = Vec::new();
         let now = now_secs();
         if ids.is_empty() {
             drop(portfolio);
@@ -648,6 +660,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             {
                 let (open_leg, close_leg) = crate::live::paper_dispatch_legs_usd(
                     self.settings.tip_lamports,
+                    crate::live::priority_fee_lamports(
+                        self.settings.compute_unit_limit,
+                        self.settings.priority_fee_micro_lamports,
+                    ),
                     sol_usd,
                 );
                 portfolio.set_paper_dispatch_legs(open_leg, close_leg);
@@ -686,8 +702,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     Ok(trade) => {
                         // Defer the breaker feed. Headlines net of
                         // dispatch bleed (pct stays edge-based).
-                        let headline = trade.net_pnl - trade.dispatch_usd;
+                        let headline = breaker_headline(trade.net_pnl, trade.dispatch_usd);
                         closed_pnls.push(headline);
+                        // Execution-gap calibration: paper booked at the
+                        // model exit; the live leg settles (or defers) below.
+                        gap_notes.push((trade.exit_price, trade.quantity));
                         let is_moonbag_exit = trade.fraction_closed < 1.0;
                         let equity = portfolio.snapshot(&card_marks).equity;
                         info!(mint = %tick.mint, id, reason = ?trade.reason,
@@ -701,7 +720,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             equity,
                             is_moonbag_exit,
                         ));
-                        closed_fraction = (closed_fraction + trade.fraction_closed).min(1.0);
+                        sold_qty += trade.quantity;
                     }
                     Err(e) => warn!(mint = %tick.mint, id, error = %e, "paper close failed"),
                 }
@@ -709,11 +728,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
 
         drop(portfolio);
+        let closed_fraction = if total_qty > 0 {
+            (sold_qty as f64 / total_qty as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         for (reason, pnl, pct, equity, moonbag) in closed_cards {
             self.emit(Alerter::format_exit(
                 &self.card_ctx(),
                 &tick.mint, &reason, pnl, pct, equity, moonbag,
             ));
+        }
+        for (paper_price, qty) in gap_notes {
+            self.exec.note_gap_paper_close(&tick.mint, paper_price, qty).await;
         }
         // Live first, breaker second: unsettled live defers the feed.
         let live_settled = if closed_fraction > 0.0 {
@@ -1084,7 +1111,7 @@ mod tests {
         fail_watch: bool,
         /// Mint decimals reported (6 = standard).
         decimals: u8,
-        /// Venue fee reported (`None` = standard tier).
+        /// Venue fee reported (`Some` = readable tier, standard 125).
         fee_bps: Option<f64>,
     }
 
@@ -1096,7 +1123,7 @@ mod tests {
                 unwatched: StdMutex::new(vec![]),
                 fail_watch: false,
                 decimals: 6,
-                fee_bps: None,
+                fee_bps: Some(125.0),
             }
         }
 
@@ -1107,7 +1134,7 @@ mod tests {
                 unwatched: StdMutex::new(vec![]),
                 fail_watch: false,
                 decimals: 6,
-                fee_bps: None,
+                fee_bps: Some(125.0),
             }
         }
 
@@ -1609,9 +1636,12 @@ mod tests {
         approx(dev_reputation_score(Some(100_000), 0, 3600), 1.0);
         approx(dev_reputation_score(Some(14_400), 1, 3600), 0.95);
         // Unknown age (unreachable via screening, which rejects ageless
-        // wallets) scores below any survivor; heavy priors bottom out.
+        // wallets) scores below any survivor; heavy priors bottom out
+        // at 0.0, tripping the heuristic `< 0.40` PASS rule instead of
+        // saturating exactly at the cutoff.
         approx(dev_reputation_score(None, 0, 3600), 0.6);
-        approx(dev_reputation_score(Some(3600), 100, 3600), 0.4);
+        approx(dev_reputation_score(Some(3600), 100, 3600), 0.0);
+        approx(dev_reputation_score(Some(3600), 10, 3600), 0.2);
         // Disabled age gate scores full trust.
         approx(dev_reputation_score(Some(1), 0, 0), 1.0);
     }
@@ -1843,20 +1873,20 @@ mod tests {
         pipe.portfolio
             .lock()
             .await
-            .open_position(
-                "MINT",
-                Side::Long,
-                2.0,
-                10.0,
-                1e9,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                opened_now,
-            )
+            .open_position_params(&simulator::OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 2.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: opened_now,
+            })
             .expect("manual open");
         pipe.exec.live_positions.lock().await.insert(
             "LIVE".to_string(),
@@ -1889,25 +1919,33 @@ mod tests {
         pipe.portfolio
             .lock()
             .await
-            .open_position(
-                "MINT",
-                Side::Long,
-                2.0,
-                10.0,
-                1e9,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                now_secs(),
-            )
+            .open_position_params(&simulator::OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 2.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: now_secs(),
+            })
             .expect("manual open");
-        // Before any tick: book value (zero unrealized).
+        // Before any tick: book value (zero unrealized). Cash reflects
+        // the actually-invested size (floored whole tokens at the filled
+        // entry), not the nominal ticket.
         let (cash_book, equity_book) = pipe.paper_cash_equity().await;
         assert!((equity_book - 100.0).abs() < 1e-9, "book {equity_book}");
-        assert_eq!(cash_book, 90.0);
+        let invested = {
+            let portfolio = pipe.portfolio.lock().await;
+            let id = portfolio.position_ids()[0];
+            let pos = portfolio.position(id).expect("pos");
+            pos.quantity as f64 * pos.entry_price
+        };
+        assert!((cash_book - (100.0 - invested)).abs() < 1e-9, "cash {cash_book}");
         // A fresh flat tick marks equity realizable: the 125 bps venue
         // fee on the exit leg deducts, so equity drops below book.
         pipe.on_tick(&tick("MINT", 2.0)).await;
@@ -1962,7 +2000,20 @@ mod tests {
             .portfolio
             .lock()
             .await
-            .open_position("MINT", Side::Long, 2.0, 10.0, 1e9, 75.0, -8.0, false, 0.0, 0, 0.0, now_secs())
+            .open_position_params(&simulator::OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 2.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: now_secs(),
+            })
             .expect("manual open");
         let mut stop = tick("MINT", 2.0);
         stop.price_usd = 1.0; // -50% << -8% SL.
@@ -2014,43 +2065,64 @@ mod tests {
     async fn confirm_registers_custom_venue_fee() {
         // FeeConfig read at confirm wires the paper ledger: a 345 bps
         // custom tier lands per mint, while an unreadable tier (None)
-        // keeps the standard 125 bps default.
-        for (fee, want) in [(Some(345.0), 345.0), (None, 125.0)] {
-            let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
-            let mut reserves = StubReserves::with_tick(tick("MINT", 2.0));
-            reserves.fee_bps = fee;
-            let pipe = pipeline_screened(
-                Settings::from_map(&HashMap::new()),
-                AuditOutcome::Allow(100),
-                reserves,
-                PaperPortfolio::new(100.0, 0.0),
-                screener,
-                None,
-            );
-            pipe.on_launch(&LaunchRequest {
-                mint: "MINT",
-                curve: "CURVE",
-                assoc_curve: "ASSOC",
-                dev: &dev_wallet(),
-                creator: None,
-                name: "TestToken",
-                symbol: "TEST",
-                slot: 5000,
-            })
-            .await;
-            pipe.poll_gates().await;
-            assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
-            assert!(
-                (pipe.portfolio.lock().await.venue_fee_for("MINT") - want).abs() < 1e-9,
-                "fee={fee:?}"
-            );
-            // Fee-aware stop: the moderate −8 stop survives the standard
-            // tier but widens past round-trip costs on 345 bps (−10.9).
-            let id = pipe.portfolio.lock().await.position_ids()[0];
-            let sl = pipe.portfolio.lock().await.position(id).expect("pos").sl_percent;
-            let want_sl = fee_aware_sl_floor(-8.0, want);
-            assert!((sl - want_sl).abs() < 1e-9, "fee={fee:?} sl={sl}");
-        }
+        // fails closed (no open).
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let mut reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        reserves.fee_bps = Some(345.0);
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            PaperPortfolio::new(100.0, 0.0),
+            screener,
+            None,
+        );
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
+        pipe.poll_gates().await;
+        assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+        assert!(
+            (pipe.portfolio.lock().await.venue_fee_for("MINT") - 345.0).abs() < 1e-9,
+        );
+        // Fee-aware stop: widens past round-trip costs on 345 bps (−10.9).
+        let id = pipe.portfolio.lock().await.position_ids()[0];
+        let sl = pipe.portfolio.lock().await.position(id).expect("pos").sl_percent;
+        let want_sl = fee_aware_sl_floor(-8.0, 345.0);
+        assert!((sl - want_sl).abs() < 1e-9, "sl={sl}");
+        // Unreadable tier fails closed.
+        let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
+        let mut reserves = StubReserves::with_tick(tick("MINT", 2.0));
+        reserves.fee_bps = None;
+        let pipe = pipeline_screened(
+            Settings::from_map(&HashMap::new()),
+            AuditOutcome::Allow(100),
+            reserves,
+            PaperPortfolio::new(100.0, 0.0),
+            screener,
+            None,
+        );
+        pipe.on_launch(&LaunchRequest {
+            mint: "MINT",
+            curve: "CURVE",
+            assoc_curve: "ASSOC",
+            dev: &dev_wallet(),
+            creator: None,
+            name: "TestToken",
+            symbol: "TEST",
+            slot: 5000,
+        })
+        .await;
+        pipe.poll_gates().await;
+        assert!(pipe.portfolio.lock().await.position_ids().is_empty());
     }
 
     #[tokio::test]
@@ -2942,20 +3014,20 @@ mod tests {
         {
             let mut portfolio = pipe.portfolio.lock().await;
             portfolio
-                .open_position(
-                    "B",
-                    Side::Long,
-                    2.0,
-                    10.0,
-                    30_000.0,
-                    75.0,
-                    -8.0,
-                    false,
-                    0.0,
-                    0,
-                    0.0,
-                    now_secs(),
-                )
+                .open_position_params(&simulator::OpenPositionParams {
+                    mint: "B",
+                    side: Side::Long,
+                    quote: 2.0,
+                    notional_usd: 10.0,
+                    liquidity_usd: 30_000.0,
+                    tp_percent: 75.0,
+                    sl_percent: -8.0,
+                    trailing: false,
+                    trail_percent: 0.0,
+                    timeout_seconds: 0,
+                    moonbag_percent: 0.0,
+                    now_secs: now_secs(),
+                })
                 .expect("open B");
         }
 
@@ -2975,20 +3047,20 @@ mod tests {
         let now = now_secs();
         let mut portfolio = funded();
         portfolio
-            .open_position(
-                "MINT",
-                Side::Long,
-                2.0,
-                10.0,
-                30_000.0,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                60,
-                0.0,
-                now,
-            )
+            .open_position_params(&simulator::OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 2.0,
+                notional_usd: 10.0,
+                liquidity_usd: 30_000.0,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 60,
+                moonbag_percent: 0.0,
+                now_secs: now,
+            })
             .expect("open");
         let pipe = pipeline_screened(
             Settings::from_map(&HashMap::new()),
@@ -3323,20 +3395,20 @@ mod tests {
         pipe.portfolio
             .lock()
             .await
-            .open_position(
-                sys,
-                Side::Long,
-                2.0,
-                10.0,
-                1e9,
-                75.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                opened_now,
-            )
+            .open_position_params(&simulator::OpenPositionParams {
+                mint: sys,
+                side: Side::Long,
+                quote: 2.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: opened_now,
+            })
             .expect("manual open");
         pipe.exec.live_positions.lock().await.insert(
             sys.to_string(),
@@ -3624,7 +3696,7 @@ mod tests {
         assert_eq!(portfolio.history()[0].fraction_closed, 0.8);
         let id = portfolio.position_ids()[0];
         let runner = portfolio.position(id).expect("runner");
-        assert_eq!((runner.quantity, runner.entry_notional), (1.0, 2.0));
+        assert_eq!((runner.quantity, runner.entry_notional), (1, 2.0));
         assert_eq!(runner.moonbag_percent, 0.0);
         // Scale-out ratchets the runner stop to breakeven.
         assert_eq!(runner.sl_percent, 0.0);
@@ -3739,20 +3811,20 @@ mod tests {
         {
             let mut portfolio = pipe.portfolio.lock().await;
             portfolio
-                .open_position(
-                    "OTHER",
-                    Side::Long,
-                    2.0,
-                    10.0,
-                    30_000.0,
-                    35.0,
-                    -8.0,
-                    false,
-                    0.0,
-                    0,
-                    0.0,
-                    now_secs(),
-                )
+                .open_position_params(&simulator::OpenPositionParams {
+                    mint: "OTHER",
+                    side: Side::Long,
+                    quote: 2.0,
+                    notional_usd: 10.0,
+                    liquidity_usd: 30_000.0,
+                    tp_percent: 35.0,
+                    sl_percent: -8.0,
+                    trailing: false,
+                    trail_percent: 0.0,
+                    timeout_seconds: 0,
+                    moonbag_percent: 0.0,
+                    now_secs: now_secs(),
+                })
                 .expect("open");
         }
         pipe.on_launch(&LaunchRequest {
@@ -3784,20 +3856,20 @@ mod tests {
         let screener = StubScreener::with_swaps("MINT", buyer_swaps("MINT", &[11, 12, 13, 14, 15]));
         let mut portfolio = funded();
         portfolio
-            .open_position(
-                "MINT",
-                Side::Long,
-                2.0,
-                10.0,
-                30_000.0,
-                35.0,
-                -8.0,
-                false,
-                0.0,
-                0,
-                0.0,
-                now_secs(),
-            )
+            .open_position_params(&simulator::OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                quote: 2.0,
+                notional_usd: 10.0,
+                liquidity_usd: 30_000.0,
+                tp_percent: 35.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: now_secs(),
+            })
             .expect("open");
         let id = portfolio.position_ids()[0];
         portfolio
@@ -3873,10 +3945,11 @@ mod tests {
         assert!(pipe.exec.live_manual.lock().await.contains_key("MINT"));
         assert!(pipe.live_tracked_mints().await.contains(&"MINT".to_string()));
         assert!(live.sells().is_empty());
-        // Give-up settles the leg: the paper profit stashed while
-        // holding flushes into the breaker (never vanishes).
-        assert!(!pipe.exec.deferred_pnl.lock().await.contains_key("MINT"));
-        assert!(pipe.daily.lock().await.day_net > 0.0);
+        // Give-up parks the bag manual (still HELD): the paper profit
+        // stashed while holding stays deferred until the manual exit
+        // clears — never flushed into the breaker while live holds.
+        assert!(pipe.exec.deferred_pnl.lock().await.contains_key("MINT"));
+        assert_eq!(pipe.daily.lock().await.day_net, 0.0);
     }
 
     #[tokio::test]

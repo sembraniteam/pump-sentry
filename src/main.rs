@@ -6,6 +6,7 @@ mod follow;
 mod gate;
 mod live;
 mod live_mirror;
+mod money;
 mod pipeline;
 mod settings;
 mod wal;
@@ -327,21 +328,23 @@ async fn run_pipeline(live_arg: bool) {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
         std::process::exit(1);
     });
+    // One RPC connection pool per process: ticker, screener, vaults,
+    // executor, and the WS backfill/fetch share this instead of opening
+    // five uncoordinated pools (rate-limit pressure + retry storms).
+    let shared_rpc = Arc::new(
+        solana_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
+            settings.http_url.clone(),
+            commitment,
+        ),
+    );
     // One SOL/USD feed for pricing plus sizing.
     let sol_feed = curve::SolUsdFeed::with_defaults();
     let sol_handle = sol_feed.clone().spawn();
-    let ticker = match CurveTicker::new(
-        &settings.http_url,
-        commitment,
+    let ticker = CurveTicker::with_rpc(
+        Arc::clone(&shared_rpc),
         Duration::from_millis(settings.tick_interval_ms),
         Arc::clone(&sol_feed),
-    ) {
-        Ok(ticker) => ticker,
-        Err(e) => {
-            eprintln!("bad ticker config: {e}");
-            std::process::exit(1);
-        }
-    };
+    );
 
     let (mut rx, stats, listener_handle) = if !settings.yellowstone_endpoint.is_empty() {
         // Geyser replaces WS ingestion (never both): full transactions
@@ -366,12 +369,15 @@ async fn run_pipeline(live_arg: bool) {
             }
         }
     } else {
-        match PumpFunListener::subscribe(ListenerConfig {
-            ws_url: settings.ws_url.clone(),
-            http_url: settings.http_url.clone(),
-            geyser_url: String::new(),
-            commitment: settings.commitment.clone(),
-        })
+        match PumpFunListener::subscribe_with_rpc(
+            ListenerConfig {
+                ws_url: settings.ws_url.clone(),
+                http_url: settings.http_url.clone(),
+                geyser_url: String::new(),
+                commitment: settings.commitment.clone(),
+            },
+            Some(Arc::clone(&shared_rpc)),
+        )
         .await
         {
             Ok(v) => v,
@@ -423,16 +429,10 @@ async fn run_pipeline(live_arg: bool) {
                 std::process::exit(1);
             }
         };
-        let executor = match SwapExecutor::new(&settings.http_url, commitment, wallet) {
-            Ok(executor) => executor
-                .with_jito(jito)
-                .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports)
-                .with_strict_sim(settings.sim_strict),
-            Err(e) => {
-                eprintln!("bad executor config: {e}");
-                std::process::exit(1);
-            }
-        };
+        let executor = SwapExecutor::with_rpc(Arc::clone(&shared_rpc), wallet)
+            .with_jito(jito)
+            .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports)
+            .with_strict_sim(settings.sim_strict);
         // Funding gate (read-only): native shortfall fails closed.
         {
             let report: LiveFundingReport =
@@ -466,8 +466,8 @@ async fn run_pipeline(live_arg: bool) {
         None
     };
 
-    let screener = match RpcScreener::new(
-        &settings.http_url,
+    let screener = RpcScreener::with_rpc(
+        Arc::clone(&shared_rpc),
         commitment,
         DevScreenConfig {
             min_age_secs: settings.dev_min_age_secs,
@@ -475,13 +475,7 @@ async fn run_pipeline(live_arg: bool) {
             sample_txs: settings.dev_screen_sample_txs,
             sig_limit: settings.dev_sig_limit.max(settings.dev_screen_sample_txs).clamp(1, 1000),
         },
-    ) {
-        Ok(screener) => screener,
-        Err(e) => {
-            eprintln!("bad screener config: {e}");
-            std::process::exit(1);
-        }
-    };
+    );
 
     let gate_interval = Duration::from_millis(settings.gate_poll_ms);
 
@@ -510,18 +504,11 @@ async fn run_pipeline(live_arg: bool) {
         info!("discord alerts disabled (DISCORD_ALERTS=false)");
     }
 
-    let vault_ticker = match VaultTicker::new(
-        &settings.http_url,
-        commitment,
+    let vault_ticker = VaultTicker::with_rpc(
+        Arc::clone(&shared_rpc),
         Duration::from_millis(settings.vault_tick_interval_ms),
         Arc::clone(&sol_feed),
-    ) {
-        Ok(ticker) => ticker,
-        Err(e) => {
-            eprintln!("bad vault ticker config: {e}");
-            std::process::exit(1);
-        }
-    };
+    );
 
     let auditor = match RugCheckClient::new() {
         Ok(auditor) => auditor,
@@ -673,6 +660,12 @@ async fn run_pipeline(live_arg: bool) {
                 });
                 info!("heartbeat: logs={} candidates={} watchlist={} open={} manual={} diverged={} pending_buys={} equity={:.2}",
                     snap.logs_seen, snap.candidates, pending, open, manual, diverged, pending_buys, equity);
+                // Execution-gap calibration: paper model vs live reality
+                // over the retained window (negative avg = live trails).
+                let (gap_n, gap_avg, gap_total) = pipeline.exec.gap_stats().await;
+                if gap_n > 0 {
+                    info!("execution gap: n={gap_n} avg={gap_avg:+.4} total={gap_total:+.4} USD (paper model vs live settle + tips)");
+                }
                 // Burn-in thresholds (all 0 = off): log-only, never cards.
                 let thresholds = &pipeline.settings;
                 if thresholds.alert_diverged_warn_n > 0 && diverged as u64 >= thresholds.alert_diverged_warn_n {

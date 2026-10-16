@@ -105,6 +105,7 @@ pub fn extract_pump_swaps(
             if raw.starts_with(&PUMP_CREATE_DISCRIMINATOR)
                 || raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
                 || raw.starts_with(&PUMP_MIGRATE_DISCRIMINATOR)
+                || raw.starts_with(&PUMP_MIGRATE_V2_DISCRIMINATOR)
             {
                 return;
             }
@@ -157,10 +158,10 @@ pub fn count_dev_creates(
 ) -> Option<usize> {
     let tx_with_meta = &fetched.transaction;
     let EncodedTransaction::Json(ui_tx) = &tx_with_meta.transaction else {
-        return Some(0);
+        return None;
     };
     let UiMessage::Raw(raw) = &ui_tx.message else {
-        return Some(0);
+        return None;
     };
     let keys = resolve_keys(raw, &tx_with_meta.meta)?;
 
@@ -226,8 +227,8 @@ pub(crate) fn resolve_keys(
     Some(keys)
 }
 
-/// Standard JSON fetch config. Allows v1 envelopes.
-/// New v2 envelopes fail here: bump then.
+/// Standard JSON fetch config. Allows transaction version 1 envelopes.
+/// Transaction version 2 envelopes fail here: bump then.
 pub fn json_tx_config(commitment: CommitmentConfig) -> RpcTransactionConfig {
     RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Json),
