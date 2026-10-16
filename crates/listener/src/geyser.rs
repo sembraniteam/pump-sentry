@@ -271,6 +271,9 @@ impl GeyserSubscriber {
                 slot,
                 tx,
             ) {
+                // Same counter the WS path feeds per decoded launch: the
+                // heartbeat's parse_ok stays comparable across feeds.
+                self.stats.inc_parse_ok();
                 emitted = true;
             }
         }
@@ -285,6 +288,7 @@ impl GeyserSubscriber {
                     slot,
                     tx,
                 ) {
+                    self.stats.inc_parse_ok();
                     emitted = true;
                 }
             }
