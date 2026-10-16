@@ -133,6 +133,25 @@ fn reconnect_wait(attempt: u32, rate_limited: bool) -> Duration {
     })
 }
 
+/// Replay slot actually sent: the server honors `from_slot` only at
+/// `processed` commitment and rejects it otherwise ("available only
+/// for `processed`"), so non-processed reconnects must subscribe
+/// clean — sending it anyway fails every cycle deterministically on
+/// our own parameter. Consequence, stated plainly: on confirmed /
+/// finalized, downtime gaps have no redelivery and are missed (no
+/// backfill exists on this path, unlike WS). Pure for unit pinning.
+fn effective_replay_slot(commitment: CommitmentLevel, from_slot: Option<u64>) -> Option<u64> {
+    match commitment {
+        CommitmentLevel::Processed => from_slot,
+        _ => {
+            if from_slot.is_some() {
+                debug!("from_slot replay unsupported at this commitment; clean subscribe");
+            }
+            None
+        }
+    }
+}
+
 impl GeyserSubscriber {
     /// Reconnect loop. Same backoff + healthy-reset policy as WS.
     async fn run(self, tx: mpsc::Sender<ListenerEvent>) {
@@ -230,7 +249,8 @@ impl GeyserSubscriber {
                     ids::redact_endpoint(&self.config.geyser_url),
                 ))
             })?;
-        let request = subscribe_request(commitment, from_slot);
+        let replay_slot = effective_replay_slot(commitment, from_slot);
+        let request = subscribe_request(commitment, replay_slot);
         let (mut sink, mut stream) = client
             .subscribe_with_request(Some(request))
             .await
@@ -238,7 +258,7 @@ impl GeyserSubscriber {
         info!(
             endpoint = %ids::redact_endpoint(&self.config.geyser_url),
             commitment = %self.config.commitment,
-            replay = from_slot.is_some(),
+            replay = replay_slot.is_some(),
             "subscribed to pump.fun transactions via geyser"
         );
         let mut last_slot: Option<u64> = from_slot;
@@ -509,6 +529,21 @@ mod tests {
                 reconnect_wait(attempt, true) >= Duration::from_secs(60),
                 "attempt={attempt}"
             );
+        }
+    }
+
+    #[test]
+    fn replay_slot_only_at_processed() {
+        // Server rejects from_slot on confirmed/finalized: sending it
+        // fails every reconnect deterministically (observed live loop).
+        assert_eq!(
+            effective_replay_slot(CommitmentLevel::Processed, Some(123)),
+            Some(123)
+        );
+        assert_eq!(effective_replay_slot(CommitmentLevel::Processed, None), None);
+        for level in [CommitmentLevel::Confirmed, CommitmentLevel::Finalized] {
+            assert_eq!(effective_replay_slot(level, Some(123)), None);
+            assert_eq!(effective_replay_slot(level, None), None);
         }
     }
 
