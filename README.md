@@ -90,7 +90,7 @@ gate_window_secs = 15                # default 10 loses to RugCheck indexing
 
 [risk]
 strategy_mode = "adaptive"           # verbatim profile; scalp/runner reshape edge
-inference_timeout_ms = 800           # ONLY for a remote gateway (opencode-go);
+inference_timeout_ms = 800           # ONLY for a remote gateway;
                                      # localhost Ollama keeps 300 (slower entries cost price)
 # inference_endpoint/model point at the gateway's /v1/chat/completions
 
