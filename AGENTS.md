@@ -7,16 +7,18 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 
 - **Never run with `--live` / `IS_LIVE=true`, never fund a wallet, never
   send transactions.** Live paths move real SOL via Jito.
-- Tests hitting real mainnet exist and are `#[ignore]`d behind env gates (`JITO_ACCEPTANCE=1`, `MAINNET_LAYOUT=1`).
+- Tests hitting real mainnet exist and are `#[ignore]`d behind env gates
+  (`JITO_ACCEPTANCE=1`, `MAINNET_LAYOUT=1`, `RAYDIUM_ACCEPTANCE=1`).
   Never run them casually;
   only on explicit user request. They cost $0 by construction (unfunded
-  payers, simulation-only) — keep it that way.
+  payers, simulation-only) — keep it that way. Raydium probes resample
+  (router-dominated blocks yield zero direct swaps); rerun, don't "fix".
 - No secrets in repo. Preflight/simulate before any dispatch change.
 
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 457 tests; live probes stay ignored
+cargo test --workspace            # 493 tests; live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
@@ -31,24 +33,54 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - `crates/ids` is the single source of truth for on-chain constants (program IDs, discriminators, fee/volume addresses).
   A program upgrade
   edits exactly one file there — never duplicate a constant elsewhere.
-- `src/pipeline.rs` (~3100 lines) is the orchestrator: gate → risk →
-  paper ledger → live mirror. `LiveExecution`/`live_mirror` (live
-  dispatch), `gate` (watchlist + opens), and `DailyBreaker` are split
-  out; method bodies live on `Pipeline` via those modules.
+- `src/pipeline.rs` (~4200 lines, ~3/4 of it `mod tests`) is the orchestrator:
+  gate → risk → paper ledger → live mirror. `LiveExecution`/`live_mirror` (live
+  dispatch + `FillGapTracker` calibration), `gate` (watchlist + opens), and `DailyBreaker` are split
+  out; method bodies live on `Pipeline` via those modules. Do NOT split
+  further (coherent as-is; 10 single-impl traits are a deliberate
+  testability trade-off, not tech debt to "fix").
 - `src/live.rs` sizes/orders live trades; `crates/executor` builds and
   sends them. Paper ledger is authoritative; live legs only mirror it.
+  `LiveBuyParams`/`LiveSellParams` carry explicit `decimals: u8` — the
+  calc path reads no hidden constant; new constructors must set it.
+- Paper quantities are `u64` whole tokens (absolute; direction from
+  `side`), and the ledger debits/invests the floored size, never the
+  nominal ticket. Tests asserting quantities use integers; paper↔live
+  size parity holds only to sub-token dust (assert bounded, not exact).
+- `paper_dispatch_legs_usd(tip, priority, sol_usd)` takes 3 args (priority
+  leg included; calm-weather floor, documented). Typed units live in
+  `src/money.rs` (`Bps`/`Percent`) with `Settings::slippage()` /
+  `runner_moonbag()` accessors — use them in new validation, don't add
+  parallel float checks.
 - Risk flow: `risk-engine` profile → `strategy` rewrite (`adaptive`/`scalp`/`runner`) → `simulator` exits
   (TP/SL/trailing/
   timeout/moonbag scale-outs with breakeven ratchet + timeout lift).
-- Skills in `.opencode/skills/` are strong defaults, **not ground truth**:
+- Skills are strong defaults, **not ground truth**:
   the Jito skill once omitted the mandatory `{"encoding":"base64"}`
   param and every bundle was refused (`-32602`). Wire formats must be
   proven against mainnet replays/simulations, never trusted from prose.
+  (There is no `.opencode/skills/` dir in this repo; comments naming
+  `skill solana-*` refer to out-of-repo docs.)
+- Alert burn-in defaults are ON (`alert_diverged_warn_n=3`,
+  `alert_risk_fallback_warn_pct=50`, `alert_giveup_burst_n=3`): model
+  trouble and divergence page ops by default. Do NOT "fix" them back to 0.
+- One shared `Arc<RpcClient>` per process (built in `main`, injected via
+  `with_rpc` / `subscribe_with_rpc`). Never add a new `RpcClient`
+  construction site; `new()` constructors are test/back-compat wrappers.
+- Resend guard holds on `Pending` AND `Unknown` (`prior_sell_pending`);
+  the stale "Unknown proceeds" comment in `live_mirror.rs` was fixed —
+  do not revert it.
+- `venue_fee=None` at confirm fails closed (non-synthetic). Test stubs
+  default to `Some(125.0)`; the `None`-fee test arm asserts zero opens.
 
 ## Hard-earned mainnet facts (don't re-derive)
 
-- New launches are `create_v2` (disc `[214,144,…]`), **version-1
-  envelopes**: fetch configs must allow v1 or RPC refuses them.
+- New launches are `create_v2` (disc `[214,144,…]`) in **both v0 and v1
+  envelopes** (2 v0 + 1 v1 among recent launches; frozen proofs:
+  `create_v2_v0_recent_mainnet.json` + `create_v2_v1_recent_mainnet.json`):
+  fetch configs must keep `maxSupportedTransactionVersion: 1`, never
+  narrow to v1-only. v0 txs use address lookup tables — key-table code
+  must include `loadedAddresses`.
 - Dispatch is v3-only (`buy_v3`/`sell_v3`, 17 accounts, fees stay on the
   curve). The legacy 12-account core, 18-account mayhem buy, and
   27/26-account `buy_v2`/`sell_v2` shapes are RETIRED from dispatch
@@ -70,9 +102,12 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   both are screened (worst trust wins) and both join the gate cohort
   (either dump aborts). Prior-launch counting uses the versioned author
   index (v1: 7, v2: 5) — a shared index undercounted v2 serial launchers.
-- Sizing assumes 6-decimal mints: the confirm gate verifies decimals per
-  mint and drops anything else (fail-closed). Live dispatch preflight is
-  warn-and-proceed unless `SIM_STRICT=true` (strict refuses unproven).
+- Sizing takes per-mint `decimals` explicitly (no hidden constant in the
+  calc path): the confirm gate verifies decimals per mint and drops
+  non-6 fail-closed, and live re-verifies at dispatch. Live dispatch
+  preflight is warn-and-proceed unless `SIM_STRICT=true` (strict refuses
+  unproven); `SwapExecutor::new` defaults strict ON, paper paths opt
+  out explicitly via `with_strict_sim(false)`.
 - Fee payer ≠ `user` happens (relayers); holders may sit in aux
   accounts, not the canonical ATA (a live `sell_v2` probe hit exactly
   this: one seller's `[14]` was aux, so the builder's canonical-ATA
@@ -93,8 +128,8 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 ## Toolchain quirks
 
 - Mixed Solana versions by design: `executor` builds on granular
-  v3/v4 crates (`solana-client 4.3`), not `solana-sdk 5` (see its README
-  version note). Don't "unify" them.
+  v3/v4 crates (`solana-client 4.3`), not `solana-sdk 5`.
+  Don't "unify" them.
 - Rust 1.99 (`rust-version` in manifests). Let-chains (`if let … && let`)
   are used and required.
 - Long RPC-bound commands: run in background, don't poll; prefer bulk
