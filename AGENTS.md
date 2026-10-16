@@ -135,7 +135,10 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 
 - Mixed Solana versions by design: `executor` builds on granular
   v3/v4 crates (`solana-client 4.3`), not `solana-sdk 5`.
-  Don't "unify" them.
+  Don't "unify" them. Never copy lockfile-resolved versions back into
+  `Cargo.toml` (it flipped `curve`/`migration` to `solana-account 5.x`
+  against `client 4.3`'s 4.x returns and broke the build): manifest
+  majors are architecture, `cargo update` touches the lockfile only.
 - Rust 1.99 (`rust-version` in manifests). Let-chains (`if let … && let`)
   are used and required.
 - Long RPC-bound commands: run in background, don't poll; prefer bulk
