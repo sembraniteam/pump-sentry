@@ -207,11 +207,17 @@ async fn run_pipeline(live_arg: bool) {
         }
     };
     let settings = Settings::from_file(table.as_ref());
-    // Scrub the bearer token from the process environment now that
-    // Settings owns a copy: same rule as the trading keypair — secrets
-    // live in guarded memory, not in `/proc` environ or later children.
+    // Scrub endpoint secrets from the process environment now that
+    // Settings owns copies: the RPC URLs carry `?api-key=` / path keys,
+    // and nothing re-reads them after boot (same rule as the bearer
+    // token and the trading keypair — secrets live in guarded memory,
+    // not in `/proc` environ or later children).
     // (Test-only: tests set their own maps and never rely on this.)
-    unsafe { std::env::remove_var("INFERENCE_API_KEY") };
+    unsafe {
+        std::env::remove_var("INFERENCE_API_KEY");
+        std::env::remove_var("MAINNET_RPC_URL");
+        std::env::remove_var("MAINNET_WSS_RPC_URL");
+    }
 
     if CurveTicker::parse_commitment(&settings.commitment).is_none() {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
