@@ -138,10 +138,22 @@ impl GeyserSubscriber {
         let commitment = geyser_commitment(&self.config.commitment).ok_or_else(|| {
             GeyserError::Connect(format!("unknown commitment '{}'", self.config.commitment))
         })?;
-        let mut client = GeyserGrpcClient::build_from_shared(self.config.geyser_url.clone())
+        let builder = GeyserGrpcClient::build_from_shared(self.config.geyser_url.clone())
             .map_err(|e| GeyserError::Connect(format!("bad geyser endpoint: {e}")))?
             .x_token(self.token.clone())
-            .map_err(|e| GeyserError::Connect(format!("bad x-token: {e}")))?
+            .map_err(|e| GeyserError::Connect(format!("bad x-token: {e}")))?;
+        // HTTPS endpoints need explicit TLS: tonic dials plaintext
+        // otherwise and the server kills it as a transport error
+        // ("Connecting to HTTPS without TLS enabled", observed live).
+        // Plain-http stays plaintext (self-hosted convention).
+        let builder = if self.config.geyser_url.starts_with("https://") {
+            builder
+                .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
+                .map_err(|e| GeyserError::Connect(format!("bad geyser TLS config: {e}")))?
+        } else {
+            builder
+        };
+        let mut client = builder
             .connect()
             .await
             .map_err(|e| {

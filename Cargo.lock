@@ -2375,6 +2375,7 @@ dependencies = [
  "solana-transaction-status",
  "thiserror 2.0.21",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "url",

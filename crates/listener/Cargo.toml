@@ -28,6 +28,10 @@ base64 = "0.23.1"
 thiserror = "2"
 tracing = "0.1"
 url = "2"
+# Direct dep for one call: TLS on the gRPC channel (native roots).
+# Version pinned to yellowstone-grpc-client's tonic; the feature is
+# unified from there, stated here so the requirement is explicit.
+tonic = { version = "0.14", features = ["tls-native-roots"] }
 yellowstone-grpc-client = "15.0.0"
 yellowstone-grpc-proto = "14.0.1"
 
