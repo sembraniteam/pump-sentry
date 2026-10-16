@@ -220,6 +220,10 @@ async fn run_pipeline(live_arg: bool) {
 
     // Paper unless explicitly live.
     let live_mode = live_arg || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
+    // Attribute the source: a lingering IS_LIVE=true in the shell is the
+    // sharpest mode footgun (every later invocation boots live). Naming
+    // the source in the boot line makes that visible before funds move.
+    let live_via = if live_arg { "--live" } else { "IS_LIVE=true" };
     // Only exact `true` enables live.
     if !live_mode
         && let Ok(v) = std::env::var("IS_LIVE")
@@ -240,15 +244,16 @@ async fn run_pipeline(live_arg: bool) {
             _ => "started (foreground)",
         };
         info!(
-            "bot {kind} — pid {} mode {} unix_ts={}",
+            "bot {kind} — pid {} mode {} ({}) unix_ts={}",
             std::process::id(),
             if live_mode { "live" } else { "paper" },
+            if live_mode { live_via } else { "default" },
             settings::now_secs(),
         );
     }
     if live_mode {
         warn!("================================================================");
-        warn!("LIVE MODE: real SOL will move via Jito bundles.");
+        warn!("LIVE MODE via {live_via}: real SOL will move via Jito bundles.");
         warn!("Starting in 5s — Ctrl-C now to abort (no confirmation prompt,");
         warn!("so automation never hangs; the delay is the abort window).");
         warn!("================================================================");
