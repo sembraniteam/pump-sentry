@@ -56,6 +56,27 @@ pub struct GeyserSubscriber {
     last_slot: Arc<std::sync::atomic::AtomicU64>,
 }
 
+    /// Rate-limit cooldown: hammering a 429 every 5s sustains the ban
+/// (each reconnect is a fresh subscribe the limiter must refuse).
+/// A minute of silence lets token-bucket limiters recover; anything
+/// still failing after that is quota/exhaustion, not burst.
+pub const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// True when the failure is an explicit 429 (never a transport guess).
+/// Word-boundary match: "4290" (counters, slots) must not trigger
+/// minute-waits.
+fn is_rate_limited(e: &GeyserError) -> bool {
+    let msg = match e {
+        GeyserError::Stream(msg) => msg,
+        GeyserError::Connect(_) => return false,
+    };
+    msg.match_indices("429").any(|(i, _)| {
+        let before = msg[..i].chars().last().is_none_or(|c| !c.is_ascii_digit());
+        let after = msg[i + 3..].chars().next().is_none_or(|c| !c.is_ascii_digit());
+        before && after
+    })
+}
+
 impl GeyserSubscriber {
     /// Build from config plus an optional `x-token` (env-only secret).
     /// Empty token is allowed (self-hosted needs none) — loudly.
@@ -100,7 +121,19 @@ impl GeyserSubscriber {
         });
         Ok((rx, stats_out, handle))
     }
+}
 
+/// Reconnect wait: normal backoff, floored at a full minute on
+/// explicit 429s. Pure so the 429 policy is unit-pinned, not log lore.
+fn reconnect_wait(attempt: u32, rate_limited: bool) -> Duration {
+    backoff_duration(attempt).max(if rate_limited {
+        RATE_LIMIT_COOLDOWN
+    } else {
+        Duration::ZERO
+    })
+}
+
+impl GeyserSubscriber {
     /// Reconnect loop. Same backoff + healthy-reset policy as WS.
     async fn run(self, tx: mpsc::Sender<ListenerEvent>) {
         let mut attempt: u32 = 0;
@@ -112,6 +145,7 @@ impl GeyserSubscriber {
             }
             let seen_before = self.stats.logs_seen();
             let session_start = std::time::Instant::now();
+            let mut rate_limited = false;
             match self.run_once(&tx, from_slot).await {
                 Ok(last_slot) => {
                     // Clean stream end: reconnect (server closed it).
@@ -122,7 +156,12 @@ impl GeyserSubscriber {
                     from_slot = last_slot;
                 }
                 Err(e) => {
-                    warn!(error = %e, attempt, "geyser error; backing off");
+                    rate_limited = is_rate_limited(&e);
+                    if rate_limited {
+                        warn!(error = %e, attempt, "geyser rate limited (429); yielding a full minute");
+                    } else {
+                        warn!(error = %e, attempt, "geyser error; backing off");
+                    }
                     // Error resets must replay too: `last_slot` tracks
                     // every processed message, so the redelivered prefix
                     // is pure dedup, never a blind gap.
@@ -135,7 +174,7 @@ impl GeyserSubscriber {
             let healthy = self.stats.logs_seen().saturating_sub(seen_before) > 1000
                 || session_start.elapsed() > Duration::from_secs(30);
             attempt = if healthy { 0 } else { attempt.saturating_add(1) };
-            let wait = backoff_duration(attempt);
+            let wait = reconnect_wait(attempt, rate_limited);
             debug!(?wait, attempt, "geyser reconnect backoff");
             tokio::time::sleep(wait).await;
         }
@@ -437,6 +476,41 @@ mod tests {
         CompiledInstruction, InnerInstruction, InnerInstructions, Message, Transaction,
         TransactionError, TransactionStatusMeta,
     };
+
+    #[test]
+    fn rate_limit_classifier_is_exact() {
+        // Only an explicit 429 counts: transport guesses must keep the
+        // fast path, or every outage degrades to minute-waits.
+        assert!(is_rate_limited(&GeyserError::Stream(
+            "code: 'Internal error', 429 Too Many Requests".to_string()
+        )));
+        for msg in [
+            "geyser connect failed: transport error",
+            "ping reply failed; reconnecting",
+            "4290 numeric lookalike",
+        ] {
+            assert!(!is_rate_limited(&GeyserError::Stream(msg.to_string())), "{msg}");
+            assert!(!is_rate_limited(&GeyserError::Connect(msg.to_string())), "{msg}");
+        }
+        assert_eq!(RATE_LIMIT_COOLDOWN, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn reconnect_wait_floors_429_at_a_minute() {
+        // backoff carries jitter, so pin bounds, not exact values: the
+        // normal path never exceeds its 5s cap, the 429 path never
+        // returns sooner than a minute, at any attempt.
+        for attempt in [0, 1, 7, u32::MAX] {
+            assert!(
+                reconnect_wait(attempt, false) <= Duration::from_secs(5),
+                "attempt={attempt}"
+            );
+            assert!(
+                reconnect_wait(attempt, true) >= Duration::from_secs(60),
+                "attempt={attempt}"
+            );
+        }
+    }
 
     #[test]
     fn commitment_maps_all_levels() {
