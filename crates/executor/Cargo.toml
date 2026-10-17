@@ -46,4 +46,5 @@ migration = { path = "../migration" }
 solana-message = "4"
 solana-rpc-client-api = "4.3.0"
 solana-instruction-error = "2"
+solana-transaction-error = "3.4"
 tokio = { version = "1", features = ["full"] }

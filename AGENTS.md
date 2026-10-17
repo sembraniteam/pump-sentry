@@ -71,7 +71,9 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   replay format: strict decode — a line missing a load-bearing field or
   carrying a wrong type is counted in `skipped`, never half-adopted; older
   shapes stay readable via `#[serde(default)]` fields. Replay/compaction
-  changes are data-loss-sensitive.
+  changes are data-loss-sensitive. `pending` lines carry an optional
+  `blockhash`, `sell_pending` an optional `sig` (both defaultable):
+  they are the reconcile/expiry evidence the guards re-read at boot.
 - Skills are strong defaults, **not ground truth**:
   the Jito skill once omitted the mandatory `{"encoding":"base64"}`
   param and every bundle was refused (`-32602`). Wire formats must be
@@ -86,7 +88,19 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   construction site; `new()` constructors are test/back-compat wrappers.
 - Resend guard holds on `Pending` AND `Unknown` (`prior_sell_pending`);
   the stale "Unknown proceeds" comment in `live_mirror.rs` was fixed —
-  do not revert it.
+  do not revert it. It now reconciles before releasing: engine-`Invalid`
+  (5-minute lookback forget) is NOT proof of no-fill, and the TTL release
+  checks the prior signature once — unverifiable reconciles hold (fail
+  closed), a landed prior is warn-surfaced as a possibly stale ledger.
+- Dispatch status semantics live in `crates/executor/src/executor.rs`
+  (`ConfirmOutcome`, `DispatchVerdict`, pinned by `timeout_is_never_a_failure`
+  / `chain_verdicts_open_only_on_voted_states`): receipt = submitted
+  (acceptance != landing); `Timeout` = unseen, never failure;
+  `Processed` is seen-but-unvoted (no position opens on it).
+  `resolve_dispatch` composes chain + engine + `reconcile_signature`
+  (full history) + blockhash expiry; `Dead` needs proof (on-chain error,
+  engine never-forwarded, or unseen + dead blockhash). Never let a
+  timeout map back to "failure" or skip the reconcile before a resend.
 - `venue_fee=None` at confirm fails closed (non-synthetic). Test stubs
   default to `Some(125.0)`; the `None`-fee test arm asserts zero opens.
 

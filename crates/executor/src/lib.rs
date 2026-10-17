@@ -14,8 +14,9 @@ mod test_fixture;
 pub mod wallet;
 
 pub use executor::{
-    BuyOrder, ConfirmOutcome, ExecutorError, FundingPrincipal, JitoReceipt, LiveFundingReport,
-    ObservedBuyFill, SellOrder, SellPumpSwapOrder, SellRaydiumOrder, SwapExecutor,
+    BuyOrder, ConfirmOutcome, DeadReason, DispatchVerdict, ExecutorError, FundingPrincipal,
+    JitoReceipt, LiveFundingReport, ObservedBuyFill, SellOrder, SellPumpSwapOrder,
+    SellRaydiumOrder, SwapExecutor,
 };
 pub use instructions::{BuyV3Accounts, PumpAmmSellV2Accounts, PumpBuyV3Args, PumpSellV3Args, PumpBuyExactQuoteInV3Args, PumpSwapBuilder, SellV3Accounts, parse_pubkey, user_ata_with_program};
 pub use quote::{CurveView, FeeSchedule, FeesBps, QuoteError, QuoteKind};

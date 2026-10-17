@@ -2,7 +2,9 @@
 
 use crate::settings::now_secs;
 use crate::wal;
-use executor::{BuyOrder, BundleStatus, ConfirmOutcome, ExecutorError, JitoReceipt, SellOrder, SwapExecutor};
+use executor::{
+    BuyOrder, BundleStatus, DispatchVerdict, ExecutorError, JitoReceipt, SellOrder, SwapExecutor,
+};
 use futures_util::stream::StreamExt;
 use ids::{ATA_RENT_LAMPORTS, BASE_TX_FEE_LAMPORTS};
 use simulator::{FillModel, Side};
@@ -59,8 +61,10 @@ pub const SELL_MAX_ATTEMPTS: u32 = 5;
 /// Max age of a resend-guard entry: a bundle that is still
 /// Pending/Unknown after this long is either lying status API or
 /// ancient history — holding resends forever strands the bag, so the
-/// guard expires loudly (warn) instead. Jito bundles resolve in
-/// minutes; an hour is pure outage margin.
+/// guard expires loudly (warn) instead. The release reconciles the
+/// prior signature first (one RPC): a prior that landed is surfaced
+/// before a replacement can compete. Jito bundles resolve in minutes;
+/// an hour is pure outage margin (its blockhash died ~59 minutes ago).
 pub const SELL_GUARD_TTL_SECS: u64 = 3_600;
 /// Recheck rounds before manual review.
 pub const PENDING_MAX_ATTEMPTS: u32 = 5;
@@ -459,16 +463,27 @@ pub struct LiveTrader {
     vol_window_secs: u64,
     /// Cap on the volatility add-on, bps (`0` = adaptive off).
     vol_extra_cap_bps: u64,
-    /// Last sell bundle per mint (resend guard: never compete with
-    /// an inflight-pending prior bundle for the same bag). Value is
-    /// `(bundle_id, noted_at_secs)`: entries expire via
-    /// [`SELL_GUARD_TTL_SECS`] so a lying status API cannot hold
-    /// resends forever.
-    last_sell_bundle: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, (String, u64)>>,
-    >,
+    /// Last sell bundle per mint (resend guard: never compete with an
+    /// inflight-pending prior bundle for the same bag). Entries expire
+    /// via [`SELL_GUARD_TTL_SECS`] so a lying status API cannot hold
+    /// resends forever; the release reconciles [`SellGuard::signature`]
+    /// first.
+    last_sell_bundle: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, SellGuard>>>,
     /// One recheck round at a time.
     recheck_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// One dispatched sell awaiting resolution (resend-guard entry).
+#[derive(Debug, Clone)]
+struct SellGuard {
+    /// Engine bundle UUID.
+    bundle_id: String,
+    /// Tx signature for reconciliation (recent + history). `None` only
+    /// for legacy WAL traces that predate the field: the engine word
+    /// governs those.
+    signature: Option<String>,
+    /// Dispatch stamp for the TTL release.
+    noted_at: u64,
 }
 
 /// Buy awaiting confirmation. Never a fill until the chain says so.
@@ -477,6 +492,10 @@ struct PendingBuy {
     position: LivePosition,
     signature: String,
     bundle_id: String,
+    /// Dispatch blockhash (base58): proves expiry when the signature
+    /// stays unseen. `None` for pending buys replayed from older WAL
+    /// lines (they park manual instead of expiring).
+    blockhash: Option<String>,
     attempts: u32,
 }
 
@@ -661,24 +680,32 @@ impl LiveTrader {
 
     /// Remember a sell bundle for the resend guard, and trace it in
     /// the WAL so a crash between dispatch and confirm does not blind
-    /// the next boot's guard (replay seeds recent traces back).
-    fn note_sell_bundle(&self, mint: &str, bundle_id: &str) {
+    /// the next boot's guard (replay seeds recent traces back). The
+    /// signature is kept for reconciliation before any release.
+    fn note_sell_bundle(&self, mint: &str, receipt: &JitoReceipt) {
         if let Ok(mut guard) = self.last_sell_bundle.lock() {
-            guard.insert(mint.to_string(), (bundle_id.to_string(), now_secs()));
+            guard.insert(
+                mint.to_string(),
+                SellGuard {
+                    bundle_id: receipt.bundle_id.clone(),
+                    signature: Some(receipt.signature.clone()),
+                    noted_at: now_secs(),
+                },
+            );
         } else {
             tracing::warn!(
                 "sell-bundle lock poisoned during note_sell_bundle; resend guard degraded"
             );
         }
-        self.write_wal_sell_pending(mint, bundle_id);
+        self.write_wal_sell_pending(mint, &receipt.bundle_id, &receipt.signature);
     }
 
     /// Forget a sell bundle after terminal confirm (landed or dead),
     /// retiring its WAL trace with it.
     fn clear_sell_bundle(&self, mint: &str) {
         if let Ok(mut guard) = self.last_sell_bundle.lock() {
-            if let Some((bundle_id, _)) = guard.remove(mint) {
-                self.write_wal_settled(&bundle_id);
+            if let Some(entry) = guard.remove(mint) {
+                self.write_wal_settled(&entry.bundle_id);
             }
         } else {
             tracing::warn!(
@@ -692,22 +719,48 @@ impl LiveTrader {
         now_secs.saturating_sub(noted_at_secs) >= SELL_GUARD_TTL_SECS
     }
 
-    /// Seed the resend guard from WAL-replayed sell traces. Only ids
-    /// the engine still calls Pending/Unknown are kept (terminal ones
-    /// release on first check); anything older than the replay window
-    /// never arrives here. Returns the kept count.
-    pub async fn seed_sell_guard(&self, items: Vec<(String, String)>) -> usize {
+    /// Seed the resend guard from WAL-replayed sell traces. A landed
+    /// prior is surfaced loudly and NOT seeded (the bag may already be
+    /// sold: a hold would only strand the exit); a signature that
+    /// cannot be ruled out (unverifiable, or a legacy trace whose
+    /// engine word is still Pending/Unknown) holds until it resolves.
+    /// Returns the kept count.
+    pub async fn seed_sell_guard(&self, items: Vec<wal::WalSellPending>) -> usize {
         let mut kept = 0usize;
-        for (mint, bundle_id) in items {
-            match self.executor.bundle_status(&bundle_id).await {
-                BundleStatus::Pending | BundleStatus::Unknown => {
-                    if let Ok(mut guard) = self.last_sell_bundle.lock() {
-                        guard.insert(mint.clone(), (bundle_id.clone(), now_secs()));
-                        kept += 1;
+        for item in items {
+            let (mint, bundle_id) = (item.mint.clone(), item.bundle_id.clone());
+            let hold = match item.signature.as_deref() {
+                Some(signature) => match self.executor.reconcile_signature(signature).await {
+                    Ok(Some(seen)) if seen.landed() => {
+                        tracing::warn!(%mint, bundle = %bundle_id, sig = %signature, "WAL replay: prior sell ALREADY LANDED on-chain; not seeding a hold — ledger may be stale, inspect");
+                        false
                     }
-                    tracing::warn!(%mint, bundle = %bundle_id, "WAL replay: prior sell bundle still engine-pending; resends hold until it resolves");
+                    // Errored or unseen: it cannot land; nothing to hold.
+                    Ok(_) => false,
+                    // Unverifiable: fail closed, hold until it resolves.
+                    Err(e) => {
+                        tracing::warn!(%mint, bundle = %bundle_id, error = %e, "WAL replay: prior sell reconcile unavailable; holding resends (fail closed)");
+                        true
+                    }
+                },
+                None => matches!(
+                    self.executor.bundle_status(&bundle_id).await,
+                    BundleStatus::Pending | BundleStatus::Unknown
+                ),
+            };
+            if hold {
+                if let Ok(mut guard) = self.last_sell_bundle.lock() {
+                    guard.insert(
+                        mint.clone(),
+                        SellGuard {
+                            bundle_id: bundle_id.clone(),
+                            signature: item.signature.clone(),
+                            noted_at: now_secs(),
+                        },
+                    );
+                    kept += 1;
                 }
-                _ => {}
+                tracing::warn!(%mint, bundle = %bundle_id, "WAL replay: prior sell bundle unresolved; resends hold until it resolves");
             }
         }
         kept
@@ -716,24 +769,75 @@ impl LiveTrader {
     /// True when the last sell bundle for `mint` may still land:
     /// resends must wait under the same cooldown, never compete with it.
     /// Both `Pending` and `Unknown` hold the guard — a status outage must
-    /// not release a second bundle for the same bag.
+    /// not release a second bundle for the same bag. Engine-terminal
+    /// states are reconciled by signature first: "forgot" (`Invalid`, a
+    /// 5-minute lookback) is not proof the sell never landed.
     pub(crate) async fn prior_sell_pending(&self, mint: &str) -> bool {
         let entry = match self.last_sell_bundle.lock() {
             Ok(guard) => guard.get(mint).cloned(),
             Err(_) => None,
         };
-        let Some((id, noted_at)) = entry else { return false };
-        if Self::sell_guard_expired(noted_at, now_secs()) {
+        let Some(entry) = entry else { return false };
+        if Self::sell_guard_expired(entry.noted_at, now_secs()) {
             if let Ok(mut guard) = self.last_sell_bundle.lock() {
                 guard.remove(mint);
             }
-            tracing::warn!(%mint, bundle = %id, "resend guard expired (TTL); releasing resend — inspect the bundle on explorer");
+            // Reconcile before release (one RPC): a landed prior means
+            // the bag may already be sold (stale ledger) — surface it;
+            // an unseen one cannot land anymore (its blockhash died
+            // long before the TTL). Either way the replacement sell is
+            // chain-idempotent: it fails or sells the remainder.
+            match entry.signature.as_deref() {
+                None => tracing::warn!(%mint, bundle = %entry.bundle_id,
+                    "resend guard expired (TTL); no signature recorded — releasing resend, inspect the bundle on explorer"),
+                Some(signature) => {
+                    match self.executor.reconcile_signature(signature).await {
+                        Ok(Some(seen)) if seen.landed() => tracing::warn!(%mint, bundle = %entry.bundle_id, %signature,
+                            "prior sell LANDED on-chain (TTL release); resend released — ledger may be stale, MANUAL REVIEW if the bag no longer exists"),
+                        // Only `FailedOnChain` remains on the contract
+                        // (a seen status is never `Timeout`).
+                        Ok(Some(_)) => tracing::warn!(%mint,
+                            bundle = %entry.bundle_id, "prior sell errored on-chain (TTL release); resend released"),
+                        Ok(None) => tracing::warn!(%mint, bundle = %entry.bundle_id,
+                            "prior sell never landed (unseen in full history); resend released"),
+                        Err(e) => tracing::warn!(%mint, bundle = %entry.bundle_id, error = %e,
+                            "prior sell reconcile unavailable at TTL; resend released (an hour-old bundle can no longer land)"),
+                    }
+                }
+            }
             return false;
         }
-        matches!(
-            self.executor.bundle_status(&id).await,
-            BundleStatus::Pending | BundleStatus::Unknown
-        )
+        let engine = self.executor.bundle_status(&entry.bundle_id).await;
+        match engine {
+            // Still inflight (or unreadable): hold.
+            BundleStatus::Pending | BundleStatus::Unknown => true,
+            // Landed on-chain: the sell executed, no competition possible.
+            BundleStatus::Landed => false,
+            // Terminal engine verdicts (Failed = never forwarded) and a
+            // forgot one (Invalid, 5-minute lookback) are the engine's
+            // word, not the chain's: reconcile the signature before
+            // releasing, so a landed prior is surfaced (stale ledger)
+            // instead of silently resending a replacement.
+            BundleStatus::Failed | BundleStatus::Invalid => match entry.signature.as_deref() {
+                // Legacy entry without a signature: engine word only.
+                None => false,
+                Some(signature) => match self.executor.reconcile_signature(signature).await {
+                    Ok(Some(seen)) if seen.landed() => {
+                        tracing::warn!(%mint, bundle = %entry.bundle_id, %signature,
+                            "prior sell LANDED on-chain (engine reports it dead/forgot); releasing resend — ledger may be stale");
+                        false
+                    }
+                    // Errored or unseen: it cannot land.
+                    Ok(_) => false,
+                    // Unverifiable: fail closed (the TTL still releases).
+                    Err(e) => {
+                        tracing::warn!(%mint, bundle = %entry.bundle_id, error = %e,
+                            "prior sell reconcile unavailable; holding resend (fail closed)");
+                        true
+                    }
+                },
+            },
+        }
     }
 
     /// True when a buy awaits confirmation.
@@ -776,28 +880,32 @@ impl LiveTrader {
             });
         let results: Vec<(PendingBuy, RecheckOutcome)> =
             futures_util::stream::iter(snapshot.into_iter().map(|entry| async {
+                // One resolution per round: chain poll, engine word,
+                // signature reconcile, expiry — never "timeout = failed".
                 let outcome = match self
                     .executor
-                    .confirm_signature(&entry.signature, LIVE_CONFIRM_TIMEOUT)
+                    .resolve_dispatch(
+                        &entry.bundle_id,
+                        &entry.signature,
+                        entry.blockhash.as_deref(),
+                        LIVE_CONFIRM_TIMEOUT,
+                    )
                     .await
                 {
-                    Ok(ConfirmOutcome::Confirmed) => RecheckOutcome::Confirmed,
-                    Ok(ConfirmOutcome::FailedOnChain) => RecheckOutcome::FailedOnChain,
-                    Ok(ConfirmOutcome::Timeout) | Err(_) => {
+                    DispatchVerdict::Landed => RecheckOutcome::Confirmed,
+                    DispatchVerdict::Dead(reason) => {
+                        tracing::warn!(mint = %entry.position.mint, bundle = %entry.bundle_id, %reason,
+                            "pending LIVE buy provably dead; no fill");
+                        RecheckOutcome::FailedOnChain
+                    }
+                    DispatchVerdict::Unknown(why) => {
                         let attempts = entry.attempts.saturating_add(1);
                         if attempts >= PENDING_MAX_ATTEMPTS {
-                            // Last word from the engine before giving up:
-                            // terminal states retire now instead of parking
-                            // a dead bundle for manual review.
-                            match self.executor.bundle_status(&entry.bundle_id).await {
-                                BundleStatus::Failed | BundleStatus::Invalid => {
-                                    RecheckOutcome::FailedOnChain
-                                }
-                                BundleStatus::Landed => RecheckOutcome::Confirmed,
-                                BundleStatus::Pending | BundleStatus::Unknown => {
-                                    RecheckOutcome::GiveUp
-                                }
-                            }
+                            // Still unresolved after the budget: park
+                            // (may hold), never drop a maybe-fill.
+                            tracing::warn!(mint = %entry.position.mint, bundle = %entry.bundle_id, why,
+                                "pending LIVE buy unresolved past the retry budget");
+                            RecheckOutcome::GiveUp
                         } else {
                             let mint = entry.position.mint.to_string();
                             self.with_pending("recheck-bump", (), |guard| {
@@ -967,13 +1075,19 @@ impl LiveTrader {
             creator,
         );
         Self::track_pending(&self.pending, &mint_str, intended.clone(), &receipt);
-        self.write_wal_pending(&intended, &receipt.signature, &receipt.bundle_id);
+        self.write_wal_pending(&intended, &receipt);
+        let dispatch_blockhash = receipt.blockhash.to_string();
         match self
             .executor
-            .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
+            .resolve_dispatch(
+                &receipt.bundle_id,
+                &receipt.signature,
+                Some(dispatch_blockhash.as_str()),
+                LIVE_CONFIRM_TIMEOUT,
+            )
             .await
         {
-            Ok(ConfirmOutcome::Confirmed) => {
+            DispatchVerdict::Landed => {
                 Self::untrack_pending(&self.pending, &mint_str);
                 let entry_fill = self
                     .observe_entry_fill(
@@ -996,91 +1110,20 @@ impl LiveTrader {
                     entry_fill,
                 ))
             }
-            Ok(ConfirmOutcome::FailedOnChain) => {
+            DispatchVerdict::Dead(reason) => {
                 Self::untrack_pending(&self.pending, &mint_str);
                 // Proven no-fill: retire the line so boot skips it.
                 self.write_wal_settled(&receipt.bundle_id);
                 Err(LiveError::Unconfirmed(format!(
-                    "buy bundle {} Confirmed failure: errored on-chain; no fill",
+                    "buy bundle {} Confirmed failure: {reason}; no fill",
                     receipt.bundle_id
                 )))
             }
-            Ok(ConfirmOutcome::Timeout) => {
-                // Engine verdict beats the silent signature: Failed /
-                // Invalid is terminal (no fill), Landed confirms.
-                match self.executor.bundle_status(&receipt.bundle_id).await {
-                    BundleStatus::Failed | BundleStatus::Invalid => {
-                        Self::untrack_pending(&self.pending, &mint_str);
-                        self.write_wal_settled(&receipt.bundle_id);
-                        Err(LiveError::Unconfirmed(format!(
-                            "buy bundle {} Confirmed failure: engine reports bundle failed/invalid; no fill",
-                            receipt.bundle_id
-                        )))
-                    }
-                    BundleStatus::Landed => {
-                        Self::untrack_pending(&self.pending, &mint_str);
-                        // Landed verdict, same fill observation: the tx
-                        // exists on-chain regardless of which confirmer
-                        // noticed first.
-                        let entry_fill = self
-                            .observe_entry_fill(
-                                &receipt.signature,
-                                &mint_str,
-                                req.decimals,
-                                tip_lamports,
-                                sol_usd,
-                            )
-                            .await;
-                        Ok((
-                            Self::pending_position(
-                                mint,
-                                curve,
-                                assoc_curve,
-                                plan.amount_tokens,
-                                creator,
-                            ),
-                            receipt.bundle_id,
-                            entry_fill,
-                        ))
-                    }
-                    BundleStatus::Pending | BundleStatus::Unknown => {
-                        // May land late: keep for recheck.
-                        Self::track_pending(
-                            &self.pending,
-                            &mint_str,
-                            Self::pending_position(
-                                mint,
-                                curve,
-                                assoc_curve,
-                                plan.amount_tokens,
-                                creator,
-                            ),
-                            &receipt,
-                        );
-                        Err(LiveError::Unconfirmed(format!(
-                            "buy bundle {} unconfirmed after {:?}; tracked as pending, rechecking",
-                            receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
-                        )))
-                    }
-                }
-            }
-            Err(e) => {
-                // Transport failure: same as timeout.
-                Self::track_pending(
-                    &self.pending,
-                    &mint_str,
-                    Self::pending_position(
-                        mint,
-                        curve,
-                        assoc_curve,
-                        plan.amount_tokens,
-                        creator,
-                    ),
-                    &receipt,
-                );
+            DispatchVerdict::Unknown(why) => {
+                // May land late: keep for recheck, never resend.
                 Err(LiveError::Unconfirmed(format!(
-                    "buy bundle {} confirm RPC failed ({e}); tracked as pending, rechecking",
-                    receipt.bundle_id
+                    "buy bundle {} unconfirmed after {:?} ({why}); tracked as pending, rechecking",
+                    receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
                 )))
             }
         }
@@ -1103,6 +1146,7 @@ impl LiveTrader {
                     position,
                     signature: receipt.signature.clone(),
                     bundle_id: receipt.bundle_id.clone(),
+                    blockhash: Some(receipt.blockhash.to_string()),
                     attempts: 1,
                 });
             }
@@ -1168,25 +1212,27 @@ impl LiveTrader {
     }
 
     /// Record a dispatch BEFORE confirming.
-    fn write_wal_pending(&self, position: &LivePosition, signature: &str, bundle_id: &str) {
+    fn write_wal_pending(&self, position: &LivePosition, receipt: &JitoReceipt) {
         self.wal_record(&wal::WalLine::Pending {
             mint: position.mint.to_string(),
             curve: position.curve.to_string(),
             assoc: position.assoc_curve.to_string(),
             amount: position.amount_tokens,
             creator: position.creator.as_ref().map(|c| c.to_string()),
-            sig: signature.to_string(),
-            bundle: bundle_id.to_string(),
+            sig: receipt.signature.clone(),
+            bundle: receipt.bundle_id.clone(),
+            blockhash: Some(receipt.blockhash.to_string()),
             ts: Some(now_secs()),
         });
     }
 
     /// Record a sell dispatch BEFORE confirming (crash window
     /// coverage: replay seeds the resend guard from unsettled lines).
-    fn write_wal_sell_pending(&self, mint: &str, bundle_id: &str) {
+    fn write_wal_sell_pending(&self, mint: &str, bundle_id: &str, signature: &str) {
         self.wal_record(&wal::WalLine::SellPending {
             mint: mint.to_string(),
             bundle: bundle_id.to_string(),
+            sig: Some(signature.to_string()),
             ts: now_secs(),
         });
     }
@@ -1292,6 +1338,7 @@ impl LiveTrader {
                             position: item.position,
                             signature: item.signature,
                             bundle_id: item.bundle_id,
+                            blockhash: item.blockhash,
                             attempts: 1,
                         });
                     }
@@ -1349,7 +1396,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE sell dispatched");
-        self.note_sell_bundle(&mint_str, &receipt.bundle_id);
+        self.note_sell_bundle(&mint_str, &receipt);
         self.confirm_pool_sell(&mint_str, &receipt, "sell").await
     }
 
@@ -1362,50 +1409,34 @@ impl LiveTrader {
         receipt: &JitoReceipt,
         label: &str,
     ) -> Result<String, LiveError> {
+        let dispatch_blockhash = receipt.blockhash.to_string();
         match self
             .executor
-            .confirm_signature(&receipt.signature, LIVE_CONFIRM_TIMEOUT)
+            .resolve_dispatch(
+                &receipt.bundle_id,
+                &receipt.signature,
+                Some(dispatch_blockhash.as_str()),
+                LIVE_CONFIRM_TIMEOUT,
+            )
             .await
         {
-            Ok(ConfirmOutcome::Confirmed) => {
+            DispatchVerdict::Landed => {
                 self.clear_sell_bundle(mint);
                 Ok(receipt.bundle_id.clone())
             }
-            Ok(ConfirmOutcome::FailedOnChain) => {
+            DispatchVerdict::Dead(reason) => {
                 // Terminally dead: never lands, so drop the id — the
                 // resend guard must not pay a status query for it, nor
                 // hold a resend for a bundle that cannot compete.
                 self.clear_sell_bundle(mint);
                 Err(LiveError::Unconfirmed(format!(
-                    "{label} bundle {} errored on-chain; still holding",
+                    "{label} bundle {} dead ({reason}); still holding",
                     receipt.bundle_id
                 )))
             }
-            Ok(ConfirmOutcome::Timeout) => {
-                match self.executor.bundle_status(&receipt.bundle_id).await {
-                    BundleStatus::Failed | BundleStatus::Invalid => {
-                        self.clear_sell_bundle(mint);
-                        Err(LiveError::Unconfirmed(format!(
-                            "{label} bundle {} engine reports bundle failed/invalid; still holding",
-                            receipt.bundle_id
-                        )))
-                    }
-                    BundleStatus::Landed => {
-                        self.clear_sell_bundle(mint);
-                        Ok(receipt.bundle_id.clone())
-                    }
-                    BundleStatus::Pending | BundleStatus::Unknown => {
-                        Err(LiveError::Unconfirmed(format!(
-                            "{label} bundle {} unconfirmed after {:?}; still holding",
-                            receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
-                        )))
-                    }
-                }
-            }
-            // Transport failure: same as timeout.
-            Err(e) => Err(LiveError::Unconfirmed(format!(
-                "{label} bundle {} confirm RPC failed ({e}); still holding",
-                receipt.bundle_id
+            DispatchVerdict::Unknown(why) => Err(LiveError::Unconfirmed(format!(
+                "{label} bundle {} unconfirmed after {:?} ({why}); still holding",
+                receipt.bundle_id, LIVE_CONFIRM_TIMEOUT
             ))),
         }
     }
@@ -1438,7 +1469,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE raydium sell dispatched");
-        self.note_sell_bundle(&mint_str, &receipt.bundle_id);
+        self.note_sell_bundle(&mint_str, &receipt);
         self.confirm_pool_sell(&mint_str, &receipt, "raydium sell").await
     }
 
@@ -1471,7 +1502,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE pumpswap sell dispatched");
-        self.note_sell_bundle(&mint_str, &receipt.bundle_id);
+        self.note_sell_bundle(&mint_str, &receipt);
         self.confirm_pool_sell(&mint_str, &receipt, "pumpswap sell").await
     }
 }

@@ -9,6 +9,8 @@ pub struct WalPending {
     pub signature: String,
     /// Engine bundle UUID (dedup key).
     pub bundle_id: String,
+    /// Dispatch blockhash (base58) for expiry proof. `None` on older lines.
+    pub blockhash: Option<String>,
 }
 
 /// One human-exit bag.
@@ -24,6 +26,9 @@ pub struct WalManual {
 pub struct WalSellPending {
     pub mint: String,
     pub bundle_id: String,
+    /// Tx signature for reconciliation before any resend release.
+    /// `None` on older lines: the engine word governs those.
+    pub signature: Option<String>,
     /// Line timestamp (recency window at import).
     pub ts: u64,
 }
@@ -46,13 +51,13 @@ pub struct WalReplay {
 }
 
 impl WalReplay {
-    /// `(mint, bundle_id)` pairs fresh enough to seed the resend
-    /// guard: the rest are ancient history, never inflight.
-    pub fn recent_sell_pending(&self, now_secs: u64) -> Vec<(String, String)> {
+    /// Sell traces fresh enough to seed the resend guard: the rest are
+    /// ancient history, never inflight.
+    pub fn recent_sell_pending(&self, now_secs: u64) -> Vec<WalSellPending> {
         self.sell_pending
             .iter()
             .filter(|s| now_secs.saturating_sub(s.ts) < SELL_PENDING_SEED_WINDOW_SECS)
-            .map(|s| (s.mint.clone(), s.bundle_id.clone()))
+            .cloned()
             .collect()
     }
 }
@@ -76,6 +81,8 @@ pub enum WalLine {
         sig: String,
         bundle: String,
         #[serde(default)]
+        blockhash: Option<String>,
+        #[serde(default)]
         ts: Option<u64>,
     },
     /// Dead bundle: retires its pending buy and sell traces.
@@ -88,6 +95,8 @@ pub enum WalLine {
     SellPending {
         mint: String,
         bundle: String,
+        #[serde(default)]
+        sig: Option<String>,
         ts: u64,
     },
     /// Confirmed fill (custody).
@@ -164,8 +173,9 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     let mut positions: HashMap<String, LivePosition> = HashMap::new();
     let mut manual: HashMap<String, WalManual> = HashMap::new();
     // Sell dispatches keyed by bundle (multiples per mint survive;
-    // the resend guard seeds from the unsettled remainder).
-    let mut sell_pending: HashMap<(String, String), u64> = HashMap::new();
+    // the resend guard seeds from the unsettled remainder). Value is
+    // `(ts, signature)`; older lines lack the signature.
+    let mut sell_pending: HashMap<(String, String), (u64, Option<String>)> = HashMap::new();
     // Fills already subtracted (by bundle id). Old files may carry the
     // same sell twice (two writers pre-fix); without this a partial
     // exit replays twice and the held runner vanishes from tracking.
@@ -209,6 +219,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 creator,
                 sig,
                 bundle,
+                blockhash,
                 ..
             } => {
                 let Some(pos) = position_from(&mint, &curve, &assoc, amount, creator.as_deref())
@@ -222,6 +233,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                         position: pos,
                         signature: sig,
                         bundle_id: bundle,
+                        blockhash,
                     },
                 );
             }
@@ -229,8 +241,13 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 pending.remove(&bundle);
                 sell_pending.retain(|(_, b), _| *b != bundle);
             }
-            WalLine::SellPending { mint, bundle, ts } => {
-                sell_pending.insert((mint, bundle), ts);
+            WalLine::SellPending {
+                mint,
+                bundle,
+                sig,
+                ts,
+            } => {
+                sell_pending.insert((mint, bundle), (ts, sig));
             }
             WalLine::Position {
                 mint,
@@ -313,7 +330,12 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
         manual: manual.into_values().collect(),
         sell_pending: sell_pending
             .into_iter()
-            .map(|((mint, bundle_id), ts)| WalSellPending { mint, bundle_id, ts })
+            .map(|((mint, bundle_id), (ts, signature))| WalSellPending {
+                mint,
+                bundle_id,
+                signature,
+                ts,
+            })
             .collect(),
         skipped,
     }
@@ -345,6 +367,7 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
                 creator: creator(p.position.creator.as_ref()),
                 sig: p.signature.clone(),
                 bundle: p.bundle_id.clone(),
+                blockhash: p.blockhash.clone(),
                 ts: Some(now),
             },
         );
@@ -361,6 +384,7 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
             &WalLine::SellPending {
                 mint: s.mint.clone(),
                 bundle: s.bundle_id.clone(),
+                sig: s.signature.clone(),
                 ts: s.ts,
             },
         );
@@ -524,6 +548,32 @@ mod tests {
         let replay = replay_lines(lines.iter().map(String::as_str));
         assert!(replay.sell_pending.is_empty());
         assert_eq!(replay.skipped, 1);
+    }
+
+    #[test]
+    fn reconciliation_fields_roundtrip_and_stay_backward_readable() {
+        // New-shape lines carry blockhash / signature: the expiry and
+        // reconcile evidence the guards need after a crash.
+        let open_pending = format!(
+            "{{\"t\":\"pending\",\"mint\":\"{TMINT}\",\"curve\":\"{TCURVE}\",\"assoc\":\"{TASSOC}\",\"amount\":1000,\"creator\":null,\"sig\":\"S1\",\"bundle\":\"B1\",\"blockhash\":\"BH1\",\"ts\":1}}"
+        );
+        let open_sell = format!(
+            "{{\"t\":\"sell_pending\",\"mint\":\"{TMINT}\",\"bundle\":\"B9\",\"sig\":\"S9\",\"ts\":1000}}"
+        );
+        let replay = replay_lines([open_pending.as_str(), open_sell.as_str()].iter().copied());
+        assert_eq!(replay.pending[0].blockhash.as_deref(), Some("BH1"));
+        assert_eq!(replay.sell_pending[0].signature.as_deref(), Some("S9"));
+        // Old-shape lines lack both fields: still readable, never skipped.
+        let old_pending = format!(
+            "{{\"t\":\"pending\",\"mint\":\"{TMINT}\",\"curve\":\"{TCURVE}\",\"assoc\":\"{TASSOC}\",\"amount\":1000,\"creator\":null,\"sig\":\"S1\",\"bundle\":\"B2\",\"ts\":1}}"
+        );
+        let old_sell = format!(
+            r#"{{"t":"sell_pending","mint":"{TMINT}","bundle":"B8","ts":1000}}"#
+        );
+        let replay = replay_lines([old_pending.as_str(), old_sell.as_str()].iter().copied());
+        assert_eq!(replay.skipped, 0);
+        assert_eq!(replay.pending[0].blockhash, None);
+        assert_eq!(replay.sell_pending[0].signature, None);
     }
 
     #[test]

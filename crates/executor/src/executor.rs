@@ -5,10 +5,12 @@ use solana_client::{
     client_error::ClientError, nonblocking::rpc_client::RpcClient, rpc_config::RpcTransactionConfig,
 };
 use solana_commitment_config::CommitmentConfig;
+use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use solana_transaction_status::{
-    EncodedTransaction, UiMessage, UiTransactionEncoding, option_serializer::OptionSerializer,
+    EncodedTransaction, TransactionConfirmationStatus, TransactionStatus, UiMessage,
+    UiTransactionEncoding, option_serializer::OptionSerializer,
 };
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -287,12 +289,73 @@ pub fn buyback_account(
     }
 }
 
-/// Fill outcome for a dispatched signature.
+/// Chain status for a dispatched signature (RPC `getSignatureStatuses`
+/// semantics). `Timeout` is NOT a failure: the transaction may still
+/// land, so callers reconcile by signature before any replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmOutcome {
+    /// Seen in a processed block (`confirmationStatus: processed`):
+    /// not voted yet; a fork can still drop it. Never a fill verdict.
+    Processed,
+    /// Voted by a supermajority (`confirmed`): the fill verdict.
     Confirmed,
+    /// Rooted (`finalized`): irreversible.
+    Finalized,
+    /// Landed and errored on-chain: fees burned, no state change.
     FailedOnChain,
+    /// Not seen within the poll budget: unknown, MAY STILL LAND.
     Timeout,
+}
+
+impl ConfirmOutcome {
+    /// True once the chain has the transaction in a block (any vote
+    /// level): `Processed` can still vanish; `Confirmed`/`Finalized` are
+    /// fill verdicts. `Timeout` and `FailedOnChain` never landed.
+    pub fn landed(self) -> bool {
+        matches!(self, Self::Processed | Self::Confirmed | Self::Finalized)
+    }
+}
+
+/// Why a dispatch is provably dead: no fill, safe to rebuild or resend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadReason {
+    /// Landed on-chain with a program error: no state change.
+    FailedOnChain,
+    /// Engine verdict: the bundle was never forwarded, it can never land.
+    NeverForwarded,
+    /// Blockhash no longer valid and the signature was never seen: the
+    /// transaction can never land.
+    Expired,
+}
+
+impl DeadReason {
+    /// Short label for logs and caller reasons.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FailedOnChain => "errored on-chain",
+            Self::NeverForwarded => "engine never forwarded the bundle",
+            Self::Expired => "blockhash expired, never landed",
+        }
+    }
+}
+
+impl std::fmt::Display for DeadReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Post-dispatch verdict every caller decision derives from (opening,
+/// tracking, releasing). `Unknown` must never be treated as failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchVerdict {
+    /// Chain-verified landing (`confirmed`/`finalized`, or engine
+    /// `Landed`). The only verdict that may open or retire a position.
+    Landed,
+    /// Provably dead: no fill, safe to rebuild or resend.
+    Dead(DeadReason),
+    /// Unresolved: MAY still land. Keep tracking; never resend blind.
+    Unknown(&'static str),
 }
 
 /// Accepted Jito bundle receipt (acceptance != landing).
@@ -302,6 +365,9 @@ pub struct JitoReceipt {
     pub bundle_id: String,
     /// First tx signature (base58) for tracking.
     pub signature: String,
+    /// Dispatch blockhash: once invalid, an unseen dispatch can never
+    /// land (the only proof of expiry).
+    pub blockhash: Hash,
 }
 
 /// Live swap executor. Cloneable; clients and wallet are shared.
@@ -806,45 +872,93 @@ impl SwapExecutor {
         self.wallet.pubkey()
     }
 
-    /// Poll a signature until it lands or `timeout` ends.
+    /// Poll a signature until it lands or `timeout` ends. Classifies per
+    /// RPC semantics: an unseen signature is `Timeout` (unknown, never
+    /// failure) and a seen-but-unvoted one reports `Processed`, so
+    /// callers never open a position on it.
     pub async fn confirm_signature(
         &self,
         signature_str: &str,
         timeout: Duration,
     ) -> Result<ConfirmOutcome, ExecutorError> {
         use std::time::Instant;
-        let signature = solana_signature::Signature::from_str(signature_str).map_err(|e| {
-            ExecutorError::BadSignature {
-                value: signature_str.to_string(),
-                msg: e.to_string(),
-            }
-        })?;
+        let signature = parse_signature(signature_str)?;
         let start = Instant::now();
+        let mut processed = false;
         loop {
             // One hung RPC stalls only this round.
             let status = match tokio::time::timeout(
                 Duration::from_secs(15),
-                self.rpc.get_signature_status(&signature),
+                self.rpc.get_signature_statuses(&[signature]),
             )
             .await
             {
-                Ok(Ok(status)) => status,
+                Ok(Ok(res)) => res.value.into_iter().next().flatten(),
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => None,
             };
-            match status {
-                Some(Ok(())) => return Ok(ConfirmOutcome::Confirmed),
-                Some(Err(_)) => return Ok(ConfirmOutcome::FailedOnChain),
-                None => {}
+            if let Some(status) = status {
+                match classify_status(&status) {
+                    ConfirmOutcome::Processed => processed = true,
+                    verdict => return Ok(verdict),
+                }
             }
             if start.elapsed() >= timeout {
-                return Ok(ConfirmOutcome::Timeout);
+                // Seen but unvoted is not "unseen": keep them distinct.
+                return Ok(if processed {
+                    ConfirmOutcome::Processed
+                } else {
+                    ConfirmOutcome::Timeout
+                });
             }
             // Deterministic stagger (no rand dep): concurrent confirms
             // for different mints desync instead of bursting the RPC in
             // lockstep every second.
             let round = (start.elapsed().as_secs() % 4) * 125;
             tokio::time::sleep(Duration::from_millis(1000 + round)).await;
+        }
+    }
+
+    /// One-shot full-history reconciliation by signature (recent cache
+    /// plus rooted ledger history). `Ok(None)` = never seen; `Err` =
+    /// unverifiable (callers fail closed and keep holding). Never
+    /// `Timeout`: a seen status always carries a chain state.
+    pub async fn reconcile_signature(
+        &self,
+        signature_str: &str,
+    ) -> Result<Option<ConfirmOutcome>, ExecutorError> {
+        let signature = parse_signature(signature_str)?;
+        let res = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.rpc.get_signature_statuses_with_history(&[signature]),
+        )
+        .await
+        .map_err(|_| ExecutorError::Timeout("get_signature_statuses_with_history"))??;
+        Ok(res
+            .value
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|status| classify_status(&status)))
+    }
+
+    /// True when the dispatch blockhash can no longer be included: with
+    /// the signature unseen, the transaction can never land. Conser­
+    /// vative: a missing/unparsable hash or any RPC trouble answers
+    /// `false` (not provably dead), so callers keep tracking.
+    async fn blockhash_expired(&self, blockhash: Option<&str>) -> bool {
+        let Some(blockhash) = blockhash.and_then(|b| Hash::from_str(b).ok()) else {
+            return false;
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            self.rpc
+                .is_blockhash_valid(&blockhash, CommitmentConfig::confirmed()),
+        )
+        .await
+        {
+            Ok(Ok(valid)) => !valid,
+            _ => false,
         }
     }
 
@@ -855,6 +969,47 @@ impl SwapExecutor {
             Some(jito) => jito.inflight_status(bundle_id).await,
             None => BundleStatus::Unknown,
         }
+    }
+
+    /// Resolve a dispatched bundle+signature into one verdict. Chain
+    /// beats engine: a landed signature decides; a timeout asks the
+    /// engine, then reconciles by signature over full history before any
+    /// terminal release, and only an unseen signature with a dead
+    /// blockhash may close as expired. `Unknown` never authorizes a
+    /// resend, and an unverifiable reconcile is never proof of death.
+    pub async fn resolve_dispatch(
+        &self,
+        bundle_id: &str,
+        signature: &str,
+        blockhash: Option<&str>,
+        timeout: Duration,
+    ) -> DispatchVerdict {
+        match self.confirm_signature(signature, timeout).await {
+            Ok(ConfirmOutcome::Timeout) | Err(_) => {}
+            Ok(outcome) => return verdict_from_chain(outcome),
+        }
+        let engine = self.bundle_status(bundle_id).await;
+        let (reconciled, expired) = match engine {
+            BundleStatus::Landed | BundleStatus::Pending => (None, false),
+            BundleStatus::Failed | BundleStatus::Invalid | BundleStatus::Unknown => {
+                // Terminal-engine and forgot/unreadable both reconcile by
+                // signature: the engine's word is never taken over the
+                // chain's, and only "unseen" opens the expiry proof.
+                match self.reconcile_signature(signature).await {
+                    Ok(seen) => {
+                        let expired = if seen.is_none() {
+                            self.blockhash_expired(blockhash).await
+                        } else {
+                            false
+                        };
+                        (seen, expired)
+                    }
+                    // Unverifiable: proof of nothing; keep it unknown.
+                    Err(_) => return DispatchVerdict::Unknown("signature reconcile unavailable"),
+                }
+            }
+        };
+        timeout_verdict(engine, reconciled, expired)
     }
 
     /// Landed-tip floor in lamports. 0 without a bundle client or on
@@ -1678,12 +1833,12 @@ impl SwapExecutor {
         label: &str,
     ) -> Result<JitoReceipt, ExecutorError> {
         let jito = self.jito.clone().ok_or(ExecutorError::NoJito)?;
-        let mut tx = self.build_tx(ixs).await?;
+        let (mut tx, mut blockhash) = self.build_tx(ixs).await?;
         match self.simulate_tx(&tx, label).await {
             Ok(()) => {}
             Err(e) if is_blockhash_expired(&e) => {
                 warn!(%label, "stale blockhash under load; resampling once");
-                tx = self.build_tx(ixs).await?;
+                (tx, blockhash) = self.build_tx(ixs).await?;
                 self.simulate_tx(&tx, label).await?;
             }
             Err(e) => return Err(e),
@@ -1701,6 +1856,7 @@ impl SwapExecutor {
                 Ok(JitoReceipt {
                     bundle_id,
                     signature,
+                    blockhash,
                 })
             }
             Ok(_) => {
@@ -1722,7 +1878,7 @@ impl SwapExecutor {
     async fn build_tx(
         &self,
         ixs: &[solana_instruction::Instruction],
-    ) -> Result<Transaction, ExecutorError> {
+    ) -> Result<(Transaction, Hash), ExecutorError> {
         let blockhash = tokio::time::timeout(
             Duration::from_secs(15),
             self.rpc.get_latest_blockhash(),
@@ -1732,10 +1888,13 @@ impl SwapExecutor {
         // Budget prefix first; empty by default.
         let mut all = self.budget_prefix();
         all.extend_from_slice(ixs);
-        Ok(Transaction::new_signed_with_payer(
-            &all,
-            Some(&self.wallet.pubkey()),
-            &[self.wallet.keypair()],
+        Ok((
+            Transaction::new_signed_with_payer(
+                &all,
+                Some(&self.wallet.pubkey()),
+                &[self.wallet.keypair()],
+                blockhash,
+            ),
             blockhash,
         ))
     }
@@ -1796,6 +1955,68 @@ fn is_blockhash_expired(err: &ExecutorError) -> bool {
     }
 }
 
+/// Parse a base58 signature without touching the network. Pure.
+fn parse_signature(value: &str) -> Result<solana_signature::Signature, ExecutorError> {
+    solana_signature::Signature::from_str(value).map_err(|e| ExecutorError::BadSignature {
+        value: value.to_string(),
+        msg: e.to_string(),
+    })
+}
+
+/// Map one RPC signature status onto the chain-status vocabulary
+/// (`confirmation_status()` carries the legacy fallback). Pure.
+fn classify_status(status: &TransactionStatus) -> ConfirmOutcome {
+    if status.err.is_some() {
+        return ConfirmOutcome::FailedOnChain;
+    }
+    match status.confirmation_status() {
+        TransactionConfirmationStatus::Processed => ConfirmOutcome::Processed,
+        TransactionConfirmationStatus::Confirmed => ConfirmOutcome::Confirmed,
+        TransactionConfirmationStatus::Finalized => ConfirmOutcome::Finalized,
+    }
+}
+
+/// Map a chain status onto a dispatch verdict. Pure.
+fn verdict_from_chain(outcome: ConfirmOutcome) -> DispatchVerdict {
+    match outcome {
+        ConfirmOutcome::Confirmed | ConfirmOutcome::Finalized => DispatchVerdict::Landed,
+        ConfirmOutcome::FailedOnChain => DispatchVerdict::Dead(DeadReason::FailedOnChain),
+        // Seen but unvoted: may still vanish on a fork, never a fill verdict.
+        ConfirmOutcome::Processed => DispatchVerdict::Unknown("seen processed; not voted yet"),
+        // Unseen: needs the engine/reconcile/expiry chain to resolve.
+        ConfirmOutcome::Timeout => DispatchVerdict::Unknown("unseen within the poll budget"),
+    }
+}
+
+/// Resolution table once the signature poll timed out. Pure: pinned by
+/// tests so no call site can drift back to "timeout means failure".
+fn timeout_verdict(
+    engine: BundleStatus,
+    reconciled: Option<ConfirmOutcome>,
+    expired: bool,
+) -> DispatchVerdict {
+    // Chain beats engine: a reconciled signature decides outright.
+    if let Some(outcome) = reconciled {
+        return verdict_from_chain(outcome);
+    }
+    match engine {
+        // The engine saw it land: chain truth, even if the poll lagged.
+        BundleStatus::Landed => DispatchVerdict::Landed,
+        // Never forwarded: no funds moved, a rebuild is safe.
+        BundleStatus::Failed => DispatchVerdict::Dead(DeadReason::NeverForwarded),
+        BundleStatus::Pending => DispatchVerdict::Unknown("engine still pending"),
+        BundleStatus::Invalid | BundleStatus::Unknown => {
+            if expired {
+                // Unseen and the blockhash is dead: can never land now.
+                DispatchVerdict::Dead(DeadReason::Expired)
+            } else {
+                // Unseen but still includable: keep tracking, never resend.
+                DispatchVerdict::Unknown("unseen; blockhash still valid")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1821,6 +2042,117 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(matches!(err, ExecutorError::BadSignature { .. }));
+    }
+
+    #[test]
+    fn status_classification_distinguishes_chain_states() {
+        let make =
+            |confirmations: Option<usize>, level: Option<TransactionConfirmationStatus>| {
+                TransactionStatus {
+                    slot: 1,
+                    confirmations,
+                    status: Ok(()),
+                    err: None,
+                    confirmation_status: level,
+                }
+            };
+        assert_eq!(
+            classify_status(&make(Some(0), Some(TransactionConfirmationStatus::Processed))),
+            ConfirmOutcome::Processed
+        );
+        assert_eq!(
+            classify_status(&make(Some(5), Some(TransactionConfirmationStatus::Confirmed))),
+            ConfirmOutcome::Confirmed
+        );
+        assert_eq!(
+            classify_status(&make(None, Some(TransactionConfirmationStatus::Finalized))),
+            ConfirmOutcome::Finalized
+        );
+        // Legacy nodes predate `confirmationStatus`: counts decide.
+        assert_eq!(
+            classify_status(&make(Some(0), None)),
+            ConfirmOutcome::Processed
+        );
+        assert_eq!(classify_status(&make(Some(1), None)), ConfirmOutcome::Confirmed);
+        assert_eq!(classify_status(&make(None, None)), ConfirmOutcome::Finalized);
+        // An on-chain error outranks any vote state.
+        let mut failed = make(None, Some(TransactionConfirmationStatus::Finalized));
+        failed.err = Some(solana_transaction_error::TransactionError::AccountNotFound);
+        assert_eq!(classify_status(&failed), ConfirmOutcome::FailedOnChain);
+    }
+
+    #[test]
+    fn chain_verdicts_open_only_on_voted_states() {
+        assert_eq!(
+            verdict_from_chain(ConfirmOutcome::Confirmed),
+            DispatchVerdict::Landed
+        );
+        assert_eq!(
+            verdict_from_chain(ConfirmOutcome::Finalized),
+            DispatchVerdict::Landed
+        );
+        assert_eq!(
+            verdict_from_chain(ConfirmOutcome::FailedOnChain),
+            DispatchVerdict::Dead(DeadReason::FailedOnChain)
+        );
+        // Processed and timeout are unknowns: never a fill, never a resend.
+        assert!(matches!(
+            verdict_from_chain(ConfirmOutcome::Processed),
+            DispatchVerdict::Unknown(_)
+        ));
+        assert!(matches!(
+            verdict_from_chain(ConfirmOutcome::Timeout),
+            DispatchVerdict::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn timeout_is_never_a_failure() {
+        // Engine "forgot" (5-minute lookback) + unseen + live blockhash:
+        // keep tracking, never declare dead.
+        assert_eq!(
+            timeout_verdict(BundleStatus::Invalid, None, false),
+            DispatchVerdict::Unknown("unseen; blockhash still valid")
+        );
+        // Status unreadable + unseen: unknown too.
+        assert_eq!(
+            timeout_verdict(BundleStatus::Unknown, None, false),
+            DispatchVerdict::Unknown("unseen; blockhash still valid")
+        );
+        // Unseen and the blockhash is dead: the only proof of expiry.
+        assert_eq!(
+            timeout_verdict(BundleStatus::Invalid, None, true),
+            DispatchVerdict::Dead(DeadReason::Expired)
+        );
+        // Engine forgot, but the signature is on-chain: chain beats engine.
+        assert_eq!(
+            timeout_verdict(BundleStatus::Invalid, Some(ConfirmOutcome::Confirmed), false),
+            DispatchVerdict::Landed
+        );
+        assert_eq!(
+            timeout_verdict(BundleStatus::Invalid, Some(ConfirmOutcome::Processed), false),
+            DispatchVerdict::Unknown("seen processed; not voted yet")
+        );
+        // Engine never forwarded: provably dead, no funds moved.
+        assert_eq!(
+            timeout_verdict(BundleStatus::Failed, None, false),
+            DispatchVerdict::Dead(DeadReason::NeverForwarded)
+        );
+        // ...but even that verdict yields to the chain: a reconciled
+        // landing is the deciding word.
+        assert_eq!(
+            timeout_verdict(BundleStatus::Failed, Some(ConfirmOutcome::Confirmed), false),
+            DispatchVerdict::Landed
+        );
+        // Engine pending holds; engine landed wins.
+        assert_eq!(
+            timeout_verdict(BundleStatus::Pending, None, false),
+            DispatchVerdict::Unknown("engine still pending")
+        );
+        assert_eq!(
+            timeout_verdict(BundleStatus::Landed, None, false),
+            DispatchVerdict::Landed
+        );
     }
 
     #[test]
