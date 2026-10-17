@@ -18,7 +18,7 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 490 tests; live probes stay ignored
+cargo test --workspace            # 528 tests; live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
@@ -61,6 +61,17 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - Risk flow: `risk-engine` profile → `strategy` rewrite (`adaptive`/`scalp`/`runner`) → `simulator` exits
   (TP/SL/trailing/
   timeout/moonbag scale-outs with breakeven ratchet + timeout lift).
+- Serde parsing goes through DTOs everywhere (wire, fixtures, WAL): test
+  fixtures decode with the same DTOs as production. Shared helpers live in
+  `crates/{executor,listener,migration}/src/test_fixture.rs`;
+  `crates/executor/tests/common/mod.rs` mirrors them for integration
+  targets (`cfg(test)` items are invisible across the lib→integration
+  boundary) — deliberate duplication, don't "dedupe".
+- `src/wal.rs` `WalLine` (tagged `t`, snake_case) is the compat-critical
+  replay format: strict decode — a line missing a load-bearing field or
+  carrying a wrong type is counted in `skipped`, never half-adopted; older
+  shapes stay readable via `#[serde(default)]` fields. Replay/compaction
+  changes are data-loss-sensitive.
 - Skills are strong defaults, **not ground truth**:
   the Jito skill once omitted the mandatory `{"encoding":"base64"}`
   param and every bundle was refused (`-32602`). Wire formats must be
@@ -132,6 +143,28 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - Mainnet fixtures live in `crates/listener/tests/fixtures/`; replay
   tests are the gate that must stay green.
 
+## Risk-engine inference (don't re-derive)
+
+- JSON-mode 400 `json_validate_failed` with empty `failed_generation` =
+  reasoning tokens ate the completion budget (live gpt-oss-120b: reasoning
+  alone ran 561–687 tokens, completion 603–720, for a ~35-token JSON
+  answer). `DEFAULT_MAX_TOKENS=1024` / `MAX_MAX_TOKENS=2048` are sized for
+  that — do not lower them; 128 and even 512 fail.
+- `SYSTEM_PROMPT` (`crates/risk-engine/src/schema.rs`) must keep the
+  "Output schema" sentence naming every `RiskProfile` key verbatim; without
+  it live models invent `tp`/`sl`/`trailing`, decode fails, and every
+  response fail-closes to PASS (`invalid_count`). Guard test:
+  `prompt_names_every_output_field`. Live-proven (curl 2/2 compliant;
+  engine 3/4 Model, rest timeout→fallback).
+- Request shape stays provider-neutral OpenAI-compatible (`max_tokens` +
+  `response_format {"type":"json_object"}`); no provider-specific fields,
+  no Groq support (removed — don't re-add). Undecodable output → PASS;
+  timeout → heuristic fallback (`FALLBACK_TIMEOUT` 300ms default,
+  `MAX_TIMEOUT` 2s clamp).
+- Measured latency per decision: gpt-oss-120b ~1.7–2.1s (mostly
+  timeout→fallback at the 2s clamp), qwen3.8-27b ~0.3s (fits). Remote
+  gateways need `inference_timeout_ms` raised (README `[risk]` example).
+
 ## Toolchain quirks
 
 - Mixed Solana versions by design: `executor` builds on granular
@@ -162,3 +195,7 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - Report honestly: dead ends, failed probes, and rejected hypotheses are
   results. Never fabricate on-chain layouts — mark unverified parts and
   gate them with failing tests.
+- Version bumps move in lockstep: root `Cargo.toml` + all 9
+  `crates/*/Cargo.toml` + the `ops/ROADMAP.md` heading ("post-X.Y.Z");
+  `Cargo.lock` follows automatically (path deps carry no version reqs).
+  Commit style: `chore(release): bump to X.Y.Z`.
