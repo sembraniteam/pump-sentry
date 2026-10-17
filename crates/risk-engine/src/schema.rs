@@ -126,22 +126,38 @@ pub const MAX_TIMEOUT_SECS: u64 = 3600;
 pub const MIN_TIMEOUT_SECS: u64 = 1;
 
 /// System instruction sent to the model.
-pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.";
+pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.\nOutput schema (exact key names and types): {\"action\":\"BUY\" or \"PASS\",\"tp_percent\":number,\"sl_percent\":number,\"trailing_stop\":boolean,\"timeout_seconds\":integer,\"moonbag_percent\":number}. For PASS use \"action\":\"PASS\" with all other fields 0 or false.";
+
+/// Inference input payload: the skill's `INPUT PAYLOAD` keys. Unknowns
+/// ship as `null`, never omitted — the model reads absent/null as
+/// "unmeasured" and a dropped key would read as "not asked".
+#[derive(Debug, Serialize)]
+struct InputPayload {
+    liquidity_usd: f64,
+    buy_velocity_5s: u32,
+    dev_reputation: f64,
+    rugcheck_score: u32,
+    venue_fee_bps: Option<f64>,
+    creation_slot_buys: Option<u32>,
+    cluster_pct: Option<f64>,
+    curve_progress: Option<f64>,
+}
 
 impl TokenMetrics {
     /// Render the skill's `INPUT PAYLOAD` as a compact JSON string.
     pub fn to_input_payload(&self) -> String {
-        serde_json::json!({
-            "liquidity_usd": self.liquidity_usd,
-            "buy_velocity_5s": self.buy_velocity_5s,
-            "dev_reputation": self.dev_reputation,
-            "rugcheck_score": self.rugcheck_score,
-            "venue_fee_bps": self.venue_fee_bps,
-            "creation_slot_buys": self.creation_slot_buys,
-            "cluster_pct": self.cluster_pct,
-            "curve_progress": self.curve_progress,
-        })
-        .to_string()
+        let payload = InputPayload {
+            liquidity_usd: self.liquidity_usd,
+            buy_velocity_5s: self.buy_velocity_5s,
+            dev_reputation: self.dev_reputation,
+            rugcheck_score: self.rugcheck_score,
+            venue_fee_bps: self.venue_fee_bps,
+            creation_slot_buys: self.creation_slot_buys,
+            cluster_pct: self.cluster_pct,
+            curve_progress: self.curve_progress,
+        };
+        // Plain scalars only: serialization cannot fail.
+        serde_json::to_string(&payload).expect("input payload serializes")
     }
 }
 
@@ -187,6 +203,34 @@ mod tests {
             serde_json::to_value(profile).expect("serialize")["action"],
             "BUY"
         );
+    }
+
+    #[test]
+    fn prompt_names_every_output_field() {
+        // The decoder takes these keys verbatim (no aliases): a prompt
+        // that only describes the fields in prose made live gpt-oss
+        // invent `tp`/`sl`/`trailing`, which fail closed to PASS.
+        let sample = RiskProfile {
+            action: Action::Buy,
+            tp_percent: 50.0,
+            sl_percent: -10.0,
+            trailing_stop: true,
+            timeout_seconds: 180,
+            moonbag_percent: 20.0,
+        };
+        let value = serde_json::to_value(sample).expect("serialize");
+        let keys: Vec<&str> = value
+            .as_object()
+            .expect("profile serializes to an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in keys {
+            assert!(
+                SYSTEM_PROMPT.contains(key),
+                "SYSTEM_PROMPT must name output key `{key}`"
+            );
+        }
     }
 
     #[test]

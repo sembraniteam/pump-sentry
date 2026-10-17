@@ -33,34 +33,81 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// DexScreener tokens body: only `pairs` matters for the price walk.
+#[derive(Debug, serde::Deserialize)]
+struct DexScreenerTokens {
+    /// Missing/null fails closed (no legs to walk).
+    #[serde(default)]
+    pairs: Option<Vec<DexScreenerPair>>,
+}
+
+/// One tokens leg. A non-object element (schema drift) is skipped by
+/// the walk, never fatal for the whole body.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum DexScreenerPair {
+    Pair {
+        #[serde(rename = "quoteToken", default)]
+        quote_token: Option<QuoteToken>,
+        #[serde(rename = "priceUsd", default)]
+        price_usd: Option<PriceUsd>,
+    },
+    Other(serde::de::IgnoredAny),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QuoteToken {
+    /// Quoted asset: `USDC` is preferred, anything else is the fallback.
+    #[serde(default)]
+    symbol: Option<String>,
+}
+
+/// `priceUsd` ships as a string; a bare number rides along without
+/// failing the feed closed (schema drift), anything else is ignored.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum PriceUsd {
+    Text(String),
+    Number(f64),
+    Other(serde::de::IgnoredAny),
+}
+
+impl PriceUsd {
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Text(s) => s.parse().ok(),
+            Self::Number(n) => Some(*n),
+            Self::Other(_) => None,
+        }
+    }
+}
+
 /// First USDC-quoted SOL price from a DexScreener tokens response.
 /// Pure (unit-tested against the live shape): `None` on missing,
 /// unpriced, or unparseable legs — the caller fails closed.
-fn parse_dexscreener_sol_usd(body: &serde_json::Value) -> Option<f64> {
-    let pairs = body.get("pairs")?.as_array()?;
-    let price_of = |p: &serde_json::Value| -> Option<(bool, f64)> {
-        let raw = p.get("priceUsd")?;
-        // String today; accept a bare number without failing closed.
-        let price = raw
-            .as_str()
-            .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| raw.as_f64())?;
-        let quote = p
-            .get("quoteToken")?
-            .get("symbol")?
-            .as_str()
-            .is_some_and(|s| s == "USDC");
-        Some((quote, price))
-    };
+fn parse_dexscreener_sol_usd(body: &str) -> Option<f64> {
+    let tokens: DexScreenerTokens = serde_json::from_str(body).ok()?;
     let mut fallback = None;
-    for p in pairs {
-        let Some((is_usdc, price)) = price_of(p) else {
+    for pair in tokens.pairs?.iter() {
+        let DexScreenerPair::Pair {
+            quote_token,
+            price_usd,
+        } = pair
+        else {
+            continue;
+        };
+        // A leg without a quote symbol was never a priced pair here:
+        // skip it, never guess its quote side.
+        let Some(symbol) = quote_token.as_ref().and_then(|q| q.symbol.as_deref()) else {
+            continue;
+        };
+        let Some(price) = price_usd.as_ref().and_then(PriceUsd::as_f64) else {
             continue;
         };
         if !price.is_finite() || price <= 0.0 {
             continue;
         }
-        if is_usdc {
+        if symbol == "USDC" {
             return Some(price);
         }
         fallback = fallback.or(Some(price));
@@ -193,10 +240,10 @@ impl SolUsdFeed {
         if !resp.status().is_success() {
             return Err(format!("dex status {}", resp.status()));
         }
-        let body: serde_json::Value = resp
-            .json()
+        let body = resp
+            .text()
             .await
-            .map_err(|e| format!("dex json failed: {e}"))?;
+            .map_err(|e| format!("dex body failed: {e}"))?;
         let usd = parse_dexscreener_sol_usd(&body)
             .ok_or_else(|| "dex missing USDC-quoted SOL price".to_string())?;
         if !usd.is_finite() || usd <= 0.0 {
@@ -295,23 +342,37 @@ mod tests {
 
     #[test]
     fn dex_parser_prefers_usdc_leg() {
-        let body: serde_json::Value = serde_json::from_str(DEX_SAMPLE).expect("json");
-        assert_eq!(parse_dexscreener_sol_usd(&body), Some(106.21));
+        assert_eq!(parse_dexscreener_sol_usd(DEX_SAMPLE), Some(106.21));
     }
 
     #[test]
     fn dex_parser_falls_back_to_any_priced_leg() {
-        let body: serde_json::Value = serde_json::from_str(
-            r#"{"pairs":[{"quoteToken":{"symbol":"XYZ"},"priceUsd":"99.5"}]}"#,
-        )
-        .expect("json");
-        assert_eq!(parse_dexscreener_sol_usd(&body), Some(99.5));
+        assert_eq!(
+            parse_dexscreener_sol_usd(
+                r#"{"pairs":[{"quoteToken":{"symbol":"XYZ"},"priceUsd":"99.5"}]}"#
+            ),
+            Some(99.5)
+        );
         // Bare numbers parse too (schema drift must not fail closed).
-        let body: serde_json::Value = serde_json::from_str(
-            r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":106.5}]}"#,
-        )
-        .expect("json");
-        assert_eq!(parse_dexscreener_sol_usd(&body), Some(106.5));
+        assert_eq!(
+            parse_dexscreener_sol_usd(
+                r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":106.5}]}"#
+            ),
+            Some(106.5)
+        );
+    }
+
+    #[test]
+    fn dex_parser_skips_drifted_legs_not_the_body() {
+        // Non-object legs and non-scalar `priceUsd` values are skipped
+        // per leg; the next priced leg still wins, so shape drift never
+        // fails the whole response closed.
+        assert_eq!(
+            parse_dexscreener_sol_usd(
+                r#"{"pairs":[42,{"priceUsd":true},{"quoteToken":{"symbol":"USDC"},"priceUsd":"106"}]}"#
+            ),
+            Some(106.0)
+        );
     }
 
     #[test]
@@ -320,12 +381,12 @@ mod tests {
             r#"{"pairs":[]}"#,
             r#"{}"#,
             r#"{"pairs":[{"quoteToken":{"symbol":"USDC"}}]}"#,
+            r#"{"pairs":[{"priceUsd":"99"}]}"#,
             r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":"abc"}]}"#,
             r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":"-3"}]}"#,
             r#"{"pairs":[{"quoteToken":{"symbol":"USDC"},"priceUsd":"0"}]}"#,
         ] {
-            let body: serde_json::Value = serde_json::from_str(raw).expect("json");
-            assert_eq!(parse_dexscreener_sol_usd(&body), None, "{raw}");
+            assert_eq!(parse_dexscreener_sol_usd(raw), None, "{raw}");
         }
     }
 }

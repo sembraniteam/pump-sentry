@@ -7,6 +7,8 @@ pub mod geyser;
 pub mod parser;
 pub mod screen;
 pub mod stream;
+#[cfg(test)]
+mod test_fixture;
 pub mod types;
 
 pub use migration::{MigratedPool, MigrationDestination, PumpSwapPool, RaydiumV4Pool};

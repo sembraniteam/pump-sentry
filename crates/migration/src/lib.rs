@@ -5,6 +5,8 @@
 pub mod detector;
 pub mod pool;
 pub mod pumpswap;
+#[cfg(test)]
+mod test_fixture;
 pub mod vault;
 
 pub use detector::{

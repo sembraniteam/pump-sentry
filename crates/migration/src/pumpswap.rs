@@ -140,20 +140,15 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    /// Frozen mainnet pool fixture: `{amm, owner, data: [u8]}`.
+    /// Frozen mainnet pool fixture: `{amm, owner, data: [u8], via}`.
     fn frozen_pool() -> (Pubkey, Pubkey, Vec<u8>) {
-        let raw = include_str!("../tests/fixtures/pumpswap_pool_mainnet.json");
-        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
-        let parse = |s: &str| {
-            Pubkey::from_str(v[s].as_str().expect("pubkey str")).expect("pubkey")
-        };
-        let data: Vec<u8> = v["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|b| b.as_u64().expect("byte") as u8)
-            .collect();
-        (parse("amm"), parse("owner"), data)
+        let fixture = crate::test_fixture::pool_fixture(include_str!(
+            "../tests/fixtures/pumpswap_pool_mainnet.json"
+        ));
+        assert_eq!(fixture.via.as_deref(), Some("getAccountInfo"));
+        let amm = fixture.amm.parse().expect("amm pubkey");
+        let owner = fixture.owner.parse().expect("owner pubkey");
+        (amm, owner, fixture.data)
     }
 
     #[test]
@@ -201,19 +196,13 @@ mod tests {
         // (slot ~457428741): parse plus the trust gate pass for its own
         // base mint — the executable counterpart to the depth-2 fixture
         // above, which pins the fail-closed path instead.
-        let raw = include_str!("../tests/fixtures/pumpswap_pool_wsol_mainnet.json");
-        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
-        assert_eq!(v["via"], "getAccountInfo");
-        let parse = |s: &str| {
-            Pubkey::from_str(v[s].as_str().expect("pubkey str")).expect("pubkey")
-        };
-        let (pool, owner) = (parse("amm"), parse("owner"));
-        let data: Vec<u8> = v["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|b| b.as_u64().expect("byte") as u8)
-            .collect();
+        let fixture = crate::test_fixture::pool_fixture(include_str!(
+            "../tests/fixtures/pumpswap_pool_wsol_mainnet.json"
+        ));
+        assert_eq!(fixture.via.as_deref(), Some("getAccountInfo"));
+        let pool = fixture.amm.parse().expect("amm pubkey");
+        let owner = fixture.owner.parse().expect("owner pubkey");
+        let data = fixture.data;
         assert_eq!(owner, PUMP_AMM_PROGRAM_ID);
         let parsed = PumpSwapPool::parse(&pool, &data).expect("parse");
         assert_eq!(parsed.pool, pool);

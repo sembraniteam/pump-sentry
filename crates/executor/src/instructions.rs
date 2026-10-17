@@ -384,53 +384,20 @@ mod tests {
     fn sell_v3_matches_frozen_sample() {
         // Byte-equality vs mainnet `sell_v3` fill (17 accounts).
         use std::collections::HashSet;
-        let raw: serde_json::Value = serde_json::from_str(include_str!(
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
             "../../listener/tests/fixtures/sell_v3_mainnet.json"
-        ))
-        .expect("fixture");
-        // Shape: bare getTransaction result.
-        let result = &raw;
+        ));
         // Landed transaction only: a failed fill proves nothing.
         assert!(
-            result
-                .get("meta")
-                .and_then(|m| m.get("err"))
-                .is_some_and(|e| e.is_null()),
+            crate::test_fixture::landed(&fetched),
             "success fixture must carry a landed transaction"
         );
-        let msg = &result["transaction"]["message"];
-        let mut keys: Vec<String> =
-            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-        if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
-            for table in ["writable", "readonly"] {
-                for addr in loaded
-                    .get(table)
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    keys.push(addr.as_str().expect("addr").to_string());
-                }
-            }
-        }
-        let pump = PUMP_PROGRAM_ID.to_string();
-        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
-        let mut found = None;
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
-                continue;
-            }
-            let data = bs58::decode(ix["data"].as_str().expect("data"))
-                .into_vec()
-                .expect("b58");
-            if data.starts_with(&PUMP_SELL_V3_DISCRIMINATOR) && data.len() == 24 {
-                let accounts: Vec<usize> =
-                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
-                found = Some((accounts, data));
-                break;
-            }
-        }
-        let (idx, data) = found.expect("sell_v3 in fixture");
+        let crate::test_fixture::FrozenFill { keys, idx, data } = crate::test_fixture::frozen_fill(
+            &fetched,
+            &PUMP_PROGRAM_ID,
+            &PUMP_SELL_V3_DISCRIMINATOR,
+            24,
+        );
         assert_eq!(idx.len(), 17);
         let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
         assert_eq!(user_volume_accumulator_pda(&key(8)), key(11));
@@ -538,53 +505,20 @@ mod tests {
         // coverage: the base mint is Token-2022 (per-mint program path),
         // the quote is WSOL on classic SPL.
         use std::collections::HashSet;
-        let raw: serde_json::Value = serde_json::from_str(include_str!(
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
             "../../listener/tests/fixtures/sell_v2_pumpswap_mainnet.json"
-        ))
-        .expect("fixture");
-        // Shape: bare getTransaction result.
-        let result = &raw;
+        ));
         // Landed transaction only: a failed fill proves nothing.
         assert!(
-            result
-                .get("meta")
-                .and_then(|m| m.get("err"))
-                .is_some_and(|e| e.is_null()),
+            crate::test_fixture::landed(&fetched),
             "success fixture must carry a landed transaction"
         );
-        let msg = &result["transaction"]["message"];
-        let mut keys: Vec<String> =
-            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-        if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
-            for table in ["writable", "readonly"] {
-                for addr in loaded
-                    .get(table)
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    keys.push(addr.as_str().expect("addr").to_string());
-                }
-            }
-        }
-        let amm = PUMP_AMM_PROGRAM_ID.to_string();
-        let pi = keys.iter().position(|k| k == &amm).expect("amm key");
-        let mut found = None;
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
-                continue;
-            }
-            let data = bs58::decode(ix["data"].as_str().expect("data"))
-                .into_vec()
-                .expect("b58");
-            if data.starts_with(&PUMP_AMM_SELL_V2_DISCRIMINATOR) && data.len() == 24 {
-                let accounts: Vec<usize> =
-                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
-                found = Some((accounts, data));
-                break;
-            }
-        }
-        let (idx, data) = found.expect("sell_v2 in fixture");
+        let crate::test_fixture::FrozenFill { keys, idx, data } = crate::test_fixture::frozen_fill(
+            &fetched,
+            &PUMP_AMM_PROGRAM_ID,
+            &PUMP_AMM_SELL_V2_DISCRIMINATOR,
+            24,
+        );
         assert_eq!(idx.len(), 17);
         let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
         // Static legs re-derive (volume accumulator is user-bound).
@@ -637,53 +571,20 @@ mod tests {
     fn buy_v3_matches_frozen_sample() {
         // Byte-equality vs mainnet `buy_v3` fill (17 accounts, no tail).
         use std::collections::HashSet;
-        let raw: serde_json::Value = serde_json::from_str(include_str!(
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
             "../../listener/tests/fixtures/buy_v3_mainnet.json"
-        ))
-        .expect("fixture");
-        // Shape: bare getTransaction result.
-        let result = &raw;
+        ));
         // Landed transaction only: a failed fill proves nothing.
         assert!(
-            result
-                .get("meta")
-                .and_then(|m| m.get("err"))
-                .is_some_and(|e| e.is_null()),
+            crate::test_fixture::landed(&fetched),
             "success fixture must carry a landed transaction"
         );
-        let msg = &result["transaction"]["message"];
-        let mut keys: Vec<String> =
-            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-        if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
-            for table in ["writable", "readonly"] {
-                for addr in loaded
-                    .get(table)
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    keys.push(addr.as_str().expect("addr").to_string());
-                }
-            }
-        }
-        let pump = PUMP_PROGRAM_ID.to_string();
-        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
-        let mut found = None;
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
-                continue;
-            }
-            let data = bs58::decode(ix["data"].as_str().expect("data"))
-                .into_vec()
-                .expect("b58");
-            if data.starts_with(&PUMP_BUY_V3_DISCRIMINATOR) && data.len() == 24 {
-                let accounts: Vec<usize> =
-                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
-                found = Some((accounts, data));
-                break;
-            }
-        }
-        let (idx, data) = found.expect("buy_v3 in fixture");
+        let crate::test_fixture::FrozenFill { keys, idx, data } = crate::test_fixture::frozen_fill(
+            &fetched,
+            &PUMP_PROGRAM_ID,
+            &PUMP_BUY_V3_DISCRIMINATOR,
+            24,
+        );
         assert_eq!(idx.len(), 17);
         let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
         assert_eq!(user_volume_accumulator_pda(&key(8)), key(11));
@@ -730,53 +631,20 @@ mod tests {
     fn buy_exact_quote_in_v3_matches_frozen_sample() {
         // Byte-equality vs mainnet `buy_exact_quote_in_v3` fill (17 accounts).
         use std::collections::HashSet;
-        let raw: serde_json::Value = serde_json::from_str(include_str!(
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
             "../../listener/tests/fixtures/buy_exact_quote_in_v3_mainnet.json"
-        ))
-        .expect("fixture");
-        // Shape: bare getTransaction result.
-        let result = &raw;
+        ));
+        // Landed transaction only: a failed fill proves nothing.
         assert!(
-            result
-                .get("meta")
-                .and_then(|m| m.get("err"))
-                .is_some_and(|e| e.is_null()),
+            crate::test_fixture::landed(&fetched),
             "success fixture must carry a landed transaction"
         );
-        let msg = &result["transaction"]["message"];
-        let mut keys: Vec<String> =
-            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-        if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
-            for table in ["writable", "readonly"] {
-                for addr in loaded
-                    .get(table)
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    keys.push(addr.as_str().expect("addr").to_string());
-                }
-            }
-        }
-        let pump = PUMP_PROGRAM_ID.to_string();
-        let pi = keys.iter().position(|k| k == &pump).expect("pump key");
-        let mut found = None;
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
-                continue;
-            }
-            let data = bs58::decode(ix["data"].as_str().expect("data"))
-                .into_vec()
-                .expect("b58");
-            if data.starts_with(&PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR) && data.len() == 24
-            {
-                let accounts: Vec<usize> =
-                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
-                found = Some((accounts, data));
-                break;
-            }
-        }
-        let (idx, data) = found.expect("buy_exact_quote_in_v3 in fixture");
+        let crate::test_fixture::FrozenFill { keys, idx, data } = crate::test_fixture::frozen_fill(
+            &fetched,
+            &PUMP_PROGRAM_ID,
+            &PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR,
+            24,
+        );
         assert_eq!(idx.len(), 17);
         let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
         assert_eq!(user_volume_accumulator_pda(&key(8)), key(11));

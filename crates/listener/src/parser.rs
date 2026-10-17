@@ -341,6 +341,7 @@ pub fn pump_program_id_bytes_match() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_transaction::versioned::TransactionVersion;
 
     fn test_pubkey(byte: u8) -> Pubkey {
         Pubkey::new_from_array([byte; 32])
@@ -442,24 +443,22 @@ mod tests {
         // Frozen mainnet create_v2: triple + creator[32] + 11 tail bytes.
         // Decoding via the IDL struct (bool after the triple) would
         // misattribute by one byte — this test breaks loudly if tried.
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/create_v2_mainnet.json"))
-                .expect("fixture");
-        let msg = &raw["result"]["transaction"]["message"];
-        let keys: Vec<String> =
-            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../tests/fixtures/create_v2_mainnet.json"
+        ));
+        let msg = crate::test_fixture::raw_message(&fetched);
+        let keys = crate::test_fixture::key_table(&fetched);
         let pump = PUMP_PROGRAM_ID.to_string();
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            let pi = ix["programIdIndex"].as_u64().expect("pi") as usize;
+        for ix in &msg.instructions {
+            let pi = usize::from(ix.program_id_index);
             if keys.get(pi) != Some(&pump) {
                 continue;
             }
-            let data = decode_ix_data(ix["data"].as_str().expect("data")).expect("decode");
+            let data = decode_ix_data(&ix.data).expect("decode");
             if !is_pump_create_v2_ix(&data) {
                 continue;
             }
-            let idx: Vec<usize> =
-                serde_json::from_value(ix["accounts"].clone()).expect("accts");
+            let idx: Vec<usize> = ix.accounts.iter().map(|i| usize::from(*i)).collect();
             // 16-account live instruction (MIN tolerance is 14).
             assert_eq!(idx.len(), 16);
             let accounts: Vec<Pubkey> = idx
@@ -500,39 +499,29 @@ mod tests {
         // breaks if parsing ever assumes v1-only. v0 transactions use
         // address lookup tables, so the key table includes loaded
         // addresses (static-only indexing would dangle).
-        let raw: serde_json::Value = serde_json::from_str(include_str!(
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
             "../tests/fixtures/create_v2_v0_recent_mainnet.json"
-        ))
-        .expect("fixture");
-        assert_eq!(raw["result"]["version"], 0);
-        assert_eq!(raw["result"]["slot"], 457429472);
-        let msg = &raw["result"]["transaction"]["message"];
-        let mut keys: Vec<String> =
-            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-        if let Some(loaded) = raw["result"]["meta"]["loadedAddresses"].as_object() {
-            for table in ["writable", "readonly"] {
-                for addr in loaded
-                    .get(table)
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    keys.push(addr.as_str().expect("addr").to_string());
-                }
-            }
-        }
+        ));
+        assert_eq!(
+            fetched.transaction.version,
+            Some(TransactionVersion::Number(0))
+        );
+        assert_eq!(fetched.slot, 457429472);
+        let msg = crate::test_fixture::raw_message(&fetched);
+        // v0 transactions use address lookup tables; `key_table` includes
+        // the loaded addresses (static-only indexing would dangle).
+        let keys = crate::test_fixture::key_table(&fetched);
         let pump = PUMP_PROGRAM_ID.to_string();
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            let pi = ix["programIdIndex"].as_u64().expect("pi") as usize;
+        for ix in &msg.instructions {
+            let pi = usize::from(ix.program_id_index);
             if keys.get(pi) != Some(&pump) {
                 continue;
             }
-            let data = decode_ix_data(ix["data"].as_str().expect("data")).expect("decode");
+            let data = decode_ix_data(&ix.data).expect("decode");
             if !is_pump_create_v2_ix(&data) {
                 continue;
             }
-            let idx: Vec<usize> =
-                serde_json::from_value(ix["accounts"].clone()).expect("accts");
+            let idx: Vec<usize> = ix.accounts.iter().map(|i| usize::from(*i)).collect();
             assert_eq!(idx.len(), 16);
             let accounts: Vec<Pubkey> = idx
                 .iter()
@@ -563,39 +552,27 @@ mod tests {
         // sig 4oZKh9Jg...): the v1 counterpart to the v0 fixture above.
         // Together they pin that launches ship both envelopes and the
         // fetch config must keep allowing both.
-        let raw: serde_json::Value = serde_json::from_str(include_str!(
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
             "../tests/fixtures/create_v2_v1_recent_mainnet.json"
-        ))
-        .expect("fixture");
-        assert_eq!(raw["result"]["version"], 1);
-        assert!(raw["result"]["slot"].as_u64().expect("slot") > 455573900);
-        let msg = &raw["result"]["transaction"]["message"];
-        let mut keys: Vec<String> =
-            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-        if let Some(loaded) = raw["result"]["meta"]["loadedAddresses"].as_object() {
-            for table in ["writable", "readonly"] {
-                for addr in loaded
-                    .get(table)
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-                {
-                    keys.push(addr.as_str().expect("addr").to_string());
-                }
-            }
-        }
+        ));
+        assert_eq!(
+            fetched.transaction.version,
+            Some(TransactionVersion::Number(1))
+        );
+        assert!(fetched.slot > 455573900);
+        let msg = crate::test_fixture::raw_message(&fetched);
+        let keys = crate::test_fixture::key_table(&fetched);
         let pump = PUMP_PROGRAM_ID.to_string();
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            let pi = ix["programIdIndex"].as_u64().expect("pi") as usize;
+        for ix in &msg.instructions {
+            let pi = usize::from(ix.program_id_index);
             if keys.get(pi) != Some(&pump) {
                 continue;
             }
-            let data = decode_ix_data(ix["data"].as_str().expect("data")).expect("decode");
+            let data = decode_ix_data(&ix.data).expect("decode");
             if !is_pump_create_v2_ix(&data) {
                 continue;
             }
-            let idx: Vec<usize> =
-                serde_json::from_value(ix["accounts"].clone()).expect("accts");
+            let idx: Vec<usize> = ix.accounts.iter().map(|i| usize::from(*i)).collect();
             assert_eq!(idx.len(), 16);
             let accounts: Vec<Pubkey> = idx
                 .iter()

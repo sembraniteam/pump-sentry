@@ -18,6 +18,10 @@ use solana_client::{
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
+use solana_transaction_status::{
+    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiMessage, UiRawMessage,
+    option_serializer::OptionSerializer,
+};
 use std::str::FromStr;
 
 /// Base58 decode or panic (frozen fixtures only — untrusted RPC data
@@ -305,43 +309,82 @@ pub async fn holder_atas(
     (out, aux)
 }
 
+/// Typed fixture transaction (bare `getTransaction` result; frozen).
+/// Panics on drift: fixtures are recorded wire truth, never user input.
+pub fn fixture_tx(raw: &str, path: &str) -> EncodedConfirmedTransactionWithStatusMeta {
+    serde_json::from_str(raw).unwrap_or_else(|e| panic!("fixture {path} must decode: {e}"))
+}
+
+/// Raw (unparsed) message of a fixture transaction; panics when the
+/// fixture is not a JSON-encoded raw message (parsed keys would drop
+/// wire indices, shifting every slot).
+pub fn fixture_raw_message<'a>(
+    fetched: &'a EncodedConfirmedTransactionWithStatusMeta,
+    path: &str,
+) -> &'a UiRawMessage {
+    match &fetched.transaction.transaction {
+        EncodedTransaction::Json(ui_tx) => match &ui_tx.message {
+            UiMessage::Raw(raw) => raw,
+            UiMessage::Parsed(_) => panic!("fixture {path} message must be raw"),
+        },
+        other => panic!("fixture {path} transaction must be JSON-encoded, got {other:?}"),
+    }
+}
+
+/// Fixture key table: static `accountKeys`, then loaded addresses
+/// (writable, then readonly) — the raw wire order.
+pub fn fixture_key_table(
+    fetched: &EncodedConfirmedTransactionWithStatusMeta,
+    path: &str,
+) -> Vec<String> {
+    let mut keys = fixture_raw_message(fetched, path).account_keys.clone();
+    if let Some(meta) = fetched.transaction.meta.as_ref()
+        && let OptionSerializer::Some(loaded) = &meta.loaded_addresses
+    {
+        keys.extend(loaded.writable.iter().cloned());
+        keys.extend(loaded.readonly.iter().cloned());
+    }
+    keys
+}
+
+/// Frozen pool fixture `{amm, owner, data: [u8]}` (Raydium V4 /
+/// PumpSwap pools; recorded via `getAccountInfo`).
+#[derive(Debug, serde::Deserialize)]
+pub struct PoolFixture {
+    pub amm: String,
+    pub owner: String,
+    pub data: Vec<u8>,
+}
+
+/// Decode a CWD-relative frozen pool fixture; panics on drift.
+pub fn pool_fixture(path: &str) -> PoolFixture {
+    let raw =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("fixture {path} readable: {e}"));
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("fixture {path} must decode: {e}"))
+}
+
 /// Fixture v3 instruction accounts in 17-shape order. Positions:
 /// `[1]` mint, `[2]` quote, `[5]` curve, `[6]` assoc, `[8]`
 /// payer/trader, `[9]` base ATA, `[13]` buyback. Panics when the
 /// fixture carries no v3 ix (frozen set, never user input).
 fn fixture_v3_slots(raw: &str, path: &str) -> Vec<Pubkey> {
-    let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
-    let msg = &v["transaction"]["message"];
+    let fetched = fixture_tx(raw, path);
     // String table (unfiltered): slot positions must not shift.
-    let mut keys: Vec<String> =
-        serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
-    if let Some(loaded) = v["meta"]["loadedAddresses"].as_object() {
-        for table in ["writable", "readonly"] {
-            for addr in loaded
-                .get(table)
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-            {
-                keys.push(addr.as_str().expect("addr").to_string());
-            }
-        }
-    }
+    let keys = fixture_key_table(&fetched, path);
     let pump = ids::PUMP_PROGRAM_ID.to_string();
     let pi = keys.iter().position(|k| k == &pump).expect("pump key");
-    for ix in msg["instructions"].as_array().expect("ixs") {
-        if ix["programIdIndex"].as_u64() != Some(pi as u64) {
+    for ix in &fixture_raw_message(&fetched, path).instructions {
+        if usize::from(ix.program_id_index) != pi {
             continue;
         }
-        let data =
-            bs58::decode(ix["data"].as_str().expect("data")).into_vec().expect("b58");
+        let data = decode_b58(&ix.data);
         let is_v3 = (data.starts_with(&ids::PUMP_BUY_V3_DISCRIMINATOR)
             || data.starts_with(&ids::PUMP_SELL_V3_DISCRIMINATOR))
             && data.len() == 24;
         if !is_v3 {
             continue;
         }
-        let idx: Vec<usize> = serde_json::from_value(ix["accounts"].clone()).expect("accts");
+        let idx: Vec<usize> = ix.accounts.iter().map(|i| usize::from(*i)).collect();
         assert_eq!(idx.len(), 17, "fixture {path} must be 17 accounts");
         return idx
             .into_iter()

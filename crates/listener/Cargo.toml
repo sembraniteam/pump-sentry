@@ -42,7 +42,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # MessageHeader for screen unit tests (fabricated transactions).
 solana-message = "4"
-# RPC fixture replay in screen tests.
+# `TransactionVersion` asserts on the frozen v0/v1 envelope fixtures.
+# Majors are architecture: 4.3 matches `solana-transaction-status` 4.3,
+# not sdk-5's 5.1 (which must stay out of fixture typing).
+solana-transaction = "4.3"
+# RPC fixture replay in screen/parser tests (typed fixture DTOs).
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [[example]]

@@ -896,7 +896,6 @@ fn decode_ui_ix(cix: &UiInstruction, account_keys: &[Pubkey]) -> Option<DecodedI
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
 
     #[test]
     fn backoff_caps_at_config() {
@@ -982,11 +981,9 @@ mod tests {
     fn replay_real_create_v2_fixture() {
         // Real mainnet create_v2: proves the v2 wire shape decodes and
         // emits exactly one launch event with the IDL account mapping.
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/create_v2_mainnet.json"))
-                .expect("fixture");
-        let fetched: EncodedConfirmedTransactionWithStatusMeta =
-            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../tests/fixtures/create_v2_mainnet.json"
+        ));
         assert_eq!(fetched.slot, 455573900);
         let stats = Arc::new(ListenerStats::new());
         let events = extract_events(&fetched, "frozen-sig", 455573900, &stats);

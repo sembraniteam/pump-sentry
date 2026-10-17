@@ -1154,106 +1154,97 @@ impl LiveTrader {
         }
     }
 
-    /// JSON creator (`null` when unknown).
-    fn wal_creator(creator: Option<&Pubkey>) -> String {
-        creator
-            .map(|c| format!("\"{c}\""))
-            .unwrap_or_else(|| "null".to_string())
+    /// Append one typed line (best-effort, synced). No-op without a WAL
+    /// path; a serialize failure would be an engine bug, so it is
+    /// warned instead of swallowed or panicked on.
+    fn wal_record(&self, line: &wal::WalLine) {
+        if self.wal_path.is_none() {
+            return;
+        }
+        match serde_json::to_string(line) {
+            Ok(json) => self.wal_append(json),
+            Err(e) => tracing::warn!(error = %e, "live WAL line serialize failed (non-fatal)"),
+        }
     }
 
     /// Record a dispatch BEFORE confirming.
     fn write_wal_pending(&self, position: &LivePosition, signature: &str, bundle_id: &str) {
-        if self.wal_path.is_none() {
-            return;
-        }
-        self.wal_append(format!(
-            "{{\"t\":\"pending\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"sig\":\"{signature}\",\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
-            position.mint,
-            position.curve,
-            position.assoc_curve,
-            position.amount_tokens,
-            Self::wal_creator(position.creator.as_ref()),
-            now_secs(),
-        ));
+        self.wal_record(&wal::WalLine::Pending {
+            mint: position.mint.to_string(),
+            curve: position.curve.to_string(),
+            assoc: position.assoc_curve.to_string(),
+            amount: position.amount_tokens,
+            creator: position.creator.as_ref().map(|c| c.to_string()),
+            sig: signature.to_string(),
+            bundle: bundle_id.to_string(),
+            ts: Some(now_secs()),
+        });
     }
 
     /// Record a sell dispatch BEFORE confirming (crash window
     /// coverage: replay seeds the resend guard from unsettled lines).
     fn write_wal_sell_pending(&self, mint: &str, bundle_id: &str) {
-        if self.wal_path.is_none() {
-            return;
-        }
-        self.wal_append(format!(
-            "{{\"t\":\"sell_pending\",\"mint\":\"{mint}\",\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
-            now_secs(),
-        ));
+        self.wal_record(&wal::WalLine::SellPending {
+            mint: mint.to_string(),
+            bundle: bundle_id.to_string(),
+            ts: now_secs(),
+        });
     }
 
     /// Record a dead bundle so boot skips it.
     fn write_wal_settled(&self, bundle_id: &str) {
-        if self.wal_path.is_none() {
-            return;
-        }
-        self.wal_append(format!(
-            "{{\"t\":\"settled\",\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
-            now_secs(),
-        ));
+        self.wal_record(&wal::WalLine::Settled {
+            bundle: bundle_id.to_string(),
+            ts: Some(now_secs()),
+        });
     }
 
     /// Record a fill and retire pending. Call AFTER tracking it.
     pub fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
-        if self.wal_path.is_none() {
-            return;
-        }
-        self.wal_append(format!(
-            "{{\"t\":\"position\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
-            position.mint,
-            position.curve,
-            position.assoc_curve,
-            position.amount_tokens,
-            Self::wal_creator(position.creator.as_ref()),
-            now_secs(),
-        ));
+        self.wal_record(&wal::WalLine::Position {
+            mint: position.mint.to_string(),
+            curve: position.curve.to_string(),
+            assoc: position.assoc_curve.to_string(),
+            amount: position.amount_tokens,
+            creator: position.creator.as_ref().map(|c| c.to_string()),
+            bundle: Some(bundle_id.to_string()),
+            ts: Some(now_secs()),
+        });
         self.write_wal_settled(bundle_id);
     }
 
-    /// Record a human-exit bag. `note` is a lookup id, unquoted.
+    /// Record a human-exit bag. `note` is a lookup id (bundle,
+    /// signature, or cause).
     pub fn record_manual(&self, position: &LivePosition, note: &str) {
-        if self.wal_path.is_none() {
-            return;
-        }
-        self.wal_append(format!(
-            "{{\"t\":\"manual\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"note\":\"{note}\",\"ts\":{}}}",
-            position.mint,
-            position.curve,
-            position.assoc_curve,
-            position.amount_tokens,
-            Self::wal_creator(position.creator.as_ref()),
-            now_secs(),
-        ));
+        self.wal_record(&wal::WalLine::Manual {
+            mint: position.mint.to_string(),
+            curve: position.curve.to_string(),
+            assoc: position.assoc_curve.to_string(),
+            amount: position.amount_tokens,
+            creator: position.creator.as_ref().map(|c| c.to_string()),
+            note: Some(note.to_string()),
+            ts: Some(now_secs()),
+        });
     }
 
     /// Retire a manual bag taken for exit. Call AFTER taking: a crash
     /// between take and sell-settle must not replay the bag as a ghost.
     pub fn unrecord_manual(&self, position: &LivePosition) {
-        if self.wal_path.is_none() {
-            return;
-        }
-        self.wal_append(format!(
-            "{{\"t\":\"take_manual\",\"mint\":\"{}\",\"amount\":{},\"ts\":{}}}",
-            position.mint, position.amount_tokens,
-            now_secs(),
-        ));
+        self.wal_record(&wal::WalLine::TakeManual {
+            mint: position.mint.to_string(),
+            amount: position.amount_tokens,
+            ts: Some(now_secs()),
+        });
     }
+
     /// Record a confirmed sell.
     pub fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
-        if self.wal_path.is_none() {
-            return;
-        }
-        self.wal_append(format!(
-            "{{\"t\":\"sell\",\"mint\":\"{mint}\",\"amount\":{amount_tokens},\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
-            now_secs(),
-        ));
+        self.wal_record(&wal::WalLine::Sell {
+            mint: mint.to_string(),
+            amount: amount_tokens,
+            bundle: Some(bundle_id.to_string()),
+            ts: Some(now_secs()),
+        });
     }
 
     /// Congestion pricing for heartbeat display: `(base, floor,

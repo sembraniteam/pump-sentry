@@ -991,23 +991,22 @@ mod tests {
     /// the parser's own frozen test (`makemerich` / `mmrich`).
     fn fixture_v2_parts() -> (Vec<u8>, Vec<usize>, Vec<String>) {
         use crate::parser::decode_ix_data;
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/create_v2_mainnet.json"))
-                .expect("fixture");
-        let msg = &raw["result"]["transaction"]["message"];
-        let keys: Vec<String> =
-            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../tests/fixtures/create_v2_mainnet.json"
+        ));
+        let msg = crate::test_fixture::raw_message(&fetched);
+        let keys = crate::test_fixture::key_table(&fetched);
         let pump = ids::PUMP_PROGRAM_ID.to_string();
-        for ix in msg["instructions"].as_array().expect("ixs") {
-            let pi = ix["programIdIndex"].as_u64().expect("pi") as usize;
+        for ix in &msg.instructions {
+            let pi = usize::from(ix.program_id_index);
             if keys.get(pi) != Some(&pump) {
                 continue;
             }
-            let data = decode_ix_data(ix["data"].as_str().expect("data")).expect("decode");
+            let data = decode_ix_data(&ix.data).expect("decode");
             if !data.starts_with(&ids::PUMP_CREATE_V2_DISCRIMINATOR) {
                 continue;
             }
-            let idx: Vec<usize> = serde_json::from_value(ix["accounts"].clone()).expect("accts");
+            let idx: Vec<usize> = ix.accounts.iter().map(|i| usize::from(*i)).collect();
             return (data, idx, keys);
         }
         panic!("no create_v2 in fixture");

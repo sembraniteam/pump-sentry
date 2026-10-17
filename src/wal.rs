@@ -57,42 +57,102 @@ impl WalReplay {
     }
 }
 
-fn field(line: &str, key: &str) -> Option<String> {
-    for part in line
-        .trim()
-        .strip_prefix('{')?
-        .strip_suffix('}')?
-        .split(',')
-    {
-        let (k, v) = part.split_once(':')?;
-        if k.trim().trim_matches('"') == key {
-            let v = v.trim();
-            if v == "null" {
-                return None;
-            }
-            return Some(v.trim_matches('"').to_string());
-        }
-    }
-    None
+/// One live-WAL line. The file is our own write-ahead log: the writer
+/// and the boot replay share this shape, so nothing parses it by hand.
+/// Field strictness matches the hand parser it replaces: a line missing
+/// a load-bearing field (or carrying the wrong type) is damage — counted
+/// in `skipped`, never half-adopted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum WalLine {
+    /// Dispatch recorded BEFORE confirming.
+    Pending {
+        mint: String,
+        curve: String,
+        assoc: String,
+        amount: u64,
+        #[serde(default)]
+        creator: Option<String>,
+        sig: String,
+        bundle: String,
+        #[serde(default)]
+        ts: Option<u64>,
+    },
+    /// Dead bundle: retires its pending buy and sell traces.
+    Settled {
+        bundle: String,
+        #[serde(default)]
+        ts: Option<u64>,
+    },
+    /// Sell dispatch awaiting confirm (resend-guard seed).
+    SellPending {
+        mint: String,
+        bundle: String,
+        ts: u64,
+    },
+    /// Confirmed fill (custody).
+    Position {
+        mint: String,
+        curve: String,
+        assoc: String,
+        amount: u64,
+        #[serde(default)]
+        creator: Option<String>,
+        #[serde(default)]
+        bundle: Option<String>,
+        #[serde(default)]
+        ts: Option<u64>,
+    },
+    /// Confirmed sell (partial or full).
+    Sell {
+        mint: String,
+        amount: u64,
+        #[serde(default)]
+        bundle: Option<String>,
+        #[serde(default)]
+        ts: Option<u64>,
+    },
+    /// Human-exit bag.
+    Manual {
+        mint: String,
+        curve: String,
+        assoc: String,
+        amount: u64,
+        #[serde(default)]
+        creator: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+        #[serde(default)]
+        ts: Option<u64>,
+    },
+    /// Manual bag taken for exit.
+    TakeManual {
+        mint: String,
+        amount: u64,
+        #[serde(default)]
+        ts: Option<u64>,
+    },
 }
 
-fn num(line: &str, key: &str) -> Option<u64> {
-    field(line, key)?.parse().ok()
-}
-
-fn position_from(line: &str) -> Option<LivePosition> {
-    // Corrupt addresses skip the line (counted): the writer only emits
-    // canonical base58 or null, so unparseable means a damaged file —
-    // never half-adopted custody.
-    let parse = |key: &str| field(line, key).and_then(|s| executor::parse_pubkey(&s).ok());
+/// Position from WAL fields. Corrupt addresses skip the line (counted):
+/// the writer only emits canonical base58 or null, so unparseable means
+/// a damaged file — never half-adopted custody.
+fn position_from(
+    mint: &str,
+    curve: &str,
+    assoc: &str,
+    amount: u64,
+    creator: Option<&str>,
+) -> Option<LivePosition> {
+    let parse = |s: &str| executor::parse_pubkey(s).ok();
     Some(LivePosition {
-        mint: parse("mint")?,
-        curve: parse("curve")?,
-        assoc_curve: parse("assoc")?,
-        amount_tokens: num(line, "amount")?,
-        creator: match field(line, "creator") {
+        mint: parse(mint)?,
+        curve: parse(curve)?,
+        assoc_curve: parse(assoc)?,
+        amount_tokens: amount,
+        creator: match creator {
             None => None,
-            Some(s) => Some(executor::parse_pubkey(&s).ok()?),
+            Some(s) => Some(parse(s)?),
         },
     })
 }
@@ -133,64 +193,69 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
         if line.is_empty() {
             continue;
         }
-        let Some(kind) = field(line, "t") else {
-            skipped += 1;
-            continue;
+        let parsed: WalLine = match serde_json::from_str(line) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
-        match kind.as_str() {
-            "pending" => {
-                let (Some(pos), sig, bundle) = (
-                    position_from(line),
-                    field(line, "sig"),
-                    field(line, "bundle"),
-                ) else {
-                    skipped += 1;
-                    continue;
-                };
-                let (Some(signature), Some(bundle_id)) = (sig, bundle) else {
+        match parsed {
+            WalLine::Pending {
+                mint,
+                curve,
+                assoc,
+                amount,
+                creator,
+                sig,
+                bundle,
+                ..
+            } => {
+                let Some(pos) = position_from(&mint, &curve, &assoc, amount, creator.as_deref())
+                else {
                     skipped += 1;
                     continue;
                 };
                 pending.insert(
-                    bundle_id.clone(),
-                    WalPending { position: pos, signature, bundle_id },
+                    bundle.clone(),
+                    WalPending {
+                        position: pos,
+                        signature: sig,
+                        bundle_id: bundle,
+                    },
                 );
             }
-            "settled" => {
-                let Some(bundle) = field(line, "bundle") else {
-                    skipped += 1;
-                    continue;
-                };
+            WalLine::Settled { bundle, .. } => {
                 pending.remove(&bundle);
                 sell_pending.retain(|(_, b), _| *b != bundle);
             }
-            "sell_pending" => {
-                let (Some(mint), Some(bundle), Some(ts)) = (
-                    field(line, "mint"),
-                    field(line, "bundle"),
-                    field(line, "ts").and_then(|s| s.parse::<u64>().ok()),
-                ) else {
-                    skipped += 1;
-                    continue;
-                };
+            WalLine::SellPending { mint, bundle, ts } => {
                 sell_pending.insert((mint, bundle), ts);
             }
-            "position" => {
-                let (Some(pos), bundle) = (position_from(line), field(line, "bundle")) else {
+            WalLine::Position {
+                mint,
+                curve,
+                assoc,
+                amount,
+                creator,
+                ..
+            } => {
+                let Some(pos) = position_from(&mint, &curve, &assoc, amount, creator.as_deref())
+                else {
                     skipped += 1;
                     continue;
                 };
-                let _ = bundle;
                 add(&mut positions, pos);
             }
-            "sell" => {
-                let (Some(mint), Some(amount)) = (field(line, "mint"), num(line, "amount")) else {
-                    skipped += 1;
-                    continue;
-                };
+            WalLine::Sell {
+                mint,
+                amount,
+                bundle,
+                ..
+            } => {
                 // Exactly-once per fill: a repeated bundle id means the
                 // same dispatch was recorded twice, not two fills.
-                if let Some(bundle) = field(line, "bundle")
+                if let Some(bundle) = bundle
                     && !seen_sells.insert(bundle)
                 {
                     continue;
@@ -202,29 +267,36 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     }
                 }
             }
-            "manual" => {
-                let Some(pos) = position_from(line) else {
+            WalLine::Manual {
+                mint,
+                curve,
+                assoc,
+                amount,
+                creator,
+                note,
+                ..
+            } => {
+                let Some(pos) = position_from(&mint, &curve, &assoc, amount, creator.as_deref())
+                else {
                     skipped += 1;
                     continue;
                 };
                 // Old lines lack note; keep bag.
-                let note = field(line, "note").unwrap_or_default();
+                let note = note.unwrap_or_default();
                 manual
                     .entry(pos.mint.to_string())
                     .and_modify(|e: &mut WalManual| {
                         e.position.amount_tokens =
                             e.position.amount_tokens.saturating_add(pos.amount_tokens);
                     })
-                    .or_insert(WalManual { position: pos, note });
+                    .or_insert(WalManual {
+                        position: pos,
+                        note,
+                    });
             }
-            "take_manual" => {
+            WalLine::TakeManual { mint, amount, .. } => {
                 // A taken-for-exit bag must not replay as a ghost when
                 // the crash lands between take and sell-settle.
-                let (Some(mint), Some(amount)) = (field(line, "mint"), num(line, "amount"))
-                else {
-                    skipped += 1;
-                    continue;
-                };
                 if let Some(entry) = manual.get_mut(&mint) {
                     entry.position.amount_tokens =
                         entry.position.amount_tokens.saturating_sub(amount);
@@ -233,7 +305,6 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     }
                 }
             }
-            _ => skipped += 1,
         }
     }
     WalReplay {
@@ -260,69 +331,67 @@ pub fn replay_file(path: &std::path::Path) -> WalReplay {
 
 /// Compact to surviving state. Call once per boot after import.
 pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
-    use std::fmt::Write as _;
     let mut out = String::new();
+    let now = crate::settings::now_secs();
+    let creator = |c: Option<&solana_pubkey::Pubkey>| c.map(|c| c.to_string());
     for p in &replay.pending {
-        let _ = writeln!(
-            out,
-            "{{\"t\":\"pending\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"sig\":\"{}\",\"bundle\":\"{}\",\"ts\":{}}}",
-            p.position.mint,
-            p.position.curve,
-            p.position.assoc_curve,
-            p.position.amount_tokens,
-            p.position
-                .creator
-                .as_ref()
-                .map(|c| format!("\"{c}\""))
-                .unwrap_or_else(|| "null".to_string()),
-            p.signature,
-            p.bundle_id,
-            crate::settings::now_secs(),
+        push_line(
+            &mut out,
+            &WalLine::Pending {
+                mint: p.position.mint.to_string(),
+                curve: p.position.curve.to_string(),
+                assoc: p.position.assoc_curve.to_string(),
+                amount: p.position.amount_tokens,
+                creator: creator(p.position.creator.as_ref()),
+                sig: p.signature.clone(),
+                bundle: p.bundle_id.clone(),
+                ts: Some(now),
+            },
         );
     }
     for s in &replay.sell_pending {
         // Prune stale traces at compaction: beyond the seed window no
         // bundle can still be inflight, so keeping them only grows
         // the file for guard entries that would never seed.
-        if crate::settings::now_secs().saturating_sub(s.ts) >= SELL_PENDING_SEED_WINDOW_SECS {
+        if now.saturating_sub(s.ts) >= SELL_PENDING_SEED_WINDOW_SECS {
             continue;
         }
-        let _ = writeln!(
-            out,
-            "{{\"t\":\"sell_pending\",\"mint\":\"{}\",\"bundle\":\"{}\",\"ts\":{}}}",
-            s.mint, s.bundle_id, s.ts,
+        push_line(
+            &mut out,
+            &WalLine::SellPending {
+                mint: s.mint.clone(),
+                bundle: s.bundle_id.clone(),
+                ts: s.ts,
+            },
         );
     }
     for p in &replay.positions {
-        let _ = writeln!(
-            out,
-            "{{\"t\":\"position\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"ts\":{}}}",
-            p.mint,
-            p.curve,
-            p.assoc_curve,
-            p.amount_tokens,
-            p.creator
-                .as_ref()
-                .map(|c| format!("\"{c}\""))
-                .unwrap_or_else(|| "null".to_string()),
-            crate::settings::now_secs(),
+        push_line(
+            &mut out,
+            &WalLine::Position {
+                mint: p.mint.to_string(),
+                curve: p.curve.to_string(),
+                assoc: p.assoc_curve.to_string(),
+                amount: p.amount_tokens,
+                creator: creator(p.creator.as_ref()),
+                bundle: None,
+                ts: Some(now),
+            },
         );
     }
     for m in &replay.manual {
         let p = &m.position;
-        let _ = writeln!(
-            out,
-            "{{\"t\":\"manual\",\"mint\":\"{}\",\"curve\":\"{}\",\"assoc\":\"{}\",\"amount\":{},\"creator\":{},\"note\":\"{}\",\"ts\":{}}}",
-            p.mint,
-            p.curve,
-            p.assoc_curve,
-            p.amount_tokens,
-            p.creator
-                .as_ref()
-                .map(|c| format!("\"{c}\""))
-                .unwrap_or_else(|| "null".to_string()),
-            m.note,
-            crate::settings::now_secs(),
+        push_line(
+            &mut out,
+            &WalLine::Manual {
+                mint: p.mint.to_string(),
+                curve: p.curve.to_string(),
+                assoc: p.assoc_curve.to_string(),
+                amount: p.amount_tokens,
+                creator: creator(p.creator.as_ref()),
+                note: Some(m.note.clone()),
+                ts: Some(now),
+            },
         );
     }
     if let Some(parent) = path.parent()
@@ -332,6 +401,21 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
     }
     if let Err(e) = crate::cli::write_private_file(path, out.as_bytes()) {
         tracing::warn!(file = %path.display(), error = %e, "live WAL compaction failed; file keeps growing (non-fatal)");
+    }
+}
+
+/// Serialize one line into the compaction buffer. The shape holds only
+/// scalars/strings, so a failure would be an engine bug: warned, never
+/// panicking (a panic here would strand the boot replay).
+fn push_line(out: &mut String, line: &WalLine) {
+    match serde_json::to_string(line) {
+        Ok(json) => {
+            out.push_str(&json);
+            out.push('\n');
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "live WAL compaction: line serialize failed (skipped)")
+        }
     }
 }
 

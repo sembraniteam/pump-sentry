@@ -5,7 +5,6 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::Client;
-use serde_json::json;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
@@ -163,17 +162,17 @@ impl JitoClient {
     pub async fn send_bundle(&self, bundle_b64: Vec<String>) -> Result<String, JitoError> {
         let payload = bundle_payload(bundle_b64);
         let url = self.bundles_url();
-        debug!(endpoint = %url, txs = payload["params"][0].as_array().map(|a| a.len()).unwrap_or(0), "submitting bundle");
+        debug!(endpoint = %url, txs = payload.params.0.len(), "submitting bundle");
         let res = self.client.post(&url).json(&payload).send().await?;
         if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             warn!(endpoint = %url, "bundle send rate-limited (1 req/s/IP/region)");
             return Err(JitoError::RateLimited);
         }
-        let body: serde_json::Value = res.json().await?;
-        if let Some(err) = body.get("error") {
-            return Err(JitoError::Rpc(err.to_string()));
+        let body: SendBundleResponse = res.json().await?;
+        if let Some(err) = body.error {
+            return Err(JitoError::Rpc(err.render()));
         }
-        let uuid = body["result"].as_str().unwrap_or("").to_string();
+        let uuid = body.result.unwrap_or_default();
         info!(bundle = %uuid, "bundle accepted");
         Ok(uuid)
     }
@@ -181,12 +180,12 @@ impl JitoClient {
     /// Engine-side bundle state. `Unknown` on any transport/parse
     /// trouble: callers keep polling the signature instead.
     pub async fn inflight_status(&self, bundle_id: &str) -> BundleStatus {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getInflightBundleStatuses",
-            "params": [[bundle_id]],
-        });
+        let payload = RpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getInflightBundleStatuses",
+            params: [[bundle_id]],
+        };
         let res = match tokio::time::timeout(
             Duration::from_millis(2000),
             self.client.post(self.inflight_status_url()).json(&payload).send(),
@@ -196,7 +195,7 @@ impl JitoClient {
             Ok(Ok(res)) => res,
             _ => return BundleStatus::Unknown,
         };
-        let body: serde_json::Value = match res.json().await {
+        let body = match res.text().await {
             Ok(body) => body,
             Err(_) => return BundleStatus::Unknown,
         };
@@ -255,21 +254,28 @@ impl JitoClient {
             Ok(Ok(res)) if res.status().is_success() => res,
             _ => return None,
         };
-        let body: serde_json::Value = res.json().await.ok()?;
+        let body = res.text().await.ok()?;
         let floor = parse_tip_floor_lamports(&body);
         if floor == 0 { None } else { Some(floor) }
     }
 }
 
+/// One landed-tip percentile row of the floor oracle.
+#[derive(Debug, serde::Deserialize)]
+struct TipFloorSample {
+    #[serde(default)]
+    landed_tips_50th_percentile: Option<f64>,
+}
+
 /// Pure: median landed tip (SOL) → lamports. 0 on any schema trouble
 /// (counted in [`tip_floor_parse_failures`], warned: a silent 0 would
-/// hide oracle-shape drift as "no congestion").
-fn parse_tip_floor_lamports(body: &serde_json::Value) -> u64 {
-    let sol = body
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|e| e.get("landed_tips_50th_percentile"))
-        .and_then(|v| v.as_f64())
+/// hide oracle-shape drift as "no congestion"). An undecodable body
+/// counts as drift too, never as a silent blip.
+fn parse_tip_floor_lamports(body: &str) -> u64 {
+    let sol = serde_json::from_str::<Vec<TipFloorSample>>(body)
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row.landed_tips_50th_percentile)
         .unwrap_or(0.0);
     if !sol.is_finite() || sol <= 0.0 {
         TIP_FLOOR_PARSE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -295,14 +301,71 @@ pub fn apply_tip_floor(base_tip_lamports: u64, floor_lamports: u64) -> u64 {
     base_tip_lamports.max(floor_lamports)
 }
 
-/// Build the `sendBundle` payload (pure). `params[1]` picks base64.
-pub fn bundle_payload(bundle_b64: Vec<String>) -> serde_json::Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "sendBundle",
-        "params": [bundle_b64, {"encoding": "base64"}],
-    })
+/// `sendBundle` request. `params[1]` (`{"encoding": "base64"}`) is
+/// mandatory: without it the engine assumes base58 and rejects with
+/// `-32602`.
+#[derive(Debug, serde::Serialize)]
+pub struct SendBundleRequest {
+    jsonrpc: &'static str,
+    id: u8,
+    method: &'static str,
+    params: (Vec<String>, BundleEncoding),
+}
+
+/// The mandatory `params[1]` of `sendBundle`.
+#[derive(Debug, serde::Serialize)]
+pub struct BundleEncoding {
+    encoding: &'static str,
+}
+
+/// Build the `sendBundle` request (pure). `params[1]` picks base64.
+pub fn bundle_payload(bundle_b64: Vec<String>) -> SendBundleRequest {
+    SendBundleRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "sendBundle",
+        params: (bundle_b64, BundleEncoding { encoding: "base64" }),
+    }
+}
+
+/// JSON-RPC request envelope (the wire shape lives here only).
+#[derive(Debug, serde::Serialize)]
+struct RpcRequest<P: serde::Serialize> {
+    jsonrpc: &'static str,
+    id: u8,
+    method: &'static str,
+    params: P,
+}
+
+/// `sendBundle` response: engine error object or the bundle UUID.
+#[derive(Debug, serde::Deserialize)]
+struct SendBundleResponse {
+    #[serde(default)]
+    error: Option<RpcErrorPayload>,
+    #[serde(default)]
+    result: Option<String>,
+}
+
+/// JSON-RPC error object. Only `code`/`message` are rendered
+/// ([`JitoError::Rpc`] text); unknown extras are ignored.
+#[derive(Debug, serde::Deserialize)]
+struct RpcErrorPayload {
+    #[serde(default)]
+    code: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl RpcErrorPayload {
+    /// Rendered text for [`JitoError::Rpc`] (logs/ops only).
+    fn render(&self) -> String {
+        match (&self.code, &self.message) {
+            (Some(code), Some(message)) => format!("code {code}: {message}"),
+            (Some(code), None) => format!("code {code}"),
+            (None, Some(message)) => message.clone(),
+            (None, None) => "unrecognized error payload".to_string(),
+        }
+    }
 }
 /// Pick a tip account from `seed` (no RNG; callers pass nanos/counter).
 pub fn select_tip_account(seed: u64) -> Pubkey {
@@ -350,12 +413,12 @@ impl JitoClient {
     /// Query `getTipAccounts` on its documented path. `None` on any
     /// failure (warned: a silent pin would hide a dead refresh).
     async fn fetch_tip_accounts(&self) -> Option<Vec<String>> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTipAccounts",
-            "params": [],
-        });
+        let payload = RpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getTipAccounts",
+            params: [0u8; 0],
+        };
         let url = self.tip_accounts_url();
         let res = match tokio::time::timeout(
             Duration::from_millis(2000),
@@ -373,18 +436,16 @@ impl JitoClient {
             warn!(endpoint = %url, status = ?res.status(), "tip refresh non-2xx; keeping cached list");
             return None;
         }
-        let body: serde_json::Value = match res.json().await {
+        let body: TipAccountsResponse = match res.json().await {
             Ok(body) => body,
             Err(e) => {
                 warn!(endpoint = %url, error = %e, "tip refresh decode failed; keeping cached list");
                 return None;
             }
         };
-        let accounts: Vec<String> = body
-            .get("result")?
-            .as_array()?
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        let raw_accounts = body.result?;
+        let accounts: Vec<String> = raw_accounts
+            .into_iter()
             // Skip bad entries; empty keeps the old list.
             .filter(|s| s.parse::<Pubkey>().is_ok_and(|p| p.to_string() == *s))
             .collect();
@@ -403,30 +464,58 @@ impl JitoClient {
     }
 }
 
+/// `getTipAccounts` response: the validated-address list.
+#[derive(Debug, serde::Deserialize)]
+struct TipAccountsResponse {
+    #[serde(default)]
+    result: Option<Vec<String>>,
+}
+
 /// Map an inflight-status response to our bundle state (pure).
 /// Entries for other bundles are skipped; anything unrecognized is
 /// `Unknown` (callers keep their existing behavior, never terminal).
-fn parse_inflight_status(body: &serde_json::Value, bundle_id: &str) -> BundleStatus {
-    let entries = body
-        .get("result")
-        .and_then(|r| r.get("value"))
-        .and_then(|v| v.as_array());
-    let Some(entries) = entries else {
+fn parse_inflight_status(body: &str, bundle_id: &str) -> BundleStatus {
+    let Ok(response) = serde_json::from_str::<InflightBundleStatuses>(body) else {
         return BundleStatus::Unknown;
     };
-    for entry in entries {
-        if entry.get("bundle_id").and_then(|b| b.as_str()) != Some(bundle_id) {
-            continue;
-        }
-        return match entry.get("status").and_then(|s| s.as_str()) {
-            Some("Landed") => BundleStatus::Landed,
-            Some("Pending") => BundleStatus::Pending,
-            Some("Failed") => BundleStatus::Failed,
-            Some("Invalid") => BundleStatus::Invalid,
-            _ => BundleStatus::Unknown,
-        };
+    let Some(entries) = response.result.and_then(|r| r.value) else {
+        return BundleStatus::Unknown;
+    };
+    let Some(entry) = entries
+        .iter()
+        .find(|e| e.bundle_id.as_deref() == Some(bundle_id))
+    else {
+        return BundleStatus::Unknown;
+    };
+    match entry.status.as_deref() {
+        Some("Landed") => BundleStatus::Landed,
+        Some("Pending") => BundleStatus::Pending,
+        Some("Failed") => BundleStatus::Failed,
+        Some("Invalid") => BundleStatus::Invalid,
+        _ => BundleStatus::Unknown,
     }
-    BundleStatus::Unknown
+}
+
+/// `getInflightBundleStatuses` response.
+#[derive(Debug, serde::Deserialize)]
+struct InflightBundleStatuses {
+    #[serde(default)]
+    result: Option<InflightBundleStatusesResult>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InflightBundleStatusesResult {
+    #[serde(default)]
+    value: Option<Vec<InflightBundleStatus>>,
+}
+
+/// One engine bundle record (`landed_slot` and friends are ignored).
+#[derive(Debug, serde::Deserialize)]
+struct InflightBundleStatus {
+    #[serde(default)]
+    bundle_id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 /// System transfer ix: from writable+signer.
@@ -530,7 +619,8 @@ mod tests {
     #[test]
     fn bundle_payload_carries_base64_encoding() {
         // Without params[1] the engine decodes base58 and refuses (-32602).
-        let payload = bundle_payload(vec!["dGVzdA==".to_string()]);
+        let payload =
+            serde_json::to_value(bundle_payload(vec!["dGVzdA==".to_string()])).expect("wire");
         assert_eq!(payload["method"], "sendBundle");
         let params = payload["params"].as_array().expect("params array");
         assert_eq!(params.len(), 2);
@@ -543,7 +633,7 @@ mod tests {
         // Multi-tx bundles must keep order and still carry the mandatory
         // base64 marker (the skill doc once omitted it for every bundle).
         let txs = vec!["eDE=".to_string(), "eDI=".to_string(), "eDM=".to_string()];
-        let payload = bundle_payload(txs.clone());
+        let payload = serde_json::to_value(bundle_payload(txs.clone())).expect("wire");
         let params = payload["params"].as_array().expect("params array");
         assert_eq!(params.len(), 2);
         let wire = params[0].as_array().expect("tx array");
@@ -553,7 +643,7 @@ mod tests {
         }
         assert_eq!(params[1]["encoding"], "base64");
         // Empty bundle keeps the shape (dispatch rejects empty upstream).
-        let empty = bundle_payload(Vec::new());
+        let empty = serde_json::to_value(bundle_payload(Vec::new())).expect("wire");
         assert_eq!(empty["params"][1]["encoding"], "base64");
     }
 
@@ -641,29 +731,33 @@ mod tests {
             ("Failed", BundleStatus::Failed),
             ("Invalid", BundleStatus::Invalid),
         ] {
-            let body: serde_json::Value =
-                serde_json::from_str(&inflight_body(status)).expect("json");
-            assert_eq!(parse_inflight_status(&body, "B1"), want, "{status}");
+            assert_eq!(
+                parse_inflight_status(&inflight_body(status), "B1"),
+                want,
+                "{status}"
+            );
         }
         // Wrong bundle, unknown state, and schema breaks stay Unknown
         // (callers keep polling the signature, never terminal).
-        let body: serde_json::Value =
-            serde_json::from_str(&inflight_body("Pending")).expect("json");
-        assert_eq!(parse_inflight_status(&body, "B9"), BundleStatus::Unknown);
-        let body: serde_json::Value =
-            serde_json::from_str(&inflight_body("Weird")).expect("json");
-        assert_eq!(parse_inflight_status(&body, "B1"), BundleStatus::Unknown);
-        let body: serde_json::Value = serde_json::from_str("{}").expect("json");
-        assert_eq!(parse_inflight_status(&body, "B1"), BundleStatus::Unknown);
+        assert_eq!(
+            parse_inflight_status(&inflight_body("Pending"), "B9"),
+            BundleStatus::Unknown
+        );
+        assert_eq!(
+            parse_inflight_status(&inflight_body("Weird"), "B1"),
+            BundleStatus::Unknown
+        );
+        assert_eq!(parse_inflight_status("{}", "B1"), BundleStatus::Unknown);
     }
 
     #[test]
     fn tip_floor_parses_median_sol_to_lamports() {
-        let body: serde_json::Value = serde_json::from_str(
-            r#"[{"time":"2024-09-01T12:58:00Z","landed_tips_25th_percentile":6e-06,"landed_tips_50th_percentile":1e-05,"landed_tips_75th_percentile":3.6e-05}]"#,
-        )
-        .expect("json");
-        assert_eq!(parse_tip_floor_lamports(&body), 10_000);
+        assert_eq!(
+            parse_tip_floor_lamports(
+                r#"[{"time":"2024-09-01T12:58:00Z","landed_tips_25th_percentile":6e-06,"landed_tips_50th_percentile":1e-05,"landed_tips_75th_percentile":3.6e-05}]"#,
+            ),
+            10_000
+        );
         for bad in [
             "[]",
             "[{}]",
@@ -672,8 +766,7 @@ mod tests {
             r#"[{"landed_tips_50th_percentile":-1.0}]"#,
             r#"[{"landed_tips_50th_percentile":"much"}]"#,
         ] {
-            let body: serde_json::Value = serde_json::from_str(bad).expect("json");
-            assert_eq!(parse_tip_floor_lamports(&body), 0, "{bad}");
+            assert_eq!(parse_tip_floor_lamports(bad), 0, "{bad}");
         }
     }
 

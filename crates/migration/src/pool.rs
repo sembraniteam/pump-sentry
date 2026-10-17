@@ -209,18 +209,10 @@ mod tests {
             "mainnet" => include_str!("../tests/fixtures/raydium_pool_mainnet.json"),
             unknown => panic!("unknown pool fixture: {unknown}"),
         };
-        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
-        let parse = |s: &str| {
-            use std::str::FromStr;
-            Pubkey::from_str(v[s].as_str().expect("pubkey str")).expect("pubkey")
-        };
-        let data: Vec<u8> = v["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|b| b.as_u64().expect("byte") as u8)
-            .collect();
-        (parse("amm"), parse("owner"), data)
+        let fixture = crate::test_fixture::pool_fixture(raw);
+        let amm = fixture.amm.parse().expect("amm pubkey");
+        let owner = fixture.owner.parse().expect("owner pubkey");
+        (amm, owner, fixture.data)
     }
 
     #[test]

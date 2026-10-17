@@ -209,7 +209,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 /// Daemon identity in the pid file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PidInfo {
     pub pid: u32,
     pub live: bool,
@@ -217,41 +217,14 @@ pub struct PidInfo {
 }
 
 impl PidInfo {
-    /// Serialize (hand-rolled JSON).
+    /// Serialize for the pid file. Plain scalars: cannot fail.
     pub fn to_json(&self) -> String {
-        format!(
-            "{{\"pid\":{},\"live\":{},\"started_at\":{}}}",
-            self.pid, self.live, self.started_at
-        )
+        serde_json::to_string(self).expect("pid info serializes")
     }
 
     /// Parse `to_json`; `None` on mismatch.
     pub fn from_json(raw: &str) -> Option<Self> {
-        let raw = raw.trim();
-        let raw = raw.strip_prefix('{')?.strip_suffix('}')?;
-        let mut pid = None;
-        let mut live = None;
-        let mut started_at = None;
-        for part in raw.split(',') {
-            let (k, v) = part.split_once(':')?;
-            match k.trim().trim_matches('"') {
-                "pid" => pid = v.trim().parse().ok(),
-                "live" => {
-                    live = match v.trim() {
-                        "true" => Some(true),
-                        "false" => Some(false),
-                        _ => None,
-                    };
-                }
-                "started_at" => started_at = v.trim().parse().ok(),
-                _ => {}
-            }
-        }
-        Some(Self {
-            pid: pid?,
-            live: live?,
-            started_at: started_at?,
-        })
+        serde_json::from_str(raw).ok()
     }
 }
 
@@ -499,7 +472,7 @@ pub async fn shutdown_signal() {
 }
 
 /// Shutdown snapshot: what was open at the signal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ShutdownSummary {
     pub ts: u64,
     pub pid: u32,
@@ -511,35 +484,9 @@ pub struct ShutdownSummary {
 }
 
 impl ShutdownSummary {
-    /// Escape one JSON string.
-    fn esc(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 2);
-        out.push('"');
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out.push('"');
-        out
-    }
-
-    /// Serialize (hand-rolled, no deps).
+    /// Serialize for the shutdown card. Plain scalars: cannot fail.
     pub fn to_json(&self) -> String {
-        let join = |v: &[String]| v.iter().map(|s| Self::esc(s)).collect::<Vec<_>>().join(",");
-        format!(
-            "{{\"ts\":{},\"pid\":{},\"live\":{},\"paper_open\":[{}],\"live_tracked\":[{}],\"watchlist_pending\":{},\"clean\":{}}}",
-            self.ts,
-            self.pid,
-            self.live,
-            join(&self.paper_open),
-            join(&self.live_tracked),
-            self.watchlist_pending,
-            self.clean
-        )
+        serde_json::to_string(self).expect("shutdown summary serializes")
     }
 }
 
@@ -911,12 +858,16 @@ pub fn cmd_sell(mint: &str) {
 /// that is not a base58 pubkey (same check as `cmd_sell`, so a queued
 /// `"ABC"` can never match a file name the daemon would honor).
 pub fn sell_request_body_mint(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let mint = value.get("mint")?.as_str()?;
-    if mint.is_empty() || executor::parse_pubkey(mint).is_err() {
+    /// `cmd_sell`'s request body (`{"mint": "...", "ts": ...}`).
+    #[derive(serde::Deserialize)]
+    struct SellRequest {
+        mint: String,
+    }
+    let request: SellRequest = serde_json::from_str(body).ok()?;
+    if request.mint.is_empty() || executor::parse_pubkey(&request.mint).is_err() {
         return None;
     }
-    Some(mint.to_string())
+    Some(request.mint)
 }
 
 /// Release repo mirrored from `install.sh`.
@@ -992,8 +943,13 @@ pub fn release_asset_name() -> Option<String> {
 /// `tag_name` out of a `releases/latest` JSON body. `None` when the
 /// shape is wrong (no releases, API error page) — never guess a tag.
 pub fn latest_tag_from_json(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    value.get("tag_name")?.as_str().map(str::to_string)
+    /// `releases/latest` body: only the tag matters here.
+    #[derive(serde::Deserialize)]
+    struct ReleaseLatest {
+        #[serde(default)]
+        tag_name: Option<String>,
+    }
+    serde_json::from_str::<ReleaseLatest>(body).ok()?.tag_name
 }
 
 /// GET bytes via `curl` (same dependency `install.sh` requires).

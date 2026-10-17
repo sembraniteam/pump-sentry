@@ -222,13 +222,7 @@ mod tests {
             "mainnet" => include_str!("../../migration/tests/fixtures/raydium_pool_mainnet.json"),
             unknown => panic!("unknown pool fixture: {unknown}"),
         };
-        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
-        v["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|b| b.as_u64().expect("byte") as u8)
-            .collect()
+        crate::test_fixture::pool_fixture(raw).data
     }
 
     /// Nonce byte of a V4 pool (`AmmInfo.nonce` at 8..16).
@@ -256,15 +250,10 @@ mod tests {
         use migration::pool::RaydiumV4Pool;
         use std::str::FromStr;
         let raw = include_str!("../../migration/tests/fixtures/raydium_pool_fartcoin.json");
-        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
-        let parse = |s: &str| Pubkey::from_str(v[s].as_str().expect("pubkey str")).expect("pubkey");
-        let (amm, owner) = (parse("amm"), parse("owner"));
-        let data: Vec<u8> = v["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|b| b.as_u64().expect("byte") as u8)
-            .collect();
+        let fixture = crate::test_fixture::pool_fixture(raw);
+        let parse = |s: &str| Pubkey::from_str(s).expect("pubkey");
+        let (amm, owner) = (parse(&fixture.amm), parse(&fixture.owner));
+        let data = fixture.data;
         let pool = RaydiumV4Pool::parse_validated(
             &amm,
             &data,

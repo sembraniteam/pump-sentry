@@ -222,11 +222,9 @@ mod tests {
     fn replay_mainnet_buy_v2_swap() {
         // Frozen mainnet `buy_v2`: trader resolves to the fee payer with
         // the exact on-chain amount (3_485_709_524_202 base units).
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/create_v2_mainnet.json"))
-                .expect("fixture");
-        let fetched: EncodedConfirmedTransactionWithStatusMeta =
-            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../../tests/fixtures/create_v2_mainnet.json"
+        ));
         let records = extract_pump_swaps(&fetched, "sig");
         let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
         assert_eq!(buys.len(), 1);
@@ -241,11 +239,9 @@ mod tests {
     fn replay_mainnet_buy_v2_amount_matches_balance_delta() {
         // Independent proof: the buyer's token-balance delta equals the
         // classified amount to the unit.
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/create_v2_mainnet.json"))
-                .expect("fixture");
-        let fetched: EncodedConfirmedTransactionWithStatusMeta =
-            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../../tests/fixtures/create_v2_mainnet.json"
+        ));
         let records = extract_pump_swaps(&fetched, "sig");
         let buy = records
             .iter()
@@ -272,11 +268,9 @@ mod tests {
     fn replay_mainnet_buy_v2_second_sample() {
         // Second independent `buy_v2`: same attribution, amount matches
         // the balance delta to the unit (8_671_591_758_466).
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/buy_v2_second_mainnet.json"))
-                .expect("fixture");
-        let fetched: EncodedConfirmedTransactionWithStatusMeta =
-            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../../tests/fixtures/buy_v2_second_mainnet.json"
+        ));
         let records = extract_pump_swaps(&fetched, "sig");
         let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
         assert_eq!(buys.len(), 1);
@@ -291,11 +285,9 @@ mod tests {
     fn replay_mainnet_sell_v2_swap() {
         // Frozen mainnet `sell_v2`: trader resolves to the fee payer with
         // the exact on-chain amount (balance-delta cross-checked off-test).
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/sell_v2_mainnet.json"))
-                .expect("fixture");
-        let fetched: EncodedConfirmedTransactionWithStatusMeta =
-            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../../tests/fixtures/sell_v2_mainnet.json"
+        ));
         assert_eq!(fetched.slot, 455676914);
         let records = extract_pump_swaps(&fetched, "sig");
         let sells: Vec<_> = records
@@ -314,11 +306,9 @@ mod tests {
     fn replay_mainnet_sell_v2_second_sample() {
         // Second independent `sell_v2` (SOL-quoted): amount matches the
         // seller's token-balance delta to the unit (1_679_259_586_074).
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/sell_v2_second_mainnet.json"))
-                .expect("fixture");
-        let fetched: EncodedConfirmedTransactionWithStatusMeta =
-            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../../tests/fixtures/sell_v2_second_mainnet.json"
+        ));
         assert_eq!(fetched.slot, 455844140);
         let records = extract_pump_swaps(&fetched, "sig");
         let sells: Vec<_> = records
@@ -875,11 +865,9 @@ mod tests {
     fn replay_real_migrate_v2_fixture() {
         // Real mainnet MigrateV2 (PumpSwap) transaction, fetched once and
         // frozen: proves the live wire shape decodes and classifies.
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/migrate_v2_pumpswap.json"))
-                .expect("fixture");
-        let fetched: EncodedConfirmedTransactionWithStatusMeta =
-            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../../tests/fixtures/migrate_v2_pumpswap.json"
+        ));
         assert_eq!(fetched.slot, 455487811);
         let Some((keys, decoded, logs)) = decode_migration_tx(&fetched) else {
             panic!("fixture must decode");
@@ -911,11 +899,9 @@ mod tests {
         // Same frozen MigrateV2 tx: the pool sits at accounts[10] of
         // the pump `migrate_v2` ix (per pump IDL), proven by the live
         // pool account it points at.
-        let raw: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/migrate_v2_pumpswap.json"))
-                .expect("fixture");
-        let fetched: EncodedConfirmedTransactionWithStatusMeta =
-            serde_json::from_value(raw["result"].clone()).expect("decode");
+        let fetched = crate::test_fixture::confirmed_tx(include_str!(
+            "../../tests/fixtures/migrate_v2_pumpswap.json"
+        ));
         let Some((_, decoded, _)) = decode_migration_tx(&fetched) else {
             panic!("fixture must decode");
         };

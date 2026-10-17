@@ -135,16 +135,12 @@ async fn raydium_authority_and_bundle_simulate() {
             MAINNET_MINT,
         ),
     ] {
-        let raw = std::fs::read_to_string(fixture).expect("fixture readable");
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("fixture json");
-        let p = |s: &str| Pubkey::from_str(v[s].as_str().expect("pubkey str")).expect("pubkey");
-        let (famm, fowner) = (p("amm"), p("owner"));
-        let fdata: Vec<u8> = v["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|b| b.as_u64().expect("byte") as u8)
-            .collect();
+        let fixture_pool = common::pool_fixture(fixture);
+        let (famm, fowner) = (
+            Pubkey::from_str(&fixture_pool.amm).expect("pubkey"),
+            Pubkey::from_str(&fixture_pool.owner).expect("pubkey"),
+        );
+        let fdata = fixture_pool.data;
         let fpool = migration::pool::RaydiumV4Pool::parse_validated(
             &famm,
             &fdata,

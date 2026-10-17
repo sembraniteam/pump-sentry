@@ -18,15 +18,22 @@ use tracing::{debug, warn};
 pub const FALLBACK_TIMEOUT: Duration = Duration::from_millis(300);
 /// Sampling temperature for near-deterministic output.
 pub const DEFAULT_TEMPERATURE: f32 = 0.1;
-/// Response token cap.
-pub const DEFAULT_MAX_TOKENS: u32 = 128;
+/// Response token cap. The budget is shared with the model's reasoning
+/// tokens (reasoning models think before they answer), so a small cap
+/// is spent entirely on reasoning: the content channel comes back
+/// empty and JSON-mode endpoints may reject the completion outright.
+/// The cap only truncates, it is never a generation target —
+/// non-reasoning models still stop at EOS.
+pub const DEFAULT_MAX_TOKENS: u32 = 1024;
 /// Max caller-configured timeout (clamped at build).
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(2);
 /// Min inference budget (clamped at build).
 pub const MIN_TIMEOUT: Duration = Duration::from_millis(50);
-/// Token budget bounds (clamped at build).
+/// Token budget bounds (clamped at build); reasoning can spend the
+/// whole budget before the answer, so the ceiling leaves headroom
+/// above the default.
 pub const MIN_MAX_TOKENS: u32 = 16;
-pub const MAX_MAX_TOKENS: u32 = 512;
+pub const MAX_MAX_TOKENS: u32 = 2048;
 
 /// Engine failures unrelated to model trouble.
 #[derive(Error, Debug)]
@@ -477,7 +484,10 @@ impl RiskEngine {
             // Non-2xx bodies carry the reason (unknown model, bad param,
             // missing header): log it truncated. Error payloads echo the
             // failure, never our secrets (bearer travels in the header,
-            // metrics are market data).
+            // metrics are market data). A JSON-mode rejection with an
+            // empty failed generation means the output budget ran out
+            // before the answer channel produced anything: raise the
+            // cap, not the prompt.
             let status = response.status();
             let detail = response
                 .text()
@@ -548,19 +558,21 @@ struct ResponseFormat {
     r#type: &'static str,
 }
 
-/// Minimal chat response shape (only what is consumed).
-#[derive(Debug, Clone, Deserialize)]
+/// Minimal chat response shape (only what is consumed). `Serialize` is
+/// for the test harness: canned HTTP bodies are built from this DTO, so
+/// a canned body can never carry a shape the decoder rejects.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChatResponse {
     #[serde(default)]
     choices: Vec<ChatChoice>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChatChoice {
     message: ChatContent,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChatContent {
     #[serde(default)]
     content: String,
@@ -654,11 +666,17 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Canned chat-completion wire body carrying `inner_json` as the
+    /// message content (built through the decoder's own DTO).
     fn chat_body(inner_json: &str) -> String {
-        serde_json::json!({
-            "choices": [{"message": {"content": inner_json}}]
+        serde_json::to_string(&ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatContent {
+                    content: inner_json.to_string(),
+                },
+            }],
         })
-        .to_string()
+        .expect("chat body serializes")
     }
 
     fn fast_engine(base: &str) -> RiskEngine {
@@ -702,6 +720,19 @@ mod tests {
         assert_eq!(FALLBACK_TIMEOUT, Duration::from_millis(300));
         let engine = RiskEngineBuilder::default().build().expect("engine");
         assert_eq!(engine.timeout, FALLBACK_TIMEOUT);
+    }
+
+    #[test]
+    fn default_token_budget_fits_reasoning_models() {
+        // A 128-token cap truncated reasoning models before the answer
+        // channel opened: the completion came back empty and JSON-mode
+        // endpoints rejected it. The default budget must fit reasoning
+        // + answer, and the ceiling must stay above it.
+        let engine = RiskEngineBuilder::default().build().expect("engine");
+        assert_eq!(engine.max_tokens, DEFAULT_MAX_TOKENS);
+        assert!(engine.max_tokens >= 512, "{}", engine.max_tokens);
+        assert!(engine.max_tokens > MIN_MAX_TOKENS);
+        assert!(engine.max_tokens < MAX_MAX_TOKENS);
     }
 
     #[test]
@@ -926,6 +957,10 @@ mod tests {
             r#"{"action":"BUY","tp_percent":-5.0,"sl_percent":3.0,"trailing_stop":false,"timeout_seconds":90}"#,
             r#"{"action":"BUY","tp_percent":90.0,"sl_percent":-8.0,"trailing_stop":true"#,
             "not json at all",
+            // Reasoning model that burned the whole budget before the
+            // answer channel (empty content; JSON-mode endpoints may
+            // reject this upstream as a 400 instead).
+            "",
         ] {
             let leaked: &'static str = Box::leak(chat_body(bad).into_boxed_str());
             let base = serve_scripted(vec![(0, 200, leaked)]).await;

@@ -9,6 +9,8 @@ pub mod instructions;
 pub mod quote;
 pub mod jito;
 pub mod raydium;
+#[cfg(test)]
+mod test_fixture;
 pub mod wallet;
 
 pub use executor::{

@@ -63,7 +63,7 @@ async fn mainnet_bundle_acceptance() {
 
     // 4. OUR exact wire path: encode -> payload (assert the A6 param!).
     let bundle = encode_bundle(std::slice::from_ref(&tx)).expect("encode");
-    let payload = bundle_payload(bundle.clone());
+    let payload = serde_json::to_value(bundle_payload(bundle.clone())).expect("payload serializes");
     assert_eq!(payload["method"], "sendBundle");
     assert_eq!(payload["params"][1]["encoding"], "base64");
 

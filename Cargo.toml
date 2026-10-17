@@ -31,6 +31,7 @@ executor = { path = "crates/executor" }
 ids = { path = "crates/ids" }
 migration = { path = "crates/migration" }
 alert = { path = "crates/alert" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
 thiserror = "2"
