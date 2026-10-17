@@ -2191,6 +2191,56 @@ async fn zero_liquidity_tick_defers_the_stop_loss() {
     assert_eq!(portfolio.history()[0].reason, ExitReason::StopLoss);
 }
 
+#[test]
+fn unpriceable_liquidity_covers_drained_reads() {
+    // Ticks carry parsed reserves: zero/NaN means a drained market or
+    // an unusable pool, never a missing read. Positive figures price.
+    assert!(unpriceable_liquidity(f64::NAN));
+    assert!(unpriceable_liquidity(f64::INFINITY));
+    assert!(unpriceable_liquidity(0.0));
+    assert!(unpriceable_liquidity(-1.0));
+    assert!(!unpriceable_liquidity(1.0));
+}
+
+#[tokio::test]
+async fn zero_liquidity_tick_defers_the_live_exit() {
+    // A live-only bag (no paper position) on a drained tick: the curve
+    // floor cannot price it, so a dispatch would burn a tip on a sell
+    // the chain must refuse. The attempt defers until a priced market
+    // returns, then the whole bag converges (nothing to mirror).
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    pipe.exec.live_positions.lock().await.insert(
+        MINT.to_string(),
+        LivePosition {
+            mint: pk(MINT),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000,
+            creator: None,
+        },
+    );
+    let mut drained = tick(MINT, 1.5);
+    drained.liquidity_usd = 0.0;
+    pipe.on_tick(&drained).await;
+    assert!(
+        live.sells().is_empty(),
+        "drained tick must not dispatch a sell"
+    );
+    assert!(pipe.exec.live_positions.lock().await.contains_key(MINT));
+    // A priced tick dispatches the full exit (ids-empty path, 1.0).
+    pipe.on_tick(&tick(MINT, 1.5)).await;
+    assert_eq!(live.sells(), vec![(MINT.to_string(), 1_000)]);
+    assert!(pipe.exec.live_positions.lock().await.is_empty());
+}
+
 #[tokio::test]
 async fn pending_buy_pins_the_watch_until_recheck() {
     // A late-confirmed buy is rechecked only on that mint's ticks:

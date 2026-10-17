@@ -13,7 +13,7 @@ use migration::VaultTicker;
 use risk_engine::{RiskEngine, StrategyMode};
 use simulator::{ExitReason, Mark, PaperPortfolio};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::live::{BuyFill, LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams};
 #[cfg(test)]
@@ -343,6 +343,13 @@ impl Screener for RpcScreener {
     }
 }
 
+/// A liquidity figure that cannot price a fill. Delivered ticks carry
+/// parsed reserves (`liquidity_usd` clamps non-positive to 0), so a
+/// zero/NaN here is a drained market or an unusable pool — not a
+/// missing read: exits defer instead of booking a fee-only fiction.
+fn unpriceable_liquidity(liquidity_usd: f64) -> bool {
+    !liquidity_usd.is_finite() || liquidity_usd <= 0.0
+}
 
 /// Shared state for event, gate, and ticker tasks. Generics allow stubs.
 pub struct Pipeline<
@@ -572,6 +579,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         self.exec.live_sell_locks.lock().await.remove(mint);
     }
 
+    /// Drained-tick notice: one warn per episode (tick-level noise is
+    /// worse than useless), debug while the same drain lasts. A drained
+    /// market holds everything — paper and live alike: the bag is real,
+    /// the exit is what has no price.
+    fn report_drained(&self, mint: &str, liquidity: f64, was_drained: bool, leg: &str) {
+        if was_drained {
+            debug!(%mint, %leg, "zero-liquidity tick — still deferred (same drained episode)");
+        } else {
+            warn!(%mint, liquidity, %leg,
+                "zero-liquidity tick — deferred until a priced market returns (no market to price a fill)");
+        }
+    }
+
     /// Close-path tail: unwatch when empty, hunt migrations. Idempotent.
     pub(crate) async fn maybe_unwatch(&self, tick: &PriceTick) {
         if !self
@@ -628,16 +648,32 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(mint = %tick.mint, age, observed_at = tick.observed_at, "stale curve tick — dropped");
             return;
         }
-        // Record the mark first. Never cache migrated curves.
-        if !tick.complete {
-            self.last_marks.lock().await.insert(
-                tick.mint.clone(),
-                (
-                    Mark { price: tick.price_usd, liquidity_usd: tick.liquidity_usd },
-                    tick.observed_at,
-                ),
-            );
-        }
+        // Record the mark first. Never cache migrated curves. The
+        // previous mark also tells whether this tick continues a
+        // drained episode: exits defer and the notice is per episode,
+        // not per tick (a drain can last many rounds).
+        let was_drained = {
+            let mut marks = self.last_marks.lock().await;
+            let was = marks
+                .get(&tick.mint)
+                .is_some_and(|(mark, _)| unpriceable_liquidity(mark.liquidity_usd));
+            if !tick.complete {
+                marks.insert(
+                    tick.mint.clone(),
+                    (
+                        Mark {
+                            price: tick.price_usd,
+                            liquidity_usd: tick.liquidity_usd,
+                        },
+                        tick.observed_at,
+                    ),
+                );
+            }
+            was
+        };
+        // Migration closes bypass (stale-spot Manual path below): a
+        // complete tick is not a drained market, it is a moved one.
+        let unpriceable = !tick.complete && unpriceable_liquidity(tick.liquidity_usd);
         // Per-mint lock.
         let _serial = self.mint_serial(&tick.mint).await;
         // Clone marks before the book guard (never nest locks).
@@ -662,9 +698,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let now = now_secs();
         if ids.is_empty() {
             drop(portfolio);
-            // No paper: retry live, recheck, maybe unwatch.
+            // No paper: retry live, recheck, maybe unwatch. A tick with
+            // no usable liquidity defers the live attempt too: the
+            // curve floor cannot price it, so a dispatch would burn a
+            // tip on a sell the chain must refuse. (Pool legs price off
+            // vault reserves and ride complete ticks — never deferred.)
             if self.exec.is_tracked(&tick.mint).await {
-                self.live_sell(&tick.mint, tick.price_usd, tick.liquidity_usd, 1.0).await;
+                if unpriceable {
+                    self.report_drained(&tick.mint, tick.liquidity_usd, was_drained, "live exit");
+                } else {
+                    self.live_sell(&tick.mint, tick.price_usd, tick.liquidity_usd, 1.0)
+                        .await;
+                }
             }
             self.recheck_live_pending().await;
             self.maybe_unwatch(tick).await;
@@ -678,14 +723,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.maybe_unwatch(tick).await;
                 return;
             }
-            // A live tick with no liquidity cannot price an exit. A
+            // A tick with no usable liquidity cannot price an exit. A
             // stop-loss must never book a fill into a drained pool:
-            // defer instead (fail closed; the position stays held).
-            // Migration closes bypass (stale-spot Manual path below).
-            if !tick.complete && (!tick.liquidity_usd.is_finite() || tick.liquidity_usd <= 0.0) {
+            // defer instead (fail closed; the position stays held, heat
+            // stays occupied, and the breaker books nothing until a
+            // priced exit — no market, no fill). Migration closes
+            // bypass (stale-spot Manual path below).
+            if unpriceable {
                 drop(portfolio);
-                warn!(mint = %tick.mint, liquidity = tick.liquidity_usd,
-                    "zero-liquidity tick — paper exits deferred (no market to price a fill)");
+                self.report_drained(&tick.mint, tick.liquidity_usd, was_drained, "paper exits");
                 self.recheck_live_pending().await;
                 self.maybe_unwatch(tick).await;
                 return;

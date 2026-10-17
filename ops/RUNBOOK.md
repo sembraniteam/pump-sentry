@@ -69,13 +69,24 @@ nothing held). A kept file is normal while the live leg still holds.
   per line. **Never delete it** unless every tracked/manual bag is
   verified exited on-chain; boot replays it into pending/positions/
   manual. Corrupt lines are skipped loudly (`skipped` count).
+- Boot ends with a per-mint chain check (`verified/unbacked/handed_off/
+  excess/unreadable/awaiting_confirm` in the replay log): a mint whose
+  replayed claims (`tracked + parked`) exceed the wallet's ATA balance
+  is suppressed in memory — no auto-exit at an unverified size — and
+  gets ONE manual note at the **chain** amount while no note covers it
+  yet (`boot-balance-mismatch`; the WAL lines stay untouched). Claims
+  below the balance only warn (unexplained excess); a mint with an
+  unconfirmed buy is skipped until that recheck resolves. The check
+  never writes the claim file, so it repeats identically every boot
+  until the bag is exited or the file is retired.
 
 ## 5. Parked bags (`MINT`, `MINT#2-…`, `MINT#late-…`)
 
-Give-ups and unknown fills park here and stop automated probing —
-this is custody, not a bug. Exit each via `sell <mint>`. Second fills
-park suffixed without clobbering the first; review every suffixed bag
-on the explorer (bundle UUID in the alert card).
+Give-ups, unknown fills, and boot chain mismatches park here and stop
+automated probing — this is custody, not a bug. Exit each via
+`sell <mint>`. Second fills park suffixed without clobbering the
+first; review every suffixed bag on the explorer (bundle UUID in the
+alert card).
 
 ## 6. Logs (no restart needed)
 
@@ -90,6 +101,7 @@ The supervisor also rotates ≥50 MB logs at start time as a backstop.
 | No entries for hours          | Gate quorums unmet / day-loss tripped / public RPC throttled (drops) | `logs`, heartbeat card, use dedicated RPC                         |
 | `diverged` alerts             | Live buy skipped/failed, paper uncovered                             | Review, fund, or accept paper-only                                |
 | Exits stalled, SOL/USD stale  | Price feed down (DexScreener; Jupiter retired)                           | By design (no static fallback); exits resume on recovery          |
+| `zero-liquidity tick` warns   | Curve/pool drained (a tick carries parsed reserves, so this is a real empty market, not a read miss) | By design: no fee-only fiction for a stop-loss. The bag stays held (paper and live, heat stays occupied, breaker books nothing) and exits resume on a priced tick; migration closes bypass. Last resort: `sell <mint>` |
 | `MANUAL REVIEW REQUIRED`      | Unknown fill / retries exhausted                                     | Explorer first, then `sell <mint>`                                |
 | `INGESTION BANNED` card       | Geyser 429s for ~30 min straight (quota/exhaustion, not burst)       | **Stop the bot.** Check token/quota/dashboard; wait out the cycle or upgrade tier. To keep running blind-free: clear `yellowstone_endpoint` (WS mode) and restart. Retries hourly on its own; backfill covers only the newest ~25s after recovery |
 | Negative execution-gap avg    | Live trails paper (congestion tips, landing latency, stale exits)     | Widen slippage, lower notional, or accept the haircut explicitly  |

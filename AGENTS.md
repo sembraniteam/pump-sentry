@@ -81,21 +81,43 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   bag, so key/amount-based netting can silently delete tracked
   custody (and compaction writes positions before manual). The parked
   note lingers by design; `take_manual` retires it. Boot chain
-  check: `reconcile_boot_custody` (main.rs) reads each bag's ATA
+  check: `reconcile_boot_custody` (main.rs) sums each mint's replayed
+  claims (tracked + parked manual, per mint — the ATA is per mint,
+  not per bag) and reads it ONCE
   (`SwapExecutor::observe_token_balance`; `Ok(None)` = no ATA = zero
-  held) and a definite ledger↔chain mismatch parks the bag manual —
-  never auto-exit an unverified size. An unreadable balance warns and
-  keeps the bag tracked (dispatch preflights still fail closed). SOL
-  is reconstructed by the funding report at boot + per-dispatch
-  solvency, not by the WAL.
-- Live ticks with non-positive/NaN liquidity defer ALL paper exits
-  (`Pipeline::on_tick`): a stop-loss must never book a fee-only fill
-  into a drained pool — the bag stays held and loud until a priced
-  market returns (migration closes bypass; live attempts still fail
-  closed on-chain). A pending buy pins the mint's watch
-  (`PendingStore::has_pending_for` via `maybe_unwatch`): late-confirm
-  rechecks ride that mint's ticks, so dropping the watch would strand
-  the buy unresolved.
+  held). Claims == chain keeps both (a parked bag plus a real re-buy
+  is one such sum); claims < chain keeps both and warns (unexplained
+  excess); claims > chain suppresses the tracked copy in memory —
+  never auto-exit an unverified size — and hands off at most ONE
+  manual note at the CHAIN amount, only while no note covers the mint
+  (repeated boots must never stack claims; the WAL lines are never
+  rewritten by the check — the file is the claim of record and
+  suppression is idempotent). Mints with an unconfirmed buy are
+  skipped (the late-confirm recheck owns that claim). An unreadable
+  balance warns and keeps the claims (dispatch preflights still fail
+  closed). Mid-run drift needs no periodic job: every dispatch
+  preflights the chain (`preflight_buy` solvency; `held >= amount` in
+  `preflight_sell`, `preflight_sell_raydium`,
+  `preflight_sell_pumpswap`). SOL is reconstructed by the funding
+  report at boot + per-dispatch solvency, not by the WAL.
+- Ticks with non-positive/NaN liquidity are unpriceable
+  (`unpriceable_liquidity`): a delivered tick carries parsed reserves
+  (the ticker clamps non-positive to 0), so this is a drained market
+  or an unusable pool — NOT a missing read. `Pipeline::on_tick` then
+  defers BOTH sides: paper exits (a stop-loss must never book a
+  fee-only fill into a drained pool) and the ids-empty live attempt
+  (the curve floor cannot price it; the dispatch would burn a tip on
+  a sell the chain must refuse; the ids-empty path sells the WHOLE
+  remainder — a boot-restored bag has no paper to mirror, so its exit
+  is all-or-nothing). The bag stays held, heat stays
+  occupied, and the breaker books nothing until a priced exit — no
+  market, no fill, by design. The notice is one warn per drained
+  episode (per-mint mark, `report_drained`), debug while it lasts;
+  migration closes bypass (a complete tick is a moved market, and its
+  pool leg prices off vault reserves). A pending buy pins the mint's
+  watch (`PendingStore::has_pending_for` via `maybe_unwatch`):
+  late-confirm rechecks ride that mint's ticks, so dropping the watch
+  would strand the buy unresolved.
 - Skills are strong defaults, **not ground truth**:
   the Jito skill once omitted the mandatory `{"encoding":"base64"}`
   param and every bundle was refused (`-32602`). Wire formats must be

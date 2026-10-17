@@ -11,6 +11,7 @@ mod pipeline;
 mod settings;
 mod wal;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -23,6 +24,7 @@ use listener::{DevScreenConfig, ListenerConfig, PumpFunListener, RpcScreener};
 use migration::{PoolTick, VaultTicker};
 use risk_engine::RiskEngine;
 use simulator::PaperPortfolio;
+use solana_pubkey::Pubkey;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -138,9 +140,9 @@ async fn replay_live_wal(
         }
     }
     // Re-watch before loops start. Failures keep bags tracked.
-    // Chain-side check first: a WAL amount is a claim, the ATA
-    // balance is custody.
-    let (verified, parked, unreadable) = reconcile_boot_custody(pipeline).await;
+    // Chain-side check first: WAL amounts are claims, ATA balances
+    // are custody.
+    let custody = reconcile_boot_custody(pipeline).await;
     let mut unwatched = 0usize;
     watched.sort();
     watched.dedup();
@@ -155,90 +157,165 @@ async fn replay_live_wal(
         positions = n_positions,
         manual = n_manual,
         guarded = n_guarded,
-        verified,
-        parked,
-        unreadable,
+        verified = custody.verified,
+        unbacked = custody.unbacked,
+        handed_off = custody.handed_off,
+        excess = custody.excess,
+        unreadable = custody.unreadable,
+        awaiting_confirm = custody.awaiting_confirm,
         unwatched,
         file = %path.display(),
         "WAL replay: recovered live custody from unclean shutdown; MANUAL REVIEW REQUIRED (delete the file to clear resolved bags)"
     );
 }
 
-/// Boot chain check (live): every replayed bag's ledger amount must
-/// match the wallet's ATA balance. A definite mismatch parks the bag
-/// manual — a bag is never auto-exited at an unverified size. An
-/// unreadable balance is loud but keeps the bag tracked (the dispatch
-/// preflights still fail closed).
+/// Replayed custody claims for one mint: the tracked copy plus every
+/// parked manual note, summed (the ATA is per mint, not per bag).
+#[derive(Default)]
+struct MintClaims {
+    tracked: u64,
+    manual: u64,
+    /// Map keys carrying the tracked claim; a suppression removes them.
+    tracked_keys: Vec<String>,
+}
+
+/// Verdict of the boot chain check for one mint (pure).
+#[derive(Debug, PartialEq, Eq)]
+enum BootCustody {
+    /// The ATA backs the claims exactly (one bag or several): keep.
+    Keep,
+    /// The ATA holds more than claimed: every claim is backed, keep
+    /// and warn (the excess is unexplained: airdrop, external send).
+    Excess,
+    /// The ATA holds less than claimed: the tracked copy's size is
+    /// unproven — suppress it (never auto-exit an unverified size).
+    /// `handoff` is the one manual note to write instead: the CHAIN
+    /// amount, and only while no note covers the mint yet and the
+    /// chain still holds something (nothing to exit otherwise).
+    SuppressTracked { handoff: Option<u64> },
+}
+
+/// Boot rule (pure). Claims are compared per mint, never per bag: two
+/// legit bags of the same mint (parked + re-bought) sum to the ATA and
+/// stay, while a parked note replayed next to a resurrected tracked
+/// copy of the SAME bag exceeds it and suppresses the copy. Repeated
+/// boots must never stack claims: the hand-off note is written once
+/// and the WAL lines stay untouched.
+fn boot_custody(tracked: u64, manual: u64, chain: u64) -> BootCustody {
+    match tracked.saturating_add(manual).cmp(&chain) {
+        std::cmp::Ordering::Equal => BootCustody::Keep,
+        std::cmp::Ordering::Less => BootCustody::Excess,
+        std::cmp::Ordering::Greater => BootCustody::SuppressTracked {
+            handoff: (manual == 0 && chain > 0).then_some(chain),
+        },
+    }
+}
+
+/// Boot chain check counters (at most one mint each).
+#[derive(Default)]
+struct BootCustodyCounts {
+    verified: usize,
+    unbacked: usize,
+    handed_off: usize,
+    excess: usize,
+    unreadable: usize,
+    awaiting_confirm: usize,
+}
+
+/// Boot chain check (live): the replayed WAL holds the claim, the ATA
+/// balance is custody. Per mint, tracked + parked amounts are summed
+/// and read against the chain ONCE:
+/// - claims match: keep both;
+/// - claims exceed: suppress the tracked copy in memory (no auto-exit
+///   at an unverified size) and hand off one manual note at the chain
+///   amount while no note covers the mint yet. The WAL lines stay
+///   untouched — the file is the claim of record and suppression
+///   substitutes nothing for it, so it is idempotent across boots;
+/// - claims fall short: keep (every claim is backed) and warn.
+///
+/// Mints with an unconfirmed buy are skipped (the late-confirm recheck
+/// still owns their claim). An unreadable balance warns and keeps the
+/// claims tracked (dispatch preflights still fail closed).
 async fn reconcile_boot_custody(
     pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
-) -> (usize, usize, usize) {
+) -> BootCustodyCounts {
     let Some(trader) = pipeline.exec.live.as_ref() else {
-        return (0, 0, 0);
+        return BootCustodyCounts::default();
     };
-    // Snapshot under the lock; read the chain without it.
-    let mut tracked: Vec<(String, live::LivePosition)> = Vec::new();
+    // Snapshot per mint under the locks; read the chain without them.
+    let mut claims: BTreeMap<Pubkey, MintClaims> = BTreeMap::new();
     for (key, pos) in pipeline.exec.live_positions.lock().await.iter() {
-        tracked.push((key.clone(), pos.clone()));
+        let claim = claims.entry(pos.mint).or_default();
+        claim.tracked = claim.tracked.saturating_add(pos.amount_tokens);
+        claim.tracked_keys.push(key.clone());
     }
-    let mut manual: Vec<(String, live::LivePosition)> = Vec::new();
-    for (key, pos) in pipeline.exec.live_manual.lock().await.iter() {
-        manual.push((key.clone(), pos.clone()));
+    for pos in pipeline.exec.live_manual.lock().await.values() {
+        let claim = claims.entry(pos.mint).or_default();
+        claim.manual = claim.manual.saturating_add(pos.amount_tokens);
     }
-    let mut verified = 0usize;
-    let mut parked = 0usize;
-    let mut unreadable = 0usize;
-    for (key, pos) in &tracked {
-        match trader.observe_token_balance(&pos.mint).await {
-            Ok(Some(chain)) if chain == pos.amount_tokens => verified += 1,
-            Ok(chain) => {
-                let chain = chain.unwrap_or(0);
-                warn!(mint = %pos.mint, ledger = pos.amount_tokens, chain,
-                    "boot reconcile: tracked bag does not match the wallet ATA; parking manual (no auto-exit at an unverified size)");
-                if let Some(held) = pipeline
-                    .exec
-                    .live_positions
-                    .lock()
-                    .await
-                    .remove(key.as_str())
-                {
-                    trader.record_manual(&held, "boot-balance-mismatch");
-                    let mut manual = pipeline.exec.live_manual.lock().await;
-                    // Same mint can hold a separate parked bag; keys
-                    // must not collide across the maps.
-                    let dest = if manual.contains_key(key.as_str()) {
-                        format!("{key}#boot-{parked}")
-                    } else {
-                        key.clone()
-                    };
-                    manual.insert(dest, held);
-                    parked += 1;
+    let mut counts = BootCustodyCounts::default();
+    for (mint, claim) in claims {
+        if trader.has_pending_for(&mint.to_string()) {
+            counts.awaiting_confirm += 1;
+            continue;
+        }
+        let chain = match trader.observe_token_balance(&mint).await {
+            Ok(chain) => chain.unwrap_or(0),
+            Err(e) => {
+                counts.unreadable += 1;
+                warn!(%mint, tracked = claim.tracked, manual = claim.manual, error = %e,
+                    "boot reconcile: ATA balance unreadable; claims kept (preflights still fail closed)");
+                continue;
+            }
+        };
+        match boot_custody(claim.tracked, claim.manual, chain) {
+            BootCustody::Keep => counts.verified += 1,
+            BootCustody::Excess => {
+                counts.excess += 1;
+                warn!(%mint, tracked = claim.tracked, manual = claim.manual, chain,
+                    "boot reconcile: chain holds MORE than the replayed claims; claims kept (unexplained excess, verify on explorer)");
+            }
+            BootCustody::SuppressTracked { handoff } => {
+                counts.unbacked += 1;
+                let mut suppressed: Option<(String, live::LivePosition)> = None;
+                for key in &claim.tracked_keys {
+                    if let Some(held) = pipeline
+                        .exec
+                        .live_positions
+                        .lock()
+                        .await
+                        .remove(key.as_str())
+                    {
+                        suppressed.get_or_insert((key.clone(), held));
+                    }
+                }
+                match suppressed {
+                    Some((key, pos)) => {
+                        warn!(%mint, tracked = claim.tracked, manual = claim.manual, chain,
+                            "boot reconcile: chain holds LESS than the replayed claims; tracked copy suppressed (no auto-exit at an unverified size)");
+                        if let Some(amount) = handoff {
+                            // Hand off at the CHAIN amount: what can
+                            // really be exited, not the distrusted claim.
+                            let held = live::LivePosition {
+                                amount_tokens: amount,
+                                ..pos
+                            };
+                            warn!(%mint, amount, "boot reconcile: manual note handed off (verify, then exit)");
+                            trader.record_manual(&held, "boot-balance-mismatch");
+                            pipeline.exec.park_manual(key, held).await;
+                            counts.handed_off += 1;
+                        }
+                    }
+                    // A parked note only: the operator's own claim.
+                    None => {
+                        warn!(%mint, manual = claim.manual, chain,
+                            "boot reconcile: parked claim exceeds the chain; verify the size before the manual exit");
+                    }
                 }
             }
-            Err(e) => {
-                unreadable += 1;
-                warn!(mint = %pos.mint, error = %e,
-                    "boot reconcile: ATA balance unreadable; bag kept tracked (preflights still fail closed)");
-            }
         }
     }
-    // Parked bags take no auto-exit — the operator needs the same
-    // size check before the manual sell.
-    for (key, pos) in &manual {
-        match trader.observe_token_balance(&pos.mint).await {
-            Ok(Some(chain)) if chain == pos.amount_tokens => verified += 1,
-            Ok(chain) => {
-                let chain = chain.unwrap_or(0);
-                warn!(key = %key, mint = %pos.mint, ledger = pos.amount_tokens, chain,
-                    "boot reconcile: parked bag does not match the wallet ATA; verify the size before the manual exit");
-            }
-            Err(e) => {
-                unreadable += 1;
-                warn!(key = %key, mint = %pos.mint, error = %e,
-                    "boot reconcile: parked bag ATA unreadable; verify before the manual exit");
-            }
-        }
-    }
-    (verified, parked, unreadable)
+    counts
 }
 
 /// Foreground pipeline.
@@ -1077,6 +1154,8 @@ async fn run_pipeline(live_arg: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::{BootCustody, boot_custody};
+
     /// Guards the rustls fix: a default must be installed.
     #[test]
     fn crypto_provider_installs() {
@@ -1089,6 +1168,39 @@ mod tests {
     fn heuristic_cap_within_audit_cap() {
         assert!(
             risk_engine::fallback::RUGCHECK_SCORE_CAP <= auditor::AuditPolicy::default().max_score
+        );
+    }
+
+    /// Per-mint boot verdicts: never a false park on two real bags,
+    /// never an auto-exit at an unverified size, one hand-off at most.
+    #[test]
+    fn boot_custody_pins_the_claim_shapes() {
+        use BootCustody::*;
+        // Chain backs the claims exactly (single bag, parked only).
+        assert_eq!(boot_custody(1_000, 0, 1_000), Keep);
+        assert_eq!(boot_custody(0, 400, 400), Keep);
+        // Parked note plus a real re-buy: sum matches, both stay.
+        assert_eq!(boot_custody(500, 500, 1_000), Keep);
+        // Resurrected parked bag: the SAME bag claimed twice.
+        assert_eq!(
+            boot_custody(1_000, 1_000, 1_000),
+            SuppressTracked { handoff: None }
+        );
+        // Ledger overstates: suppress and hand off at the chain size.
+        assert_eq!(
+            boot_custody(1_000, 0, 600),
+            SuppressTracked { handoff: Some(600) }
+        );
+        // Chain empty: nothing left to exit, no note.
+        assert_eq!(boot_custody(1_000, 0, 0), SuppressTracked { handoff: None });
+        // Parked note overstated: the operator's claim, no suppression.
+        assert_eq!(boot_custody(0, 400, 100), SuppressTracked { handoff: None });
+        // Chain holds more than claimed: every claim is backed.
+        assert_eq!(boot_custody(1_000, 0, 1_200), Excess);
+        // Saturation must not wrap into a false `Keep`.
+        assert_eq!(
+            boot_custody(u64::MAX, u64::MAX, 10),
+            SuppressTracked { handoff: None }
         );
     }
 }
