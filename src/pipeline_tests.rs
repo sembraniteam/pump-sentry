@@ -88,6 +88,8 @@ struct StubLiveInner {
     block_mint: StdMutex<Option<String>>,
     started: StdMutex<Vec<String>>,
     unblock: tokio::sync::Notify,
+    /// Mints with a simulated unconfirmed buy (late-confirm hook).
+    pending: StdMutex<Vec<String>>,
 }
 
 impl StubLive {
@@ -106,6 +108,7 @@ impl StubLive {
                 block_mint: StdMutex::new(None),
                 started: StdMutex::new(vec![]),
                 unblock: tokio::sync::Notify::new(),
+                pending: StdMutex::new(vec![]),
             }),
         }
     }
@@ -273,15 +276,23 @@ impl SellSink for StubLive {
 }
 
 impl PendingStore for StubLive {
-    // No unconfirmed-buy tracking: stub dispatches settle
-    // synchronously, so every pending query is visibly empty
-    // (previously inherited silent defaults).
+    // No unconfirmed buys of its own: the `pending` hook states a
+    // late-confirm scenario explicitly, empty by default.
     fn has_pending(&self) -> bool {
-        false
+        !self.inner.pending.lock().expect("lock").is_empty()
     }
 
     fn pending_mints(&self) -> Vec<String> {
-        Vec::new()
+        self.inner.pending.lock().expect("lock").clone()
+    }
+
+    fn has_pending_for(&self, mint: &str) -> bool {
+        self.inner
+            .pending
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|m| m == mint)
     }
 
     async fn prior_sell_pending(&self, _mint: &str) -> bool {
@@ -2132,6 +2143,95 @@ async fn tick_closes_on_take_profit_and_unwatches() {
     assert_eq!(trade.reason, ExitReason::TakeProfit);
     assert!(trade.net_pnl > 0.0);
     drop(portfolio);
+    assert_eq!(
+        pipe.reserves.unwatched.lock().expect("lock").as_slice(),
+        [MINT]
+    );
+}
+
+#[tokio::test]
+async fn zero_liquidity_tick_defers_the_stop_loss() {
+    // A drained pool cannot price an exit. The realizable stop must
+    // not book a fee-only fiction: the tick is deferred, the bag stays
+    // held, and the watch survives.
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(tick(MINT, 2.0));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        PaperPortfolio::new(100.0, 0.0),
+        screener,
+        None,
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    // Same breach as `paper_only_stop_fires_on_realizable_and_nets_bleed`
+    // (1.87 nets past -8%), but the pool reads empty: hold.
+    let mut drained = tick(MINT, 1.87);
+    drained.liquidity_usd = 0.0;
+    pipe.on_tick(&drained).await;
+    assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+    assert!(pipe.reserves.unwatched.lock().expect("lock").is_empty());
+    // Liquidity returns: the same price closes, so the hold above was
+    // the missing market, not a missing trigger.
+    pipe.on_tick(&tick(MINT, 1.87)).await;
+    let portfolio = pipe.portfolio.lock().await;
+    assert!(portfolio.position_ids().is_empty());
+    assert_eq!(portfolio.history()[0].reason, ExitReason::StopLoss);
+}
+
+#[tokio::test]
+async fn pending_buy_pins_the_watch_until_recheck() {
+    // A late-confirmed buy is rechecked only on that mint's ticks:
+    // unwatching while a buy is pending would strand it unresolved.
+    let live = StubLive::working();
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(tick(MINT, 2.0));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        funded(),
+        screener,
+        Some(live.clone()),
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    // A buy is still awaiting confirmation while the paper side closes
+    // (and the mirror sells the tracked bag): nothing else holds the mint.
+    live.inner
+        .pending
+        .lock()
+        .expect("lock")
+        .push(MINT.to_string());
+    pipe.on_tick(&tick(MINT, 3.0)).await;
+    assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+    assert!(pipe.exec.live_positions.lock().await.is_empty());
+    assert!(pipe.reserves.unwatched.lock().expect("lock").is_empty());
+    // Pending resolved: the next tick unwatches the empty mint.
+    live.inner.pending.lock().expect("lock").clear();
+    pipe.on_tick(&tick(MINT, 3.0)).await;
     assert_eq!(
         pipe.reserves.unwatched.lock().expect("lock").as_slice(),
         [MINT]

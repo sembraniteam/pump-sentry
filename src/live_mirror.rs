@@ -635,7 +635,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.exec.manual_holds_base(mint).await {
             return true;
         }
-        trader.pending_mints().iter().any(|m| m == mint)
+        trader.has_pending_for(mint)
     }
 
     /// Mirror a paper open with a real buy. Fails closed on stale SOL.

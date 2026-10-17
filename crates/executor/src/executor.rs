@@ -225,6 +225,13 @@ async fn rpc_timeout<T>(
     }
 }
 
+/// SPL token account amount: base layout `mint(32) owner(32)
+/// amount(u64)` (Token-2022 extensions follow the base fields). `None`
+/// when the data is too short — callers fail closed, never read 0.
+fn token_account_amount(data: &[u8]) -> Option<u64> {
+    data.get(64..72)?.try_into().ok().map(u64::from_le_bytes)
+}
+
 /// Mint supply for fee tiers (SPL Mint `supply @36..44`).
 /// `None` on failure; caller keeps the order guard.
 async fn mint_supply(rpc: &RpcClient, mint: &Pubkey) -> Option<u64> {
@@ -647,6 +654,32 @@ impl SwapExecutor {
             return None;
         }
         Some(account.owner)
+    }
+
+    /// Raw ATA balance of the trading wallet for `mint`, in base units.
+    /// `Ok(None)` when the ATA does not exist yet (nothing held);
+    /// `Err` when unreadable (mint/token program unknown, RPC doubt) —
+    /// callers must fail closed and never read `Err` as zero.
+    pub async fn observe_token_balance(&self, mint: &Pubkey) -> Result<Option<u64>, ExecutorError> {
+        let Some(token_program) = self.token_program(mint).await else {
+            return Err(ExecutorError::BadOrder(
+                "mint account unreadable; token program unknown".to_string(),
+            ));
+        };
+        let ata =
+            crate::instructions::user_ata_with_program(&self.wallet.pubkey(), mint, &token_program);
+        match tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&ata)).await {
+            Ok(Ok(account)) => token_account_amount(&account.data)
+                .map(Some)
+                .ok_or_else(|| {
+                    ExecutorError::BadOrder(format!(
+                        "token account data too short for {mint} (layout change?); refusing"
+                    ))
+                }),
+            Ok(Err(e)) if e.to_string().contains("AccountNotFound") => Ok(None),
+            Ok(Err(e)) => Err(ExecutorError::Rpc(e)),
+            Err(_) => Err(ExecutorError::Timeout("observe_token_balance")),
+        }
     }
 
     /// Fee-aware sell floor. Re-quotes the net from live state and
@@ -1158,12 +1191,9 @@ impl SwapExecutor {
                 "Token-2022 raydium vaults unproven; refusing (fail-closed)".to_string(),
             ));
         }
-        let vault_amount = |data: &[u8]| -> Option<u64> {
-            data.get(64..72)?.try_into().ok().map(u64::from_le_bytes)
-        };
         let (Some(base_reserve), Some(quote_reserve)) = (
-            vault_amount(&base_vault.data),
-            vault_amount(&quote_vault.data),
+            token_account_amount(&base_vault.data),
+            token_account_amount(&quote_vault.data),
         ) else {
             return Err(ExecutorError::BadOrder(
                 "raydium vault balances unreadable; refusing".to_string(),
@@ -1350,12 +1380,9 @@ impl SwapExecutor {
                 )));
             }
         }
-        let vault_amount = |data: &[u8]| -> Option<u64> {
-            data.get(64..72)?.try_into().ok().map(u64::from_le_bytes)
-        };
         let (Some(base_reserve), Some(quote_reserve)) = (
-            vault_amount(&base_vault.data),
-            vault_amount(&quote_vault.data),
+            token_account_amount(&base_vault.data),
+            token_account_amount(&quote_vault.data),
         ) else {
             return Err(ExecutorError::BadOrder(
                 "pumpswap vault balances unreadable; refusing".to_string(),
@@ -2066,6 +2093,15 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(matches!(err, ExecutorError::BadSignature { .. }));
+    }
+
+    #[test]
+    fn token_account_amount_reads_base_layout() {
+        let mut data = vec![0u8; 165];
+        data[64..72].copy_from_slice(&125u64.to_le_bytes());
+        assert_eq!(token_account_amount(&data), Some(125));
+        // Too short for the base layout: unreadable, never zero.
+        assert_eq!(token_account_amount(&data[..64]), None);
     }
 
     #[test]

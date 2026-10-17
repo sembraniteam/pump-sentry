@@ -75,7 +75,27 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   `blockhash`; `sell_pending` an optional `sig` + `blockhash` (all
   defaultable): they are the reconcile/expiry evidence the guards
   re-read at boot. Lines without them (pre-upgrade) can never prove
-  expiry: they park to manual instead of dropping.
+  expiry: they park to manual instead of dropping. Do NOT add replay
+  netting for `manual` lines: parking is a runtime-map move, and the
+  same mint can legitimately hold a parked bag AND a separate re-buy
+  bag, so key/amount-based netting can silently delete tracked
+  custody (and compaction writes positions before manual). The parked
+  note lingers by design; `take_manual` retires it. Boot chain
+  check: `reconcile_boot_custody` (main.rs) reads each bag's ATA
+  (`SwapExecutor::observe_token_balance`; `Ok(None)` = no ATA = zero
+  held) and a definite ledger↔chain mismatch parks the bag manual —
+  never auto-exit an unverified size. An unreadable balance warns and
+  keeps the bag tracked (dispatch preflights still fail closed). SOL
+  is reconstructed by the funding report at boot + per-dispatch
+  solvency, not by the WAL.
+- Live ticks with non-positive/NaN liquidity defer ALL paper exits
+  (`Pipeline::on_tick`): a stop-loss must never book a fee-only fill
+  into a drained pool — the bag stays held and loud until a priced
+  market returns (migration closes bypass; live attempts still fail
+  closed on-chain). A pending buy pins the mint's watch
+  (`PendingStore::has_pending_for` via `maybe_unwatch`): late-confirm
+  rechecks ride that mint's ticks, so dropping the watch would strand
+  the buy unresolved.
 - Skills are strong defaults, **not ground truth**:
   the Jito skill once omitted the mandatory `{"encoding":"base64"}`
   param and every bundle was refused (`-32602`). Wire formats must be

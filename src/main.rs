@@ -138,6 +138,9 @@ async fn replay_live_wal(
         }
     }
     // Re-watch before loops start. Failures keep bags tracked.
+    // Chain-side check first: a WAL amount is a claim, the ATA
+    // balance is custody.
+    let (verified, parked, unreadable) = reconcile_boot_custody(pipeline).await;
     let mut unwatched = 0usize;
     watched.sort();
     watched.dedup();
@@ -152,10 +155,90 @@ async fn replay_live_wal(
         positions = n_positions,
         manual = n_manual,
         guarded = n_guarded,
+        verified,
+        parked,
+        unreadable,
         unwatched,
         file = %path.display(),
         "WAL replay: recovered live custody from unclean shutdown; MANUAL REVIEW REQUIRED (delete the file to clear resolved bags)"
     );
+}
+
+/// Boot chain check (live): every replayed bag's ledger amount must
+/// match the wallet's ATA balance. A definite mismatch parks the bag
+/// manual — a bag is never auto-exited at an unverified size. An
+/// unreadable balance is loud but keeps the bag tracked (the dispatch
+/// preflights still fail closed).
+async fn reconcile_boot_custody(
+    pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
+) -> (usize, usize, usize) {
+    let Some(trader) = pipeline.exec.live.as_ref() else {
+        return (0, 0, 0);
+    };
+    // Snapshot under the lock; read the chain without it.
+    let mut tracked: Vec<(String, live::LivePosition)> = Vec::new();
+    for (key, pos) in pipeline.exec.live_positions.lock().await.iter() {
+        tracked.push((key.clone(), pos.clone()));
+    }
+    let mut manual: Vec<(String, live::LivePosition)> = Vec::new();
+    for (key, pos) in pipeline.exec.live_manual.lock().await.iter() {
+        manual.push((key.clone(), pos.clone()));
+    }
+    let mut verified = 0usize;
+    let mut parked = 0usize;
+    let mut unreadable = 0usize;
+    for (key, pos) in &tracked {
+        match trader.observe_token_balance(&pos.mint).await {
+            Ok(Some(chain)) if chain == pos.amount_tokens => verified += 1,
+            Ok(chain) => {
+                let chain = chain.unwrap_or(0);
+                warn!(mint = %pos.mint, ledger = pos.amount_tokens, chain,
+                    "boot reconcile: tracked bag does not match the wallet ATA; parking manual (no auto-exit at an unverified size)");
+                if let Some(held) = pipeline
+                    .exec
+                    .live_positions
+                    .lock()
+                    .await
+                    .remove(key.as_str())
+                {
+                    trader.record_manual(&held, "boot-balance-mismatch");
+                    let mut manual = pipeline.exec.live_manual.lock().await;
+                    // Same mint can hold a separate parked bag; keys
+                    // must not collide across the maps.
+                    let dest = if manual.contains_key(key.as_str()) {
+                        format!("{key}#boot-{parked}")
+                    } else {
+                        key.clone()
+                    };
+                    manual.insert(dest, held);
+                    parked += 1;
+                }
+            }
+            Err(e) => {
+                unreadable += 1;
+                warn!(mint = %pos.mint, error = %e,
+                    "boot reconcile: ATA balance unreadable; bag kept tracked (preflights still fail closed)");
+            }
+        }
+    }
+    // Parked bags take no auto-exit — the operator needs the same
+    // size check before the manual sell.
+    for (key, pos) in &manual {
+        match trader.observe_token_balance(&pos.mint).await {
+            Ok(Some(chain)) if chain == pos.amount_tokens => verified += 1,
+            Ok(chain) => {
+                let chain = chain.unwrap_or(0);
+                warn!(key = %key, mint = %pos.mint, ledger = pos.amount_tokens, chain,
+                    "boot reconcile: parked bag does not match the wallet ATA; verify the size before the manual exit");
+            }
+            Err(e) => {
+                unreadable += 1;
+                warn!(key = %key, mint = %pos.mint, error = %e,
+                    "boot reconcile: parked bag ATA unreadable; verify before the manual exit");
+            }
+        }
+    }
+    (verified, parked, unreadable)
 }
 
 /// Foreground pipeline.

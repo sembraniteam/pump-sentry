@@ -121,6 +121,10 @@ pub trait PendingStore {
     /// Mints awaiting confirmation.
     fn pending_mints(&self) -> Vec<String>;
 
+    /// True while a buy for `mint` awaits confirmation. Late-confirm
+    /// rechecks ride that mint's ticks, so its watch must not drop.
+    fn has_pending_for(&self, mint: &str) -> bool;
+
     /// True when the last sell bundle for `mint` is still
     /// engine-pending: resends must wait, never compete with it.
     async fn prior_sell_pending(&self, mint: &str) -> bool;
@@ -197,6 +201,10 @@ impl PendingStore for LiveTrader {
 
     fn pending_mints(&self) -> Vec<String> {
         self.pending_mints()
+    }
+
+    fn has_pending_for(&self, mint: &str) -> bool {
+        self.has_pending_for(mint)
     }
 
     async fn prior_sell_pending(&self, mint: &str) -> bool {
@@ -578,6 +586,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.exec.is_tracked(&tick.mint).await {
             return;
         }
+        // A pending buy's late-confirm recheck rides this mint's ticks
+        // (close-path tail): unwatching would strand it unresolved.
+        if let Some(trader) = &self.exec.live
+            && trader.has_pending_for(&tick.mint)
+        {
+            return;
+        }
         // Manual bags pin the watch while the curve is live.
         if !tick.complete && self.exec.manual_holds(&tick.mint).await {
             return;
@@ -659,6 +674,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             if !tick.complete && self.sol_feed.price().is_none() {
                 drop(portfolio);
                 warn!(mint = %tick.mint, "stale SOL/USD — paper exits deferred (no static fallback)");
+                self.recheck_live_pending().await;
+                self.maybe_unwatch(tick).await;
+                return;
+            }
+            // A live tick with no liquidity cannot price an exit. A
+            // stop-loss must never book a fill into a drained pool:
+            // defer instead (fail closed; the position stays held).
+            // Migration closes bypass (stale-spot Manual path below).
+            if !tick.complete && (!tick.liquidity_usd.is_finite() || tick.liquidity_usd <= 0.0) {
+                drop(portfolio);
+                warn!(mint = %tick.mint, liquidity = tick.liquidity_usd,
+                    "zero-liquidity tick — paper exits deferred (no market to price a fill)");
                 self.recheck_live_pending().await;
                 self.maybe_unwatch(tick).await;
                 return;

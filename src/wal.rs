@@ -476,6 +476,12 @@ mod tests {
         )
     }
 
+    fn manual_line(amount: u64, note: &str) -> String {
+        format!(
+            r#"{{"t":"manual","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":{amount},"creator":null,"note":"{note}","ts":2}}"#
+        )
+    }
+
     #[test]
     fn duplicate_sell_lines_subtract_once() {
         // The same fill recorded twice (two writers pre-fix, or a
@@ -605,5 +611,23 @@ mod tests {
         let replay = replay_lines([park.as_str(), take_part.as_str()].iter().copied());
         assert_eq!(replay.manual.len(), 1);
         assert_eq!(replay.manual[0].position.amount_tokens, 400);
+    }
+
+    #[test]
+    fn manual_park_keeps_a_same_mint_position_bag() {
+        // Parking is a runtime-map move, not a WAL net: the same mint
+        // can hold a parked bag AND a separate re-buy bag, so replay
+        // must keep the position copy (netting by key/amount would
+        // silently delete tracked custody).
+        let rows = [
+            position_line(TMINT, 1000, "B1"),
+            manual_line(1000, "exhausted"),
+            position_line(TMINT, 500, "B3"),
+        ];
+        let replay = replay_lines(rows.iter().map(String::as_str));
+        assert_eq!(replay.positions.len(), 1);
+        assert_eq!(replay.positions[0].amount_tokens, 1500);
+        assert_eq!(replay.manual.len(), 1);
+        assert_eq!(replay.manual[0].position.amount_tokens, 1000);
     }
 }

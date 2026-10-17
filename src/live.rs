@@ -828,6 +828,19 @@ impl LiveTrader {
         }
     }
 
+    /// Raw ATA balance for `mint` in base units (boot reconciliation).
+    /// `Ok(None)` = no ATA (nothing held); `Err` = unreadable (fail
+    /// closed: never read as zero).
+    pub async fn observe_token_balance(&self, mint: &Pubkey) -> Result<Option<u64>, ExecutorError> {
+        self.executor.observe_token_balance(mint).await
+    }
+
+    /// True while a buy for `mint` awaits confirmation. Late-confirm
+    /// rechecks ride that mint's ticks, so the watch must not drop.
+    pub fn has_pending_for(&self, mint: &str) -> bool {
+        self.with_pending("has_pending_for", false, |guard| guard.contains_key(mint))
+    }
+
     /// True when a buy awaits confirmation.
     pub fn has_pending(&self) -> bool {
         self.with_pending("has_pending", true, |guard| !guard.is_empty())
