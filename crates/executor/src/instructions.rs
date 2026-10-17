@@ -476,10 +476,11 @@ mod tests {
     fn sell_pumpswap_v2_matches_documented_layout() {
         // Layout cross-checked against live sell_v2 frames by the
         // `pumpswap_sell_v2_simulates` acceptance probe (globals, fee
-        // config, program slot, both PDA legs); this unit test pins the
-        // 17-account table from PUMP_SWAP_TRADE_V2.md plus IDL
+        // config, program slot, both PDA legs) and byte-pinned by
+        // `sell_pumpswap_v2_matches_frozen_fill`; this unit test pins
+        // the 17-account table from PUMP_SWAP_TRADE_V2.md plus IDL
         // writability (pool/user/volumes writable, configs/programs
-        // readonly, user signer). Still no frozen fill fixture.
+        // readonly, user signer).
         use std::collections::HashSet;
         let key = |b: u8| Pubkey::new_from_array([b; 32]);
         let accts = PumpAmmSellV2Accounts {
@@ -527,6 +528,109 @@ mod tests {
             };
             assert_eq!(*meta, expect, "flags {i}");
         }
+    }
+
+    #[test]
+    fn sell_pumpswap_v2_matches_frozen_fill() {
+        // Byte-equality vs a frozen mainnet `sell_v2` fill (17 accounts,
+        // slot 457835709). First frozen fill: proves the 17-account wire
+        // shape against chain data, not just the doc table. Bonus
+        // coverage: the base mint is Token-2022 (per-mint program path),
+        // the quote is WSOL on classic SPL.
+        use std::collections::HashSet;
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../listener/tests/fixtures/sell_v2_pumpswap_mainnet.json"
+        ))
+        .expect("fixture");
+        // Shape: bare getTransaction result.
+        let result = &raw;
+        // Landed transaction only: a failed fill proves nothing.
+        assert!(
+            result
+                .get("meta")
+                .and_then(|m| m.get("err"))
+                .is_some_and(|e| e.is_null()),
+            "success fixture must carry a landed transaction"
+        );
+        let msg = &result["transaction"]["message"];
+        let mut keys: Vec<String> =
+            serde_json::from_value(msg["accountKeys"].clone()).expect("keys");
+        if let Some(loaded) = result["meta"]["loadedAddresses"].as_object() {
+            for table in ["writable", "readonly"] {
+                for addr in loaded
+                    .get(table)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    keys.push(addr.as_str().expect("addr").to_string());
+                }
+            }
+        }
+        let amm = PUMP_AMM_PROGRAM_ID.to_string();
+        let pi = keys.iter().position(|k| k == &amm).expect("amm key");
+        let mut found = None;
+        for ix in msg["instructions"].as_array().expect("ixs") {
+            if ix["programIdIndex"].as_u64() != Some(pi as u64) {
+                continue;
+            }
+            let data = bs58::decode(ix["data"].as_str().expect("data"))
+                .into_vec()
+                .expect("b58");
+            if data.starts_with(&PUMP_AMM_SELL_V2_DISCRIMINATOR) && data.len() == 24 {
+                let accounts: Vec<usize> =
+                    serde_json::from_value(ix["accounts"].clone()).expect("accts");
+                found = Some((accounts, data));
+                break;
+            }
+        }
+        let (idx, data) = found.expect("sell_v2 in fixture");
+        assert_eq!(idx.len(), 17);
+        let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
+        // Static legs re-derive (volume accumulator is user-bound).
+        assert_eq!(amm_user_volume_accumulator_pda(&key(1)), key(12));
+        assert_eq!(amm_event_authority_pda(), key(15));
+        assert_eq!(key(2), PUMP_AMM_GLOBAL_CONFIG);
+        assert_eq!(key(13), PUMP_AMM_FEE_CONFIG);
+        assert_eq!(key(16), PUMP_AMM_PROGRAM_ID);
+        assert_eq!(key(4), WSOL_MINT);
+        let amount = u64::from_le_bytes(data[8..16].try_into().expect("u64"));
+        let min_quote_out = u64::from_le_bytes(data[16..24].try_into().expect("u64"));
+        assert_eq!(amount, 144_793_893_234);
+        assert_eq!(min_quote_out, 841_554_396);
+        let built = PumpSwapBuilder::build_sell_pumpswap_v2_ix(
+            amount,
+            min_quote_out,
+            &PumpAmmSellV2Accounts {
+                pool: &key(0),
+                user: &key(1),
+                base_mint: &key(3),
+                quote_mint: &key(4),
+                user_base_token_account: &key(5),
+                user_quote_token_account: &key(6),
+                pool_base_token_account: &key(7),
+                pool_quote_token_account: &key(8),
+                base_token_program: &key(9),
+                quote_token_program: &key(10),
+                buyback_fee_recipient: &key(14),
+            },
+        );
+        assert_eq!(built.program_id, PUMP_AMM_PROGRAM_ID);
+        assert_eq!(built.accounts.len(), 17);
+        // Same writable set as the documented table (1 is the signer).
+        let writable: HashSet<usize> = [0, 1, 5, 6, 7, 8, 12, 14].into_iter().collect();
+        for (i, meta) in built.accounts.iter().enumerate() {
+            assert_eq!(meta.pubkey, key(i), "position {i}");
+            let expect = if i == 1 {
+                AccountMeta::new(key(i), true)
+            } else if writable.contains(&i) {
+                AccountMeta::new(key(i), false)
+            } else {
+                AccountMeta::new_readonly(key(i), false)
+            };
+            assert_eq!(*meta, expect, "flags {i}");
+        }
+        assert_eq!(built.data, data);
     }
 
     #[test]

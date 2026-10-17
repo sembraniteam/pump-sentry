@@ -124,10 +124,11 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   send exists anywhere (deleted — sniper flow must never face
   sandwich exposure). Do NOT re-add one without a written MEV analysis.
 - PumpSwap `sell_v2` IS sim-proven now (`pumpswap_sell_v2_simulates`:
-  builder + quote floor vs live pool + live funded holder, GREEN).
-  Still no frozen sell_v2 fill fixture, and no funded trial
-  (buy-then-sell for real) — that trial is an operator action, never
-  run from here.
+  builder + quote floor vs live pool + live funded holder, GREEN) and
+  byte-pinned by a frozen fill (`sell_v2_pumpswap_mainnet.json`, slot
+  457835709, Token-2022 base — `sell_pumpswap_v2_matches_frozen_fill`).
+  Still no funded trial (buy-then-sell for real) — that trial is an
+  operator action, never run from here.
 - Mainnet fixtures live in `crates/listener/tests/fixtures/`; replay
   tests are the gate that must stay green.
 

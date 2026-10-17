@@ -15,6 +15,9 @@ wallet attribution + exact base-unit amounts):
 - `sell_v2_mainnet.json`, `sell_v2_second_mainnet.json` — two `sell_v2` samples.
 - `buy_v3_mainnet.json`, `sell_v3_mainnet.json`,
   `buy_exact_quote_in_v3_mainnet.json` — v3 fills (17-account layout).
+- `sell_v2_pumpswap_mainnet.json` — PumpSwap `sell_v2` fill (17
+  accounts, slot 457835709; Token-2022 base mint, WSOL quote):
+  byte-pinned by `sell_pumpswap_v2_matches_frozen_fill`.
 - `migrate_v2_pumpswap.json` — `MigrateV2` (PumpSwap) migration.
 - `fee_config_live.bin` — live FeeConfig bytes (4097 B), shared by
   `executor::quote` and `curve::fee` decode tests (include by relative
