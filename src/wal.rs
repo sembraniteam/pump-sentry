@@ -81,6 +81,10 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     // exit replays twice and the held runner vanishes from tracking.
     let mut seen_sells: HashSet<String> = HashSet::new();
     let mut skipped = 0usize;
+    // Same-mint bags merge by summing amounts: custody cares about
+    // the total held, and per-bundle granularity would ripple into
+    // every mint-keyed tracker downstream. Distinct manual notes
+    // collapse to the first (amounts stay exact).
     let add = |map: &mut HashMap<String, LivePosition>, p: LivePosition| {
         map.entry(p.mint.to_string())
             .and_modify(|e| {

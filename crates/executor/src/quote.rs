@@ -225,6 +225,26 @@ pub fn slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option
     u64::try_from(guard).ok().filter(|g| *g > 0)
 }
 
+/// Priority fee in lamports: `limit * price / 1e6`, ceiled. Single
+/// implementation shared by live debiting and the paper estimate
+/// (both sides delegate here). Clamped to a sane lamport cap: a giant
+/// price must not turn a cost estimate into a multi-SOL debit.
+pub fn priority_fee_lamports(compute_unit_limit: u32, micro_lamports_per_cu: u64) -> u64 {
+    let raw = (u128::from(compute_unit_limit))
+        .saturating_mul(u128::from(micro_lamports_per_cu))
+        .saturating_add(999_999)
+        / 1_000_000;
+    let cap = u128::from(u32::MAX);
+    if raw > cap {
+        tracing::warn!(
+            compute_unit_limit,
+            priority_fee_micro_lamports = micro_lamports_per_cu,
+            "priority fee overflowed sane cap; clamping dispatch cost"
+        );
+    }
+    u64::try_from(raw.min(cap)).unwrap_or(u64::from(u32::MAX))
+}
+
 /// Bonding-curve mcap in lamports.
 /// Canonical implementation lives in [`curve::fee::market_cap`]; this
 /// wrapper only converts the `None` (zero-`vt` or overflow) into the

@@ -663,7 +663,8 @@ fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> O
 
 /// True for plain-http endpoints outside localhost: bearer tokens
 /// sent there travel in cleartext. Local servers are exempt.
-fn is_plain_http_remote(endpoint: &str) -> bool {
+/// Shared with the live boot gate (refuses there, warns elsewhere).
+pub(crate) fn is_plain_http_remote(endpoint: &str) -> bool {
     let rest = match endpoint.trim().strip_prefix("http://") {
         Some(r) => r,
         None => return false,

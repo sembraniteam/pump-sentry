@@ -333,8 +333,9 @@ pub struct LiveFundingReport {
     pub payer: Pubkey,
     /// Native SOL in lamports (`None` = unreadable).
     pub native_balance: Option<u64>,
-    /// Native lamports required (tip + priority + base fee + one ATA
-    /// rent + 0.05 SOL reserve).
+    /// Native lamports required, scaled to a full book: every
+    /// position pays buy + sell dispatches (tip + priority + base
+    /// each), one ATA rent per new mint, plus the 0.05 SOL reserve.
     pub native_required: u64,
     /// Wallet WSOL ATA.
     pub wsol_ata: Pubkey,
@@ -458,26 +459,33 @@ impl SwapExecutor {
     }
 
     /// Priority fee per dispatch, ceiled (`limit * price / 1e6`).
+    /// Delegates to the shared [`crate::quote::priority_fee_lamports`].
     fn priority_fee_lamports(&self) -> u64 {
-        let prio = (self.compute_unit_limit as u128)
-            .saturating_mul(self.compute_unit_price as u128)
-            .saturating_add(999_999)
-            / 1_000_000;
-        u64::try_from(prio).unwrap_or(u64::MAX)
+        crate::quote::priority_fee_lamports(self.compute_unit_limit, self.compute_unit_price)
     }
 
-    /// Read-only funding snapshot. Moves no funds. Matches a real
-    /// first-touch dispatch cost (tip + priority + base fee + one ATA
-    /// rent + reserve), so a green report means the wallet can actually
-    /// open — not just cover the tip.
-    pub async fn live_funding_report(&self, tip_lamports: u64) -> LiveFundingReport {
+    /// Read-only funding snapshot. Moves no funds. Scaled to a full
+    /// book — every position pays buy + sell dispatches, one ATA rent
+    /// per new mint (assumes all mints new: conservative), plus the
+    /// reserve — so a green report means the wallet can actually run
+    /// `max_open_positions`, not just cover the first touch.
+    pub async fn live_funding_report(
+        &self,
+        tip_lamports: u64,
+        max_open_positions: usize,
+    ) -> LiveFundingReport {
         use crate::instructions::{WSOL_MINT, user_ata_with_program};
-        let required = self
-            .effective_tip(tip_lamports, true)
-            .saturating_add(self.priority_fee_lamports())
-            .saturating_add(ids::BASE_TX_FEE_LAMPORTS)
-            .saturating_add(ids::ATA_RENT_LAMPORTS)
-            .saturating_add(crate::wallet::MIN_SOL_RESERVE_LAMPORTS);
+        let positions = max_open_positions.max(1) as u128;
+        let per_dispatch = u128::from(self.effective_tip(tip_lamports, true))
+            .saturating_add(u128::from(self.priority_fee_lamports()))
+            .saturating_add(u128::from(ids::BASE_TX_FEE_LAMPORTS));
+        let required_128 = per_dispatch
+            .saturating_mul(positions)
+            .saturating_mul(2)
+            .saturating_add(u128::from(ids::ATA_RENT_LAMPORTS).saturating_mul(positions))
+            .saturating_add(u128::from(crate::wallet::MIN_SOL_RESERVE_LAMPORTS));
+        // Overflow can only overstate (fail-closed boot), never understate.
+        let required = u64::try_from(required_128).unwrap_or(u64::MAX);
         let native_balance = rpc_timeout(
             Duration::from_secs(15),
             self.rpc.get_balance(&self.wallet.pubkey()),

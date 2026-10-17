@@ -42,7 +42,7 @@ async fn main() {
         cli::CliAction::Status => cli::cmd_status(),
         cli::CliAction::Logs { lines, follow } => cli::cmd_logs(lines, follow).await,
         cli::CliAction::Sell { mint } => cli::cmd_sell(&mint),
-        cli::CliAction::Upgrade => cli::cmd_upgrade(),
+        cli::CliAction::Upgrade { allow_unverified } => cli::cmd_upgrade(allow_unverified),
         cli::CliAction::InitConfig => {
             let path = config::resolve_config_path();
             match config::ensure_config_file(&path) {
@@ -305,6 +305,12 @@ async fn run_pipeline(live_arg: bool) {
             eprintln!("live mode refuses QUOTE_USD override (static fallback is paper-only by construction)");
             std::process::exit(1);
         }
+        if settings.inference_api_key.is_some()
+            && crate::settings::is_plain_http_remote(&settings.inference_endpoint)
+        {
+            eprintln!("live mode refuses INFERENCE_API_KEY over plain-http remote INFERENCE_ENDPOINT (bearer travels in cleartext); use https or localhost");
+            std::process::exit(1);
+        }
         // Split-brain clusters can never land. Enforced when both identify.
         fn cluster_of(url: &str) -> Option<&'static str> {
             let lower = url.to_ascii_lowercase();
@@ -467,16 +473,18 @@ async fn run_pipeline(live_arg: bool) {
             .with_strict_sim(settings.sim_strict);
         // Funding gate (read-only): native shortfall fails closed.
         {
-            let report: LiveFundingReport =
-                executor.live_funding_report(settings.tip_lamports).await;
+            let report: LiveFundingReport = executor
+                .live_funding_report(settings.tip_lamports, settings.max_open_positions)
+                .await;
             match report.native_ok() {
-                Some(true) => info!(payer = %report.payer, balance = report.native_balance, required = report.native_required, "live native SOL covers tip + reserve"),
+                Some(true) => info!(payer = %report.payer, balance = report.native_balance, required = report.native_required, max_open = settings.max_open_positions, "live native SOL covers full-book dispatch + reserve"),
                 Some(false) => {
                     eprintln!(
-                        "live wallet {} short native SOL: have {} lamports, need {} (tip + 0.05 reserve); fund before live",
+                        "live wallet {} short native SOL: have {} lamports, need {} for {} positions (dispatch + ATA rent + 0.05 reserve); fund before live",
                         report.payer,
                         report.native_balance.unwrap_or(0),
-                        report.native_required
+                        report.native_required,
+                        settings.max_open_positions
                     );
                     std::process::exit(1);
                 }
@@ -703,14 +711,16 @@ async fn run_pipeline(live_arg: bool) {
                     warn!("ingestion STILL BANNED on geyser: bot is blind, retries hourly; check token/quota or fall back to WS mode");
                 }
                 // Execution-gap calibration: paper model vs live reality
-                // over the retained window (negative avg = live trails).
+                // over the retained window. Both legs read negative when
+                // live trails; the exit leg is a LOWER BOUND (tick proxy,
+                // excl. intra-bundle slip — see `FillGap` docs).
                 let (gap_n, gap_avg, gap_total) = pipeline.exec.gap_stats().await;
                 if gap_n > 0 {
-                    info!("execution gap: n={gap_n} avg={gap_avg:+.4} total={gap_total:+.4} USD (paper model vs live settle + tips)");
+                    info!("execution gap (lower bound, excl. intra-bundle slip): n={gap_n} avg={gap_avg:+.4} total={gap_total:+.4} USD (paper model vs live settle + tips)");
                 }
                 let (egap_n, egap_avg, egap_total) = pipeline.exec.entry_gap_stats().await;
                 if egap_n > 0 {
-                    info!("entry gap: n={egap_n} avg={egap_avg:+.4} total={egap_total:+.4} USD (paper quote vs landed fill)");
+                    info!("entry gap (negative = live paid more): n={egap_n} avg={egap_avg:+.4} total={egap_total:+.4} USD (paper quote vs landed fill)");
                 }
                 // Burn-in thresholds (all 0 = off): log-only, never cards.
                 let thresholds = &pipeline.settings;

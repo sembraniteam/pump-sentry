@@ -200,24 +200,13 @@ pub fn escalated_tip(base_tip_lamports: u64, failed_attempts: u32) -> u64 {
     base_tip_lamports.saturating_mul(mult as u64)
 }
 
-/// Priority fee in lamports: `limit * price / 1e6`, ceiled. Pure so both
-/// live debiting and the paper estimate share one formula (DRY).
-/// Clamped to a sane lamport cap: a giant price must not turn a cost
-/// estimate into a multi-SOL debit.
+/// Priority fee in lamports: `limit * price / 1e6`, ceiled. Delegates
+/// to the single [`executor::quote::priority_fee_lamports`]
+/// implementation so live debiting and the paper estimate share one
+/// formula (DRY). Clamped to a sane lamport cap: a giant price must
+/// not turn a cost estimate into a multi-SOL debit.
 pub fn priority_fee_lamports(compute_unit_limit: u32, micro_lamports: u64) -> u64 {
-    let raw = (compute_unit_limit as u128)
-        .saturating_mul(micro_lamports as u128)
-        .saturating_add(999_999)
-        / 1_000_000;
-    let cap = u128::from(u32::MAX);
-    if raw > cap {
-        tracing::warn!(
-            compute_unit_limit,
-            priority_fee_micro_lamports = micro_lamports,
-            "priority fee overflowed sane cap; clamping dispatch cost"
-        );
-    }
-    u64::try_from(raw.min(cap)).unwrap_or(u64::from(u32::MAX))
+    executor::quote::priority_fee_lamports(compute_unit_limit, micro_lamports)
 }
 
 /// Paper-mode dispatch-bleed estimate per leg (open, close), USD.
@@ -227,7 +216,7 @@ pub fn priority_fee_lamports(compute_unit_limit: u32, micro_lamports: u64) -> u6
 ///
 /// Absolute lamports, NOT a rate: at defaults (100k tip, SOL $150)
 /// the round trip is ~$0.34 — ~0.3% on a $113 ticket but ~3.4% on the
-/// default $10 `NOTIONAL_USD`, larger than the 2.53% venue round trip.
+/// default $10 `NOTIONAL_USD`, larger than the 2.47% venue round trip.
 /// This is a calm-weather FLOOR, not a ceiling: live pays escalated
 /// tips (up to 4x base), the moving Jito `tip_floor` oracle, and the
 /// same priority leg under congestion. Paper is cheap exactly when
@@ -1209,19 +1198,29 @@ impl LiveTrader {
 
     /// Import boot-replayed pendings into recheck.
     pub fn import_pending(&self, items: Vec<wal::WalPending>) -> usize {
+        use std::collections::hash_map::Entry;
         self.with_pending("wal-import", 0, |guard| {
             let mut n = 0usize;
             for item in items {
                 let mint = item.position.mint.to_string();
-                guard.entry(mint).or_insert_with(|| {
-                    n += 1;
-                    PendingBuy {
-                        position: item.position,
-                        signature: item.signature,
-                        bundle_id: item.bundle_id,
-                        attempts: 1,
+                match guard.entry(mint) {
+                    Entry::Vacant(slot) => {
+                        n += 1;
+                        slot.insert(PendingBuy {
+                            position: item.position,
+                            signature: item.signature,
+                            bundle_id: item.bundle_id,
+                            attempts: 1,
+                        });
                     }
-                });
+                    // First wins, but never silently: a skipped pending
+                    // is a buy the rechecker will never see (pre-restart
+                    // dup-guard makes this rare, never impossible).
+                    Entry::Occupied(_) => {
+                        tracing::warn!(mint = %item.position.mint, bundle = %item.bundle_id,
+                            "WAL replay: second pending for same mint skipped (first wins; inspect the file)");
+                    }
+                }
             }
             n
         })
@@ -1290,13 +1289,20 @@ impl LiveTrader {
                 self.clear_sell_bundle(mint);
                 Ok(receipt.bundle_id.clone())
             }
-            Ok(ConfirmOutcome::FailedOnChain) => Err(LiveError::Unconfirmed(format!(
-                "{label} bundle {} errored on-chain; still holding",
-                receipt.bundle_id
-            ))),
+            Ok(ConfirmOutcome::FailedOnChain) => {
+                // Terminally dead: never lands, so drop the id — the
+                // resend guard must not pay a status query for it, nor
+                // hold a resend for a bundle that cannot compete.
+                self.clear_sell_bundle(mint);
+                Err(LiveError::Unconfirmed(format!(
+                    "{label} bundle {} errored on-chain; still holding",
+                    receipt.bundle_id
+                )))
+            }
             Ok(ConfirmOutcome::Timeout) => {
                 match self.executor.bundle_status(&receipt.bundle_id).await {
                     BundleStatus::Failed | BundleStatus::Invalid => {
+                        self.clear_sell_bundle(mint);
                         Err(LiveError::Unconfirmed(format!(
                             "{label} bundle {} engine reports bundle failed/invalid; still holding",
                             receipt.bundle_id
@@ -1406,8 +1412,46 @@ mod tests {
     }
 
     #[test]
-    fn tip_escalates_bounded_by_attempts() {
-        assert_eq!(escalated_tip(100_000, 0), 100_000);
+    fn fee_inclusive_cost_covers_every_two_leg_split() {
+        // Parity pin against `executor::quote::buy_cost_incl_fees`,
+        // which ceils the protocol and creator legs separately:
+        // `ceil(a) + ceil(b)` exceeds `ceil(a + b)` by at most one, so
+        // single-ceil-plus-one must cover every split of the tier —
+        // never underfund, never over-cover by more than a lamport.
+        const D: u128 = BPS_DENOMINATOR as u128;
+        let ceil_fee = |base: u64, bps: u64| -> u128 {
+            u128::from(base).saturating_mul(u128::from(bps)).div_ceil(D)
+        };
+        for base in [
+            0u64, 1, 2, 99, 100, 101, 999, 1024, 1_000_000, 123_456_789, 6_750_000_001,
+            4_294_967_295, u64::MAX / 20_000,
+        ] {
+            for tier in [0u64, 1, 125, 250, 300, 1000, 5000] {
+                for t1 in [0u64, 1, tier / 3, tier / 2, tier] {
+                    if t1 > tier {
+                        continue;
+                    }
+                    let t2 = tier - t1;
+                    let Some(covered) = fee_inclusive_cost(base, tier as f64) else {
+                        continue;
+                    };
+                    let onchain =
+                        u128::from(base) + ceil_fee(base, t1) + ceil_fee(base, t2);
+                    assert!(
+                        u128::from(covered) >= onchain,
+                        "underfunded: base={base} tier={tier} split={t1}+{t2}"
+                    );
+                    assert!(
+                        u128::from(covered) - onchain <= 1,
+                        "over-cover: base={base} tier={tier} split={t1}+{t2}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tip_escalates_bounded_by_attempts() {        assert_eq!(escalated_tip(100_000, 0), 100_000);
         assert_eq!(escalated_tip(100_000, 1), 200_000);
         assert_eq!(escalated_tip(100_000, 2), 300_000);
         assert_eq!(escalated_tip(100_000, 3), 400_000);

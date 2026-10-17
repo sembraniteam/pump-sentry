@@ -678,11 +678,13 @@ fn dead_engine() -> Option<risk_engine::RiskEngine> {
 #[tokio::test]
 async fn engined_fallback_still_opens() {
     // Engine present but down: confirm falls back to heuristic and
-    // opens — entries must not halt when the model does.
+    // opens — entries must not halt when the model does. Default
+    // window: a zero window times out at first observation by design
+    // (`gate_times_out_on_dead_token`), so it can never confirm here.
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
     let reserves = StubReserves::with_tick(tick(MINT, 2.0));
     let pipe = pipeline_engined(
-        settings(&[("GATE_WINDOW_SECS", "0")]),
+        Settings::from_map(&HashMap::new()),
         AuditOutcome::Allow(100),
         reserves,
         PaperPortfolio::new(100.0, 0.0),
@@ -2509,9 +2511,10 @@ async fn paper_only_stop_fires_on_realizable_and_nets_bleed() {
     let close_leg = 105_000.0 / LAMPORTS_PER_SOL * 150.0;
     assert!((trade.dispatch_usd - close_leg).abs() < 1e-9);
     assert!((portfolio.total_dispatch_usd() - (open_leg + close_leg)).abs() < 1e-6);
-    // Breaker and cards see edge net of bleed.
+    // Breaker sees edge net of BOTH legs: the open leg booked at
+    // open, the close leg netted at close.
     let day_net = pipe.daily.lock().await.day_net;
-    assert!((day_net - (trade.net_pnl - trade.dispatch_usd)).abs() < 1e-9);
+    assert!((day_net - (trade.net_pnl - trade.dispatch_usd - open_leg)).abs() < 1e-6);
 }
 
 #[tokio::test]

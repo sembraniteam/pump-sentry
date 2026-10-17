@@ -743,8 +743,22 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 &tick.mint, &reason, pnl, pct, equity, moonbag,
             ));
         }
-        for (paper_price, qty) in gap_notes {
-            self.exec.note_gap_paper_close(&tick.mint, paper_price, qty).await;
+        // One note per tick per mint (qty-weighted avg): the live leg
+        // dispatches at most once per tick, so N notes would orphan N-1
+        // and misattribute the next settle. Same-mint multi-positions
+        // only arise via manual opens (the gate refuses seconds).
+        if !gap_notes.is_empty() {
+            let mut qty_total = 0u64;
+            let mut px_qty = 0.0f64;
+            for (paper_price, qty) in &gap_notes {
+                qty_total = qty_total.saturating_add(*qty);
+                px_qty += paper_price * (*qty as f64);
+            }
+            if qty_total > 0 {
+                self.exec
+                    .note_gap_paper_close(&tick.mint, px_qty / qty_total as f64, qty_total)
+                    .await;
+            }
         }
         // Live first, breaker second: unsettled live defers the feed.
         let live_settled = if closed_fraction > 0.0 {

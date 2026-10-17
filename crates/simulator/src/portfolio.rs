@@ -126,7 +126,9 @@ pub struct OpenPositionParams<'a> {
     pub now_secs: u64,
 }
 
-/// Accounting snapshot.
+/// Accounting snapshot. `realized_pnl` is trade edge only and
+/// excludes dispatch bleed — use `realized_net_pnl()` (edge minus
+/// bleed) for headlines and the breaker, never this field.
 #[derive(Debug, Clone)]
 pub struct PortfolioSnapshot {
     pub cash: f64,
@@ -242,6 +244,13 @@ impl PaperPortfolio {
     /// wins (legs move with SOL); zero disables.
     pub fn set_paper_dispatch_legs(&mut self, open_usd: f64, close_usd: f64) {
         self.paper_dispatch_legs = (open_usd, close_usd);
+    }
+
+    /// Current legs (open, close). The open leg is what the last open
+    /// debited, so the breaker can book it at open while the close
+    /// headline only nets the close leg.
+    pub fn paper_dispatch_legs(&self) -> (f64, f64) {
+        self.paper_dispatch_legs
     }
 
     /// Cumulative dispatch bleed debited so far.

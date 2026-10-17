@@ -27,7 +27,8 @@ pub enum FillModel {
     /// Curve cost: impact + venue fee, capped.
     /// Buys `s/(1-s)+fee`, sells `s/(1+s)+fee`.
     /// `s` = notional/liquidity, `fee` = bps/10_000.
-    /// Default 125 bps/side; round trip ~2.53%.
+    /// Default 125 bps/side; round trip ~2.47% (`1 - (1-f)/(1+f)`:
+    /// buy pays the fee on top, sell nets it underneath).
     BondingCurve {
         /// Venue fee per side, bps.
         fee_bps_per_side: f64,

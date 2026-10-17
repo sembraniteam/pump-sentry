@@ -16,9 +16,12 @@ wallet attribution + exact base-unit amounts):
 - `buy_v3_mainnet.json`, `sell_v3_mainnet.json`,
   `buy_exact_quote_in_v3_mainnet.json` — v3 fills (17-account layout).
 - `migrate_v2_pumpswap.json` — `MigrateV2` (PumpSwap) migration.
-- `fee_config_live.bin` — live FeeConfig bytes (4097 B). **Single copy**:
-  both `executor::quote` and `curve::fee` decode tests include this one
-  file by relative path; do not duplicate it into other crates.
+- `fee_config_live.bin` — live FeeConfig bytes (4097 B), shared by
+  `executor::quote` and `curve::fee` decode tests (include by relative
+  path; do not duplicate it into other crates).
+- `amm_global_config_live.bin`, `amm_fee_config_live.bin` — live
+  Raydium AMM global/fee-config bytes, included by `executor::quote`
+  decode tests.
 
 Rules: never hand-edit a fixture (re-fetch + re-freeze instead), never
 delete one while a replay test includes it, and keep the

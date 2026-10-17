@@ -655,11 +655,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(%mint, liq = liquidity_usd, "non-positive curve liquidity; dropping signal (fail-closed)");
             return;
         }
-        // Venue fee must be readable on live ticks: an unreadable tier
-        // would book the standard tier while live pays the custom one
-        // (fail-cheap). Synthetic (override-priced) registers no tier,
-        // so it stays `None` by construction below.
-        if !priced_via_override && venue_fee.is_none() {
+        // Venue fee must be readable AND sane on live ticks: an
+        // unreadable tier would book the standard tier while live pays
+        // the custom one (fail-cheap), and NaN/negative would poison
+        // fee math downstream. Synthetic (override-priced) registers
+        // no tier, so it stays `None` by construction below.
+        if !priced_via_override && venue_fee.is_none_or(|f| !f.is_finite() || f < 0.0) {
             warn!(%mint, "venue fee unreadable; dropping (fail-closed)");
             return;
         }
@@ -918,6 +919,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             now_secs: now,
         }) {
             Ok(id) => {
+                // What this open debited (same legs `open_position`
+                // used): the breaker books it now because the close
+                // headline only nets the close leg.
+                let open_leg_usd = portfolio.paper_dispatch_legs().0;
                 let snap = portfolio.snapshot(&HashMap::new());
                 info!(%mint, id, entry = format!("{entry_quote:.10}"),
                     tp = profile.tp_percent, sl = profile.sl_percent,
@@ -933,6 +938,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     req.risk,
                 );
                 drop(portfolio);
+                // Paper-only open-leg bleed feeds the breaker at open
+                // (live mode records the actual buy tip at buy instead;
+                // synthetic never feeds the breaker).
+                if self.exec.live.is_none()
+                    && open_leg_usd.is_finite()
+                    && open_leg_usd > 0.0
+                    && !self.exec.is_synthetic(mint).await
+                {
+                    self.daily.lock().await.record(-open_leg_usd, now);
+                }
                 self.emit(card);
                 // No feed means no live leg: exits would be manual.
                 if let Err(e) = self.reserves.watch(mint, curve).await {

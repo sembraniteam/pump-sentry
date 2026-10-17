@@ -30,15 +30,17 @@ no WSOL float needed for SOL pairs:
 
 ```
 required_native = max_open_positions × (notional_usd/SOL_USD × (1+slippage_bps/10000) + fees)
-                + jito_tip_lamports × max_open_positions × 2   // buy + sell legs
-                + priority fees (compute_unit_limit × priority_fee_micro_lamports / 1e6 per dispatch)
-                + 5_000 lamports base fee per dispatch
-                + ~2_039_280 lamports (one ATA rent per new mint)
+                + max_open_positions × 2 × (jito_tip_lamports + priority_per_dispatch + 5_000 base)  // buy + sell legs
+                + max_open_positions × ~2_039_280 lamports (one ATA rent per new mint; assumes all mints new)
                 + 0.05 SOL reserve (hard floor, never spent)
 ```
 
+where priority_per_dispatch = compute_unit_limit × priority_fee_micro_lamports / 1e6.
+Boot enforces the dispatch part via the scaled funding report (notional
+legs are checked per trade by solvency).
+
 A WSOL float funds **token-paired quotes only**. Boot fails closed
-below tip+reserve and warns loudly on zero WSOL.
+below the scaled requirement and warns loudly on zero WSOL.
 
 ## 3. Start / stop / inspect
 

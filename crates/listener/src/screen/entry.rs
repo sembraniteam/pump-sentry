@@ -163,16 +163,19 @@ impl EntryGate {
             }
         }
         let buyers = entry.buyers.len();
+        // Deadline first: a quorum that arrives after the window is
+        // stale signal, not a confirm — entries get `window_secs`,
+        // never a poll round more.
+        if now_secs >= entry.deadline_secs {
+            let reason = format!("timeout: only {buyers} distinct buyers in window");
+            self.pending.remove(mint);
+            return GateOutcome::Abort { reason };
+        }
         if buyers >= self.min_buyers as usize {
             self.pending.remove(mint);
             return GateOutcome::Confirm {
                 buyers: buyers as u32,
             };
-        }
-        if now_secs >= entry.deadline_secs {
-            let reason = format!("timeout: only {buyers} distinct buyers in window");
-            self.pending.remove(mint);
-            return GateOutcome::Abort { reason };
         }
         GateOutcome::Wait
     }

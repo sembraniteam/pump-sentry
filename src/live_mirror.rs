@@ -26,13 +26,15 @@ pub struct FillGap {
 /// and live fill share one flow). Fill price comes from real pre/post
 /// balances, so this leg is strictly more direct than exit gaps (which
 /// proxy the settle via tick); only the USD conversion rides the feed.
+/// Sign matches [`FillGap`]: negative means live did worse (paid more
+/// here), so both heartbeat legs read the same way.
 #[derive(Debug, Clone)]
 pub struct EntryGap {
     pub mint: String,
     pub paper_price_usd: f64,
     pub fill_price_usd: f64,
     pub qty_tokens: f64,
-    /// `(fill - paper) * qty`: negative means live paid more.
+    /// `(paper - fill) * qty`: negative means live paid more.
     pub gap_usd: f64,
 }
 
@@ -158,7 +160,7 @@ impl FillGapTracker {
         {
             return None;
         }
-        let gap_usd = (fill_price_usd - paper_price_usd) * qty_tokens;
+        let gap_usd = (paper_price_usd - fill_price_usd) * qty_tokens;
         if !gap_usd.is_finite() {
             return None;
         }
@@ -880,7 +882,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return false;
             }
             Err(e) => {
-                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "mint decimals unreadable; live sell deferred");
+                let attempts = self.exec.note_failure(mint, now).await;
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), attempts, "mint decimals unreadable; live sell deferred (counts toward retry budget)");
                 return false;
             }
         };
@@ -935,8 +938,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Never compete with our own inflight bundle: a resend while
         // the prior sell is still engine-pending risks two live
         // bundles for one bag. Both Pending and Unknown hold the
-        // resend (status outage must not fork exits).
-        if attempts > 0 && trader.prior_sell_pending(mint).await {
+        // resend (status outage must not fork exits). Unconditional:
+        // GiveUp resets the retry budget before parking, so a gated
+        // `attempts > 0` check would go blind exactly when a stale
+        // bundle may still land.
+        if trader.prior_sell_pending(mint).await {
             warn!(%mint, attempts, "prior sell bundle still inflight (Pending/Unknown); holding resend");
             return false;
         }
@@ -1277,16 +1283,17 @@ mod tests {
         assert!(t.note_entry_gap("M", 1.0, 0.0, 10.0).is_none());
         assert!(t.note_entry_gap("M", 1.0, 1.0, 0.0).is_none());
         assert_eq!(t.entry_stats(), (0, 0.0, 0.0));
-        // Paper 0.0000042, landed 0.0000045 over 2.35M tokens:
-        // (0.0000045 - 0.0000042) * 2_350_000 = +0.705.
+        // Paper 0.0000042, landed 0.0000045 over 2.35M tokens: live
+        // paid more, so the gap is negative like the exit leg
+        // ((0.0000042 - 0.0000045) * 2_350_000 = -0.705).
         let gap = t
             .note_entry_gap("M", 0.000_004_2, 0.000_004_5, 2_350_000.0)
             .expect("gap");
-        assert!((gap.gap_usd - 0.705).abs() < 1e-9, "gap={}", gap.gap_usd);
+        assert!((gap.gap_usd + 0.705).abs() < 1e-9, "gap={}", gap.gap_usd);
         let (n, avg, total) = t.entry_stats();
         assert_eq!(n, 1);
-        assert!((avg - 0.705).abs() < 1e-9);
-        assert!((total - 0.705).abs() < 1e-9);
+        assert!((avg + 0.705).abs() < 1e-9);
+        assert!((total + 0.705).abs() < 1e-9);
     }
 
     #[test]

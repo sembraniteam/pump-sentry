@@ -47,7 +47,7 @@ Commands:
   run [--live]            Run in the foreground (for debugging)
   sell <mint>             Queue a manual full exit for one mint now
   init-config             Write ~/.pump-sentry/config.toml when missing
-  upgrade                 Install the latest release (refuses when behind nothing or daemon runs)
+  upgrade                 Install the latest release (refuses when behind nothing or daemon runs; --allow-unverified to skip checksum)
   help                    Show this help
 
 Options:
@@ -97,7 +97,9 @@ pub enum CliAction {
     /// Write the categorized default config when missing.
     InitConfig,
     /// Install the latest release over this binary.
-    Upgrade,
+    /// Self-update from GitHub releases. Refuses to install
+    /// unverified unless `--allow-unverified` is passed.
+    Upgrade { allow_unverified: bool },
     /// Manual full exit for one mint.
     Sell {
         mint: String,
@@ -129,7 +131,9 @@ pub fn parse_cli(args: &[String]) -> CliAction {
             live: live_flag(args),
         },
         "init-config" => CliAction::InitConfig,
-        "upgrade" => CliAction::Upgrade,
+        "upgrade" => CliAction::Upgrade {
+            allow_unverified: args.iter().any(|a| a == "--allow-unverified"),
+        },
         "logs" => CliAction::Logs {
             lines: log_lines(args),
             follow: args.iter().any(|a| a == "--follow" || a == "-f"),
@@ -1012,7 +1016,7 @@ fn curl_fetch(url: &str) -> std::io::Result<Vec<u8>> {
 /// `upgrade`: install the newest release over this binary, else say so.
 /// Refuses while the daemon runs (replacing a live trader's binary is
 /// never safe) and on unsupported platforms.
-pub fn cmd_upgrade() -> ! {
+pub fn cmd_upgrade(allow_unverified: bool) -> ! {
     let current = ReleaseVersion::current();
     let body = match curl_fetch(RELEASE_API_URL) {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -1086,7 +1090,10 @@ pub fn cmd_upgrade() -> ! {
         eprintln!("cannot stage upgrade: {e}");
         std::process::exit(1);
     }
-    match sha.as_deref() {
+    // Verified installs only by default: an unverified binary
+    // replaces the running bot, so `--allow-unverified` must be an
+    // explicit operator override, never silent acceptance.
+    let verified = match sha.as_deref() {
         Some(body) => {
             let want = String::from_utf8_lossy(body)
                 .split_whitespace()
@@ -1094,7 +1101,8 @@ pub fn cmd_upgrade() -> ! {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if want.len() != 64 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
-                eprintln!("warning: checksum file malformed; installing unverified");
+                eprintln!("checksum file malformed; cannot verify");
+                false
             } else {
                 match sha256_of_file(&tgz) {
                     Some(have) if have != want => {
@@ -1102,16 +1110,26 @@ pub fn cmd_upgrade() -> ! {
                         let _ = std::fs::remove_dir_all(&dir);
                         std::process::exit(1);
                     }
-                    Some(_) => {}
+                    Some(_) => true,
                     None => {
-                        eprintln!("warning: no sha256 tool; installing unverified");
+                        eprintln!("no sha256 tool; cannot verify");
+                        false
                     }
                 }
             }
         }
         None => {
-            eprintln!("warning: no checksum file published; installing unverified");
+            eprintln!("no checksum file published; cannot verify");
+            false
         }
+    };
+    if !verified && !allow_unverified {
+        eprintln!("refusing to install unverified binary (retry with --allow-unverified to override)");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::process::exit(1);
+    }
+    if !verified {
+        eprintln!("warning: installing UNVERIFIED binary (--allow-unverified)");
     }
     match std::process::Command::new("tar")
         .args(["-xzf"])
@@ -1282,7 +1300,15 @@ mod tests {
         );
         assert_eq!(
             parse_cli(&argv(&["bot", "upgrade"])),
-            CliAction::Upgrade
+            CliAction::Upgrade {
+                allow_unverified: false
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["bot", "upgrade", "--allow-unverified"])),
+            CliAction::Upgrade {
+                allow_unverified: true
+            }
         );
         assert_eq!(
             parse_cli(&argv(&["bot", "run", "--live"])),
