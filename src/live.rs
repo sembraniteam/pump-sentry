@@ -59,13 +59,18 @@ pub const SELL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 /// Failed sells before manual exit.
 pub const SELL_MAX_ATTEMPTS: u32 = 5;
 /// Max age of a resend-guard entry: a bundle that is still
-/// Pending/Unknown after this long is either lying status API or
-/// ancient history — holding resends forever strands the bag, so the
-/// guard expires loudly (warn) instead. The release reconciles the
-/// prior signature first (one RPC): a prior that landed is surfaced
-/// before a replacement can compete. Jito bundles resolve in minutes;
-/// an hour is pure outage margin (its blockhash died ~59 minutes ago).
+/// unresolved after this long is either lying status API or ancient
+/// history — holding resends forever strands the bag, so the guard
+/// expires loudly (warn) instead. Every earlier release goes through
+/// the shared resolver (chain evidence first) and is refused without
+/// proof; only this last resort is deliberately evidence-free, sized
+/// well past blockhash validity (~60-90s), so the bundle cannot land
+/// under any normal condition. Jito bundles resolve in minutes; an
+/// hour is pure outage margin.
 pub const SELL_GUARD_TTL_SECS: u64 = 3_600;
+/// Resolver poll deadline for guard checks: one-shot, so a guard
+/// check never blocks the exit path waiting for votes.
+const SELL_GUARD_RESOLVE_TIMEOUT: Duration = Duration::ZERO;
 /// Recheck rounds before manual review.
 pub const PENDING_MAX_ATTEMPTS: u32 = 5;
 /// Recheck fanout: bounded like the gate (`GATE_FANOUT` there is also 16).
@@ -464,11 +469,12 @@ pub struct LiveTrader {
     /// Cap on the volatility add-on, bps (`0` = adaptive off).
     vol_extra_cap_bps: u64,
     /// Last sell bundle per mint (resend guard: never compete with an
-    /// inflight-pending prior bundle for the same bag). Entries expire
-    /// via [`SELL_GUARD_TTL_SECS`] so a lying status API cannot hold
-    /// resends forever; the release reconciles [`SellGuard::signature`]
-    /// first.
-    last_sell_bundle: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, SellGuard>>>,
+    /// inflight prior bundle for the same bag). Entries are resolved by
+    /// [`LiveTrader::prior_sell_state`] before every release; only the
+    /// [`SELL_GUARD_TTL_SECS`] bound releases without proof, so a lying
+    /// status API cannot hold resends forever.
+    last_sell_bundle:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, SellGuard>>>,
     /// One recheck round at a time.
     recheck_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -482,8 +488,22 @@ struct SellGuard {
     /// for legacy WAL traces that predate the field: the engine word
     /// governs those.
     signature: Option<String>,
+    /// Dispatch blockhash (base58) for the expiry proof. `None` on
+    /// legacy traces, same caveat as `signature`.
+    blockhash: Option<String>,
     /// Dispatch stamp for the TTL release.
     noted_at: u64,
+}
+
+/// Prior-sell resolution for the resend guard (policy vocabulary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorSell {
+    /// Unresolved: the prior may still land, hold resends.
+    Hold,
+    /// Landed on-chain: release, and surface the possibly stale ledger.
+    Landed,
+    /// Provably no-fill: release silently.
+    Dead,
 }
 
 /// Buy awaiting confirmation. Never a fill until the chain says so.
@@ -689,6 +709,7 @@ impl LiveTrader {
                 SellGuard {
                     bundle_id: receipt.bundle_id.clone(),
                     signature: Some(receipt.signature.clone()),
+                    blockhash: Some(receipt.blockhash.to_string()),
                     noted_at: now_secs(),
                 },
             );
@@ -697,7 +718,7 @@ impl LiveTrader {
                 "sell-bundle lock poisoned during note_sell_bundle; resend guard degraded"
             );
         }
-        self.write_wal_sell_pending(mint, &receipt.bundle_id, &receipt.signature);
+        self.write_wal_sell_pending(mint, receipt);
     }
 
     /// Forget a sell bundle after terminal confirm (landed or dead),
@@ -719,48 +740,60 @@ impl LiveTrader {
         now_secs.saturating_sub(noted_at_secs) >= SELL_GUARD_TTL_SECS
     }
 
+    /// Resolve a prior sell dispatch into guard policy: the shared
+    /// resolver decides (chain beats engine; only a dead blockhash
+    /// closes it as expired; unverifiable never releases). A legacy
+    /// trace without a signature gets the engine word only — those
+    /// lines age out of the WAL.
+    async fn prior_sell_state(&self, entry: &SellGuard) -> PriorSell {
+        match entry.signature.as_deref() {
+            Some(signature) => match self
+                .executor
+                .resolve_dispatch(
+                    &entry.bundle_id,
+                    signature,
+                    entry.blockhash.as_deref(),
+                    SELL_GUARD_RESOLVE_TIMEOUT,
+                )
+                .await
+            {
+                DispatchVerdict::Unknown(_) => PriorSell::Hold,
+                DispatchVerdict::Landed => PriorSell::Landed,
+                DispatchVerdict::Dead(_) => PriorSell::Dead,
+            },
+            None => match self.executor.bundle_status(&entry.bundle_id).await {
+                BundleStatus::Pending | BundleStatus::Unknown => PriorSell::Hold,
+                BundleStatus::Landed => PriorSell::Landed,
+                BundleStatus::Failed | BundleStatus::Invalid => PriorSell::Dead,
+            },
+        }
+    }
+
     /// Seed the resend guard from WAL-replayed sell traces. A landed
     /// prior is surfaced loudly and NOT seeded (the bag may already be
-    /// sold: a hold would only strand the exit); a signature that
-    /// cannot be ruled out (unverifiable, or a legacy trace whose
-    /// engine word is still Pending/Unknown) holds until it resolves.
-    /// Returns the kept count.
+    /// sold: a hold would only strand the exit); an unresolved one
+    /// holds until it resolves. The TTL runs from the dispatch stamp,
+    /// not from boot. Returns the kept count.
     pub async fn seed_sell_guard(&self, items: Vec<wal::WalSellPending>) -> usize {
         let mut kept = 0usize;
         for item in items {
-            let (mint, bundle_id) = (item.mint.clone(), item.bundle_id.clone());
-            let hold = match item.signature.as_deref() {
-                Some(signature) => match self.executor.reconcile_signature(signature).await {
-                    Ok(Some(seen)) if seen.landed() => {
-                        tracing::warn!(%mint, bundle = %bundle_id, sig = %signature, "WAL replay: prior sell ALREADY LANDED on-chain; not seeding a hold — ledger may be stale, inspect");
-                        false
-                    }
-                    // Errored or unseen: it cannot land; nothing to hold.
-                    Ok(_) => false,
-                    // Unverifiable: fail closed, hold until it resolves.
-                    Err(e) => {
-                        tracing::warn!(%mint, bundle = %bundle_id, error = %e, "WAL replay: prior sell reconcile unavailable; holding resends (fail closed)");
-                        true
-                    }
-                },
-                None => matches!(
-                    self.executor.bundle_status(&bundle_id).await,
-                    BundleStatus::Pending | BundleStatus::Unknown
-                ),
+            let entry = SellGuard {
+                bundle_id: item.bundle_id.clone(),
+                signature: item.signature.clone(),
+                blockhash: item.blockhash.clone(),
+                noted_at: item.ts,
             };
-            if hold {
-                if let Ok(mut guard) = self.last_sell_bundle.lock() {
-                    guard.insert(
-                        mint.clone(),
-                        SellGuard {
-                            bundle_id: bundle_id.clone(),
-                            signature: item.signature.clone(),
-                            noted_at: now_secs(),
-                        },
-                    );
-                    kept += 1;
+            let (mint, bundle_id) = (item.mint.clone(), item.bundle_id.clone());
+            match self.prior_sell_state(&entry).await {
+                PriorSell::Hold => {
+                    if let Ok(mut guard) = self.last_sell_bundle.lock() {
+                        guard.insert(mint.clone(), entry);
+                        kept += 1;
+                    }
+                    tracing::warn!(%mint, %bundle_id, "WAL replay: prior sell unresolved; resends hold until it resolves");
                 }
-                tracing::warn!(%mint, bundle = %bundle_id, "WAL replay: prior sell bundle unresolved; resends hold until it resolves");
+                PriorSell::Landed => tracing::warn!(%mint, %bundle_id, "WAL replay: prior sell ALREADY LANDED on-chain; not seeding a hold — ledger may be stale, inspect"),
+                PriorSell::Dead => {}
             }
         }
         kept
@@ -768,10 +801,8 @@ impl LiveTrader {
 
     /// True when the last sell bundle for `mint` may still land:
     /// resends must wait under the same cooldown, never compete with it.
-    /// Both `Pending` and `Unknown` hold the guard — a status outage must
-    /// not release a second bundle for the same bag. Engine-terminal
-    /// states are reconciled by signature first: "forgot" (`Invalid`, a
-    /// 5-minute lookback) is not proof the sell never landed.
+    /// [`prior_sell_state`] carries the evidence rules; the TTL is the
+    /// only evidence-free release, and it is loud.
     pub(crate) async fn prior_sell_pending(&self, mint: &str) -> bool {
         let entry = match self.last_sell_bundle.lock() {
             Ok(guard) => guard.get(mint).cloned(),
@@ -782,61 +813,18 @@ impl LiveTrader {
             if let Ok(mut guard) = self.last_sell_bundle.lock() {
                 guard.remove(mint);
             }
-            // Reconcile before release (one RPC): a landed prior means
-            // the bag may already be sold (stale ledger) — surface it;
-            // an unseen one cannot land anymore (its blockhash died
-            // long before the TTL). Either way the replacement sell is
-            // chain-idempotent: it fails or sells the remainder.
-            match entry.signature.as_deref() {
-                None => tracing::warn!(%mint, bundle = %entry.bundle_id,
-                    "resend guard expired (TTL); no signature recorded — releasing resend, inspect the bundle on explorer"),
-                Some(signature) => {
-                    match self.executor.reconcile_signature(signature).await {
-                        Ok(Some(seen)) if seen.landed() => tracing::warn!(%mint, bundle = %entry.bundle_id, %signature,
-                            "prior sell LANDED on-chain (TTL release); resend released — ledger may be stale, MANUAL REVIEW if the bag no longer exists"),
-                        // Only `FailedOnChain` remains on the contract
-                        // (a seen status is never `Timeout`).
-                        Ok(Some(_)) => tracing::warn!(%mint,
-                            bundle = %entry.bundle_id, "prior sell errored on-chain (TTL release); resend released"),
-                        Ok(None) => tracing::warn!(%mint, bundle = %entry.bundle_id,
-                            "prior sell never landed (unseen in full history); resend released"),
-                        Err(e) => tracing::warn!(%mint, bundle = %entry.bundle_id, error = %e,
-                            "prior sell reconcile unavailable at TTL; resend released (an hour-old bundle can no longer land)"),
-                    }
-                }
-            }
+            tracing::warn!(%mint, bundle = %entry.bundle_id, signature = ?entry.signature,
+                "resend guard expired (TTL); prior sell unresolved for an hour — releasing resend, inspect the bundle on explorer");
             return false;
         }
-        let engine = self.executor.bundle_status(&entry.bundle_id).await;
-        match engine {
-            // Still inflight (or unreadable): hold.
-            BundleStatus::Pending | BundleStatus::Unknown => true,
-            // Landed on-chain: the sell executed, no competition possible.
-            BundleStatus::Landed => false,
-            // Terminal engine verdicts (Failed = never forwarded) and a
-            // forgot one (Invalid, 5-minute lookback) are the engine's
-            // word, not the chain's: reconcile the signature before
-            // releasing, so a landed prior is surfaced (stale ledger)
-            // instead of silently resending a replacement.
-            BundleStatus::Failed | BundleStatus::Invalid => match entry.signature.as_deref() {
-                // Legacy entry without a signature: engine word only.
-                None => false,
-                Some(signature) => match self.executor.reconcile_signature(signature).await {
-                    Ok(Some(seen)) if seen.landed() => {
-                        tracing::warn!(%mint, bundle = %entry.bundle_id, %signature,
-                            "prior sell LANDED on-chain (engine reports it dead/forgot); releasing resend — ledger may be stale");
-                        false
-                    }
-                    // Errored or unseen: it cannot land.
-                    Ok(_) => false,
-                    // Unverifiable: fail closed (the TTL still releases).
-                    Err(e) => {
-                        tracing::warn!(%mint, bundle = %entry.bundle_id, error = %e,
-                            "prior sell reconcile unavailable; holding resend (fail closed)");
-                        true
-                    }
-                },
-            },
+        match self.prior_sell_state(&entry).await {
+            PriorSell::Hold => true,
+            PriorSell::Landed => {
+                tracing::warn!(%mint, bundle = %entry.bundle_id, signature = ?entry.signature,
+                    "prior sell LANDED on-chain; releasing resend — ledger may be stale, MANUAL REVIEW if the bag no longer exists");
+                false
+            }
+            PriorSell::Dead => false,
         }
     }
 
@@ -1228,11 +1216,12 @@ impl LiveTrader {
 
     /// Record a sell dispatch BEFORE confirming (crash window
     /// coverage: replay seeds the resend guard from unsettled lines).
-    fn write_wal_sell_pending(&self, mint: &str, bundle_id: &str, signature: &str) {
+    fn write_wal_sell_pending(&self, mint: &str, receipt: &JitoReceipt) {
         self.wal_record(&wal::WalLine::SellPending {
             mint: mint.to_string(),
-            bundle: bundle_id.to_string(),
-            sig: Some(signature.to_string()),
+            bundle: receipt.bundle_id.clone(),
+            sig: Some(receipt.signature.clone()),
+            blockhash: Some(receipt.blockhash.to_string()),
             ts: now_secs(),
         });
     }
@@ -1327,6 +1316,17 @@ impl LiveTrader {
     /// Import boot-replayed pendings into recheck.
     pub fn import_pending(&self, items: Vec<wal::WalPending>) -> usize {
         use std::collections::hash_map::Entry;
+        // Pre-upgrade lines carry no blockhash: their expiry can never
+        // be proven, so an unresolved one parks to manual instead of
+        // dropping. Surface the count once, at the only moment it is
+        // knowable.
+        let legacy = items.iter().filter(|i| i.blockhash.is_none()).count();
+        if legacy > 0 {
+            tracing::warn!(
+                legacy,
+                "WAL replay: pending line(s) without blockhash (pre-upgrade); unresolved ones park to manual, never auto-drop"
+            );
+        }
         self.with_pending("wal-import", 0, |guard| {
             let mut n = 0usize;
             for item in items {

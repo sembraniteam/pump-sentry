@@ -358,6 +358,19 @@ pub enum DispatchVerdict {
     Unknown(&'static str),
 }
 
+/// Expiry evidence for an unseen signature (pure input to the verdict
+/// table). Only `Expired` may close a dispatch as dead: `Unknown` is
+/// every other outcome, including a missing hash (pre-upgrade WAL line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnseenExpiry {
+    /// Blockhash answered invalid: cannot be included anymore.
+    Expired,
+    /// Blockhash still includable: the dispatch may still land.
+    Live,
+    /// No blockhash recorded, or the check could not run.
+    Unknown,
+}
+
 /// Accepted Jito bundle receipt (acceptance != landing).
 #[derive(Debug, Clone)]
 pub struct JitoReceipt {
@@ -942,23 +955,26 @@ impl SwapExecutor {
             .map(|status| classify_status(&status)))
     }
 
-    /// True when the dispatch blockhash can no longer be included: with
-    /// the signature unseen, the transaction can never land. Conser­
-    /// vative: a missing/unparsable hash or any RPC trouble answers
-    /// `false` (not provably dead), so callers keep tracking.
-    async fn blockhash_expired(&self, blockhash: Option<&str>) -> bool {
-        let Some(blockhash) = blockhash.and_then(|b| Hash::from_str(b).ok()) else {
-            return false;
+    /// Expiry evidence for a possibly-dispatch blockhash. Only an
+    /// explicit "invalid" answer from `isBlockhashValid` is `Expired`;
+    /// every doubt (missing/unparsable hash, RPC trouble) stays
+    /// `Unknown` and never releases a dispatch. The blockhash dimension
+    /// is what makes expiry precise: wall-clock age is not a proof
+    /// (validity is 150 slots, which a degraded cluster can stretch).
+    async fn unseen_expiry(&self, blockhash: Option<&str>) -> UnseenExpiry {
+        let Some(hash) = blockhash.and_then(|b| Hash::from_str(b).ok()) else {
+            return UnseenExpiry::Unknown;
         };
         match tokio::time::timeout(
             Duration::from_secs(15),
             self.rpc
-                .is_blockhash_valid(&blockhash, CommitmentConfig::confirmed()),
+                .is_blockhash_valid(&hash, CommitmentConfig::confirmed()),
         )
         .await
         {
-            Ok(Ok(valid)) => !valid,
-            _ => false,
+            Ok(Ok(false)) => UnseenExpiry::Expired,
+            Ok(Ok(true)) => UnseenExpiry::Live,
+            _ => UnseenExpiry::Unknown,
         }
     }
 
@@ -973,10 +989,12 @@ impl SwapExecutor {
 
     /// Resolve a dispatched bundle+signature into one verdict. Chain
     /// beats engine: a landed signature decides; a timeout asks the
-    /// engine, then reconciles by signature over full history before any
-    /// terminal release, and only an unseen signature with a dead
-    /// blockhash may close as expired. `Unknown` never authorizes a
-    /// resend, and an unverifiable reconcile is never proof of death.
+    /// engine — whose terminal verdicts (Landed, Failed) are taken as
+    /// given — then reconciles by signature over full history before
+    /// any terminal release. Only an unseen signature with a provably
+    /// dead blockhash may close as expired; unverifiable reconciles and
+    /// unprovable expiry stay `Unknown`, which never authorizes a
+    /// resend (the caller's own bound releases those, loudly).
     pub async fn resolve_dispatch(
         &self,
         bundle_id: &str,
@@ -989,27 +1007,31 @@ impl SwapExecutor {
             Ok(outcome) => return verdict_from_chain(outcome),
         }
         let engine = self.bundle_status(bundle_id).await;
-        let (reconciled, expired) = match engine {
-            BundleStatus::Landed | BundleStatus::Pending => (None, false),
-            BundleStatus::Failed | BundleStatus::Invalid | BundleStatus::Unknown => {
-                // Terminal-engine and forgot/unreadable both reconcile by
-                // signature: the engine's word is never taken over the
-                // chain's, and only "unseen" opens the expiry proof.
+        let (reconciled, expiry) = match engine {
+            // Engine terminal states need no chain second-opinion: the
+            // poll above already checked the chain for this signature.
+            BundleStatus::Landed | BundleStatus::Failed | BundleStatus::Pending => {
+                (None, UnseenExpiry::Unknown)
+            }
+            // Forgot (5-minute lookback) or unreadable: no testimony at
+            // all. The signature is the reconciliation key, and only
+            // "unseen" opens the expiry question.
+            BundleStatus::Invalid | BundleStatus::Unknown => {
                 match self.reconcile_signature(signature).await {
                     Ok(seen) => {
-                        let expired = if seen.is_none() {
-                            self.blockhash_expired(blockhash).await
+                        let expiry = if seen.is_none() {
+                            self.unseen_expiry(blockhash).await
                         } else {
-                            false
+                            UnseenExpiry::Unknown
                         };
-                        (seen, expired)
+                        (seen, expiry)
                     }
                     // Unverifiable: proof of nothing; keep it unknown.
                     Err(_) => return DispatchVerdict::Unknown("signature reconcile unavailable"),
                 }
             }
         };
-        timeout_verdict(engine, reconciled, expired)
+        timeout_verdict(engine, reconciled, expiry)
     }
 
     /// Landed-tip floor in lamports. 0 without a bundle client or on
@@ -1993,7 +2015,7 @@ fn verdict_from_chain(outcome: ConfirmOutcome) -> DispatchVerdict {
 fn timeout_verdict(
     engine: BundleStatus,
     reconciled: Option<ConfirmOutcome>,
-    expired: bool,
+    expiry: UnseenExpiry,
 ) -> DispatchVerdict {
     // Chain beats engine: a reconciled signature decides outright.
     if let Some(outcome) = reconciled {
@@ -2005,15 +2027,17 @@ fn timeout_verdict(
         // Never forwarded: no funds moved, a rebuild is safe.
         BundleStatus::Failed => DispatchVerdict::Dead(DeadReason::NeverForwarded),
         BundleStatus::Pending => DispatchVerdict::Unknown("engine still pending"),
-        BundleStatus::Invalid | BundleStatus::Unknown => {
-            if expired {
-                // Unseen and the blockhash is dead: can never land now.
-                DispatchVerdict::Dead(DeadReason::Expired)
-            } else {
-                // Unseen but still includable: keep tracking, never resend.
-                DispatchVerdict::Unknown("unseen; blockhash still valid")
+        BundleStatus::Invalid | BundleStatus::Unknown => match expiry {
+            // Unseen and the blockhash is dead: can never land now.
+            UnseenExpiry::Expired => DispatchVerdict::Dead(DeadReason::Expired),
+            // Unseen but still includable: keep tracking, never resend.
+            UnseenExpiry::Live => DispatchVerdict::Unknown("unseen; blockhash still valid"),
+            // Unseen with no expiry evidence: same hold, honest reason
+            // (pre-upgrade WAL lines have no blockhash to check).
+            UnseenExpiry::Unknown => {
+                DispatchVerdict::Unknown("unseen; expiry unproved (no blockhash to check)")
             }
-        }
+        },
     }
 }
 
@@ -2111,46 +2135,63 @@ mod tests {
         // Engine "forgot" (5-minute lookback) + unseen + live blockhash:
         // keep tracking, never declare dead.
         assert_eq!(
-            timeout_verdict(BundleStatus::Invalid, None, false),
+            timeout_verdict(BundleStatus::Invalid, None, UnseenExpiry::Live),
             DispatchVerdict::Unknown("unseen; blockhash still valid")
         );
         // Status unreadable + unseen: unknown too.
         assert_eq!(
-            timeout_verdict(BundleStatus::Unknown, None, false),
+            timeout_verdict(BundleStatus::Unknown, None, UnseenExpiry::Live),
             DispatchVerdict::Unknown("unseen; blockhash still valid")
+        );
+        // No blockhash recorded (pre-upgrade line): unproved, never dead.
+        assert_eq!(
+            timeout_verdict(BundleStatus::Invalid, None, UnseenExpiry::Unknown),
+            DispatchVerdict::Unknown("unseen; expiry unproved (no blockhash to check)")
         );
         // Unseen and the blockhash is dead: the only proof of expiry.
         assert_eq!(
-            timeout_verdict(BundleStatus::Invalid, None, true),
+            timeout_verdict(BundleStatus::Invalid, None, UnseenExpiry::Expired),
             DispatchVerdict::Dead(DeadReason::Expired)
         );
         // Engine forgot, but the signature is on-chain: chain beats engine.
         assert_eq!(
-            timeout_verdict(BundleStatus::Invalid, Some(ConfirmOutcome::Confirmed), false),
+            timeout_verdict(
+                BundleStatus::Invalid,
+                Some(ConfirmOutcome::Confirmed),
+                UnseenExpiry::Unknown
+            ),
             DispatchVerdict::Landed
         );
         assert_eq!(
-            timeout_verdict(BundleStatus::Invalid, Some(ConfirmOutcome::Processed), false),
+            timeout_verdict(
+                BundleStatus::Invalid,
+                Some(ConfirmOutcome::Processed),
+                UnseenExpiry::Unknown
+            ),
             DispatchVerdict::Unknown("seen processed; not voted yet")
         );
         // Engine never forwarded: provably dead, no funds moved.
         assert_eq!(
-            timeout_verdict(BundleStatus::Failed, None, false),
+            timeout_verdict(BundleStatus::Failed, None, UnseenExpiry::Unknown),
             DispatchVerdict::Dead(DeadReason::NeverForwarded)
         );
         // ...but even that verdict yields to the chain: a reconciled
         // landing is the deciding word.
         assert_eq!(
-            timeout_verdict(BundleStatus::Failed, Some(ConfirmOutcome::Confirmed), false),
+            timeout_verdict(
+                BundleStatus::Failed,
+                Some(ConfirmOutcome::Confirmed),
+                UnseenExpiry::Unknown
+            ),
             DispatchVerdict::Landed
         );
         // Engine pending holds; engine landed wins.
         assert_eq!(
-            timeout_verdict(BundleStatus::Pending, None, false),
+            timeout_verdict(BundleStatus::Pending, None, UnseenExpiry::Unknown),
             DispatchVerdict::Unknown("engine still pending")
         );
         assert_eq!(
-            timeout_verdict(BundleStatus::Landed, None, false),
+            timeout_verdict(BundleStatus::Landed, None, UnseenExpiry::Unknown),
             DispatchVerdict::Landed
         );
     }

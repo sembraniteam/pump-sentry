@@ -72,8 +72,10 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   carrying a wrong type is counted in `skipped`, never half-adopted; older
   shapes stay readable via `#[serde(default)]` fields. Replay/compaction
   changes are data-loss-sensitive. `pending` lines carry an optional
-  `blockhash`, `sell_pending` an optional `sig` (both defaultable):
-  they are the reconcile/expiry evidence the guards re-read at boot.
+  `blockhash`; `sell_pending` an optional `sig` + `blockhash` (all
+  defaultable): they are the reconcile/expiry evidence the guards
+  re-read at boot. Lines without them (pre-upgrade) can never prove
+  expiry: they park to manual instead of dropping.
 - Skills are strong defaults, **not ground truth**:
   the Jito skill once omitted the mandatory `{"encoding":"base64"}`
   param and every bundle was refused (`-32602`). Wire formats must be
@@ -86,12 +88,15 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - One shared `Arc<RpcClient>` per process (built in `main`, injected via
   `with_rpc` / `subscribe_with_rpc`). Never add a new `RpcClient`
   construction site; `new()` constructors are test/back-compat wrappers.
-- Resend guard holds on `Pending` AND `Unknown` (`prior_sell_pending`);
-  the stale "Unknown proceeds" comment in `live_mirror.rs` was fixed —
-  do not revert it. It now reconciles before releasing: engine-`Invalid`
-  (5-minute lookback forget) is NOT proof of no-fill, and the TTL release
-  checks the prior signature once — unverifiable reconciles hold (fail
-  closed), a landed prior is warn-surfaced as a possibly stale ledger.
+- Resend guard (`prior_sell_pending`) decides through the SAME
+  `resolve_dispatch` as buys (`prior_sell_state` in `src/live.rs`): hold
+  while `Unknown`, release on `Landed` (warn: possibly stale ledger) or
+  `Dead`. The stale "Unknown proceeds" comment in `live_mirror.rs` was
+  fixed — do not revert it. Engine-`Invalid` (5-minute lookback forget)
+  is NOT proof of no-fill; unverifiable reconciles hold (fail closed).
+  The TTL release (`SELL_GUARD_TTL_SECS`) is the ONLY evidence-free
+  release, deliberately loud; guard checks poll one-shot
+  (`SELL_GUARD_RESOLVE_TIMEOUT`) so they never block an exit.
 - Dispatch status semantics live in `crates/executor/src/executor.rs`
   (`ConfirmOutcome`, `DispatchVerdict`, pinned by `timeout_is_never_a_failure`
   / `chain_verdicts_open_only_on_voted_states`): receipt = submitted
@@ -101,6 +106,12 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   (full history) + blockhash expiry; `Dead` needs proof (on-chain error,
   engine never-forwarded, or unseen + dead blockhash). Never let a
   timeout map back to "failure" or skip the reconcile before a resend.
+  Expiry (`unseen_expiry`) is checked ONLY for an unseen signature and
+  only an explicit invalid answer counts: a missing/unparsable hash or
+  any RPC doubt stays `Unknown` (never dead). Engine `Landed`/`Failed`
+  need no reconcile (the confirm poll already queried the chain for
+  that signature); `reconcile_signature` is only called when the engine
+  has no testimony (`Invalid`/`Unknown`).
 - `venue_fee=None` at confirm fails closed (non-synthetic). Test stubs
   default to `Some(125.0)`; the `None`-fee test arm asserts zero opens.
 
