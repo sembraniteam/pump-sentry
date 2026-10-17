@@ -850,6 +850,31 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             info!(%mint, max = self.settings.max_open_positions, "heat limit: skipping");
             return;
         }
+        // Live exposure counts too: paper cash recycles on close while
+        // live SOL stays locked (tracked/parked/pending), so paper-only
+        // heat would keep opening into a stuck, diverged book. Mints
+        // already paired with paper count once.
+        {
+            let mut paper_mints = std::collections::HashSet::new();
+            for id in portfolio.position_ids() {
+                if let Some(p) = portfolio.position(id) {
+                    paper_mints.insert(p.mint.clone());
+                }
+            }
+            let live_extra = self
+                .exec
+                .held_base_mints()
+                .await
+                .into_iter()
+                .filter(|m| !paper_mints.contains(m))
+                .count();
+            if portfolio.position_ids().len() + live_extra
+                >= self.settings.max_open_positions
+            {
+                info!(%mint, max = self.settings.max_open_positions, live_extra, "heat limit (incl. live-held mints): skipping");
+                return;
+            }
+        }
         if portfolio
             .position_ids()
             .iter()

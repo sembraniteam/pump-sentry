@@ -43,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # auto-select a process default and panics on first TLS use.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 toml = "1.1.8"
+zeroize = "1"
 solana-client = "4.3.0"
 solana-pubkey = "4.4"
 url = "2"

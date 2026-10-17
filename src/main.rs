@@ -18,7 +18,7 @@ use std::time::Duration;
 use alert::Alerter;
 use auditor::RugCheckClient;
 use curve::{CurveTicker, PriceTick};
-use executor::{JitoClient, LiveFundingReport, SwapExecutor, WalletGuard};
+use executor::{FundingPrincipal, JitoClient, LiveFundingReport, SwapExecutor, WalletGuard};
 use listener::{DevScreenConfig, ListenerConfig, PumpFunListener, RpcScreener};
 use migration::{PoolTick, VaultTicker};
 use risk_engine::RiskEngine;
@@ -81,19 +81,31 @@ async fn replay_live_wal(
     use crate::wal;
     let path = live_wal_path();
     let replay = wal::replay_file(&path);
-    if replay.pending.is_empty() && replay.positions.is_empty() && replay.manual.is_empty() {
+    if replay.pending.is_empty()
+        && replay.positions.is_empty()
+        && replay.manual.is_empty()
+        && replay.sell_pending.is_empty()
+    {
         return;
     }
     let mut watched: Vec<(String, String)> = Vec::new();
     let mut n_pending = 0usize;
     let mut n_positions = 0usize;
     let mut n_manual = 0usize;
+    let mut n_guarded = 0usize;
     for p in &replay.pending {
         watched.push((p.position.mint.to_string(), p.position.curve.to_string()));
     }
     wal::compact_file(&path, &replay);
     if let Some(trader) = pipeline.exec.live.as_ref() {
+        // Seed before the pending move below (borrow discipline).
+        let recent = replay.recent_sell_pending(crate::settings::now_secs());
         n_pending = trader.import_pending(replay.pending);
+        // Reseed the resend guard from recent unsettled sell traces:
+        // a crash between dispatch and confirm leaves the bundle
+        // inflight but the in-memory guard empty. Only engine-pending
+        // traces are kept; terminal ones release on first check.
+        n_guarded = trader.seed_sell_guard(recent).await;
     }
     {
         let mut guard = pipeline.exec.live_positions.lock().await;
@@ -139,6 +151,7 @@ async fn replay_live_wal(
         pending = n_pending,
         positions = n_positions,
         manual = n_manual,
+        guarded = n_guarded,
         unwatched,
         file = %path.display(),
         "WAL replay: recovered live custody from unclean shutdown; MANUAL REVIEW REQUIRED (delete the file to clear resolved bags)"
@@ -380,7 +393,16 @@ async fn run_pipeline(live_arg: bool) {
         // Geyser replaces WS ingestion (never both): full transactions
         // arrive inline. REST stays for ticks/screens/sim. The x-token
         // is env-only (secret, never the config file, never logged).
-        let token = std::env::var(listener::YELLOWSTONE_TOKEN_ENV).ok();
+        // `_FILE` avoids exporting it into shell history either.
+        let token = std::env::var(listener::YELLOWSTONE_TOKEN_ENV)
+            .ok()
+            .or_else(|| {
+                std::env::var(format!("{}_FILE", listener::YELLOWSTONE_TOKEN_ENV))
+                    .ok()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
         match listener::GeyserSubscriber::subscribe_with_rpc(
             ListenerConfig {
                 ws_url: settings.ws_url.clone(),
@@ -434,7 +456,7 @@ async fn run_pipeline(live_arg: bool) {
         .timeout(Duration::from_millis(settings.inference_timeout_ms))
         .headers(settings.inference_headers.clone());
     if let Some(key) = &settings.inference_api_key {
-        engine_builder = engine_builder.api_key(key);
+        engine_builder = engine_builder.api_key(key.as_str());
     }
     let engine = match engine_builder.build() {
         Ok(engine) => Some(engine),
@@ -472,15 +494,33 @@ async fn run_pipeline(live_arg: bool) {
             .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports)
             .with_strict_sim(settings.sim_strict);
         // Funding gate (read-only): native shortfall fails closed.
+        // Principal needs a SOL price: one-shot fetch, skipped loudly
+        // when unreadable (dispatch legs still enforced; per-trade
+        // solvency covers runtime).
         {
+            let principal = match sol_feed.fetch_once().await {
+                Ok(sol_usd) => Some(FundingPrincipal {
+                    notional_usd: settings.notional_usd,
+                    slippage_bps: settings.slippage_bps,
+                    sol_usd,
+                }),
+                Err(e) => {
+                    warn!(error = %e, "SOL price unreadable at funding gate; principal unchecked (dispatch legs still enforced)");
+                    None
+                }
+            };
             let report: LiveFundingReport = executor
-                .live_funding_report(settings.tip_lamports, settings.max_open_positions)
+                .live_funding_report(
+                    settings.tip_lamports,
+                    settings.max_open_positions,
+                    principal,
+                )
                 .await;
             match report.native_ok() {
-                Some(true) => info!(payer = %report.payer, balance = report.native_balance, required = report.native_required, max_open = settings.max_open_positions, "live native SOL covers full-book dispatch + reserve"),
+                Some(true) => info!(payer = %report.payer, balance = report.native_balance, required = report.native_required, max_open = settings.max_open_positions, "live native SOL covers full-book principal + dispatch + reserve"),
                 Some(false) => {
                     eprintln!(
-                        "live wallet {} short native SOL: have {} lamports, need {} for {} positions (dispatch + ATA rent + 0.05 reserve); fund before live",
+                        "live wallet {} short native SOL: have {} lamports, need {} for {} positions (principal + dispatch + ATA rent + 0.05 reserve); fund before live",
                         report.payer,
                         report.native_balance.unwrap_or(0),
                         report.native_required,
@@ -606,6 +646,10 @@ async fn run_pipeline(live_arg: bool) {
     // within seconds instead of next heartbeat.
     let mut ingestion_banned_seen = false;
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+    // Saturation drops are latency signal: an exit delayed a tick is
+    // slippage paper never pays, so they ride the heartbeat.
+    let tick_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pool_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stats_task = Arc::clone(&stats);
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
     let mut clean_shutdown = false;
@@ -648,9 +692,11 @@ async fn run_pipeline(live_arg: bool) {
                 let Some(tick) = tick else { break };
                 let pipeline = Arc::clone(&pipeline);
                 let permits = Arc::clone(&permits);
+                let tick_drops = Arc::clone(&tick_drops);
                 in_flight.spawn(async move {
                     let Ok(_permit) = permits.try_acquire_owned() else {
                         // Tick drops are warn (launches stay debug).
+                        tick_drops.fetch_add(1, Ordering::Relaxed);
                         warn!(mint = %tick.mint, "tick dropped: dispatch saturated; exit delayed");
                         return;
                     };
@@ -661,8 +707,10 @@ async fn run_pipeline(live_arg: bool) {
                 let Some(pool) = pool else { break };
                 let pipeline = Arc::clone(&pipeline);
                 let permits = Arc::clone(&permits);
+                let pool_drops = Arc::clone(&pool_drops);
                 in_flight.spawn(async move {
                     let Ok(_permit) = permits.try_acquire_owned() else {
+                        pool_drops.fetch_add(1, Ordering::Relaxed);
                         debug!(mint = %pool.mint, "pool tick dropped: dispatch saturated");
                         return;
                     };
@@ -705,6 +753,30 @@ async fn run_pipeline(live_arg: bool) {
                 });
                 info!("heartbeat: logs={} candidates={} watchlist={} open={} manual={} diverged={} pending_buys={} equity={:.2}",
                     snap.logs_seen, snap.candidates, pending, open, manual, diverged, pending_buys, equity);
+                // Stashed and synthetic PnL bypass the breaker by
+                // design — but invisible bypasses hide exposure, so
+                // both ride the heartbeat every round.
+                {
+                    let (deferred_n, deferred_total) = pipeline.exec.deferred_stats().await;
+                    let synthetic_n = pipeline.exec.synthetic_count().await;
+                    if deferred_n > 0 || synthetic_n > 0 {
+                        info!("breaker bypass: deferred_pnl_n={deferred_n} deferred_total={deferred_total:+.2} synthetic_n={synthetic_n} (excluded from day-loss breaker)");
+                    }
+                }
+                let tick_dropped = tick_drops.load(Ordering::Relaxed);
+                let pool_dropped = pool_drops.load(Ordering::Relaxed);
+                if tick_dropped > 0 || pool_dropped > 0 {
+                    warn!("saturation drops: curve_ticks={tick_dropped} pool_ticks={pool_dropped} (delayed exits are slippage paper never pays)");
+                }
+                // Adaptive slippage widens live guards/floors with
+                // volatility while paper models base slippage only: say
+                // so every heartbeat or the gap reads as pure alpha.
+                if pipeline.settings.slippage_vol_window_secs > 0
+                    && pipeline.settings.slippage_vol_extra_cap_bps > 0
+                {
+                    info!("adaptive slippage armed (window={}s cap={}bps): live pays volatility add-on, paper does not",
+                        pipeline.settings.slippage_vol_window_secs, pipeline.settings.slippage_vol_extra_cap_bps);
+                }
                 // A ban must never be discoverable only from a weeks-old
                 // edge card: re-log every heartbeat while it holds.
                 if stats_task.ingestion_banned.load(Ordering::Relaxed) {
@@ -721,6 +793,23 @@ async fn run_pipeline(live_arg: bool) {
                 let (egap_n, egap_avg, egap_total) = pipeline.exec.entry_gap_stats().await;
                 if egap_n > 0 {
                     info!("entry gap (negative = live paid more): n={egap_n} avg={egap_avg:+.4} total={egap_total:+.4} USD (paper quote vs landed fill)");
+                }
+                // Congestion pricing vs the paper calm-floor: paper legs
+                // pay base tip only, live pays up to worst_4x per
+                // dispatch under congestion. Read paper edge net of the
+                // worst case, not the floor.
+                if live_mode
+                    && let Some(trader) = pipeline.exec.live.as_ref()
+                {
+                    let (base, floor, worst) = trader.congestion_snapshot().await;
+                    let worst_usd = pipeline
+                        .sol_feed
+                        .stamped_price()
+                        .map(|(s, _)| worst as f64 / ids::LAMPORTS_PER_SOL as f64 * s)
+                        .filter(|v| v.is_finite())
+                        .map(|v| format!("${v:.2}"))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    info!("congestion: base_tip={base} floor={floor} worst_4x={worst} lamports/dispatch ({worst_usd} at 4x; paper legs pay base only)");
                 }
                 // Burn-in thresholds (all 0 = off): log-only, never cards.
                 let thresholds = &pipeline.settings;

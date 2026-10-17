@@ -80,8 +80,11 @@ Settings that live **outside** the file (env-only, never in `config.toml`):
 |---------------------------------------------------------------------------------------|----------------------------------------------------------------|
 | `IS_LIVE`                                                                             | safety-critical, exact `true` per invocation, same as `--live` |
 | `SOLANA_PRIVATE_KEY`                                                                  | moves money, live only                                         |
+| `SOLANA_PRIVATE_KEY_FILE`                                                             | preferred: 0600 key file, avoids exporting the key             |
 | `INFERENCE_API_KEY`                                                                   | bearer token, scrubbed after boot                              |
+| `INFERENCE_API_KEY_FILE`                                                              | preferred: 0600 bearer file, avoids exporting the token        |
 | `YELLOWSTONE_TOKEN`                                                                   | geyser x-token (auth + billing)                                |
+| `YELLOWSTONE_TOKEN_FILE`                                                              | preferred: 0600 token file, avoids exporting the token         |
 | `CONFIG_FILE` / `PID_FILE` / `LOG_FILE`                                               | path overrides                                                 |
 | `BOT_DAEMON` / `BOT_INVOCATION` / `BOT_FIRST_RUN`                                     | daemon markers                                                 |
 | `HERMES_BIN`                                                                          | alert binary override                                          |

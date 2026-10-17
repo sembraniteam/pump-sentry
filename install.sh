@@ -10,6 +10,9 @@
 # Build from source instead of a release binary:
 #   curl -fsSL .../install.sh | bash -s -- --from-source
 #
+# Skip checksum verification (refused by default):
+#   curl -fsSL .../install.sh | bash -s -- --allow-unverified
+#
 # Knobs (env):
 #   VERSION      release tag (default: latest)
 #   INSTALL_DIR  binary destination (default: /usr/local/bin when writable,
@@ -39,14 +42,19 @@ case "$(uname -m)" in
 esac
 
 # Argument check first: --help / bad flags must not trigger network.
-case "${1:-}" in
-    -h|--help)
-        awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"
-        exit 0
-        ;;
-    --from-source|"") ;;
-    *) die "unknown argument '$1' (only --from-source is supported)" ;;
-esac
+ALLOW_UNVERIFIED=0
+FROM_SOURCE=0
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)
+            awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"
+            exit 0
+            ;;
+        --from-source) FROM_SOURCE=1 ;;
+        --allow-unverified) ALLOW_UNVERIFIED=1 ;;
+        *) die "unknown argument '$arg' (supported: --from-source, --allow-unverified)" ;;
+    esac
+done
 
 if [ -n "${VERSION:-}" ]; then
     TAG="$VERSION"
@@ -72,7 +80,7 @@ TMP="$(mktemp -d)"
 # shellcheck disable=SC2064
 trap "rm -rf '$TMP'" EXIT
 
-if [ "${1:-}" = "--from-source" ]; then
+if [ "$FROM_SOURCE" = "1" ]; then
     command -v git >/dev/null 2>&1 || die "need 'git' for --from-source"
     command -v cargo >/dev/null 2>&1 || die "need 'cargo' for --from-source (https://rustup.rs)"
     log "building $APP $TAG from source (release; takes a while) ..."
@@ -89,18 +97,40 @@ else
         || die "download failed: $BASE/$ASSET (no asset for $OS/$ARCH yet? try --from-source)"
     if curl -fsSL --retry 3 -o "$TMP/$ASSET.sha256" "$BASE/$ASSET.sha256" 2>/dev/null; then
         WANT="$(awk '{print $1}' "$TMP/$ASSET.sha256")"
-        if command -v sha256sum >/dev/null 2>&1; then
+        case "$WANT" in
+            *[^0-9a-fA-F]*|"") WANT="" ;;
+        esac
+        if [ -z "$WANT" ] || [ "${#WANT}" -ne 64 ]; then
+            [ "$ALLOW_UNVERIFIED" = "1" ] \
+                || die "checksum file malformed; refusing unverified install (retry with --allow-unverified to override)"
+            log "warning: checksum file malformed; installing UNVERIFIED (--allow-unverified)"
+        elif command -v sha256sum >/dev/null 2>&1; then
             HAVE="$(sha256sum "$TMP/$ASSET" | awk '{print $1}')"
+            [ "$WANT" = "$HAVE" ] || die "checksum mismatch for $ASSET"
+            log "checksum ok"
         elif command -v shasum >/dev/null 2>&1; then
             HAVE="$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}')"
+            [ "$WANT" = "$HAVE" ] || die "checksum mismatch for $ASSET"
+            log "checksum ok"
         else
-            log "warning: no sha256 tool; skipping checksum verification"
-            HAVE="$WANT"
+            [ "$ALLOW_UNVERIFIED" = "1" ] \
+                || die "no sha256 tool; refusing unverified install (retry with --allow-unverified to override)"
+            log "warning: no sha256 tool; installing UNVERIFIED (--allow-unverified)"
         fi
-        [ "$WANT" = "$HAVE" ] || die "checksum mismatch for $ASSET"
-        log "checksum ok"
     else
-        log "warning: no checksum file published; installing unverified"
+        [ "$ALLOW_UNVERIFIED" = "1" ] \
+            || die "no checksum file published; refusing unverified install (retry with --allow-unverified to override)"
+        log "warning: no checksum file published; installing UNVERIFIED (--allow-unverified)"
+    fi
+    # Tar-slip guard: validate member names before extracting (no
+    # absolute paths, no `..`, no symlinks — a malicious archive must
+    # not write outside $TMP).
+    MEMBERS="$(tar -tzf "$TMP/$ASSET" 2>/dev/null)" || die "archive unreadable"
+    if printf '%s\n' "$MEMBERS" | grep -E -e '^/' -e '\.\./' >/dev/null; then
+        die "archive has unsafe members (absolute path or ..); refusing to install"
+    fi
+    if tar -tzvf "$TMP/$ASSET" 2>/dev/null | grep -E '^l' >/dev/null; then
+        die "archive contains symlinks; refusing to install"
     fi
     tar -xzf "$TMP/$ASSET" -C "$TMP" || die "extract failed"
     [ -f "$TMP/$APP" ] || die "archive has no $APP binary"

@@ -56,6 +56,12 @@ pub const LIVE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SELL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 /// Failed sells before manual exit.
 pub const SELL_MAX_ATTEMPTS: u32 = 5;
+/// Max age of a resend-guard entry: a bundle that is still
+/// Pending/Unknown after this long is either lying status API or
+/// ancient history — holding resends forever strands the bag, so the
+/// guard expires loudly (warn) instead. Jito bundles resolve in
+/// minutes; an hour is pure outage margin.
+pub const SELL_GUARD_TTL_SECS: u64 = 3_600;
 /// Recheck rounds before manual review.
 pub const PENDING_MAX_ATTEMPTS: u32 = 5;
 /// Recheck fanout: bounded like the gate (`GATE_FANOUT` there is also 16).
@@ -454,8 +460,13 @@ pub struct LiveTrader {
     /// Cap on the volatility add-on, bps (`0` = adaptive off).
     vol_extra_cap_bps: u64,
     /// Last sell bundle per mint (resend guard: never compete with
-    /// an inflight-pending prior bundle for the same bag).
-    last_sell_bundle: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// an inflight-pending prior bundle for the same bag). Value is
+    /// `(bundle_id, noted_at_secs)`: entries expire via
+    /// [`SELL_GUARD_TTL_SECS`] so a lying status API cannot hold
+    /// resends forever.
+    last_sell_bundle: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, (String, u64)>>,
+    >,
     /// One recheck round at a time.
     recheck_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -648,21 +659,27 @@ impl LiveTrader {
         }
     }
 
-    /// Remember a sell bundle for the resend guard.
+    /// Remember a sell bundle for the resend guard, and trace it in
+    /// the WAL so a crash between dispatch and confirm does not blind
+    /// the next boot's guard (replay seeds recent traces back).
     fn note_sell_bundle(&self, mint: &str, bundle_id: &str) {
         if let Ok(mut guard) = self.last_sell_bundle.lock() {
-            guard.insert(mint.to_string(), bundle_id.to_string());
+            guard.insert(mint.to_string(), (bundle_id.to_string(), now_secs()));
         } else {
             tracing::warn!(
                 "sell-bundle lock poisoned during note_sell_bundle; resend guard degraded"
             );
         }
+        self.write_wal_sell_pending(mint, bundle_id);
     }
 
-    /// Forget a sell bundle after confirm.
+    /// Forget a sell bundle after terminal confirm (landed or dead),
+    /// retiring its WAL trace with it.
     fn clear_sell_bundle(&self, mint: &str) {
         if let Ok(mut guard) = self.last_sell_bundle.lock() {
-            guard.remove(mint);
+            if let Some((bundle_id, _)) = guard.remove(mint) {
+                self.write_wal_settled(&bundle_id);
+            }
         } else {
             tracing::warn!(
                 "sell-bundle lock poisoned during clear_sell_bundle; resend guard degraded"
@@ -670,16 +687,49 @@ impl LiveTrader {
         }
     }
 
+    /// True when a guard entry outlived its TTL (pure, unit-pinned).
+    fn sell_guard_expired(noted_at_secs: u64, now_secs: u64) -> bool {
+        now_secs.saturating_sub(noted_at_secs) >= SELL_GUARD_TTL_SECS
+    }
+
+    /// Seed the resend guard from WAL-replayed sell traces. Only ids
+    /// the engine still calls Pending/Unknown are kept (terminal ones
+    /// release on first check); anything older than the replay window
+    /// never arrives here. Returns the kept count.
+    pub async fn seed_sell_guard(&self, items: Vec<(String, String)>) -> usize {
+        let mut kept = 0usize;
+        for (mint, bundle_id) in items {
+            match self.executor.bundle_status(&bundle_id).await {
+                BundleStatus::Pending | BundleStatus::Unknown => {
+                    if let Ok(mut guard) = self.last_sell_bundle.lock() {
+                        guard.insert(mint.clone(), (bundle_id.clone(), now_secs()));
+                        kept += 1;
+                    }
+                    tracing::warn!(%mint, bundle = %bundle_id, "WAL replay: prior sell bundle still engine-pending; resends hold until it resolves");
+                }
+                _ => {}
+            }
+        }
+        kept
+    }
+
     /// True when the last sell bundle for `mint` may still land:
     /// resends must wait under the same cooldown, never compete with it.
     /// Both `Pending` and `Unknown` hold the guard — a status outage must
     /// not release a second bundle for the same bag.
     pub(crate) async fn prior_sell_pending(&self, mint: &str) -> bool {
-        let id = match self.last_sell_bundle.lock() {
+        let entry = match self.last_sell_bundle.lock() {
             Ok(guard) => guard.get(mint).cloned(),
             Err(_) => None,
         };
-        let Some(id) = id else { return false };
+        let Some((id, noted_at)) = entry else { return false };
+        if Self::sell_guard_expired(noted_at, now_secs()) {
+            if let Ok(mut guard) = self.last_sell_bundle.lock() {
+                guard.remove(mint);
+            }
+            tracing::warn!(%mint, bundle = %id, "resend guard expired (TTL); releasing resend — inspect the bundle on explorer");
+            return false;
+        }
         matches!(
             self.executor.bundle_status(&id).await,
             BundleStatus::Pending | BundleStatus::Unknown
@@ -1127,6 +1177,18 @@ impl LiveTrader {
         ));
     }
 
+    /// Record a sell dispatch BEFORE confirming (crash window
+    /// coverage: replay seeds the resend guard from unsettled lines).
+    fn write_wal_sell_pending(&self, mint: &str, bundle_id: &str) {
+        if self.wal_path.is_none() {
+            return;
+        }
+        self.wal_append(format!(
+            "{{\"t\":\"sell_pending\",\"mint\":\"{mint}\",\"bundle\":\"{bundle_id}\",\"ts\":{}}}",
+            now_secs(),
+        ));
+    }
+
     /// Record a dead bundle so boot skips it.
     fn write_wal_settled(&self, bundle_id: &str) {
         if self.wal_path.is_none() {
@@ -1171,6 +1233,18 @@ impl LiveTrader {
         ));
     }
 
+    /// Retire a manual bag taken for exit. Call AFTER taking: a crash
+    /// between take and sell-settle must not replay the bag as a ghost.
+    pub fn unrecord_manual(&self, position: &LivePosition) {
+        if self.wal_path.is_none() {
+            return;
+        }
+        self.wal_append(format!(
+            "{{\"t\":\"take_manual\",\"mint\":\"{}\",\"amount\":{},\"ts\":{}}}",
+            position.mint, position.amount_tokens,
+            now_secs(),
+        ));
+    }
     /// Record a confirmed sell.
     pub fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
         if self.wal_path.is_none() {
@@ -1182,6 +1256,23 @@ impl LiveTrader {
         ));
     }
 
+    /// Congestion pricing for heartbeat display: `(base, floor,
+    /// worst)` where worst is 4x base lifted to the oracle floor —
+    /// the per-dispatch figure paper legs never pay. Mirrors
+    /// [`Self::effective_tip`] at max escalation.
+    pub async fn congestion_snapshot(&self) -> (u64, u64, u64) {
+        let base = self.tip_lamports;
+        let esc = escalated_tip(base, u32::MAX);
+        if base == 0 {
+            return (0, 0, 0);
+        }
+        let floor = self.executor.tip_floor_lamports().await;
+        (
+            base,
+            floor,
+            esc.max(floor.min(base.saturating_mul(TIP_ESCALATION_MAX_MULT))),
+        )
+    }
     /// Congestion-aware tip for an attempt: escalated base lifted to
     /// the landed-tip floor, bounded at 4x base. Static tips underland
     /// in congestion and overpay in calm; the floor adapts both legs.
@@ -1448,6 +1539,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sell_guard_expires_on_ttl() {
+        // A guard entry older than the TTL releases (loudly at the
+        // call site): Jito bundles resolve in minutes, so an hour-old
+        // hold is outage, not custody.
+        assert!(!LiveTrader::sell_guard_expired(1_000, 1_000));
+        assert!(!LiveTrader::sell_guard_expired(1_000, 1_000 + SELL_GUARD_TTL_SECS - 1));
+        assert!(LiveTrader::sell_guard_expired(1_000, 1_000 + SELL_GUARD_TTL_SECS));
+        assert!(LiveTrader::sell_guard_expired(1_000, 1_000 + SELL_GUARD_TTL_SECS + 3_600));
+        // Clock skew never panics, never holds.
+        assert!(!LiveTrader::sell_guard_expired(2_000, 1_000));
     }
 
     #[test]

@@ -11,9 +11,11 @@ use tokio::sync::Mutex;
 /// Deadline for fee-input reads.
 pub const FEE_TIMEOUT: Duration = Duration::from_secs(10);
 /// FeeConfig/Global cache TTL. Short on purpose: a schedule change
-/// must reach paper within minutes, and a cold read is only 2 RPCs on
-/// the rare confirm path.
-pub const FEE_CACHE_TTL: Duration = Duration::from_secs(900);
+/// must reach paper within minutes (stale tiers misprice paper the
+/// same way they loosen live floors), and a cold read is only 2 RPCs
+/// on the rare confirm path. Same value as the dispatch twin
+/// (`executor::FEE_INPUTS_TTL`).
+pub const FEE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Cached globals: FeeConfig bytes, gate byte, fetch time.
 pub type FeeInputsCache = Arc<Mutex<Option<(Vec<u8>, u8, Instant)>>>;

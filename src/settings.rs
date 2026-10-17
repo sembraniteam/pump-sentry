@@ -2,6 +2,7 @@
 
 use risk_engine::StrategyMode;
 use std::collections::HashMap;
+use zeroize::Zeroizing;
 
 /// Default Jito block-engine base URL (override via `JITO_ENDPOINT`).
 /// Global endpoint stays the default (anycast reachability over shaving
@@ -72,8 +73,9 @@ pub struct Settings {
     pub inference_model: String,
     /// Inference deadline in ms.
     pub inference_timeout_ms: u64,
-    /// Bearer token, if the provider needs one.
-    pub inference_api_key: Option<String>,
+    /// Bearer token, if the provider needs one. Zeroized on drop;
+    /// never logged (Debug redacts), never read from the file.
+    pub inference_api_key: Option<Zeroizing<String>>,
     /// Optional extra headers sent on every inference request, as
     /// `"Name: value, ..."` (e.g. OpenCode Go `x-opencode-session`).
     /// Empty (default) sends none. `authorization`/`user-agent` and
@@ -187,6 +189,14 @@ impl Settings {
         let (mut merged, mut file_notes) = crate::config::overlay(file);
         if let Ok(key) = std::env::var("INFERENCE_API_KEY") {
             merged.insert("INFERENCE_API_KEY".to_string(), key);
+        } else if let Some(key) = std::env::var("INFERENCE_API_KEY_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            // Preferred: the bearer never enters the environment.
+            merged.insert("INFERENCE_API_KEY".to_string(), key);
         }
         let mut settings = Self::from_map(&merged);
         // File notes first: they name the source of a value.
@@ -228,7 +238,7 @@ impl Settings {
             inference_endpoint: get_string(vars, "INFERENCE_ENDPOINT", DEFAULT_INFERENCE_ENDPOINT),
             inference_model: get_string(vars, "INFERENCE_MODEL", "llama3.2:1b"),
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300, &mut notes),
-            inference_api_key: vars.get("INFERENCE_API_KEY").cloned(),
+            inference_api_key: vars.get("INFERENCE_API_KEY").map(|s| Zeroizing::new(s.clone())),
             inference_headers: parse_inference_headers(vars, &mut notes),
             slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200, &mut notes),
             slippage_vol_window_secs: get_int(vars, "SLIPPAGE_VOL_WINDOW_SECS", 0, &mut notes),
@@ -780,7 +790,10 @@ mod tests {
         assert_eq!(s.fetch_concurrency, 8);
         assert_eq!(s.backfill_sig_limit, 100);
         assert_eq!(s.reconnect_backoff_max_ms, 5000);
-        assert_eq!(s.inference_api_key.as_deref(), Some("secret"));
+        assert_eq!(
+            s.inference_api_key.as_ref().map(|k| k.as_str()),
+            Some("secret")
+        );
         assert!(s.sim_strict);
     }
 
@@ -902,7 +915,10 @@ mod tests {
         let saved = std::env::var("INFERENCE_API_KEY").ok();
         unsafe { std::env::set_var("INFERENCE_API_KEY", "test-secret") };
         let s = Settings::from_file(Some(&file));
-        assert_eq!(s.inference_api_key.as_deref(), Some("test-secret"));
+        assert_eq!(
+            s.inference_api_key.as_ref().map(|k| k.as_str()),
+            Some("test-secret")
+        );
         match saved {
             Some(v) => unsafe { std::env::set_var("INFERENCE_API_KEY", v) },
             None => unsafe { std::env::remove_var("INFERENCE_API_KEY") },
@@ -912,6 +928,39 @@ mod tests {
             !crate::config::KEYMAP.iter().any(|(_, _, flat)| *flat == "INFERENCE_API_KEY"),
             "inference key must never gain a file mapping"
         );
+    }
+
+    #[test]
+    fn inference_key_file_fallback_avoids_export() {
+        // Preferred path: bearer from a file so it never enters the
+        // environment (`ps e`, shell history stay clean).
+        let file: toml::Table = "[risk]\n".parse().expect("test toml");
+        let saved = std::env::var("INFERENCE_API_KEY").ok();
+        let saved_file = std::env::var("INFERENCE_API_KEY_FILE").ok();
+        unsafe { std::env::remove_var("INFERENCE_API_KEY") };
+        let dir = std::env::temp_dir().join(format!(
+            "inference-key-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("key.txt");
+        std::fs::write(&path, "  file-secret\n").expect("write");
+        unsafe { std::env::set_var("INFERENCE_API_KEY_FILE", &path) };
+        let s = Settings::from_file(Some(&file));
+        assert_eq!(
+            s.inference_api_key.as_ref().map(|k| k.as_str()),
+            Some("file-secret")
+        );
+        unsafe { std::env::remove_var("INFERENCE_API_KEY_FILE") };
+        match saved {
+            Some(v) => unsafe { std::env::set_var("INFERENCE_API_KEY", v) },
+            None => unsafe { std::env::remove_var("INFERENCE_API_KEY") },
+        }
+        if let Some(v) = saved_file {
+            unsafe { std::env::set_var("INFERENCE_API_KEY_FILE", v) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

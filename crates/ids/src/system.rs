@@ -27,6 +27,8 @@ pub const BASE_TX_FEE_LAMPORTS: u64 = 5_000;
 pub const ATA_RENT_LAMPORTS: u64 = 2_039_280;
 /// Basis-point denominator (100%): slippage, fees, pro-rata math.
 pub const BPS_DENOMINATOR: u64 = 10_000;
+/// Lamports per SOL (chain constant).
+pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 #[cfg(test)]
 mod tests {

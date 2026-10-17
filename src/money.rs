@@ -29,9 +29,6 @@ impl Bps {
     }
 
     /// Raw value in basis points.
-    ///
-    /// Covered by unit tests; no production call site yet — it arrives
-    /// with the `Settings` migration (see module TODO).
     #[allow(dead_code)]
     #[must_use]
     pub const fn get(self) -> u32 {
@@ -61,9 +58,6 @@ impl Percent {
     }
 
     /// Raw value in percent.
-    ///
-    /// Covered by unit tests; no production call site yet — it arrives
-    /// with the `Settings` migration (see module TODO).
     #[allow(dead_code)]
     #[must_use]
     pub const fn get(self) -> f64 {

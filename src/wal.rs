@@ -19,6 +19,19 @@ pub struct WalManual {
     pub note: String,
 }
 
+/// One sell dispatch awaiting confirm (resend-guard seed).
+#[derive(Debug, Clone)]
+pub struct WalSellPending {
+    pub mint: String,
+    pub bundle_id: String,
+    /// Line timestamp (recency window at import).
+    pub ts: u64,
+}
+
+/// Sell traces newer than this seed the resend guard at boot; older
+/// bundles cannot still be inflight (Jito drops them in minutes).
+pub const SELL_PENDING_SEED_WINDOW_SECS: u64 = 900;
+
 /// Boot state.
 #[derive(Debug, Default, Clone)]
 pub struct WalReplay {
@@ -26,8 +39,22 @@ pub struct WalReplay {
     pub pending: Vec<WalPending>,
     pub positions: Vec<LivePosition>,
     pub manual: Vec<WalManual>,
+    /// Unsettled sell dispatches (guard seeds).
+    pub sell_pending: Vec<WalSellPending>,
     /// Corrupt lines skipped.
     pub skipped: usize,
+}
+
+impl WalReplay {
+    /// `(mint, bundle_id)` pairs fresh enough to seed the resend
+    /// guard: the rest are ancient history, never inflight.
+    pub fn recent_sell_pending(&self, now_secs: u64) -> Vec<(String, String)> {
+        self.sell_pending
+            .iter()
+            .filter(|s| now_secs.saturating_sub(s.ts) < SELL_PENDING_SEED_WINDOW_SECS)
+            .map(|s| (s.mint.clone(), s.bundle_id.clone()))
+            .collect()
+    }
 }
 
 fn field(line: &str, key: &str) -> Option<String> {
@@ -76,6 +103,9 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     let mut pending: HashMap<String, WalPending> = HashMap::new();
     let mut positions: HashMap<String, LivePosition> = HashMap::new();
     let mut manual: HashMap<String, WalManual> = HashMap::new();
+    // Sell dispatches keyed by bundle (multiples per mint survive;
+    // the resend guard seeds from the unsettled remainder).
+    let mut sell_pending: HashMap<(String, String), u64> = HashMap::new();
     // Fills already subtracted (by bundle id). Old files may carry the
     // same sell twice (two writers pre-fix); without this a partial
     // exit replays twice and the held runner vanishes from tracking.
@@ -84,10 +114,16 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     // Same-mint bags merge by summing amounts: custody cares about
     // the total held, and per-bundle granularity would ripple into
     // every mint-keyed tracker downstream. Distinct manual notes
-    // collapse to the first (amounts stay exact).
+    // collapse to the first (amounts stay exact). A second curve for
+    // the same mint should not exist (one curve per mint) — if it
+    // ever does, say so loudly instead of silently adopting it.
     let add = |map: &mut HashMap<String, LivePosition>, p: LivePosition| {
         map.entry(p.mint.to_string())
             .and_modify(|e| {
+                if e.curve != p.curve || e.assoc_curve != p.assoc_curve {
+                    tracing::warn!(mint = %e.mint, kept = %e.curve, dropped = %p.curve,
+                        "WAL replay: same mint, different curve — keeping first, amounts still summed");
+                }
                 e.amount_tokens = e.amount_tokens.saturating_add(p.amount_tokens);
             })
             .or_insert(p);
@@ -126,6 +162,18 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     continue;
                 };
                 pending.remove(&bundle);
+                sell_pending.retain(|(_, b), _| *b != bundle);
+            }
+            "sell_pending" => {
+                let (Some(mint), Some(bundle), Some(ts)) = (
+                    field(line, "mint"),
+                    field(line, "bundle"),
+                    field(line, "ts").and_then(|s| s.parse::<u64>().ok()),
+                ) else {
+                    skipped += 1;
+                    continue;
+                };
+                sell_pending.insert((mint, bundle), ts);
             }
             "position" => {
                 let (Some(pos), bundle) = (position_from(line), field(line, "bundle")) else {
@@ -169,6 +217,22 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     })
                     .or_insert(WalManual { position: pos, note });
             }
+            "take_manual" => {
+                // A taken-for-exit bag must not replay as a ghost when
+                // the crash lands between take and sell-settle.
+                let (Some(mint), Some(amount)) = (field(line, "mint"), num(line, "amount"))
+                else {
+                    skipped += 1;
+                    continue;
+                };
+                if let Some(entry) = manual.get_mut(&mint) {
+                    entry.position.amount_tokens =
+                        entry.position.amount_tokens.saturating_sub(amount);
+                    if entry.position.amount_tokens == 0 {
+                        manual.remove(&mint);
+                    }
+                }
+            }
             _ => skipped += 1,
         }
     }
@@ -176,6 +240,10 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
         pending: pending.into_values().collect(),
         positions: positions.into_values().collect(),
         manual: manual.into_values().collect(),
+        sell_pending: sell_pending
+            .into_iter()
+            .map(|((mint, bundle_id), ts)| WalSellPending { mint, bundle_id, ts })
+            .collect(),
         skipped,
     }
 }
@@ -210,6 +278,19 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
             p.signature,
             p.bundle_id,
             crate::settings::now_secs(),
+        );
+    }
+    for s in &replay.sell_pending {
+        // Prune stale traces at compaction: beyond the seed window no
+        // bundle can still be inflight, so keeping them only grows
+        // the file for guard entries that would never seed.
+        if crate::settings::now_secs().saturating_sub(s.ts) >= SELL_PENDING_SEED_WINDOW_SECS {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "{{\"t\":\"sell_pending\",\"mint\":\"{}\",\"bundle\":\"{}\",\"ts\":{}}}",
+            s.mint, s.bundle_id, s.ts,
         );
     }
     for p in &replay.positions {
@@ -326,5 +407,56 @@ mod tests {
         ];
         let replay = replay_lines(lines.iter().map(String::as_str));
         assert!(replay.positions.is_empty());
+    }
+
+    #[test]
+    fn sell_pending_seeds_guard_until_settled() {
+        // Dispatch-then-crash leaves an unsettled sell trace: replay
+        // must surface it for the resend guard, and the terminal
+        // `settled` line must retire it.
+        let open = format!(r#"{{"t":"sell_pending","mint":"{TMINT}","bundle":"B9","ts":1000}}"#);
+        let retired = r#"{"t":"settled","bundle":"B9","ts":1001}"#.to_string();
+        let replay = replay_lines([open.as_str()].iter().copied());
+        assert_eq!(replay.sell_pending.len(), 1);
+        assert_eq!(replay.sell_pending[0].bundle_id, "B9");
+        // Fresh trace seeds; ancient trace never (cannot be inflight).
+        assert_eq!(replay.recent_sell_pending(1000).len(), 1);
+        assert!(
+            replay
+                .recent_sell_pending(1000 + SELL_PENDING_SEED_WINDOW_SECS)
+                .is_empty()
+        );
+        let replay = replay_lines([open.as_str(), retired.as_str()].iter().copied());
+        assert!(replay.sell_pending.is_empty());
+        assert!(replay.recent_sell_pending(1001).is_empty());
+    }
+
+    #[test]
+    fn sell_pending_without_ts_skips_loudly() {
+        // New-kind lines always carry ts; a missing one is damage.
+        let lines = [format!(
+            r#"{{"t":"sell_pending","mint":"{TMINT}","bundle":"B9"}}"#
+        )];
+        let replay = replay_lines(lines.iter().map(String::as_str));
+        assert!(replay.sell_pending.is_empty());
+        assert_eq!(replay.skipped, 1);
+    }
+
+    #[test]
+    fn take_manual_retires_parked_bag() {
+        // Park then take for exit: a crash between take and
+        // sell-settle must not replay the bag as a ghost.
+        let park = format!(
+            r#"{{"t":"manual","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":1000,"creator":null,"note":"sell-retries-exhausted","ts":1}}"#
+        );
+        let take = format!(r#"{{"t":"take_manual","mint":"{TMINT}","amount":1000,"ts":2}}"#);
+        let replay = replay_lines([park.as_str(), take.as_str()].iter().copied());
+        assert!(replay.manual.is_empty());
+        // Partial take leaves the remainder parked.
+        let take_part =
+            format!(r#"{{"t":"take_manual","mint":"{TMINT}","amount":600,"ts":2}}"#);
+        let replay = replay_lines([park.as_str(), take_part.as_str()].iter().copied());
+        assert_eq!(replay.manual.len(), 1);
+        assert_eq!(replay.manual[0].position.amount_tokens, 400);
     }
 }

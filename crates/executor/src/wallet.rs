@@ -17,7 +17,7 @@ pub const MIN_SOL_RESERVE_LAMPORTS: u64 = 50_000_000;
 /// Wallet failures.
 #[derive(Error, Debug)]
 pub enum WalletGuardError {
-    #[error("Environment variable SOLANA_PRIVATE_KEY missing")]
+    #[error("SOLANA_PRIVATE_KEY missing (or SOLANA_PRIVATE_KEY_FILE unreadable)")]
     MissingKeyEnv,
     #[error("Failed to decode base58 private key: {0}")]
     Base58Decode(#[from] bs58::decode::Error),
@@ -46,16 +46,26 @@ pub struct WalletGuard {
 }
 
 impl WalletGuard {
-    /// Load from `SOLANA_PRIVATE_KEY` (trims whitespace, zeroizes).
+    /// Load from `SOLANA_PRIVATE_KEY` (trims whitespace, zeroizes),
+    /// else from the file at `SOLANA_PRIVATE_KEY_FILE` (preferred:
+    /// never `export` the key into shell/profile history — a file
+    /// keeps it out of `/proc` environ and `ps`).
     /// On success the variable is scrubbed from the process
     /// environment: the keypair lives only in guarded memory
     /// afterwards, not in `/proc` environ, core dumps, or children
     /// spawned later. A second load fails loudly (`MissingKeyEnv`) —
     /// that is the guarantee working, not a bug.
     pub fn load_from_env() -> Result<Self, WalletGuardError> {
-        let key_str = Zeroizing::new(
-            env::var("SOLANA_PRIVATE_KEY").map_err(|_| WalletGuardError::MissingKeyEnv)?,
-        );
+        let key_str = match env::var("SOLANA_PRIVATE_KEY") {
+            Ok(k) => Zeroizing::new(k),
+            Err(_) => match env::var("SOLANA_PRIVATE_KEY_FILE")
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+            {
+                Some(k) => Zeroizing::new(k),
+                None => return Err(WalletGuardError::MissingKeyEnv),
+            },
+        };
         let loaded = Self::from_base58(key_str.trim())?;
         unsafe { env::remove_var("SOLANA_PRIVATE_KEY") };
         Ok(loaded)
@@ -87,7 +97,8 @@ impl WalletGuard {
         &self.keypair
     }
 
-    /// Assert `balance >= trade + tip + priority + reserve`. Deadline-bound.
+    /// Assert `balance >= trade + tip + priority + base fee + one ATA
+    /// rent + reserve`. Deadline-bound.
     /// Priority is explicit (not folded into tip) so shortfalls name the
     /// right knob. Simulation still gates every dispatch; this only
     /// fails fast before burning sim budget.
@@ -105,9 +116,13 @@ impl WalletGuard {
         .await
         .map_err(|_| WalletGuardError::Timeout)?
         .map_err(WalletGuardError::Rpc)?;
+        // Same legs the funding gate scales (minus the book multiple:
+        // this guards one dispatch, the gate guards the book).
         let required = trade_lamports
             .saturating_add(tip_lamports)
             .saturating_add(priority_lamports)
+            .saturating_add(ids::BASE_TX_FEE_LAMPORTS)
+            .saturating_add(ids::ATA_RENT_LAMPORTS)
             .saturating_add(MIN_SOL_RESERVE_LAMPORTS);
         if balance < required {
             return Err(WalletGuardError::InsufficientFunds {
@@ -139,11 +154,16 @@ mod tests {
     fn missing_env_errors() {
         let _guard = env_lock().lock().expect("lock");
         let saved = env::var("SOLANA_PRIVATE_KEY").ok();
+        let saved_file = env::var("SOLANA_PRIVATE_KEY_FILE").ok();
         unsafe { env::remove_var("SOLANA_PRIVATE_KEY") };
+        unsafe { env::remove_var("SOLANA_PRIVATE_KEY_FILE") };
         let err = WalletGuard::load_from_env().err().expect("must fail");
         assert!(matches!(err, WalletGuardError::MissingKeyEnv));
         if let Some(v) = saved {
             unsafe { env::set_var("SOLANA_PRIVATE_KEY", v) };
+        }
+        if let Some(v) = saved_file {
+            unsafe { env::set_var("SOLANA_PRIVATE_KEY_FILE", v) };
         }
     }
 
@@ -173,6 +193,41 @@ mod tests {
         let expected = keypair_from_seed(&seed).expect("seed").pubkey();
         let loaded = WalletGuard::from_base58(&bs58::encode(seed).into_string()).expect("load");
         assert_eq!(loaded.pubkey(), expected);
+    }
+
+    #[test]
+    fn loads_from_file_when_env_unset() {
+        // Preferred path: the key never enters the environment
+        // (`ps e`, shell history, `/proc` stay clean).
+        let _guard = env_lock().lock().expect("lock");
+        let saved = env::var("SOLANA_PRIVATE_KEY").ok();
+        let saved_file = env::var("SOLANA_PRIVATE_KEY_FILE").ok();
+        unsafe { env::remove_var("SOLANA_PRIVATE_KEY") };
+        let dir = std::env::temp_dir().join(format!(
+            "wallet-file-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("key.txt");
+        let keypair = Keypair::new();
+        std::fs::write(
+            &path,
+            format!("  {}\n", bs58::encode(keypair.to_bytes()).into_string()),
+        )
+        .expect("write");
+        unsafe { env::set_var("SOLANA_PRIVATE_KEY_FILE", &path) };
+        let loaded = WalletGuard::load_from_env().expect("load");
+        assert_eq!(loaded.pubkey(), keypair.pubkey());
+        unsafe { env::remove_var("SOLANA_PRIVATE_KEY_FILE") };
+        match saved {
+            Some(v) => unsafe { env::set_var("SOLANA_PRIVATE_KEY", v) },
+            None => unsafe { env::remove_var("SOLANA_PRIVATE_KEY") },
+        }
+        if let Some(v) = saved_file {
+            unsafe { env::set_var("SOLANA_PRIVATE_KEY_FILE", v) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

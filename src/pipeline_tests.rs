@@ -317,6 +317,8 @@ impl WalSink for StubLive {
     fn record_manual(&self, _position: &LivePosition, _note: &str) {}
 
     fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {}
+
+    fn unrecord_manual(&self, _position: &LivePosition) {}
 }
 
 /// Canned reserve feed with watch tracking.
@@ -1199,6 +1201,47 @@ async fn confirm_flow_opens_with_measured_velocity() {
     drop(portfolio);
     assert_eq!(pipe.pending_count().await, 0);
     assert_eq!(pipe.reserves.watched.lock().expect("lock").len(), 1);
+}
+
+#[tokio::test]
+async fn heat_counts_live_held_mints() {
+    // Paper cash recycles on close while live SOL stays locked: a
+    // parked manual bag must occupy heat, or a stuck book keeps
+    // opening into divergence on recycled cash.
+    let live = StubLive::working();
+    let mut settings = Settings::from_map(&HashMap::new());
+    settings.max_open_positions = 1;
+    let pipe = pipeline_screened(
+        settings,
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+        Some(live.clone()),
+    );
+    pipe.exec.live_manual.lock().await.insert(
+        MINT.to_string(),
+        LivePosition {
+            mint: pk(MINT),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000,
+            creator: None,
+        },
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    assert!(pipe.portfolio.lock().await.position_ids().is_empty());
 }
 
 #[tokio::test]
@@ -2604,6 +2647,38 @@ async fn manual_sell_exits_parked_manual_bag() {
     );
     pipe.exec.live_manual.lock().await.insert(
         sys.to_string(),
+        LivePosition {
+            mint: pk(sys),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000,
+            creator: None,
+        },
+    );
+    assert!(pipe.manual_sell(sys).await);
+    assert_eq!(live.sells(), vec![(sys.to_string(), 1_000)]);
+    assert!(pipe.exec.live_manual.lock().await.is_empty());
+    assert!(pipe.exec.live_positions.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn manual_sell_drains_suffixed_dup_bags() {
+    // A second fill that lands while the mint is tracked parks under
+    // `{mint}#2-…` (suffixed keys are not valid `sell` targets
+    // themselves): one `sell MINT` must drain the backlog, not strand
+    // it until a code change.
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 2.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    pipe.exec.live_manual.lock().await.insert(
+        format!("{sys}#2-deadbeef"),
         LivePosition {
             mint: pk(sys),
             curve: pk(CURVE),

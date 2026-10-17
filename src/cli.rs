@@ -1124,7 +1124,9 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
         }
     };
     if !verified && !allow_unverified {
-        eprintln!("refusing to install unverified binary (retry with --allow-unverified to override)");
+        eprintln!(
+            "refusing to install unverified binary (retry with --allow-unverified to override)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         std::process::exit(1);
     }

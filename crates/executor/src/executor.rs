@@ -323,8 +323,9 @@ pub struct SwapExecutor {
 
 /// Fee-input cache TTL. Same value as the paper reader twin
 /// (`curve::fee::FEE_CACHE_TTL`): a schedule change must reach
-/// dispatch within minutes.
-pub const FEE_INPUTS_TTL: Duration = Duration::from_secs(900);
+/// dispatch within minutes — stale tiers quote sell floors loose,
+/// so the window stays short (two small account reads per window).
+pub const FEE_INPUTS_TTL: Duration = Duration::from_secs(300);
 
 /// Read-only funding snapshot. `None` = unreadable, never funded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +342,41 @@ pub struct LiveFundingReport {
     pub wsol_ata: Pubkey,
     /// WSOL balance (`None` = missing/unreadable).
     pub wsol_balance: Option<u64>,
+}
+
+/// Trade principal for the funding gate (SOL-pair buys pay native).
+#[derive(Debug, Clone, Copy)]
+pub struct FundingPrincipal {
+    /// Paper notional per trade, USD.
+    pub notional_usd: f64,
+    /// Slippage guard, bps (principal sized past it).
+    pub slippage_bps: u64,
+    /// SOL/USD for conversion.
+    pub sol_usd: f64,
+}
+
+impl FundingPrincipal {
+    /// Principal lamports per position, ceiled past slippage. `None`
+    /// on garbage inputs (fail-closed: caller skips principal loudly,
+    /// never boots a fiction).
+    fn per_position_lamports(&self) -> Option<u128> {
+        if !self.notional_usd.is_finite()
+            || self.notional_usd <= 0.0
+            || !self.sol_usd.is_finite()
+            || self.sol_usd <= 0.0
+        {
+            return None;
+        }
+        let slipped = self.notional_usd * (10_000.0 + self.slippage_bps as f64) / 10_000.0;
+        if !slipped.is_finite() || slipped <= 0.0 {
+            return None;
+        }
+        let lamports = slipped / self.sol_usd * ids::LAMPORTS_PER_SOL as f64;
+        if !lamports.is_finite() || lamports <= 0.0 {
+            return None;
+        }
+        Some(lamports.ceil() as u128)
+    }
 }
 
 impl LiveFundingReport {
@@ -466,24 +502,32 @@ impl SwapExecutor {
 
     /// Read-only funding snapshot. Moves no funds. Scaled to a full
     /// book — every position pays buy + sell dispatches, one ATA rent
-    /// per new mint (assumes all mints new: conservative), plus the
-    /// reserve — so a green report means the wallet can actually run
-    /// `max_open_positions`, not just cover the first touch.
+    /// per new mint (assumes all mints new: conservative), trade
+    /// principal per position, plus the reserve — so a green report
+    /// means the wallet can actually run `max_open_positions`, not
+    /// just cover the first touch. `None` principal (price unreadable)
+    /// skips principal loudly, never boots a fiction.
     pub async fn live_funding_report(
         &self,
         tip_lamports: u64,
         max_open_positions: usize,
+        principal: Option<FundingPrincipal>,
     ) -> LiveFundingReport {
         use crate::instructions::{WSOL_MINT, user_ata_with_program};
         let positions = max_open_positions.max(1) as u128;
         let per_dispatch = u128::from(self.effective_tip(tip_lamports, true))
             .saturating_add(u128::from(self.priority_fee_lamports()))
             .saturating_add(u128::from(ids::BASE_TX_FEE_LAMPORTS));
-        let required_128 = per_dispatch
+        let mut required_128 = per_dispatch
             .saturating_mul(positions)
             .saturating_mul(2)
             .saturating_add(u128::from(ids::ATA_RENT_LAMPORTS).saturating_mul(positions))
             .saturating_add(u128::from(crate::wallet::MIN_SOL_RESERVE_LAMPORTS));
+        if let Some(p) = principal
+            && let Some(each) = p.per_position_lamports()
+        {
+            required_128 = required_128.saturating_add(each.saturating_mul(positions));
+        }
         // Overflow can only overstate (fail-closed boot), never understate.
         let required = u64::try_from(required_128).unwrap_or(u64::MAX);
         let native_balance = rpc_timeout(

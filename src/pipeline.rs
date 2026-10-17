@@ -157,6 +157,10 @@ pub trait WalSink {
 
     /// Record a sell (call BEFORE subtracting).
     fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str);
+
+    /// Retire a manual bag taken for exit (call AFTER taking): without
+    /// this, a crash before compaction replays the bag as a ghost.
+    fn unrecord_manual(&self, position: &LivePosition);
 }
 
 /// Umbrella bound for the full live contract. New code depends on the
@@ -229,6 +233,10 @@ impl WalSink for LiveTrader {
 
     fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
         self.record_sell(mint, amount_tokens, bundle_id)
+    }
+
+    fn unrecord_manual(&self, position: &LivePosition) {
+        self.unrecord_manual(position)
     }
 }
 

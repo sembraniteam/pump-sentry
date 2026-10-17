@@ -6,7 +6,7 @@ use reqwest::Client;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use std::sync::{
+use zeroize::Zeroizing;use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
@@ -68,7 +68,8 @@ pub struct RiskDecision {
 pub struct RiskEngineBuilder {
     endpoint: String,
     model: String,
-    api_key: Option<String>,
+    /// Bearer token (zeroized on drop; never logged, only redacted).
+    api_key: Option<Zeroizing<String>>,
     extra_headers: Vec<(String, String)>,
     timeout: Duration,
     temperature: f32,
@@ -125,7 +126,7 @@ impl RiskEngineBuilder {
 
     /// Bearer token; skipped for local servers.
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.api_key = Some(api_key.into());
+        self.api_key = Some(Zeroizing::new(api_key.into()));
         self
     }
 
@@ -178,7 +179,7 @@ pub struct RiskEngine {
     client: Client,
     endpoint: String,
     model: String,
-    api_key: Option<String>,
+    api_key: Option<Zeroizing<String>>,
     extra_headers: Vec<(HeaderName, HeaderValue)>,
     timeout: Duration,
     temperature: f32,
@@ -460,7 +461,7 @@ impl RiskEngine {
             )
             .json(&request);
         if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
+            req = req.bearer_auth(key.as_str());
         }
         for (name, value) in &self.extra_headers {
             req = req.header(name.clone(), value.clone());

@@ -117,7 +117,8 @@ A week nominal with no burst exits burn-in.
 
 Three secrets: `SOLANA_PRIVATE_KEY` (moves money), `INFERENCE_API_KEY`
 (bills your LLM account), and `?api-key=` inside RPC URLs (bills your
-RPC account).
+RPC account). `YELLOWSTONE_TOKEN` (geyser auth+billing) follows the
+same rules.
 
 **Bot guarantees (coded + tested):**
 - Secrets enter via env only, never via `config.toml` (no file mapping exists).
@@ -125,9 +126,14 @@ RPC account).
 - Secrets never reach logs: bearer redacted, URL queries stripped, keypair has no `Debug`.
 
 **Operator rules (the bot cannot do these for you):**
-- Never `export SECRET=...` inline — it lands in shell history. Use `read -s`, a `0600` env file, or the OS keychain.
+- Never `export SECRET=...` inline — it lands in shell history AND in
+  `/proc` environ + `ps e` output, which the daemon child inherits.
+  Prefer the `*_FILE` variants (`SOLANA_PRIVATE_KEY_FILE`,
+  `INFERENCE_API_KEY_FILE`, `YELLOWSTONE_TOKEN_FILE`): 0600 files
+  the bot reads once at boot. Fallback: `read -s`, a `0600` env file,
+  or the OS keychain.
 - Scope RPC keys per use, with IP allowlists where offered. A key pasted into `config.toml` makes that file a secret: keep `~/.pump-sentry/` `0700` (new config files are `0600` from birth).
-- Keep inference on localhost; a remote plain-http endpoint with a key set raises a `cleartext` boot warning — treat it as a finding.
+- Keep inference on localhost; a remote plain-http endpoint with a key set raises a `cleartext` boot warning — treat it as a finding (live refuses it outright).
 
 **Rotation:**
 1. RPC/inference keys: mint new, swap env, restart, delete old. No funds move — 5 minutes.

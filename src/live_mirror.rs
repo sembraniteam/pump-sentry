@@ -328,13 +328,19 @@ impl<L> LiveExecution<L> {
     /// Subtract a confirmed sell; true when the bag emptied.
     /// A missing bag is custody drift (dispatch confirmed what we no
     /// longer track): loud, then treated as settled so the breaker
-    /// still resolves instead of deferring forever.
+    /// still resolves instead of deferring forever. An amount larger
+    /// than tracked is also drift, but the other way: zeroing the bag
+    /// would hide it, so refuse (false) and keep investigating.
     pub async fn subtract_fill(&self, mint: &str, amount: u64) -> bool {
         let mut guard = self.live_positions.lock().await;
         match guard.get_mut(mint) {
             Some(tracked) => {
-                tracked.amount_tokens = tracked.amount_tokens.saturating_sub(amount);
-                if tracked.amount_tokens == 0 {
+                let Some(remaining) = tracked.amount_tokens.checked_sub(amount) else {
+                    warn!(%mint, amount, held = tracked.amount_tokens, "sell confirmed more than tracked; refusing to zero the bag");
+                    return false;
+                };
+                tracked.amount_tokens = remaining;
+                if remaining == 0 {
                     guard.remove(mint);
                     true
                 } else {
@@ -386,6 +392,27 @@ impl<L> LiveExecution<L> {
         self.live_positions.lock().await.keys().cloned().collect()
     }
 
+    /// Distinct base mints with live exposure (tracked, parked, or
+    /// pending buys). Heat counts these alongside paper positions:
+    /// paper cash recycles on close while live SOL stays locked, so
+    /// paper-only heat would keep opening into a stuck, diverged book.
+    pub async fn held_base_mints(&self) -> std::collections::HashSet<String>
+    where
+        L: LiveSink,
+    {
+        let mut out = std::collections::HashSet::new();
+        for key in self.live_positions.lock().await.keys() {
+            out.insert(live_base_mint(key).to_string());
+        }
+        for key in self.live_manual.lock().await.keys() {
+            out.insert(live_base_mint(key).to_string());
+        }
+        if let Some(trader) = self.live.as_ref() {
+            out.extend(trader.pending_mints());
+        }
+        out
+    }
+
     /// Manual keys (exact plus suffixed).
     pub async fn manual_keys(&self) -> Vec<String> {
         self.live_manual.lock().await.keys().cloned().collect()
@@ -407,6 +434,20 @@ impl<L> LiveExecution<L> {
     /// Diverged mints for reporting.
     pub async fn diverged_keys(&self) -> Vec<String> {
         self.live_diverged.lock().await.keys().cloned().collect()
+    }
+
+    /// `(mints, total)` stashed while live holds: paper PnL kept out
+    /// of the breaker. Invisible stashes hide real exposure, so the
+    /// heartbeat carries both numbers.
+    pub async fn deferred_stats(&self) -> (usize, f64) {
+        let guard = self.deferred_pnl.lock().await;
+        let total: f64 = guard.values().map(|(t, _)| *t).sum();
+        (guard.len(), total)
+    }
+
+    /// Override-priced mints excluded from the breaker.
+    pub async fn synthetic_count(&self) -> usize {
+        self.synthetic_mints.lock().await.len()
     }
 
     /// Stamp a GiveUp (buy-unconfirmed or sell-budget-exhausted) for
@@ -849,6 +890,28 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
+    /// Give up automation, park the tracked bag for manual exit.
+    /// Always returns false: parked manual is still held, so the
+    /// caller must NOT treat this as settled (paper PnL routes through
+    /// the normal stash path instead of feeding the breaker for a bag
+    /// that never exited — it settles when the manual exit clears).
+    async fn park_for_manual_exit(&self, trader: &L, mint: &str, now: u64, cause: &str) -> bool
+    where
+        L: LiveSink,
+    {
+        self.exec.reset_retry(mint).await;
+        if let Some(held) = self.exec.tracked(mint).await {
+            trader.record_manual(&held, "sell-retries-exhausted");
+        }
+        if let Some(held) = self.exec.remove_tracked(mint).await {
+            self.exec.park_manual(mint.to_string(), held).await;
+        }
+        self.exec.note_giveup(now).await;
+        warn!(%mint, cause, "LIVE sell gave up; parked for manual exit (still HELD)");
+        self.emit(format!("LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"));
+        false
+    }
+
     /// Mirror paper closes with sells. True means settled.
     pub(crate) async fn live_sell(&self, mint: &str, price_usd: f64, liquidity_usd: f64, fraction_closed: f64) -> bool {
         let Some(trader) = &self.exec.live else { return true };
@@ -889,14 +952,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         let probe = {
             let Some(tracked) = self.exec.tracked(mint).await else {
-                // Nothing tracked: flush only when no manual bag
-                // remains either, else stashed paper PnL would feed
-                // the breaker while live still holds (the GiveUp
-                // double-count, one tick later).
+                // Nothing tracked: settle only when no manual bag
+                // remains either. A parked manual bag is still live
+                // exposure, so this tick's paper close must defer like
+                // any unsettled live hold (the caller stashes on
+                // `false`) — feeding it as a win would hide real
+                // losses behind paper that never exited.
                 if !self.exec.manual_holds_base(mint).await {
                     self.flush_deferred_pnl(mint).await;
+                    return true;
                 }
-                return true;
+                return false;
             };
             // Floored math (oversell is unauthorized).
             let numer = (fraction_closed.clamp(0.0, 1.0) * BPS_DENOMINATOR as f64).floor() as u64;
@@ -943,6 +1009,21 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // `attempts > 0` check would go blind exactly when a stale
         // bundle may still land.
         if trader.prior_sell_pending(mint).await {
+            // A hold is not free: a bundle stuck Pending/Unknown
+            // forever would strand the exit with no budget trail.
+            // Count holds like failures so the bag parks to manual
+            // after the same budget instead of holding forever.
+            let attempts = self.exec.note_failure(mint, now).await;
+            if attempts >= SELL_MAX_ATTEMPTS {
+                return self
+                    .park_for_manual_exit(
+                        trader,
+                        mint,
+                        now,
+                        "prior sell bundle still inflight past the retry budget",
+                    )
+                    .await;
+            }
             warn!(%mint, attempts, "prior sell bundle still inflight (Pending/Unknown); holding resend");
             return false;
         }
@@ -1019,27 +1100,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 let attempts = self.exec.note_failure(mint, now).await;
                 if attempts >= SELL_MAX_ATTEMPTS {
                     // Give up automation, park manual.
-                    self.exec.reset_retry(mint).await;
-                    if let Some(held) = self.exec.tracked(mint).await {
-                        trader.record_manual(&held, "sell-retries-exhausted");
-                    }
-                    if let Some(held) = self.exec.remove_tracked(mint).await {
-                        self.exec.park_manual(mint.to_string(), held).await;
-                    }
-                    self.exec.note_giveup(now).await;
-                    if deterministic {
-                        warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "LIVE sell deterministically rejected after budget; parked for manual exit (still HELD)");
+                    let cause = if deterministic {
+                        format!(
+                            "deterministically rejected: {}",
+                            ids::strip_error_url(&e.to_string())
+                        )
                     } else {
-                        warn!(%mint, "LIVE sell gave up after retries; parked for manual exit (still HELD)");
-                    }
-                    self.emit(format!("LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"));
-                    // Parked manual = still held: the caller must NOT treat
-                    // this as settled. Returning false routes this tick's
-                    // paper PnL through the normal stash path instead of
-                    // feeding the breaker for a bag that never exited —
-                    // the same deferral as the cooling/retry path. It
-                    // settles when the manual exit clears.
-                    false
+                        "retries exhausted".to_string()
+                    };
+                    return self.park_for_manual_exit(trader, mint, now, &cause).await;
                 } else if deterministic {
                     warn!(%mint, error = %ids::strip_error_url(&e.to_string()), attempts, "LIVE sell rejected before dispatch; holding, will re-probe");
                     false
@@ -1062,8 +1131,20 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let curve = {
             if let Some(tracked) = self.exec.tracked(mint).await {
                 Some(tracked.curve)
+            } else if let Some(curve) = self.exec.manual_curve(mint).await {
+                Some(curve)
             } else {
-                self.exec.manual_curve(mint).await
+                // Suffixed dup bags park under `{mint}#…`: no exact-key
+                // bag, so price off the first parked dup (drained below).
+                // Without any parked bag there is nothing to do.
+                let mut found = None;
+                for key in self.exec.manual_keys().await {
+                    if key != mint && live_base_mint(&key) == mint {
+                        found = self.exec.manual_curve(&key).await;
+                        break;
+                    }
+                }
+                found
             }
         };
         let Some(curve) = curve else {
@@ -1080,12 +1161,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         // Resurrect parked bags so `live_sell` can probe them. Only the
         // exact key resurrects (one tracked bag per mint); suffixed
-        // duplicates stay parked and are reported loudly instead of
-        // rotting silently — exit each explicitly.
+        // duplicates are drained by the loop at the end of this call.
         if !self.exec.is_tracked(mint).await
             && let Some(held) = self.exec.take_manual_exact(mint).await
         {
             warn!(%mint, amount = held.amount_tokens, "manual sell resurrects a parked bag for explicit exit");
+            if let Some(trader) = self.exec.live.as_ref() {
+                trader.unrecord_manual(&held);
+            }
             self.exec.insert_tracked(held).await;
         }
         let parked_dups: Vec<String> = self
@@ -1096,11 +1179,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .filter(|k| k != mint && live_base_mint(k) == mint)
             .collect();
         if !parked_dups.is_empty() {
-            warn!(%mint, dups = ?parked_dups, "other parked bags for this mint stay parked; exit each explicitly");
-            self.emit(format!(
-                "manual sell on {mint} leaves parked duplicates ({}) standing by; exit each explicitly",
-                parked_dups.join(", ")
-            ));
+            warn!(%mint, dups = ?parked_dups, "other parked bags for this mint drain after the primary settles");
         }
         // Feed boundary: the reserve feed keys on strings; custody holds
         // the validated key (converted once here, not re-parsed).
@@ -1108,11 +1187,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let tick = match self.reserves.fetch_tick(mint, &curve_str).await {
             Ok(tick) => tick,
             Err(CurveError::BadMintKey(_)) | Err(CurveError::BadCurveKey(_)) => {
-                warn!(%mint, "manual sell request unroutable; dropping request");
-                // Terminal: evict locks and tier.
-                self.evict_mint_locks(mint).await;
-                self.portfolio.lock().await.clear_venue_fee_for_mint(mint);
-                return true;
+                // Unroutable, but custody may still be held (tracked or
+                // parked): dropping the request would orphan the bag
+                // while telling the operator it settled. Keep retrying;
+                // locks/tiers stay so the next round can proceed.
+                warn!(%mint, "manual sell request unroutable; keeping request while custody is held");
+                return false;
             }
             Err(e) => {
                 warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "manual sell price unreadable; keeping request for next round");
@@ -1169,22 +1249,57 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         for (paper_price, qty) in gap_notes {
             self.exec.note_gap_paper_close(&tick.mint, paper_price, qty).await;
         }
-        // Live first, breaker second.
-        let live_settled = self.live_sell(&tick.mint, tick.price_usd, tick.liquidity_usd, 1.0).await;
-        if live_settled {
-            if self.exec.is_synthetic(&tick.mint).await {
-                warn!(mint = %tick.mint, "synthetic paper PnL excluded from day-loss breaker (override price, no market)");
-            } else {
-                for pnl in closed_pnls {
-                    self.daily.lock().await.record(pnl, now);
+        // Live first, breaker second: sell whatever is tracked
+        // (primary, or a parked bag resurrected above), pulling parked
+        // dups (`{mint}#2-…`, `#wal-…`) into the free slot one by one.
+        // No paper legs pair with dups (paper holds at most one
+        // position per mint). Paper PnL feeds the breaker only after
+        // everything settles; tracked custody is never replaced.
+        if self.exec.live.is_some() {
+            loop {
+                if !self.exec.is_tracked(&tick.mint).await {
+                    let Some(dup_key) = self
+                        .exec
+                        .manual_keys()
+                        .await
+                        .into_iter()
+                        .find(|k| k != mint && live_base_mint(k) == mint)
+                    else {
+                        break;
+                    };
+                    let Some(held) = self.exec.take_manual_exact(&dup_key).await
+                    else {
+                        break;
+                    };
+                    if let Some(trader) = self.exec.live.as_ref() {
+                        trader.unrecord_manual(&held);
+                    }
+                    self.exec.insert_tracked(held).await;
+                }
+                if !self
+                    .live_sell(&tick.mint, tick.price_usd, tick.liquidity_usd, 1.0)
+                    .await
+                {
+                    warn!(mint = %tick.mint, "manual sell: live still holds; breaker PnL deferred, request kept");
+                    self.exec.stash_deferred_pnl(&tick.mint, closed_pnls).await;
+                    return false;
                 }
             }
+        }
+        if self.exec.is_synthetic(&tick.mint).await {
+            warn!(mint = %tick.mint, "synthetic paper PnL excluded from day-loss breaker (override price, no market)");
         } else {
-            warn!(mint = %tick.mint, "manual sell: live still holds; breaker PnL deferred, request kept");
-            self.exec.stash_deferred_pnl(&tick.mint, closed_pnls).await;
-            return false;
+            for pnl in closed_pnls {
+                self.daily.lock().await.record(pnl, now);
+            }
         }
         self.settle_close_tail(&tick).await;
+        // Bags may remain (GiveUp-parked): keep the request so the
+        // next `sell` round continues the drain instead of dropping a
+        // file for custody that is still held.
+        if self.exec.manual_holds_base(&tick.mint).await {
+            return false;
+        }
         true
     }
 }
@@ -1338,6 +1453,11 @@ mod tests {
         assert!(!exec.is_tracked(&m).await);
         assert!(exec.subtract_fill(&m, 1).await);
         assert!(exec.remove_tracked(&m).await.is_none());
+        // Over-subtract refuses instead of masking: the bag stays with
+        // its held amount for investigation.
+        exec.insert_tracked(bag("MINT", 100)).await;
+        assert!(!exec.subtract_fill(&m, 101).await);
+        assert_eq!(exec.tracked(&m).await.expect("bag").amount_tokens, 100);
     }
 
     #[tokio::test]
