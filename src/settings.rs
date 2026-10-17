@@ -712,6 +712,14 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serializes env-mutating tests (process-global env shared by
+    /// parallel test threads).
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -911,6 +919,7 @@ mod tests {
     fn inference_key_stays_env_only() {
         // The single sanctioned env exception: a bearer token must
         // never sit in the config file.
+        let _lock = env_lock().lock().expect("lock");
         let file: toml::Table = "[risk]\n".parse().expect("test toml");
         let saved = std::env::var("INFERENCE_API_KEY").ok();
         unsafe { std::env::set_var("INFERENCE_API_KEY", "test-secret") };
@@ -934,6 +943,7 @@ mod tests {
     fn inference_key_file_fallback_avoids_export() {
         // Preferred path: bearer from a file so it never enters the
         // environment (`ps e`, shell history stay clean).
+        let _lock = env_lock().lock().expect("lock");
         let file: toml::Table = "[risk]\n".parse().expect("test toml");
         let saved = std::env::var("INFERENCE_API_KEY").ok();
         let saved_file = std::env::var("INFERENCE_API_KEY_FILE").ok();
