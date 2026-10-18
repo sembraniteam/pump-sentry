@@ -87,8 +87,9 @@ pub const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_flo
 /// oracle costs one attempt per window, not per dispatch).
 pub const TIP_FLOOR_TTL_SECS: u64 = 60;
 
-/// Lamports per SOL (floor conversion).
-const LAMPORTS_PER_SOL_F: f64 = 1_000_000_000.0;
+/// Lamports per SOL (floor conversion). Single source is
+/// `ids::LAMPORTS_PER_SOL`.
+const LAMPORTS_PER_SOL_F: f64 = ids::LAMPORTS_PER_SOL as f64;
 
 /// Consecutive schema failures parsing the tip-floor oracle (metric:
 /// a rising count means the oracle shape drifted, not just blipped).
@@ -225,17 +226,10 @@ impl JitoClient {
         self.floor.lock().map(|g| g.0).unwrap_or(0)
     }
 
-    /// Last floor-fetch unix seconds (0 = never).
-    pub fn tip_floor_last_update(&self) -> u64 {
-        self.floor.lock().map(|g| g.1).unwrap_or(0)
-    }
-
     /// True when the cached floor is past [`TIP_FLOOR_TTL_SECS`]
     /// (or never fetched): the next `tip_floor_lamports` refetches.
-    pub fn tip_floor_stale(&self) -> bool {
-        self.tip_floor_stale_at(unix_secs())
-    }
-
+    /// `TipEscalator` (this module) drives every refetch, so this is
+    /// the only caller of the timestamp comparison.
     fn tip_floor_stale_at(&self, now: u64) -> bool {
         self.floor
             .lock()

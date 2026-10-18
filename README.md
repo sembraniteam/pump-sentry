@@ -69,8 +69,8 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 | `execution` | `slippage_bps`, `slippage_vol_window_secs`, `slippage_vol_extra_cap_bps`, `priority_fee_micro_lamports`, `compute_unit_limit`, `jito_tip_lamports`, `jito_endpoint`, `sim_strict`                    | `200` / `0` / `0` / `0` / `0` / `100000` / global / `false`        |
 | `alerts`    | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs`                                                     | `true` / host default / `3` / `50` / `3` / `3600`                  |
 
-\* test-only.
-\*`yellowstone_endpoint`: non-empty selects Yellowstone gRPC ingestion instead of WS (x-token via `YELLOWSTONE_TOKEN` env, never the file).
+- `quote_usd` is test-only.
+- `yellowstone_endpoint`: non-empty selects Yellowstone gRPC ingestion instead of WS (x-token via `YELLOWSTONE_TOKEN` env, never the file).
 
 - `fetch_concurrency` bounds parallel `getTransaction` fetches (lower on metered RPC; `0` refuses at boot); `backfill_sig_limit` caps sigs per reconnect backfill (`0` disables it); `reconnect_backoff_max_ms` caps reconnect backoff (raise on flaky sockets).
 - `strategy_mode`: `adaptive` runs the profile verbatim; `scalp` clamps TP to +25…+35%; `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
@@ -176,7 +176,7 @@ trail_percent = 3.0              # locks profit sooner; more exits on noise
 [risk]
 strategy_mode = "runner"         # main TP exits, 30% moonbag rides toward 5x–10x
                                  # with a forced trail (never trailless)
-runner_moonbag_percent = 30.0    # 0–100; 100 would mean full exit (never 100)
+runner_moonbag_percent = 30.0    # 0–100; >= 100 coerces to 0 (full exit at TP)
 
 [execution]
 slippage_bps = 300               # tolerates 3% adverse move per side to land fills;

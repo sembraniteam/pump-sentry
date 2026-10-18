@@ -33,6 +33,11 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - `crates/ids` is the single source of truth for on-chain constants (program IDs, discriminators, fee/volume addresses).
   A program upgrade
   edits exactly one file there — never duplicate a constant elsewhere.
+- `crates/curve/src/fee.rs` is the single source for the Pump.fun fee
+  schedule: decode, tier pick, and the creator-leg rule (`creator ==
+  default` ⇒ creator fee 0). `executor::quote` and the paper fee view
+  both delegate — a second copy once charged paper a creator fee the
+  chain never charges (live sell floor looser than the dispatch quote).
 - `src/pipeline.rs` (~770 lines prod; tests live in `src/pipeline_tests.rs`
   via `#[path]`, same crate so `pub(crate)` stays private) is the orchestrator:
   gate → risk → paper ledger → live mirror. `LiveExecution`/`live_mirror` (live
@@ -53,6 +58,12 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   `side`), and the ledger debits/invests the floored size, never the
   nominal ticket. Tests asserting quantities use integers; paper↔live
   size parity holds only to sub-token dust (assert bounded, not exact).
+  Partial slices size through `simulator::slice_quantity` (floored,
+  never rounded; NaN/≤0 → 0, ≥100% → whole): the paper book and the
+  live sell mirror share it so one scale-out cannot size two ways.
+- Watchlist hard cap evicts by `PendingSignal::intake_secs` (oldest
+  intake first), never by a re-stamped audit time, so audit retries
+  cannot change who gets shed.
 - Paper entries/exits are state-based: `simulator::market`
   (`CurveReserves`, `entry_fill`/`exit_price`) is the single quote math,
   mirrored by `src/live.rs` (`plan_buy`/`plan_sell_floor`,
@@ -69,8 +80,9 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   ticks price off stale spot in paper (documented boundary; live pool
   legs settle at vault reserves). `PortfolioSnapshot` carries
   `mark_value` + `realizable_value` (`exit_discount_usd` = impact+fee);
-  paper closes log `realizable_vs_mark_bps`, gate cards report the BOOKED
-  entry, never the tick spot.
+  paper closes log `realizable_vs_mark_bps` (plus the booked
+  `book_mark`/`book_discount`), gate cards report the BOOKED entry,
+  never the tick spot.
 - Failed-dispatch costs are honest: only `DeadReason::FailedOnChain`
   burns base + priority fees (`failed_dispatch_cost_lamports`; the tip
   rolls back); `NeverForwarded`/`Expired` debit nothing.
@@ -236,7 +248,8 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   without a frozen v3-era sample proving a NEW launch uses it.
 - Token program is per-mint (classic SPL vs Token-2022); ATA derivation
   must use it. Ticks price with real mint decimals (cached); the confirm
-  gate still drops non-6 mints fail-closed.
+  gate still drops non-6 mints fail-closed. `live::six_decimals` is the
+  one decimals admission read (gate drop signal + live buy/sell paths).
 - Raydium migration pools are WSOL-**based** (WSOL at slot 400, token at
   432; vault contents prove it) — the old code assumed WSOL-quoted and
   rejected every real pool at both the trust gate and the vault pricer.

@@ -1068,12 +1068,18 @@ async fn run_pipeline(live_arg: bool) {
                 if gate_rounds.is_multiple_of(MANUAL_SELL_DRAIN_EVERY) {
                     let (_, log_file) = cli::resolve_paths();
                     for (mint, path) in cli::pending_sell_requests(&log_file) {
-                        // Body must name the file mint; else drop.
-                        let body_ok = std::fs::read_to_string(&path)
-                            .ok()
-                            .and_then(|b| cli::sell_request_body_mint(&b))
-                            .is_some_and(|m| m == mint);
-                        if !body_ok {
+                        // A request whose body does not name its own mint
+                        // is stale garbage: drop it. An unreadable file is
+                        // transient IO — keep the request for the next
+                        // drain instead of swallowing an operator sell.
+                        let body = match std::fs::read_to_string(&path) {
+                            Ok(body) => body,
+                            Err(e) => {
+                                warn!(%mint, path = %path.display(), error = %e, "manual sell request unreadable; keeping for next drain");
+                                continue;
+                            }
+                        };
+                        if cli::sell_request_body_mint(&body).is_none_or(|named| named != mint) {
                             warn!(%mint, path = %path.display(), "manual sell request body mismatch; dropping request");
                             let _ = std::fs::remove_file(&path);
                             continue;

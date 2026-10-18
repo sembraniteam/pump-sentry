@@ -205,6 +205,9 @@ pub struct PendingSignal {
     /// admission only; confirm re-screens this (plus creator) and takes
     /// the worst trust there — no stored score ever crosses the wait.
     pub dev: String,
+    /// Watch-entry intake time. The hard cap sheds the oldest intake
+    /// first; audit retries never re-stamp it.
+    pub intake_secs: u64,
 }
 
 /// Gate plus signal context under one lock.
@@ -361,15 +364,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
         // 3. Watchlist; confirms happen in poll_gates.
         let mut state = self.gate_state.lock().await;
-        // Hard cap: shed oldest past the cap (refreshes of a known
-        // mint never shed). Gate and meta drop together.
+        // Hard cap: shed the oldest intake past the cap (refreshes of a
+        // known mint never shed). Gate and meta drop together.
         if !state.meta.contains_key(mint)
             && state.meta.len() >= WATCHLIST_HARD_CAP
-            && let Some(oldest) = state.meta.keys().next().cloned()
+            && let Some(oldest) = oldest_watch_entry(&state.meta)
         {
             state.gate.remove(&oldest);
             state.meta.remove(&oldest);
-            warn!(mint = %oldest, cap = WATCHLIST_HARD_CAP, "watchlist at hard cap; shedding oldest");
+            warn!(mint = %oldest, cap = WATCHLIST_HARD_CAP, "watchlist at hard cap; shedding oldest intake");
         }
         if !state.gate.submit(mint, dev, now_secs()) {
             warn!(%mint, "bad dev address; skipping");
@@ -394,6 +397,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 last_sig: None,
                 creator: req.creator.map(|c| c.to_string()),
                 dev: dev.to_string(),
+                intake_secs: now,
             },
         );
         match audit_score {
@@ -673,14 +677,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         }
         const _: () = assert!(crate::live::TOKEN_DECIMALS == 6);
-        match self.reserves.token_decimals(mint).await {
-            Ok(6) => {}
-            Ok(other) => {
+        match crate::live::six_decimals(&self.reserves, mint).await {
+            Ok(_) => {}
+            Err(crate::live::DecimalsRefusal::NonSix(other)) => {
                 warn!(%mint, decimals = other, "non-6-decimal mint; sizing assumes 6 — dropping signal");
                 return;
             }
-            Err(e) => {
-                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "mint decimals unreadable; dropping signal (fail-closed)");
+            Err(crate::live::DecimalsRefusal::Unreadable(error)) => {
+                warn!(%mint, %error, "mint decimals unreadable; dropping signal (fail-closed)");
                 return;
             }
         }
@@ -1052,9 +1056,41 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     }
 }
 
+/// Oldest watch entry by intake time (hard-cap eviction key). `None`
+/// on an empty map. Deterministic: never a HashMap-key accident.
+fn oldest_watch_entry(meta: &HashMap<String, PendingSignal>) -> Option<String> {
+    meta.iter()
+        .min_by_key(|(_, signal)| signal.intake_secs)
+        .map(|(mint, _)| mint.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_cap_sheds_the_oldest_intake() {
+        let signal = |intake_secs: u64| PendingSignal {
+            curve: "C".to_string(),
+            creator: None,
+            assoc_curve: "A".to_string(),
+            audit_score: Some(1),
+            last_audit_secs: intake_secs + 500,
+            creation_slot: 1,
+            last_sig: None,
+            dev: "D".to_string(),
+            intake_secs,
+        };
+        let mut meta = HashMap::new();
+        meta.insert("newest".to_string(), signal(300));
+        meta.insert("oldest".to_string(), signal(100));
+        meta.insert("middle".to_string(), signal(200));
+        assert_eq!(oldest_watch_entry(&meta), Some("oldest".to_string()));
+        // Audit retries re-stamp `last_audit_secs`, never the intake key.
+        meta.get_mut("middle").expect("m").last_audit_secs = 9_999;
+        assert_eq!(oldest_watch_entry(&meta), Some("oldest".to_string()));
+        assert_eq!(oldest_watch_entry(&HashMap::new()), None);
+    }
 
     #[test]
     fn fee_aware_sl_floor_leaves_standard_stops() {

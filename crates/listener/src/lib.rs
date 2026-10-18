@@ -14,8 +14,8 @@ pub mod types;
 pub use migration::{MigratedPool, MigrationDestination, PumpSwapPool, RaydiumV4Pool};
 pub use parser::{
     PUMP_CREATE_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR, PumpCreateInstructionArgs,
-    PumpCreateV2InstructionArgs, PumpParseError, PumpTokenLaunchEvent, decode_ix_data,
-    is_pump_create_ix, is_pump_create_v2_ix, parse_pump_create, parse_pump_create_v2,
+    PumpParseError, PumpTokenLaunchEvent, decode_ix_data, is_pump_create_ix, is_pump_create_v2_ix,
+    parse_pump_create, parse_pump_create_v2,
 };
 pub use screen::{
     BundleAnalysis, BundleDetector, BundleVerdict, DecodedIx, DetectedMigration, DevScreenConfig,

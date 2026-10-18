@@ -852,8 +852,8 @@ async fn pumpswap_sell_v2_simulates() {
         user_ata_with_program,
     };
     use executor::quote::{
-        market_cap, parse_amm_creator_gate, parse_fee_schedule,
-        pumpswap_fee_bps, pumpswap_sell_floor, pumpswap_sell_out, PoolView,
+        PoolView, market_cap, parse_amm_creator_gate, pumpswap_fee_bps, pumpswap_sell_floor,
+        pumpswap_sell_out,
     };
     use migration::pumpswap::PumpSwapPool;
     let rpc = common::rpc_client();
@@ -1014,9 +1014,9 @@ async fn pumpswap_sell_v2_simulates() {
                 continue;
             }
         };
-        let schedule = match parse_fee_schedule(&fee_config.data) {
-            Ok(s) => s,
-            Err(_) => {
+        let schedule = match curve::fee::parse_schedule(&fee_config.data) {
+            Some(s) => s,
+            None => {
                 failures.push(format!("pool {pool}: fee schedule unparsable; skipping"));
                 continue;
             }
@@ -1171,4 +1171,426 @@ async fn pumpswap_sell_v2_simulates() {
         failures.join("\n")
     );
     println!("PUMPSWAP SELL_V2 GREEN");
+}
+
+/// Creatorless-PumpSwap-pool fee probe (audit A1, end-to-end): the
+/// program charges NO creator fee when the pool's `coin_creator` is
+/// the default key. Proves it with OUR builder and OUR quote math on a
+/// live pool: the sell's `min_quote_amount_out` floor sits 0.1% under
+/// the creator-0 model's net, so a chain charging the tier creator leg
+/// (30 bps on the live schedule) would have to refuse it. A control
+/// floor 5% above the model's net proves the stop is enforced (the
+/// GREEN is not vacuous).
+///
+/// Target: any WSOL-quoted PumpSwap pool with 32 zero bytes at
+/// `POOL_COIN_CREATOR_OFFSET` (211). The holder is found from the
+/// pool's recent `sell_v2` fills (or largest accounts) unless
+/// `PUMP_ACCEPTANCE_HOLDER` names a funded base-side token account —
+/// needed for legacy pools whose trades predate public RPC signature
+/// windows. Simulation only, never sends anything.
+///
+/// `PUMP_ACCEPTANCE_POOL=<pool> [PUMP_ACCEPTANCE_HOLDER=<token acct>] \
+///   MAINNET_LAYOUT=1 cargo test -p executor --test \
+///   mainnet_layout_acceptance -- --ignored --nocapture creatorless`
+#[tokio::test]
+#[ignore]
+async fn pumpswap_creatorless_pool_pays_no_creator_fee() {
+    if std::env::var("MAINNET_LAYOUT").as_deref() != Ok("1") {
+        eprintln!("skipped: set MAINNET_LAYOUT=1 to run the live fee probe");
+        return;
+    }
+    let pool_env = match std::env::var("PUMP_ACCEPTANCE_POOL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!("skipped: set PUMP_ACCEPTANCE_POOL=<creatorless pumpswap pool>");
+            return;
+        }
+    };
+    use executor::instructions::{
+        PumpAmmSellV2Accounts, build_create_ata_ix, user_ata_with_program,
+    };
+    use executor::quote::{
+        PoolView, QuoteKind, market_cap, parse_amm_creator_gate, pumpswap_fee_bps,
+        pumpswap_sell_out,
+    };
+    use migration::pumpswap::PumpSwapPool;
+    use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+
+    /// One unsigned sell skeleton; `sig_verify` off. Simulation only.
+    #[allow(clippy::too_many_arguments)]
+    async fn sim_sell(
+        rpc: &RpcClient,
+        user: &Pubkey,
+        pool: &PumpSwapPool,
+        user_base: &Pubkey,
+        user_quote: &Pubkey,
+        base_program: &Pubkey,
+        quote_program: &Pubkey,
+        amount: u64,
+        floor: u64,
+        label: &str,
+    ) -> Result<(), common::SimVerdict> {
+        let mut ixs = Vec::new();
+        if rpc.get_account(user_quote).await.is_err() {
+            ixs.push(build_create_ata_ix(
+                user,
+                user,
+                &pool.quote_mint,
+                user_quote,
+                quote_program,
+            ));
+        }
+        let buyback = user_ata_with_program(
+            &ids::DEFAULT_BUYBACK_FEE_RECIPIENT,
+            &pool.quote_mint,
+            quote_program,
+        );
+        if rpc.get_account(&buyback).await.is_err() {
+            ixs.push(build_create_ata_ix(
+                user,
+                &ids::DEFAULT_BUYBACK_FEE_RECIPIENT,
+                &pool.quote_mint,
+                &buyback,
+                quote_program,
+            ));
+        }
+        ixs.push(PumpSwapBuilder::build_sell_pumpswap_v2_ix(
+            amount,
+            floor,
+            &PumpAmmSellV2Accounts {
+                pool: &pool.pool,
+                user,
+                base_mint: &pool.base_mint,
+                quote_mint: &pool.quote_mint,
+                user_base_token_account: user_base,
+                user_quote_token_account: user_quote,
+                pool_base_token_account: &pool.base_vault,
+                pool_quote_token_account: &pool.quote_vault,
+                base_token_program: base_program,
+                quote_token_program: quote_program,
+                buyback_fee_recipient: &buyback,
+            },
+        ));
+        common::sim_ix_green(rpc, user, ixs, label).await
+    }
+
+    let rpc = common::rpc_client();
+    let pool_key = Pubkey::from_str(pool_env.trim()).expect("pool pubkey");
+    let acct = rpc.get_account(&pool_key).await.expect("pool readable");
+    let parsed = PumpSwapPool::parse(&pool_key, &acct.data).expect("pool parses");
+    assert!(
+        PumpSwapPool::validate(&parsed, &acct.owner, &parsed.base_mint),
+        "pool {pool_key} is not AMM-owned and WSOL-quoted; refusing"
+    );
+    assert!(
+        parsed.coin_creator == Pubkey::default(),
+        "pool {pool_key} is NOT creatorless (coin_creator={}); point PUMP_ACCEPTANCE_POOL at a \
+         coin-creator-default pool",
+        parsed.coin_creator
+    );
+    let base_mint_acct = rpc.get_account(&parsed.base_mint).await.expect("base mint");
+    let base_program = base_mint_acct.owner;
+    let quote_program = rpc
+        .get_account(&parsed.quote_mint)
+        .await
+        .expect("quote mint")
+        .owner;
+
+    // Holder: `PUMP_ACCEPTANCE_HOLDER` (a base-side token account that
+    // holds real tokens — canonical ATA or aux) wins. Legacy creatorless
+    // pools need it: their trades are older than public RPCs' signature
+    // windows and `getTokenLargestAccounts` is gated on most of them.
+    // Otherwise hunt (read-only): newest sell_v2 users on the pool,
+    // then largest accounts as the fallback for quiet pools.
+    let env_holder = std::env::var("PUMP_ACCEPTANCE_HOLDER")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let mut holder: Option<(Pubkey, Pubkey, u64)> = None;
+    let mut sigs = Vec::new();
+    if let Some(raw) = env_holder {
+        let ata = Pubkey::from_str(raw.trim()).expect("holder token account pubkey");
+        let Some((owner, mint, held)) = common::token_account(&rpc, &ata).await else {
+            panic!("PUMP_ACCEPTANCE_HOLDER {ata}: unreadable token account");
+        };
+        assert!(
+            mint == parsed.base_mint,
+            "PUMP_ACCEPTANCE_HOLDER {ata} holds {mint}, not the pool base mint {}",
+            parsed.base_mint
+        );
+        assert!(
+            held >= 1_000,
+            "PUMP_ACCEPTANCE_HOLDER {ata} holds {held} base units; need >= 1000"
+        );
+        assert!(
+            rpc.get_balance(&owner).await.unwrap_or(0) >= 50_000,
+            "PUMP_ACCEPTANCE_HOLDER owner {owner} cannot pay fees (needs >= 50000 lamports)"
+        );
+        holder = Some((owner, ata, held));
+    } else {
+        sigs = rpc
+            .get_signatures_for_address_with_config(
+                &pool_key,
+                GetConfirmedSignaturesForAddress2Config {
+                    limit: Some(25),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_default();
+    }
+    'sigs: for sig in &sigs {
+        let Some(tx) = common::scan_tx(&rpc, &sig.signature).await else {
+            continue;
+        };
+        let Some(amm_idx) = tx
+            .keys
+            .iter()
+            .position(|k| *k == ids::PUMP_AMM_PROGRAM_ID)
+            .map(|i| i as u8)
+        else {
+            continue;
+        };
+        for cix in &tx.ixs {
+            if cix.program_idx != amm_idx
+                || cix.data.len() != 24
+                || cix.data[..8] != ids::PUMP_AMM_SELL_V2_DISCRIMINATOR
+            {
+                continue;
+            }
+            let Some(accounts) = common::resolve_accounts(&tx, cix) else {
+                continue;
+            };
+            if accounts.len() != 17 {
+                continue;
+            }
+            let Some((_, _, held)) = common::token_account(&rpc, &accounts[5]).await else {
+                continue;
+            };
+            if held < 1_000 || rpc.get_balance(&accounts[1]).await.unwrap_or(0) < 50_000 {
+                continue;
+            }
+            holder = Some((accounts[1], accounts[5], held));
+            break 'sigs;
+        }
+    }
+    let (user, user_base, held) = match holder {
+        Some(v) => v,
+        None => {
+            let mut found = None;
+            let (holders, _aux) = common::holder_atas(&rpc, &parsed.base_mint, &pool_key).await;
+            for (owner, ata, amount) in holders {
+                if amount >= 1_000 && rpc.get_balance(&owner).await.unwrap_or(0) >= 50_000 {
+                    found = Some((owner, ata, amount));
+                    break;
+                }
+            }
+            match found {
+                Some(v) => v,
+                None => panic!(
+                    "no funded holder found on pool {pool_key} ({} recent sigs); resample or \
+                     point PUMP_ACCEPTANCE_POOL at an actively traded creatorless pool",
+                    sigs.len()
+                ),
+            }
+        }
+    };
+    let user_quote = user_ata_with_program(&user, &parsed.quote_mint, &quote_program);
+    let base_vault = rpc
+        .get_account(&parsed.base_vault)
+        .await
+        .expect("base vault");
+    let quote_vault = rpc
+        .get_account(&parsed.quote_vault)
+        .await
+        .expect("quote vault");
+    assert!(
+        base_vault.owner == base_program && quote_vault.owner == quote_program,
+        "pool {pool_key}: vault token programs differ from the mints; refusing"
+    );
+    let global = rpc
+        .get_account(&ids::PUMP_AMM_GLOBAL_CONFIG)
+        .await
+        .expect("global config");
+    let fee_config = rpc
+        .get_account(&ids::PUMP_AMM_FEE_CONFIG)
+        .await
+        .expect("fee config");
+    assert!(
+        global.owner == ids::PUMP_AMM_PROGRAM_ID && fee_config.owner == ids::FEE_CONFIG_PROGRAM,
+        "pool {pool_key}: global/fee-config owners unexpected; refusing"
+    );
+    // Amounts come from account data (token account amount @64..72,
+    // mint supply @36..44): `getTokenAccountBalance`/`getTokenSupply`
+    // are indexed methods many public RPCs gate behind a personal token.
+    let supply = u64::from_le_bytes(
+        base_mint_acct
+            .data
+            .get(36..44)
+            .expect("mint supply field")
+            .try_into()
+            .expect("supply bytes"),
+    );
+    let base_reserve = u64::from_le_bytes(
+        base_vault
+            .data
+            .get(64..72)
+            .expect("base vault amount field")
+            .try_into()
+            .expect("base amount bytes"),
+    );
+    let quote_reserve = u64::from_le_bytes(
+        quote_vault
+            .data
+            .get(64..72)
+            .expect("quote vault amount field")
+            .try_into()
+            .expect("quote amount bytes"),
+    );
+    let eff_quote = u64::try_from(i128::from(quote_reserve) + parsed.virtual_quote_reserves)
+        .ok()
+        .filter(|v| *v > 0)
+        .expect("effective reserves positive");
+    let real_cap = quote_reserve
+        .checked_sub(u64::try_from(parsed.fee_buckets).expect("fee buckets fit"))
+        .expect("fee buckets within vault");
+    let circulating = if parsed.is_mayhem {
+        ids::PUMP_AMM_MAYHEM_SUPPLY
+    } else {
+        supply
+    };
+    let mcap = market_cap(eff_quote, base_reserve, circulating).expect("mcap");
+    let gate_on = parse_amm_creator_gate(&global.data).expect("creator gate");
+    let schedule = curve::fee::parse_schedule(&fee_config.data).expect("fee schedule");
+    let fees = pumpswap_fee_bps(
+        &schedule,
+        gate_on,
+        parsed.creator_fee_bps,
+        parsed.coin_creator == Pubkey::default(),
+        mcap,
+    )
+    .expect("tier fees");
+    assert_eq!(fees.creator, 0, "creatorless pool must price creator=0");
+    let kind = if parsed.quote_mint == ids::WSOL_MINT {
+        QuoteKind::SolLike
+    } else if parsed.quote_mint == ids::USDC_MINT {
+        QuoteKind::Usdc
+    } else {
+        QuoteKind::Other
+    };
+    // Pre-A1 pricing: override-or-tier creator, no default-key rule —
+    // the counterfactual the live chain is tested against.
+    let (_proto, tier_creator) = curve::fee::select_tier(&schedule, kind, mcap).expect("fee tier");
+    let creator_counterfactual = if gate_on && parsed.creator_fee_bps != 0 {
+        parsed.creator_fee_bps
+    } else {
+        tier_creator
+    };
+    let view_rule = PoolView {
+        base_reserve,
+        eff_quote_reserve: eff_quote,
+        real_quote_cap: real_cap,
+        lp_bps: fees.lp,
+        proto_bps: fees.protocol,
+        creator_bps: fees.creator,
+    };
+    let view_mirror = PoolView {
+        creator_bps: creator_counterfactual,
+        ..view_rule
+    };
+    let sellable = held.saturating_sub(held / 100).max(1);
+    let mut sized = None;
+    for div in [1u64, 2, 4, 8, 16] {
+        let amount = (sellable / div).max(1);
+        let (Ok(net_rule), Ok(net_mirror)) = (
+            pumpswap_sell_out(&view_rule, amount),
+            pumpswap_sell_out(&view_mirror, amount),
+        ) else {
+            continue;
+        };
+        let gap = net_rule.saturating_sub(net_mirror);
+        if net_rule == 0 || gap.saturating_mul(500) < net_rule {
+            continue;
+        }
+        sized = Some((amount, net_rule, net_mirror, gap));
+        break;
+    }
+    let Some((amount, net_rule, net_mirror, gap)) = sized else {
+        panic!(
+            "no size on pool {pool_key} yields a >=0.2% creator-leg gap (held={held}); rerun with \
+             a more liquid target"
+        )
+    };
+    let floor_proof = net_rule - net_rule / 1_000;
+    let floor_control = net_rule + net_rule / 20;
+    println!(
+        "creatorless pool {pool_key}: user={user} held={held} amount={amount} net_rule={net_rule} \
+         net_counterfactual={net_mirror} gap={gap} tier_creator_bps={tier_creator} \
+         pool_creator_fee_bps={} floor_proof={floor_proof} floor_control={floor_control}",
+        parsed.creator_fee_bps
+    );
+    // Proof first (freshest reads): a charged creator leg (~30 bps
+    // here) sits ~0.3% under the model net, i.e. under this floor.
+    let mut proof = None;
+    for attempt in 0..3u32 {
+        match sim_sell(
+            &rpc,
+            &user,
+            &parsed,
+            &user_base,
+            &user_quote,
+            &base_program,
+            &quote_program,
+            amount,
+            floor_proof,
+            "CREATORLESS-PUMP-AMM-SELL",
+        )
+        .await
+        {
+            Err(common::SimVerdict::Transport(e)) if attempt < 2 => {
+                eprintln!("proof sim transport trouble ({e}); backing off");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            other => {
+                proof = Some(other);
+                break;
+            }
+        }
+    }
+    match proof.expect("proof sim never returned") {
+        Ok(()) => println!(
+            "PROOF GREEN: pool {pool_key} cleared floor {floor_proof} under a creator-0 model"
+        ),
+        Err(common::SimVerdict::Transport(e)) => panic!("transport trouble: {e} (rerun)"),
+        Err(common::SimVerdict::Layout(logs)) => panic!(
+            "creatorless pool {pool_key} did NOT clear the creator-0 floor {floor_proof} (model \
+             net {net_rule}, counterfactual {net_mirror}): the chain is not pricing creator=0\n\
+             {logs}"
+        ),
+    }
+    match sim_sell(
+        &rpc,
+        &user,
+        &parsed,
+        &user_base,
+        &user_quote,
+        &base_program,
+        &quote_program,
+        amount,
+        floor_control,
+        "CREATORLESS-PUMP-AMM-SELL-CONTROL",
+    )
+    .await
+    {
+        Ok(()) => panic!(
+            "control floor {floor_control} (5% above the model net {net_rule}) executed clean: \
+             the stop is not enforced or the quote model underestimates"
+        ),
+        Err(common::SimVerdict::Layout(_)) => {
+            println!("CONTROL RED as expected: floor {floor_control} refused by the program");
+        }
+        Err(common::SimVerdict::Transport(e)) => {
+            println!("control inconclusive (transport: {e})");
+        }
+    }
+    println!("CREATORLESS POOL FEE PROBE GREEN");
 }

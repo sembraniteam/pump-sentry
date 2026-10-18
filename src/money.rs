@@ -15,8 +15,9 @@
 pub struct Bps(u32);
 
 impl Bps {
-    /// Denominator: 100% in basis points.
-    pub const DENOMINATOR: u32 = 10_000;
+    /// Denominator: 100% in basis points. Single source is
+    /// `ids::BPS_DENOMINATOR`.
+    pub const DENOMINATOR: u32 = ids::BPS_DENOMINATOR as u32;
 
     /// Validated constructor: `None` when above 100%.
     #[must_use]

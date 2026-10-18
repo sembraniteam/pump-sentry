@@ -69,6 +69,7 @@ pub struct PumpCreateInstructionArgs {
 ///
 /// WARNING: not a wire mirror. Live bytes carry the 32-byte creator
 /// after the triple. Never use for wire decoding.
+#[cfg(test)]
 #[derive(borsh::BorshDeserialize, borsh::BorshSerialize, Debug, Clone, PartialEq, Eq)]
 pub struct PumpCreateV2InstructionArgs {
     /// Token name.

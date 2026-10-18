@@ -251,7 +251,6 @@ async fn mint_supply(rpc: &RpcClient, mint: &Pubkey) -> Option<u64> {
 /// Fee inputs: creator gate + tier schedule. `None` on failure.
 async fn fetch_fee_inputs(rpc: &RpcClient) -> Option<(bool, crate::quote::FeeSchedule)> {
     use crate::instructions::{FEE_CONFIG_ACCOUNT, FEE_CONFIG_PROGRAM, GLOBAL_ACCOUNT};
-    use crate::quote::{parse_fee_gate, parse_fee_schedule};
     let (global, schedule) = tokio::join!(
         async {
             let account =
@@ -259,7 +258,7 @@ async fn fetch_fee_inputs(rpc: &RpcClient) -> Option<(bool, crate::quote::FeeSch
             if account.owner != crate::instructions::PUMP_PROGRAM_ID {
                 return None;
             }
-            parse_fee_gate(&account.data).ok()
+            curve::fee::parse_fee_gate(&account.data)
         },
         async {
             let account =
@@ -267,7 +266,7 @@ async fn fetch_fee_inputs(rpc: &RpcClient) -> Option<(bool, crate::quote::FeeSch
             if account.owner != FEE_CONFIG_PROGRAM {
                 return None;
             }
-            parse_fee_schedule(&account.data).ok()
+            curve::fee::parse_schedule(&account.data)
         }
     );
     Some((global?, schedule?))
@@ -453,7 +452,8 @@ impl FundingPrincipal {
         {
             return None;
         }
-        let slipped = self.notional_usd * (10_000.0 + self.slippage_bps as f64) / 10_000.0;
+        let slipped = self.notional_usd * (ids::BPS_DENOMINATOR as f64 + self.slippage_bps as f64)
+            / ids::BPS_DENOMINATOR as f64;
         if !slipped.is_finite() || slipped <= 0.0 {
             return None;
         }
@@ -1112,7 +1112,7 @@ impl SwapExecutor {
                 "raydium sell amount_tokens is 0".to_string(),
             ));
         }
-        if order.slippage_bps >= 10_000 {
+        if order.slippage_bps >= ids::BPS_DENOMINATOR {
             return Err(ExecutorError::BadOrder(
                 "raydium sell slippage >= 100%: refusing unguarded floor".to_string(),
             ));
@@ -1269,8 +1269,8 @@ impl SwapExecutor {
             WSOL_MINT, user_ata_with_program,
         };
         use crate::quote::{
-            market_cap, parse_amm_creator_gate, parse_fee_schedule, pumpswap_fee_bps,
-            pumpswap_sell_floor, pumpswap_sell_out,
+            market_cap, parse_amm_creator_gate, pumpswap_fee_bps, pumpswap_sell_floor,
+            pumpswap_sell_out,
         };
         use migration::pumpswap::PumpSwapPool;
         if order.amount_tokens == 0 {
@@ -1278,7 +1278,7 @@ impl SwapExecutor {
                 "pumpswap sell amount_tokens is 0".to_string(),
             ));
         }
-        if order.slippage_bps >= 10_000 {
+        if order.slippage_bps >= ids::BPS_DENOMINATOR {
             return Err(ExecutorError::BadOrder(
                 "pumpswap sell slippage >= 100%: refusing unguarded floor".to_string(),
             ));
@@ -1421,10 +1421,9 @@ impl SwapExecutor {
                 "pumpswap instructions disabled by admin; refusing".to_string(),
             ));
         }
-        let schedule =
-            parse_fee_schedule(&fee_config.data).map_err(|_| {
-                ExecutorError::BadOrder("pumpswap fee schedule unparsable; refusing".to_string())
-            })?;
+        let schedule = curve::fee::parse_schedule(&fee_config.data).ok_or_else(|| {
+            ExecutorError::BadOrder("pumpswap fee schedule unparsable; refusing".to_string())
+        })?;
         // Effective quote: vault plus signed virtual reserves.
         let eff_quote = (i128::from(quote_reserve))
             .checked_add(parsed.virtual_quote_reserves)
@@ -1532,7 +1531,7 @@ impl SwapExecutor {
         if order.max_sol_cost == 0 {
             return Err(ExecutorError::BadOrder("buy max_sol_cost is 0".to_string()));
         }
-        if order.slippage_bps >= 10_000 {
+        if order.slippage_bps >= ids::BPS_DENOMINATOR {
             return Err(ExecutorError::BadOrder(
                 "buy slippage >= 100%: refusing unguarded ceiling".to_string(),
             ));

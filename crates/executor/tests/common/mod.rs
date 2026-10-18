@@ -19,8 +19,8 @@ use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiMessage, UiRawMessage,
-    option_serializer::OptionSerializer,
+    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
+    EncodedTransactionWithStatusMeta, UiMessage, UiRawMessage, option_serializer::OptionSerializer,
 };
 use std::str::FromStr;
 
@@ -171,55 +171,74 @@ pub async fn scan_block(rpc: &RpcClient, slot: u64) -> Option<Vec<ScannedTx>> {
     if transactions.is_empty() {
         return None;
     }
-    let mut out = Vec::new();
-    for tx_meta in transactions {
-        // Failed transactions create nothing: their account references
-        // (curves, vaults) may never exist on-chain.
-        if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
-            continue;
-        }
-        let solana_transaction_status::EncodedTransaction::Json(ui_tx) = &tx_meta.transaction
-        else {
-            continue;
-        };
-        let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
-            continue;
-        };
-        let mut keys: Vec<Pubkey> = raw
-            .account_keys
-            .iter()
-            .filter_map(|k| Pubkey::from_str(k).ok())
-            .collect();
-        if keys.len() != raw.account_keys.len() {
-            continue;
-        }
-        if let Some(meta) = &tx_meta.meta {
-            use solana_transaction_status::option_serializer::OptionSerializer;
-            if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
-                for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
-                    let Ok(p) = Pubkey::from_str(k) else { continue };
-                    keys.push(p);
-                }
+    Some(transactions.iter().filter_map(decode_tx_meta).collect())
+}
+
+/// Fetch one transaction by signature and decode it exactly like
+/// [`scan_block`] does. `None` on transport trouble, a failed
+/// transaction, or a non-raw JSON shape — resample, never a verdict.
+pub async fn scan_tx(rpc: &RpcClient, signature: &str) -> Option<ScannedTx> {
+    let sig = solana_signature::Signature::from_str(signature).ok()?;
+    let fetched = rpc
+        .get_transaction_with_config(
+            &sig,
+            solana_client::rpc_config::RpcTransactionConfig {
+                encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
+                commitment: None,
+                max_supported_transaction_version: Some(1),
+            },
+        )
+        .await
+        .ok()?;
+    decode_tx_meta(&fetched.transaction)
+}
+
+/// Decode one JSON transaction into a [`ScannedTx`]. `None` for failed
+/// transactions (they create nothing: their account references —
+/// curves, vaults — may never exist on-chain) and non-raw shapes.
+fn decode_tx_meta(tx_meta: &EncodedTransactionWithStatusMeta) -> Option<ScannedTx> {
+    if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
+        return None;
+    }
+    let solana_transaction_status::EncodedTransaction::Json(ui_tx) = &tx_meta.transaction else {
+        return None;
+    };
+    let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
+        return None;
+    };
+    let mut keys: Vec<Pubkey> = raw
+        .account_keys
+        .iter()
+        .filter_map(|k| Pubkey::from_str(k).ok())
+        .collect();
+    if keys.len() != raw.account_keys.len() {
+        return None;
+    }
+    if let Some(meta) = &tx_meta.meta {
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+            for k in loaded.writable.iter().chain(loaded.readonly.iter()) {
+                let Ok(p) = Pubkey::from_str(k) else { continue };
+                keys.push(p);
             }
         }
-        let ixs = raw
-            .instructions
-            .iter()
-            .filter_map(|cix| {
-                Some(ScannedIx {
-                    program_idx: cix.program_id_index,
-                    data: decode_b58_opt(&cix.data)?,
-                    accounts: cix.accounts.iter().map(|i| usize::from(*i)).collect(),
-                })
-            })
-            .collect();
-        out.push(ScannedTx {
-            sig: ui_tx.signatures.first().cloned().unwrap_or_default(),
-            keys,
-            ixs,
-        });
     }
-    Some(out)
+    let ixs = raw
+        .instructions
+        .iter()
+        .filter_map(|cix| {
+            Some(ScannedIx {
+                program_idx: cix.program_id_index,
+                data: decode_b58_opt(&cix.data)?,
+                accounts: cix.accounts.iter().map(|i| usize::from(*i)).collect(),
+            })
+        })
+        .collect();
+    Some(ScannedTx {
+        sig: ui_tx.signatures.first().cloned().unwrap_or_default(),
+        keys,
+        ixs,
+    })
 }
 
 /// Resolve instruction account slots against the key table.
@@ -235,8 +254,8 @@ pub fn resolve_accounts(tx: &ScannedTx, ix: &ScannedIx) -> Option<Vec<Pubkey>> {
 
 /// Read a token account: `(owner, mint, amount)`. `None` when missing
 /// or unparsable (closed ATA, short data — resample, never GREEN).
-/// Owner/mint come from account data, the amount from the balance
-/// call (same two reads the probes always did).
+/// All three fields come from the account data (SPL and Token-2022
+/// share this base layout) — no indexed `getTokenAccountBalance`.
 pub async fn token_account(rpc: &RpcClient, ata: &Pubkey) -> Option<(Pubkey, Pubkey, u64)> {
     let data = rpc.get_account_data(ata).await.ok()?;
     if data.len() < 72 {
@@ -244,13 +263,7 @@ pub async fn token_account(rpc: &RpcClient, ata: &Pubkey) -> Option<(Pubkey, Pub
     }
     let owner = Pubkey::new_from_array(data[32..64].try_into().ok()?);
     let mint = Pubkey::new_from_array(data[0..32].try_into().ok()?);
-    let amount: u64 = rpc
-        .get_token_account_balance(ata)
-        .await
-        .ok()?
-        .amount
-        .parse()
-        .ok()?;
+    let amount = u64::from_le_bytes(data[64..72].try_into().ok()?);
     Some((owner, mint, amount))
 }
 

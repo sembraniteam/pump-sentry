@@ -71,11 +71,11 @@ pub trait ReserveFeed {
 
 impl ReserveFeed for CurveTicker {
     async fn fetch_tick(&self, mint: &str, curve: &str) -> Result<PriceTick, CurveError> {
-        self.fetch_tick(mint, curve).await
+        CurveTicker::fetch_tick(self, mint, curve).await
     }
 
     async fn token_decimals(&self, mint: &str) -> Result<u8, CurveError> {
-        self.token_decimals(mint).await
+        CurveTicker::token_decimals(self, mint).await
     }
 
     async fn fetch_tick_with_fee(
@@ -83,15 +83,15 @@ impl ReserveFeed for CurveTicker {
         mint: &str,
         curve: &str,
     ) -> Result<(PriceTick, Option<f64>), CurveError> {
-        self.fetch_tick_with_fee(mint, curve).await
+        CurveTicker::fetch_tick_with_fee(self, mint, curve).await
     }
 
     async fn watch(&self, mint: &str, curve: &str) -> Result<(), CurveError> {
-        self.watch(mint, curve).await
+        CurveTicker::watch(self, mint, curve).await
     }
 
     async fn unwatch(&self, mint: &str) -> bool {
-        self.unwatch(mint).await
+        CurveTicker::unwatch(self, mint).await
     }
 }
 
@@ -187,85 +187,90 @@ pub trait LiveSink: BuySink + SellSink + PendingStore + CostLedger + WalSink {}
 
 impl<T: BuySink + SellSink + PendingStore + CostLedger + WalSink> LiveSink for T {}
 
+// Trait impls below call the inherent methods explicitly
+// (`LiveTrader::buy(self, ..)`): a same-name `self.buy(..)` delegation
+// silently becomes unbounded recursion the day the inherent method is
+// renamed away.
+
 impl BuySink for LiveTrader {
     async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String, Option<BuyFill>), LiveError> {
-        self.buy(req).await
+        LiveTrader::buy(self, req).await
     }
 }
 
 impl SellSink for LiveTrader {
     async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
-        self.sell(req).await
+        LiveTrader::sell(self, req).await
     }
 
     async fn sell_raydium(&self, req: &RaydiumSellParams<'_>) -> Result<String, LiveError> {
-        self.sell_raydium(req).await
+        LiveTrader::sell_raydium(self, req).await
     }
 
     async fn sell_pumpswap(&self, req: &PumpSwapSellParams<'_>) -> Result<String, LiveError> {
-        self.sell_pumpswap(req).await
+        LiveTrader::sell_pumpswap(self, req).await
     }
 }
 
 impl PendingStore for LiveTrader {
     fn has_pending(&self) -> bool {
-        self.has_pending()
+        LiveTrader::has_pending(self)
     }
 
     fn pending_mints(&self) -> Vec<String> {
-        self.pending_mints()
+        LiveTrader::pending_mints(self)
     }
 
     fn has_pending_for(&self, mint: &str) -> bool {
-        self.has_pending_for(mint)
+        LiveTrader::has_pending_for(self, mint)
     }
 
     async fn prior_sell_pending(&self, mint: &str) -> bool {
-        self.prior_sell_pending(mint).await
+        LiveTrader::prior_sell_pending(self, mint).await
     }
 
     async fn recheck_pending(&self) -> Vec<PendingRecheck> {
-        self.recheck_pending().await
+        LiveTrader::recheck_pending(self).await
     }
 }
 
 impl CostLedger for LiveTrader {
     async fn effective_tip(&self, failed_attempts: u32) -> u64 {
-        self.effective_tip(failed_attempts).await
+        LiveTrader::effective_tip(self, failed_attempts).await
     }
 
     fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64 {
-        self.dispatch_cost_for_tip(tip_lamports)
+        LiveTrader::dispatch_cost_for_tip(self, tip_lamports)
     }
 
     fn first_touch_cost_lamports(&self) -> u64 {
-        self.first_touch_cost_lamports()
+        LiveTrader::first_touch_cost_lamports(self)
     }
 
     fn failed_dispatch_cost_lamports(&self) -> u64 {
-        self.failed_dispatch_cost_lamports()
+        LiveTrader::failed_dispatch_cost_lamports(self)
     }
 }
 
 impl WalSink for LiveTrader {
     fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
-        self.acknowledge_buy(position, bundle_id)
+        LiveTrader::acknowledge_buy(self, position, bundle_id)
     }
 
     fn record_manual(&self, position: &LivePosition, note: &str) {
-        self.record_manual(position, note)
+        LiveTrader::record_manual(self, position, note)
     }
 
     fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
-        self.record_sell(mint, amount_tokens, bundle_id)
+        LiveTrader::record_sell(self, mint, amount_tokens, bundle_id)
     }
 
     fn unrecord_manual(&self, position: &LivePosition) {
-        self.unrecord_manual(position)
+        LiveTrader::unrecord_manual(self, position)
     }
 
     fn wal_degraded(&self) -> bool {
-        self.wal_degraded()
+        LiveTrader::wal_degraded(self)
     }
 }
 
@@ -830,11 +835,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         } else {
                             f64::NAN
                         };
-                        let equity = portfolio.snapshot(&card_marks).equity;
+                        // Book-level mark vs realizable: what the open
+                        // positions are worth at the mark and what
+                        // liquidating the whole book would cost right
+                        // now (size impact + venue fee), next to this
+                        // trade's own realized gap.
+                        let snapshot = portfolio.snapshot(&card_marks);
+                        let equity = snapshot.equity;
                         info!(mint = %tick.mint, id, reason = ?trade.reason,
                         net = format!("{:+.2}", headline),
                         pct = format!("{:+.2}%", trade.net_pnl_percent),
                         realizable_vs_mark_bps = format!("{:+.0}", vs_mark_bps),
+                        book_mark = format!("{:.2}", snapshot.mark_value),
+                        book_discount = format!("{:.2}", snapshot.exit_discount_usd()),
                         "paper position closed");
                         closed_cards.push((
                             format!("{:?}", trade.reason),

@@ -10,8 +10,8 @@ mod test_fixture;
 pub mod vault;
 
 pub use detector::{
-    GRADUATION_REAL_SOL_LAMPORTS, MigrationDestination, MigrationError, MigrationMonitor,
-    PUMP_AMM_PROGRAM_ID, PUMP_MIGRATE_DISCRIMINATOR, PUMP_MIGRATE_V2_LOG, RAYDIUM_V4_PROGRAM_ID,
+    MigrationDestination, MigrationError, MigrationMonitor, PUMP_AMM_PROGRAM_ID,
+    PUMP_MIGRATE_DISCRIMINATOR, PUMP_MIGRATE_V2_LOG, RAYDIUM_V4_PROGRAM_ID,
 };
 pub use pool::{RaydiumV4Pool, WSOL_MINT};
 pub use pumpswap::{PumpSwapPool, virtual_reserves};

@@ -853,23 +853,39 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> std::io::Result<()>
     staged
 }
 
-/// Pending sell requests, sorted by mint.
+/// Pending sell requests, sorted by mint. A missing state dir is empty
+/// (nothing written yet); any other read failure is loud — a broken
+/// path must never look like "no requests".
 pub fn pending_sell_requests(log_file: &Path) -> Vec<(String, PathBuf)> {
     let dir = log_file.parent().filter(|d| !d.as_os_str().is_empty());
-    let entries = dir
-        .and_then(|d| std::fs::read_dir(d).ok())
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name().is_some_and(|n| {
-                        let n = n.to_string_lossy();
-                        n.starts_with("sell-") && n.ends_with(".json")
-                    })
+    let Some(dir) = dir else {
+        return Vec::new();
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|entry| match entry {
+                Ok(e) => Some(e.path()),
+                Err(e) => {
+                    eprintln!("warning: unreadable state-dir entry: {e}");
+                    None
+                }
+            })
+            .filter(|p| {
+                p.file_name().is_some_and(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with("sell-") && n.ends_with(".json")
                 })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+            })
+            .collect::<Vec<_>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!(
+                "warning: cannot read state dir {} : {e}; no sell requests this round",
+                dir.display()
+            );
+            Vec::new()
+        }
+    };
     let mut out: Vec<(String, PathBuf)> = entries
         .into_iter()
         .filter_map(|p| {

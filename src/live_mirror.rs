@@ -209,9 +209,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::live::{
-    BPS_DENOMINATOR, LAMPORTS_PER_SOL, LiveBuyParams, LiveError, LivePosition,
-    LiveSellParams, LiveTrader, PumpSwapSellParams, RaydiumSellParams, RecheckOutcome,
-    SELL_MAX_ATTEMPTS, SELL_RETRY_COOLDOWN,
+    DecimalsRefusal, LAMPORTS_PER_SOL, LiveBuyParams, LiveError, LivePosition, LiveSellParams,
+    LiveTrader, PumpSwapSellParams, RaydiumSellParams, RecheckOutcome, SELL_MAX_ATTEMPTS,
+    SELL_RETRY_COOLDOWN, six_decimals,
 };
 use crate::pipeline::{
     AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener, CURVE_TICK_STALE_SECS,
@@ -237,23 +237,6 @@ pub(crate) fn breaker_headline(net_pnl: f64, dispatch_usd: f64) -> f64 {
         net_pnl - dispatch_usd
     } else {
         net_pnl
-    }
-}
-
-/// Probe WAL writability without writing: an existing file must
-/// open for append; a missing file needs a live parent dir.
-/// Startup-probe API for the binary entrypoint (outside this
-/// module's scope); used in tests until wired there.
-#[allow(dead_code)]
-pub fn wal_writable(path: &std::path::Path) -> bool {
-    if path.exists() {
-        std::fs::OpenOptions::new().append(true).open(path).is_ok()
-    } else {
-        match path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            Some(dir) => dir.is_dir(),
-            // Bare filename: current dir must exist.
-            None => std::path::Path::new(".").is_dir(),
-        }
     }
 }
 
@@ -688,9 +671,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Decimals explicit (cached read): sizing assumes per-mint units.
         // Gate drops non-6; live re-verifies so a 9-decimal mint can
         // never size 1000x wrong here.
-        let decimals = match self.reserves.token_decimals(mint).await {
-            Ok(6) => 6u8,
-            Ok(other) => {
+        let decimals = match six_decimals(&self.reserves, mint).await {
+            Ok(d) => d,
+            Err(DecimalsRefusal::NonSix(other)) => {
                 warn!(%mint, decimals = other, "non-6-decimal mint; live buy skipped (fail-closed)");
                 self.exec
                     .mark_diverged(mint, "live buy skipped: non-6 decimals".to_string())
@@ -698,8 +681,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.emit(format!("LIVE buy skipped on {mint} (non-6 decimals); paper open WITHOUT live cover"));
                 return;
             }
-            Err(e) => {
-                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "mint decimals unreadable; live buy skipped (fail-closed)");
+            Err(DecimalsRefusal::Unreadable(error)) => {
+                warn!(%mint, %error, "mint decimals unreadable; live buy skipped (fail-closed)");
                 self.exec
                     .mark_diverged(mint, "live buy skipped: decimals unreadable".to_string())
                     .await;
@@ -986,16 +969,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Decimals explicit (cached): floor math needs per-mint units.
         // Unreadable retries next tick; non-6 counts toward the retry
         // budget like dust (gate never opens those, so this is drift).
-        let decimals = match self.reserves.token_decimals(mint).await {
-            Ok(6) => 6u8,
-            Ok(other) => {
+        let decimals = match six_decimals(&self.reserves, mint).await {
+            Ok(d) => d,
+            Err(DecimalsRefusal::NonSix(other)) => {
                 let attempts = self.exec.note_failure(mint, now).await;
                 warn!(%mint, decimals = other, attempts, "non-6-decimal mint; live sell refused (fail-closed)");
                 return false;
             }
-            Err(e) => {
+            Err(DecimalsRefusal::Unreadable(error)) => {
                 let attempts = self.exec.note_failure(mint, now).await;
-                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), attempts, "mint decimals unreadable; live sell deferred (counts toward retry budget)");
+                warn!(%mint, %error, attempts, "mint decimals unreadable; live sell deferred (counts toward retry budget)");
                 return false;
             }
         };
@@ -1013,14 +996,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 }
                 return false;
             };
-            // Floored math (oversell is unauthorized).
-            let numer = (fraction_closed.clamp(0.0, 1.0) * BPS_DENOMINATOR as f64).floor() as u64;
+            // Whole-token slice via the shared paper rule (floored,
+            // never rounded): overselling is unauthorized and the live
+            // leg must sell exactly the paper slice the book closed, or
+            // the mirror drifts by dust forever.
             let held = tracked.amount_tokens;
-            let sell_amount = ((held as u128 * numer as u128) / BPS_DENOMINATOR as u128) as u64;
-            if sell_amount > held {
-                warn!(mint = %mint, sell_amount, held, "live sell sizing overflow; refusing");
-                return false;
-            }
+            let sell_amount = simulator::slice_quantity(held, fraction_closed);
             // Floor only (never ceiling). Dust counts toward the retry
             // budget like any failed probe (note_failure stamps the
             // cooldown too), so an unsellable remainder parks to manual
@@ -1465,18 +1446,6 @@ mod tests {
         assert!(t.note_live_settle("M", 2.9, 0.0).is_none());
         let (n, _, _) = t.stats();
         assert_eq!(n, 2);
-    }
-
-    #[test]
-    fn wal_probe_detects_missing_parent() {
-        use std::path::Path;
-        // Bare filename: no file touched, current dir lives.
-        assert!(wal_writable(Path::new("definitely-a-wal-probe-name.log")));
-        assert!(!wal_writable(Path::new("/no/such/dir/ever/wal.log")));
-        let probe = std::env::temp_dir().join("pump-sentry-wal-probe.tmp");
-        std::fs::write(&probe, "x").expect("probe write");
-        assert!(wal_writable(&probe));
-        std::fs::remove_file(&probe).ok();
     }
 
     #[tokio::test]

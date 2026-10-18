@@ -17,8 +17,8 @@ pub const FEE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`executor::FEE_INPUTS_TTL`).
 pub const FEE_CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// Cached globals: FeeConfig bytes, gate byte, fetch time.
-pub type FeeInputsCache = Arc<Mutex<Option<(Vec<u8>, u8, Instant)>>>;
+/// Cached globals: FeeConfig bytes, creator-fee gate, fetch time.
+pub type FeeInputsCache = Arc<Mutex<Option<(Vec<u8>, bool, Instant)>>>;
 
 /// Mint supply cache. Supplies never change on bonding curves (fixed at
 /// creation; gated mints have no live mint authority), so entries never
@@ -26,11 +26,15 @@ pub type FeeInputsCache = Arc<Mutex<Option<(Vec<u8>, u8, Instant)>>>;
 /// first-seen evicted past the cap, not a random key).
 pub type SupplyCache = Arc<Mutex<HashMap<String, (u64, Instant)>>>;
 
-/// Quote-mint class.
+/// Quote-mint class selecting the fee schedule.
+/// Canonical single source: `executor::quote` re-exports this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuoteKind {
+pub enum QuoteKind {
+    /// SOL-like: `fee_tiers`.
     SolLike,
+    /// USDC: `stable_fee_tiers`.
     Usdc,
+    /// Else exotic-or-flat.
     Other,
 }
 
@@ -56,21 +60,39 @@ pub async fn venue_fee_for_data(
     } else {
         mint_supply(rpc, supply_cache, mint).await?
     };
-    let (fee_bytes, gate_byte) = cached_fee_inputs(rpc, cache).await?;
-    let gate_on = match gate_byte {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
+    let (fee_bytes, gate_on) = cached_fee_inputs(rpc, cache).await?;
     let schedule = parse_schedule(&fee_bytes)?;
     let (proto, creator) =
         select_tier(&schedule, view.kind, market_cap(view.vq, view.vt, supply)?)?;
-    let coin = if gate_on && view.coin_override != 0 {
-        view.coin_override
-    } else {
-        creator
-    };
+    let coin = effective_creator_bps(
+        view.coin_override,
+        creator,
+        gate_on,
+        view.creator_is_default,
+    );
     Some(effective_total(proto, coin)? as f64)
+}
+
+/// Creator leg in whole bps, with both program rules applied: the
+/// per-coin (or per-pool) override wins while the creator-fee gate is
+/// on and nonzero, and a creatorless curve (or pool) charges no creator
+/// fee at all. Canonical single source: `executor::quote` calls this
+/// for curve and PumpSwap quotes, so paper and dispatch can never
+/// disagree on the creator leg.
+pub fn effective_creator_bps(
+    override_bps: u64,
+    tier_creator_bps: u64,
+    gate_on: bool,
+    creator_is_default: bool,
+) -> u64 {
+    if creator_is_default {
+        return 0;
+    }
+    if gate_on && override_bps != 0 {
+        override_bps
+    } else {
+        tier_creator_bps
+    }
 }
 
 /// Venue total; `None` past 100%.
@@ -83,7 +105,7 @@ fn effective_total(proto: u64, creator: u64) -> Option<u64> {
 }
 
 /// Joined FeeConfig + Global read behind the TTL cache.
-async fn cached_fee_inputs(rpc: &RpcClient, cache: &FeeInputsCache) -> Option<(Vec<u8>, u8)> {
+async fn cached_fee_inputs(rpc: &RpcClient, cache: &FeeInputsCache) -> Option<(Vec<u8>, bool)> {
     if let Some((bytes, gate, at)) = cache.lock().await.clone()
         && at.elapsed() < FEE_CACHE_TTL
     {
@@ -101,9 +123,20 @@ async fn cached_fee_inputs(rpc: &RpcClient, cache: &FeeInputsCache) -> Option<(V
     if fee.owner != ids::FEE_CONFIG_PROGRAM || global.owner != ids::PUMP_PROGRAM_ID {
         return None;
     }
-    let gate = *global.data.get(ids::GLOBAL_FEE_GATE_OFFSET)?;
+    let gate = parse_fee_gate(&global.data)?;
     *cache.lock().await = Some((fee.data.clone(), gate, Instant::now()));
     Some((fee.data, gate))
+}
+
+/// Creator-fee gate byte (0/1) from Global account data. `None` on
+/// short/bad bytes. Canonical single source: dispatch's fee-input fetch
+/// calls this too.
+pub fn parse_fee_gate(data: &[u8]) -> Option<bool> {
+    match data.get(ids::GLOBAL_FEE_GATE_OFFSET) {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    }
 }
 
 /// Curve fee inputs for tier selection.
@@ -115,12 +148,18 @@ struct CurveFeeView {
     vq: u64,
     stored_supply: u64,
     is_mayhem: bool,
+    /// Creator is the default key: the program charges no creator fee.
+    creator_is_default: bool,
 }
 
 fn curve_fee_inputs(data: &[u8]) -> Option<CurveFeeView> {
     if data.len() < ids::CURVE_COIN_CREATOR_FEE_END {
         return None;
     }
+    let creator: [u8; 32] = data
+        .get(ids::CURVE_CREATOR_OFFSET..ids::CURVE_CREATOR_END)?
+        .try_into()
+        .ok()?;
     let raw: [u8; 32] = data
         .get(ids::CURVE_QUOTE_MINT_OFFSET..ids::CURVE_QUOTE_MINT_END)?
         .try_into()
@@ -146,6 +185,7 @@ fn curve_fee_inputs(data: &[u8]) -> Option<CurveFeeView> {
             .copied()
             .unwrap_or(0)
             != 0,
+        creator_is_default: creator == [0u8; 32],
     })
 }
 
@@ -218,8 +258,10 @@ pub struct FeeSchedule {
 /// `ids::MAX_FEE_TIERS`).
 use ids::MAX_FEE_TIERS;
 
-/// Highest tier at or below mcap, else the first.
-fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<FeesBps> {
+/// Highest tier at or below mcap, else the first. `None` when empty.
+/// Canonical single source: `executor::quote` re-uses this for curve and
+/// PumpSwap tier picks.
+pub fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<FeesBps> {
     let first = tiers.first()?;
     if mcap < first.0 {
         return Some(first.1);
@@ -233,8 +275,8 @@ fn tier_for(tiers: &[FeeTierRow], mcap: u128) -> Option<FeesBps> {
     Some(picked)
 }
 
-/// (protocol, creator) for one quote kind at `mcap`.
-fn select_tier(schedule: &FeeSchedule, kind: QuoteKind, mcap: u128) -> Option<(u64, u64)> {
+/// `(protocol, creator)` for one quote kind at `mcap`.
+pub fn select_tier(schedule: &FeeSchedule, kind: QuoteKind, mcap: u128) -> Option<(u64, u64)> {
     let fees = match kind {
         QuoteKind::SolLike => tier_for(&schedule.tiers, mcap)?,
         QuoteKind::Usdc => tier_for(&schedule.stable, mcap)?,
@@ -250,8 +292,10 @@ fn select_tier(schedule: &FeeSchedule, kind: QuoteKind, mcap: u128) -> Option<(u
     Some((fees.protocol, fees.creator))
 }
 
-/// Decode the schedule from FeeConfig bytes.
-fn parse_schedule(data: &[u8]) -> Option<FeeSchedule> {
+/// Decode the schedule from FeeConfig bytes. `None` on malformed
+/// bytes. Canonical single source: dispatch's fee-input fetch uses this
+/// too.
+pub fn parse_schedule(data: &[u8]) -> Option<FeeSchedule> {
     const TIERS_OFF: usize = 8 + 1 + 32 + 24;
     let flat = FeesBps {
         lp: u64le(data, 41)?,
@@ -428,6 +472,9 @@ mod tests {
             (1_000, 2_000, 3_000)
         );
         assert!(!view.is_mayhem);
+        assert!(view.creator_is_default);
+        data[ids::CURVE_CREATOR_OFFSET..ids::CURVE_CREATOR_END].copy_from_slice(&[9u8; 32]);
+        assert!(!curve_fee_inputs(&data).expect("view").creator_is_default);
         data[83..115].copy_from_slice(&ids::WSOL_MINT.to_bytes());
         assert_eq!(curve_fee_inputs(&data).expect("w").kind, QuoteKind::SolLike);
         data[83..115].copy_from_slice(&ids::USDC_MINT.to_bytes());
@@ -441,17 +488,63 @@ mod tests {
 
     #[test]
     fn override_applies_before_total() {
-        let coin = |gate_on: bool, coin_override: u64, creator: u64| {
-            if gate_on && coin_override != 0 {
-                coin_override
-            } else {
-                creator
-            }
-        };
-        assert_eq!(effective_total(95, coin(true, 250, 30)), Some(125 + 220));
-        assert_eq!(effective_total(95, coin(false, 250, 30)), Some(125));
-        assert_eq!(effective_total(95, coin(true, 0, 30)), Some(125));
+        // The real rule (not a local copy): gate-on override wins,
+        // creatorless curves charge no creator fee at all.
+        assert_eq!(effective_creator_bps(250, 30, true, false), 250);
+        assert_eq!(effective_creator_bps(250, 30, false, false), 30);
+        assert_eq!(effective_creator_bps(0, 30, true, false), 30);
+        assert_eq!(effective_creator_bps(250, 30, true, true), 0);
+        assert_eq!(effective_creator_bps(0, 0, true, true), 0);
+        assert_eq!(
+            effective_total(95, effective_creator_bps(250, 30, true, false)),
+            Some(345)
+        );
+        assert_eq!(
+            effective_total(95, effective_creator_bps(250, 30, false, false)),
+            Some(125)
+        );
+        assert_eq!(
+            effective_total(95, effective_creator_bps(0, 30, true, false)),
+            Some(125)
+        );
         assert_eq!(effective_total(u64::MAX, 1), None);
         assert_eq!(effective_total(9_000, 9_000), None);
+    }
+
+    #[test]
+    fn creatorless_curve_zeroes_creator_leg() {
+        // End-to-end over curve bytes: default creator key -> proto only,
+        // override or not (program rule shared with dispatch).
+        let bytes = |creator: [u8; 32], override_bps: u64| {
+            let mut data = vec![0u8; 123];
+            data[8..16].copy_from_slice(&1_000u64.to_le_bytes());
+            data[16..24].copy_from_slice(&2_000u64.to_le_bytes());
+            data[40..48].copy_from_slice(&3_000u64.to_le_bytes());
+            data[49..81].copy_from_slice(&creator);
+            data[115..123].copy_from_slice(&override_bps.to_le_bytes());
+            data
+        };
+        let sched = parse_schedule(&two_tier_bytes()).expect("two-tier decodes");
+        let total = |creator: [u8; 32], override_bps: u64, gate_on: bool| {
+            let view = curve_fee_inputs(&bytes(creator, override_bps)).expect("view");
+            let (proto, creator) = select_tier(
+                &sched,
+                view.kind,
+                market_cap(view.vq, view.vt, view.stored_supply).expect("mcap"),
+            )
+            .expect("tier");
+            let coin = effective_creator_bps(
+                view.coin_override,
+                creator,
+                gate_on,
+                view.creator_is_default,
+            );
+            effective_total(proto, coin).expect("total")
+        };
+        // Live tier at mcap 2*3000/1000 = 6000 lamports is (95, 30).
+        assert_eq!(total([9u8; 32], 0, true), 125);
+        assert_eq!(total([9u8; 32], 250, true), 345);
+        assert_eq!(total([0u8; 32], 250, true), 95);
+        assert_eq!(total([0u8; 32], 250, false), 95);
     }
 }

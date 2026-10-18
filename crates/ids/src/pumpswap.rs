@@ -49,8 +49,6 @@ pub const POOL_CREATOR_OFFSET: usize = 11;
 pub const POOL_BASE_MINT_OFFSET: usize = 43;
 /// Quote mint slot (WSOL on executable pools).
 pub const POOL_QUOTE_MINT_OFFSET: usize = 75;
-/// LP mint slot end (exclusive).
-pub const POOL_LP_MINT_END: usize = 139;
 /// Base vault slot (token inventory).
 pub const POOL_BASE_VAULT_OFFSET: usize = 139;
 /// Quote vault slot (WSOL inventory).

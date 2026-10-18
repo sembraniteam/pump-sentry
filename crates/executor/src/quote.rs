@@ -41,8 +41,9 @@ pub enum QuoteError {
 
 /// Fee triple in bps (IDL order: lp, protocol, creator).
 /// Canonical single source: [`curve::fee::FeesBps`], re-exported here
-/// so dispatch and the paper ledger share one schedule type.
-pub use curve::fee::{FeeSchedule, FeeTierRow, FeesBps};
+/// so dispatch and the paper ledger share one schedule type. Same for
+/// the quote-mint class selecting the tier table.
+pub use curve::fee::{FeeSchedule, FeeTierRow, FeesBps, QuoteKind};
 
 /// Curve inputs for quoting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,108 +63,10 @@ pub struct CurveView {
     pub quote: QuoteKind,
 }
 
-/// Quote-mint class selecting the schedule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuoteKind {
-    /// SOL-like: `fee_tiers`.
-    SolLike,
-    /// USDC: `stable_fee_tiers`.
-    Usdc,
-    /// Else exotic-or-flat.
-    Other,
-}
-
-/// Max decoded tiers per table (DoS bound; live uses 1+1).
-/// Single source is [`ids::MAX_FEE_TIERS`]; re-exported here.
-pub use ids::MAX_FEE_TIERS;
-
-/// Decode [`FeeSchedule`]. Layout: disc(8) + bump(1) + admin(32) + flat(24)
-/// + fee vec + stable vec + exotic(24, zeros when predating the extension).
-pub fn parse_fee_schedule(data: &[u8]) -> Result<FeeSchedule, QuoteError> {
-    let off = 8usize + 1 + 32 + 24;
-    if data.len() < off + 4 {
-        return Err(QuoteError::BadAccount);
-    }
-    let flat = FeesBps {
-        lp: u64le(data, 41)?,
-        protocol: u64le(data, 49)?,
-        creator: u64le(data, 57)?,
-    };
-    let (tiers, next) = parse_tier_vec(data, off)?;
-    let (stable, next) = parse_tier_vec(data, next)?;
-    // Pre-extension accounts (4073 bytes) end here: missing exotic
-    // reads as unset, like the reference.
-    let exotic = if data.len() >= next + 24 {
-        FeesBps {
-            lp: u64le(data, next)?,
-            protocol: u64le(data, next + 8)?,
-            creator: u64le(data, next + 16)?,
-        }
-    } else if data.len() == next {
-        FeesBps::default()
-    } else {
-        return Err(QuoteError::BadAccount);
-    };
-    Ok(FeeSchedule { tiers, stable, flat, exotic })
-}
-
-/// Creator-fee gate from Global byte 1045. `Err` on short/bad bytes.
-pub fn parse_fee_gate(data: &[u8]) -> Result<bool, QuoteError> {
-    let b = *data.get(1045).ok_or(QuoteError::BadAccount)?;
-    match b {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(QuoteError::BadAccount),
-    }
-}
-
-fn parse_tier_vec(data: &[u8], off: usize) -> Result<(Vec<FeeTierRow>, usize), QuoteError> {
-    let n = u32le(data, off)? as usize;
-    if n > MAX_FEE_TIERS {
-        return Err(QuoteError::BadAccount);
-    }
-    let mut out = Vec::with_capacity(n.min(16));
-    let mut at = off + 4;
-    // Thresholds must ascend (tier selection assumes it; mirrors the
-    // paper-ledger parser in `curve::fee`). Anything else fails closed.
-    let mut prev = 0u128;
-    for _ in 0..n {
-        let threshold = u128le(data, at)?;
-        if threshold < prev {
-            return Err(QuoteError::BadAccount);
-        }
-        prev = threshold;
-        let fees = FeesBps {
-            lp: u64le(data, at + 16)?,
-            protocol: u64le(data, at + 24)?,
-            creator: u64le(data, at + 32)?,
-        };
-        out.push((threshold, fees));
-        at += 40;
-    }
-    Ok((out, at))
-}
-
-fn u64le(data: &[u8], off: usize) -> Result<u64, QuoteError> {
-    data.get(off..off + 8)
-        .and_then(|b| <[u8; 8]>::try_from(b).ok())
-        .map(u64::from_le_bytes)
-        .ok_or(QuoteError::BadAccount)
-}
-
-fn u32le(data: &[u8], off: usize) -> Result<u32, QuoteError> {
-    data.get(off..off + 4)
-        .and_then(|b| <[u8; 4]>::try_from(b).ok())
-        .map(u32::from_le_bytes)
-        .ok_or(QuoteError::BadAccount)
-}
-
-fn u128le(data: &[u8], off: usize) -> Result<u128, QuoteError> {
-    data.get(off..off + 16)
-        .and_then(|b| <[u8; 16]>::try_from(b).ok())
-        .map(u128::from_le_bytes)
-        .ok_or(QuoteError::BadAccount)
-}
+// FeeConfig decode, creator-fee gate, tier pick, and the creator-leg
+// rule live in `curve::fee` (the paper ledger's reader, which depends
+// on nothing in this crate). Re-used below: one decoder, one tier
+// selection, one creator-leg rule for paper and dispatch alike.
 
 /// `ceil(a / b)` for non-zero `b`. Crate-private: only the quote
 /// builders below use it.
@@ -257,23 +160,10 @@ pub fn market_cap(vq: u64, vt: u64, supply: u64) -> Result<u128, QuoteError> {
     curve::fee::market_cap(vq, vt, supply).ok_or(QuoteError::MathOverflow)
 }
 
-/// Highest tier at or below `mcap`, else the first. `None` when empty.
-pub fn tier_for(tiers: &[(u128, FeesBps)], mcap: u128) -> Option<&FeesBps> {
-    let first = tiers.first()?;
-    if mcap < first.0 {
-        return Some(&first.1);
-    }
-    let mut picked: &FeesBps = &first.1;
-    for (threshold, fees) in tiers.iter() {
-        if mcap >= *threshold {
-            picked = fees;
-        }
-    }
-    Some(picked)
-}
-
 /// `(protocol, creator)` bps. Schedule by quote kind + mcap, then the coin
 /// rate wins while the gate is on and nonzero. Global bps fields unused.
+/// Tier pick and creator-leg rules live in `curve::fee` (shared with the
+/// paper ledger, so the two can never drift).
 pub fn curve_fee_bps(
     schedule: &FeeSchedule,
     gate_on: bool,
@@ -281,23 +171,15 @@ pub fn curve_fee_bps(
     mint_supply: u64,
 ) -> Result<(u64, u64), QuoteError> {
     let mcap = market_cap(view.vq, view.vt, mint_supply)?;
-    let fees = match view.quote {
-        QuoteKind::SolLike => tier_for(&schedule.tiers, mcap).ok_or(QuoteError::EmptyFeeTiers)?,
-        QuoteKind::Usdc => tier_for(&schedule.stable, mcap).ok_or(QuoteError::EmptyFeeTiers)?,
-        QuoteKind::Other => {
-            let e = &schedule.exotic;
-            if e.lp == 0 && e.protocol == 0 && e.creator == 0 {
-                &schedule.flat
-            } else {
-                e
-            }
-        }
-    };
-    let creator =
-        if gate_on && view.coin_creator_fee_bps != 0 { view.coin_creator_fee_bps } else { fees.creator };
-    // Creatorless curves charge no creator fee (program rule).
-    let creator = if view.creator_is_default { 0 } else { creator };
-    Ok((fees.protocol, creator))
+    let (proto, tier_creator) =
+        curve::fee::select_tier(schedule, view.quote, mcap).ok_or(QuoteError::EmptyFeeTiers)?;
+    let creator = curve::fee::effective_creator_bps(
+        view.coin_creator_fee_bps,
+        tier_creator,
+        gate_on,
+        view.creator_is_default,
+    );
+    Ok((proto, creator))
 }
 
 /// Fee-inclusive cost to buy `amount`. Over-remainder fails closed.
@@ -447,7 +329,7 @@ pub fn pumpswap_sell_out(view: &PoolView, amount: u64) -> Result<u64, QuoteError
 
 /// Slippage floor over a net quote (rounds down).
 /// `None` on degenerate input or zero floor.
-fn slip_floor(net_quote: u64, slippage_bps: u64) -> Option<u64> {
+pub(crate) fn slip_floor(net_quote: u64, slippage_bps: u64) -> Option<u64> {
     if net_quote == 0 || u128::from(slippage_bps) >= BPS_DENOMINATOR {
         return None;
     }
@@ -481,16 +363,16 @@ pub fn pumpswap_fee_bps(
     coin_creator_default: bool,
     mcap: u128,
 ) -> Result<FeesBps, QuoteError> {
-    let tier = tier_for(&schedule.tiers, mcap).ok_or(QuoteError::EmptyFeeTiers)?;
-    let creator = if gate_on && pool_creator_fee_bps != 0 {
-        pool_creator_fee_bps
-    } else {
-        tier.creator
-    };
+    let tier = curve::fee::tier_for(&schedule.tiers, mcap).ok_or(QuoteError::EmptyFeeTiers)?;
     Ok(FeesBps {
         lp: tier.lp,
         protocol: tier.protocol,
-        creator: if coin_creator_default { 0 } else { creator },
+        creator: curve::fee::effective_creator_bps(
+            pool_creator_fee_bps,
+            tier.creator,
+            gate_on,
+            coin_creator_default,
+        ),
     })
 }
 
@@ -712,7 +594,7 @@ mod tests {
         // Same FeeConfig layout as the curve schedule: 25 live tiers.
         let bytes: &[u8] =
             include_bytes!("../../listener/tests/fixtures/amm_fee_config_live.bin");
-        let sched = parse_fee_schedule(bytes).expect("live AMM schedule decodes");
+        let sched = curve::fee::parse_schedule(bytes).expect("live AMM schedule decodes");
         assert_eq!(sched.tiers.len(), 25);
         assert_eq!(
             sched.tiers[0],
@@ -766,24 +648,24 @@ mod tests {
         // Live FeeConfig bytes (4097 bytes, trailing zero room): single (0, 95, 30).
         let bytes: &[u8] = include_bytes!("../../listener/tests/fixtures/fee_config_live.bin");
         assert_eq!(bytes.len(), 4097);
-        let sched = parse_fee_schedule(bytes).expect("live schedule decodes");
+        let sched = curve::fee::parse_schedule(bytes).expect("live schedule decodes");
         let one = vec![(0u128, FeesBps { lp: 0, protocol: 95, creator: 30 })];
         assert_eq!(sched.tiers, one);
         assert_eq!(sched.stable, one);
         assert_eq!(sched.flat, FeesBps { lp: 0, protocol: 95, creator: 30 });
         assert_eq!(sched.exotic, FeesBps { lp: 0, protocol: 95, creator: 30 });
-        // Hostile / short buffers fail closed.
-        assert_eq!(parse_fee_schedule(&bytes[..72]), Err(QuoteError::BadAccount));
+        // Hostile / short buffers fail closed (shared parser).
+        assert!(curve::fee::parse_schedule(&bytes[..72]).is_none());
         let mut hostile = bytes[..177].to_vec();
         hostile[65..69].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(parse_fee_schedule(&hostile), Err(QuoteError::BadAccount));
+        assert!(curve::fee::parse_schedule(&hostile).is_none());
     }
 
     #[test]
     fn descending_tiers_fail_closed() {
-        // Thresholds must ascend (tier selection assumes it; mirrors
-        // the paper-ledger parser). Duplicate the single live row and
-        // force a descent at the second row.
+        // Thresholds must ascend (tier selection assumes it; shared
+        // with the paper-ledger reader). Duplicate the single live row
+        // and force a descent at the second row.
         let bytes: &[u8] = include_bytes!("../../listener/tests/fixtures/fee_config_live.bin");
         let mut bad = bytes.to_vec();
         let row: Vec<u8> = bad[69..109].to_vec();
@@ -791,19 +673,19 @@ mod tests {
         bad[65..69].copy_from_slice(&2u32.to_le_bytes());
         bad[69..85].copy_from_slice(&5u128.to_le_bytes());
         bad[109..125].copy_from_slice(&0u128.to_le_bytes());
-        assert_eq!(parse_fee_schedule(&bad), Err(QuoteError::BadAccount));
+        assert!(curve::fee::parse_schedule(&bad).is_none());
     }
 
     #[test]
     fn fee_gate_parses_boolean_byte() {
         let mut data = vec![0u8; 1088];
         data[1045] = 1;
-        assert_eq!(parse_fee_gate(&data), Ok(true));
+        assert_eq!(curve::fee::parse_fee_gate(&data), Some(true));
         data[1045] = 0;
-        assert_eq!(parse_fee_gate(&data), Ok(false));
+        assert_eq!(curve::fee::parse_fee_gate(&data), Some(false));
         data[1045] = 7;
-        assert_eq!(parse_fee_gate(&data), Err(QuoteError::BadAccount));
-        assert_eq!(parse_fee_gate(&data[..1045]), Err(QuoteError::BadAccount));
+        assert_eq!(curve::fee::parse_fee_gate(&data), None);
+        assert_eq!(curve::fee::parse_fee_gate(&data[..1045]), None);
     }
 
     #[test]

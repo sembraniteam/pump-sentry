@@ -48,11 +48,6 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// True for [`Verdict::Allow`].
-    pub fn is_allow(&self) -> bool {
-        matches!(self, Verdict::Allow)
-    }
-
     /// Convert to `Result`, joining every reason into the rejection.
     pub fn into_result(self) -> Result<(), RugCheckError> {
         match self {

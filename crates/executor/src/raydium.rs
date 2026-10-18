@@ -12,8 +12,9 @@ use solana_pubkey::Pubkey;
 pub const SWAP_BASE_IN_V2_TAG: u8 = 16;
 /// AMM v4 fee: 25 bps off input.
 pub const AMM_V4_FEE_BPS: u64 = 25;
-/// Fee denominator for [`AMM_V4_FEE_BPS`].
-pub const AMM_V4_FEE_DEN: u64 = 10_000;
+/// Fee denominator for [`AMM_V4_FEE_BPS`]. Single source is
+/// `ids::BPS_DENOMINATOR`.
+pub const AMM_V4_FEE_DEN: u64 = ids::BPS_DENOMINATOR;
 
 /// Quote `amount_in` with fee. `None` on degenerate inputs.
 /// Over-limit fees refuse (fail-closed); the on-chain fee itself
@@ -47,15 +48,10 @@ pub fn quote_base_in_std(amount_in: u64, in_reserve: u64, out_reserve: u64) -> O
 }
 
 /// Slippage floor. `None` on degenerate input or zero floor.
+/// Same formula as the curve/PumpSwap floors (single source:
+/// [`crate::quote::slip_floor`]); venue-explicit name.
 pub fn raydium_sell_floor(quoted_out: u64, slippage_bps: u64) -> Option<u64> {
-    if quoted_out == 0 || slippage_bps >= 10_000 {
-        return None;
-    }
-    let floor = (quoted_out as u128 * (10_000 - slippage_bps as u128) / 10_000u128) as u64;
-    if floor == 0 {
-        return None;
-    }
-    Some(floor)
+    crate::quote::slip_floor(quoted_out, slippage_bps)
 }
 
 /// AMM vault authority for a pool nonce. Proof helper, not dispatch

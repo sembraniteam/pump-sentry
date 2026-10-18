@@ -14,8 +14,6 @@ pub use ids::{
 pub const PUMP_MIGRATE_V2_LOG: &str = "migratev2";
 /// Raydium pool-init marker (same case-insensitive match).
 pub const RAYDIUM_INITIALIZE2_LOG: &str = "initialize2";
-/// Real SOL collected at graduation (~84 SOL).
-pub const GRADUATION_REAL_SOL_LAMPORTS: u64 = 84_000_000_000;
 
 /// Migration failures.
 #[derive(Error, Debug, PartialEq, Eq)]

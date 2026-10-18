@@ -71,15 +71,30 @@ impl CloseSlice {
             mint: position.mint.clone(),
             side: position.side,
             entry_price: position.entry_price,
-            // Floor, never round: overselling is unauthorized, and a
-            // zero-sized slice is rejected by `settle` (live dust parity).
-            quantity: (position.quantity as f64 * fraction).floor() as u64,
+            quantity: slice_quantity(position.quantity, fraction),
             entry_notional: position.entry_notional * fraction,
             entry_fee: position.entry_fee * fraction,
             opened_at: position.opened_at,
             fraction,
         }
     }
+}
+
+/// Whole-token slice of `quantity` for a partial close: floored, never
+/// rounded (overselling is unauthorized). A fraction at or above 100%
+/// slices the whole position; a zero, negative, or NaN fraction slices
+/// to zero (the book rejects that as dust; matches a live sell that
+/// sizes to zero). Single source: the paper book and the live sell
+/// mirror size every scale-out through this, so the two can never
+/// disagree by a token.
+pub fn slice_quantity(quantity: u64, fraction: f64) -> u64 {
+    if fraction >= 1.0 {
+        return quantity;
+    }
+    if !fraction.is_finite() || fraction <= 0.0 {
+        return 0;
+    }
+    (quantity as f64 * fraction).floor() as u64
 }
 
 /// Finite value or zero.
@@ -442,11 +457,7 @@ impl PaperPortfolio {
                 .positions
                 .get(&id)
                 .ok_or(PortfolioError::PositionNotFound(id))?;
-            let slice_qty = if fraction >= 1.0 {
-                position.quantity
-            } else {
-                (position.quantity as f64 * fraction).floor() as u64
-            };
+            let slice_qty = slice_quantity(position.quantity, fraction);
             let opposed = self.fill_for_mint(&position.mint);
             if slice_qty > 0 && opposed.exit_price(position.side, mark, slice_qty).is_none() {
                 return Err(PortfolioError::CurveExhausted {
@@ -1423,6 +1434,28 @@ mod tests {
             .expect("partial");
         assert_eq!(part.quantity, 3);
         assert_eq!(pf.position(id2).expect("p").quantity, 7);
+    }
+
+    #[test]
+    fn slice_quantity_floors_never_rounds() {
+        // Paper book and live sell mirror both size through this, so a
+        // scale-out can never drift between them by a token.
+        assert_eq!(slice_quantity(10_000, 1.0), 10_000);
+        assert_eq!(slice_quantity(10_000, 1.5), 10_000);
+        assert_eq!(slice_quantity(10_000, f64::INFINITY), 10_000);
+        assert_eq!(slice_quantity(10_000, 0.3), 3_000);
+        assert_eq!(slice_quantity(9_999, 0.00015), 1);
+        assert_eq!(slice_quantity(100, 0.999), 99);
+        assert_eq!(
+            slice_quantity(1_000_000_000_000_000, 0.5),
+            500_000_000_000_000
+        );
+        // Dust and garbage slice to zero (book rejects as dust; live
+        // counts it toward the retry budget).
+        assert_eq!(slice_quantity(9_999, 0.0001), 0);
+        assert_eq!(slice_quantity(100, 0.0), 0);
+        assert_eq!(slice_quantity(100, -0.5), 0);
+        assert_eq!(slice_quantity(100, f64::NAN), 0);
     }
 
     #[test]

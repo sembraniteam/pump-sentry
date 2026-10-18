@@ -10,5 +10,6 @@ pub use market::{
 };
 pub use portfolio::{
     OpenPositionParams, PaperPortfolio, PortfolioError, PortfolioSnapshot, RUNNER_BACKSTOP_SECS,
+    slice_quantity,
 };
 pub use types::{ClosedTrade, ExitReason, Position, PositionId, Side};

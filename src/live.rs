@@ -27,6 +27,34 @@ pub const VENUE_FEE_BPS: u64 = simulator::STANDARD_VENUE_FEE_BPS as u64;
 /// Single source is `executor::quote::BPS_DENOMINATOR` (u128 domain there).
 pub const BPS_DENOMINATOR: u64 = executor::quote::BPS_DENOMINATOR as u64;
 
+/// Refusal from the six-decimal admission gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecimalsRefusal {
+    /// Mint reports a different decimal count (never sized).
+    NonSix(u8),
+    /// Decimals unreadable (RPC error text, URL-stripped for logs).
+    Unreadable(String),
+}
+
+/// Admission gate for mint decimals: `Ok(d)` with `d == TOKEN_DECIMALS`
+/// passes; any other count or an unreadable read fails closed with a
+/// log-ready reason. Intake, live buy, and live sell all read through
+/// this — one read, one rule; every sizing path downstream assumes 6.
+/// Callers own their side effects (drop signal, skip the live leg,
+/// spend a retry).
+pub async fn six_decimals(
+    reserves: &impl crate::pipeline::ReserveFeed,
+    mint: &str,
+) -> Result<u8, DecimalsRefusal> {
+    match reserves.token_decimals(mint).await {
+        Ok(d) if u32::from(d) == TOKEN_DECIMALS => Ok(d),
+        Ok(other) => Err(DecimalsRefusal::NonSix(other)),
+        Err(e) => Err(DecimalsRefusal::Unreadable(ids::strip_error_url(
+            &e.to_string(),
+        ))),
+    }
+}
+
 /// Mark-price trail per mint for volatility-adaptive slippage.
 type MarkTrail = std::sync::Arc<std::sync::Mutex<HashMap<String, VecDeque<(u64, f64)>>>>;
 
