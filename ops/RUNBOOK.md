@@ -3,9 +3,16 @@
 Paper mode needs nothing here. Live mode (`--live` / `IS_LIVE=true`)
 moves real SOL: do every item in order, skip nothing.
 
-## 1. Pre-flight checklist (boot refuses without these)
+## 1. Pre-flight checklist
 
 Tunables live in `~/.pump-sentry/config.toml` by category (auto-created; the file is the only source, secrets stay in env).
+
+Items come in two kinds: **boot-enforced** ones stop live boot (the
+process exits with the named error until they pass); **operator** items
+are checks only you can make — skipping one means unproven live
+capability, not a refusal.
+
+**Boot-enforced — live start refuses until these pass:**
 
 - [ ] `max_daily_loss_usd>0` — day-loss breaker (exits always work); the
   tally persists in `day-state.json`, so a restart never resets it.
@@ -16,9 +23,16 @@ Tunables live in `~/.pump-sentry/config.toml` by category (auto-created; the fil
 - [ ] Key file `0600` — `SOLANA_PRIVATE_KEY_FILE` must not be group/other
   readable; boot refuses it (`chmod 600 <file>` is the fix). Prefer the
   file over `SOLANA_PRIVATE_KEY` (env leaks into `/proc`, `ps`, children).
-- [ ] `hot_wallet_max_sol` set — buys refuse while the wallet holds more.
-  Fund the wallet at or below the cap (see §2) and sweep any excess;
-  never raise the cap to "make the buy fit".
+- [ ] RPC and Jito serve the same cluster — boot refuses when both URLs
+  identify a cluster and they differ (devnet RPC + mainnet Jito can never
+  land); unidentifiable URLs only warn, so check them yourself.
+
+**Operator — run before funding; the bot cannot verify these:**
+
+- [ ] `hot_wallet_max_sol` set — optional cap: buy preflight refuses while
+  the wallet holds more (boot only warns). Fund the wallet at or below the
+  cap (see §2), sweep any excess, and never raise the cap to "make the buy
+  fit".
 - [ ] `mainnet_v3_17_simulates` GREEN on this exact binary
   (`MAINNET_LAYOUT=1 cargo test -p executor --test mainnet_layout_acceptance -- --ignored`).
 - [ ] `mainnet_bundle_acceptance` GREEN (Jito base64 wire proof, $0 probe:
@@ -26,9 +40,9 @@ Tunables live in `~/.pump-sentry/config.toml` by category (auto-created; the fil
 - [ ] `raydium_authority_and_bundle_simulate` GREEN (post-migration exit proof:
   `RAYDIUM_ACCEPTANCE=1 cargo test -p executor --test raydium_authority_acceptance -- --ignored`).
   All three are simulation-only ($0 by construction); rerun on router-dominated
-  samples — resampling is the procedure, not a failure.
-- [ ] RPC and Jito serve the same cluster (boot checks URL substrings;
-  devnet RPC + mainnet Jito can never land).
+  samples — resampling is the procedure, not a failure. Set `MAINNET_RPC_URL`
+  in the shell to give the probes a dedicated RPC (they dial it when set;
+  the bot itself reads its RPC from `config.toml`).
 
 ## 2. Funding math (native SOL first)
 

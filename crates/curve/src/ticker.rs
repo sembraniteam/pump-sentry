@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, warn};
 
-// Warn slots: persistent fee/read trouble pages ops, not every round.
+// Warn slots: persistent fee/read trouble warns once per slot, not every round.
 static FEE_WARN_AT: AtomicU64 = AtomicU64::new(0);
 static TICK_WARN_AT: AtomicU64 = AtomicU64::new(0);
 

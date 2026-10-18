@@ -12,9 +12,19 @@ cargo test -p executor
 JITO_ACCEPTANCE=1 cargo test -p executor --test jito_acceptance -- --ignored --nocapture  # $0 bundle proof
 MAINNET_LAYOUT=1 cargo test -p executor --test mainnet_layout_acceptance -- --ignored --nocapture  # $0 v3 sim proof
 RAYDIUM_ACCEPTANCE=1 cargo test -p executor --test raydium_authority_acceptance -- --ignored --nocapture  # $0 exit proof
+# creatorless-fee probe (skips itself without PUMP_ACCEPTANCE_POOL):
+MAINNET_LAYOUT=1 PUMP_ACCEPTANCE_POOL=<pool> [PUMP_ACCEPTANCE_HOLDER=<token acct>] \
+  cargo test -p executor --test mainnet_layout_acceptance -- --ignored --nocapture creatorless
 ```
 
-All three probes are simulation-only ($0 by construction: unfunded
-payers, nothing sent); rerun on throttled/stale samples.
+All four probes are simulation-only ($0 by construction: unfunded
+payers, nothing sent); rerun on throttled/stale samples. Probes dial
+`MAINNET_RPC_URL` when set (dedicated RPC recommended: the public node
+429s after bulk scans). The creatorless probe needs any WSOL-quoted
+PumpSwap pool whose `coin_creator` is the default key;
+`PUMP_ACCEPTANCE_HOLDER` names a funded base-side token account only for
+legacy pools whose trades predate public signature windows (otherwise a
+holder is found automatically). None of these variables is read by the
+bot.
 
 Fund before live: native SOL for trade+fees+tips; WSOL float only for token-paired quotes.

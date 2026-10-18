@@ -8,7 +8,9 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 - **Never run with `--live` / `IS_LIVE=true`, never fund a wallet, never
   send transactions.** Live paths move real SOL via Jito.
 - Tests hitting real mainnet exist and are `#[ignore]`d behind env gates
-  (`JITO_ACCEPTANCE=1`, `MAINNET_LAYOUT=1`, `RAYDIUM_ACCEPTANCE=1`).
+  (`JITO_ACCEPTANCE=1`, `MAINNET_LAYOUT=1`, `RAYDIUM_ACCEPTANCE=1`; the
+  creatorless-fee probe also needs `PUMP_ACCEPTANCE_POOL` and optionally
+  `PUMP_ACCEPTANCE_HOLDER`, and the probes dial `MAINNET_RPC_URL` when set).
   Never run them casually;
   only on explicit user request. They cost $0 by construction (unfunded
   payers, simulation-only) — keep it that way. Raydium probes resample
@@ -18,7 +20,7 @@ binary (`src/`) + 9 crates (`crates/*`). Default mode is paper-only.
 ## Verify (in this order)
 
 ```sh
-cargo test --workspace            # 528 tests; live probes stay ignored
+cargo test --workspace            # 569 passed; 6 live probes stay ignored
 cargo clippy --all-targets        # must be zero warnings
 cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
                                   # your own lines, never whole-tree fmt
@@ -38,8 +40,9 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   default` ⇒ creator fee 0). `executor::quote` and the paper fee view
   both delegate — a second copy once charged paper a creator fee the
   chain never charges (live sell floor looser than the dispatch quote).
-- `src/pipeline.rs` (~770 lines prod; tests live in `src/pipeline_tests.rs`
-  via `#[path]`, same crate so `pub(crate)` stays private) is the orchestrator:
+- `src/pipeline.rs` (923 lines, ~640 of code; tests live in
+  `src/pipeline_tests.rs` via `#[path]`, same crate so `pub(crate)`
+  stays private) is the orchestrator:
   gate → risk → paper ledger → live mirror. `LiveExecution`/`live_mirror` (live
   dispatch + `FillGapTracker` calibration), `gate` (watchlist + opens), and `DailyBreaker` are split
   out; method bodies live on `Pipeline` via those modules. Do NOT split
@@ -198,7 +201,8 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   `skill solana-*` refer to out-of-repo docs.)
 - Alert burn-in defaults are ON (`alert_diverged_warn_n=3`,
   `alert_risk_fallback_warn_pct=50`, `alert_giveup_burst_n=3`): model
-  trouble and divergence page ops by default. Do NOT "fix" them back to 0.
+  trouble and divergence log a warn by default — log-only, never
+  Discord cards (`ops/RUNBOOK.md` §8). Do NOT "fix" them back to 0.
 - One shared `Arc<RpcClient>` per process (built in `main`, injected via
   `with_rpc` / `subscribe_with_rpc`). Never add a new `RpcClient`
   construction site; `new()` constructors are test/back-compat wrappers.

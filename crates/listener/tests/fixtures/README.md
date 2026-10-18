@@ -27,10 +27,9 @@ operator with RPC access can close them.
   present). Hunt evidence: 2 v0 + 1 v1 among the last 3 launches
   resolved — envelope version varies, the fetch config stays
   `maxSupportedTransactionVersion: 1` for both.
-- Hunt tool (kept for future re-freezes):
-  `/private/var/.../T/opencode/hunt_v1.py` (bulk `getBlock` scan for
-  the `create_v2` discriminator, then `getTransaction` to resolve
-  per-tx versions; freezes the first v1 past the old slot).
+- Hunt method (no script kept — re-create as needed): bulk `getBlock`
+  scan for the `create_v2` discriminator, then `getTransaction` per hit
+  to resolve per-tx versions; freeze the first v1 past the old slot.
 
 ## Gap 2: PumpSwap WSOL-quoted executable pool — CLOSED 2026-10-16
 

@@ -92,7 +92,8 @@ Settings that live **outside** the file (env-only, never in `config.toml`):
 | `CONFIG_FILE` / `PID_FILE` / `LOG_FILE`                                               | path overrides                                                 |
 | `BOT_DAEMON` / `BOT_INVOCATION` / `BOT_FIRST_RUN`                                     | daemon markers                                                 |
 | `HERMES_BIN`                                                                          | alert binary override                                          |
-| `JITO_ACCEPTANCE`, `MAINNET_LAYOUT`, `RAYDIUM_ACCEPTANCE` (`*_ACCEPTANCE` test gates) | test gates, ignored by default                                 |
+| `JITO_ACCEPTANCE`, `MAINNET_LAYOUT`, `RAYDIUM_ACCEPTANCE`                             | live-probe gates, ignored by default                           |
+| `PUMP_ACCEPTANCE_POOL`, `PUMP_ACCEPTANCE_HOLDER`, `MAINNET_RPC_URL`                   | live probes only (executor tests): creatorless-fee target, RPC override; the bot never reads these |
 
 ## Going live
 

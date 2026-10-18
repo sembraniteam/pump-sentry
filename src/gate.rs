@@ -116,7 +116,7 @@ pub(crate) fn fee_aware_sl_floor(sl_percent: f64, per_side_total_bps: f64) -> f6
     clamped
 }
 
-/// Watchlist size that pages ops (entries die by deadline; the hard
+/// Watchlist size that warns ops (entries die by deadline; the hard
 /// cap below only sheds under flood).
 const WATCHLIST_WARN_SIZE: usize = 64;
 

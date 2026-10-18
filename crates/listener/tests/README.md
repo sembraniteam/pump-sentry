@@ -1,8 +1,8 @@
 # listener/tests — frozen mainnet fixtures only
 
-This directory holds **no test targets**: `tests/` contains only
-`fixtures/` (frozen mainnet JSON/bin blobs replayed by unit tests via
-`include_str!` / `include_bytes!`).
+This directory holds **no runnable test targets**: it contains only
+frozen mainnet blobs (`fixtures/`, JSON/bin, replayed by unit tests via
+`include_str!` / `include_bytes!`) plus these notes.
 
 Fixture inventory (each pinned by at least one replay test asserting
 wallet attribution + exact base-unit amounts):

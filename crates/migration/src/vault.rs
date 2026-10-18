@@ -17,7 +17,7 @@ use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
-// Warn slot: persistent price trouble pages ops, not every round.
+// Warn slot: persistent price trouble warns once per slot, not every round.
 static PRICE_WARN_AT: AtomicU64 = AtomicU64::new(0);
 
 /// SPL amount offset/length.
