@@ -645,7 +645,7 @@ async fn run_pipeline(live_arg: bool) {
         let wallet = match WalletGuard::load_from_env() {
             Ok(wallet) => wallet,
             Err(e) => {
-                eprintln!("live mode requires SOLANA_PRIVATE_KEY: {e}");
+                eprintln!("live mode cannot load the wallet: {e}");
                 std::process::exit(1);
             }
         }
