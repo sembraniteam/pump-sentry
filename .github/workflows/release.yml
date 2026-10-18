@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   clippy:
-    name: clippy
+    name: Clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -40,7 +40,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: test workspace
+    name: Test workspace
     needs: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -67,7 +67,8 @@ jobs:
         run: cargo test --workspace
 
   build:
-    name: build (${{ matrix.asset }})
+    name: Build (${{ matrix.asset }})
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     timeout-minutes: 30
     strategy:
@@ -106,10 +107,10 @@ jobs:
             ~/.cargo/git
             target
 
-      - name: build release binary
+      - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: pack asset + checksum
+      - name: Pack asset + checksum
         shell: bash
         run: |
           set -euo pipefail
@@ -132,7 +133,8 @@ jobs:
           path: dist/
 
   publish:
-    name: publish release
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     steps:
