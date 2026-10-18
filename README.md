@@ -33,11 +33,13 @@ Pipeline: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum →
 | `pump-sentry stop`         | stop with drain + snapshot                                    |
 | `pump-sentry restart --live` | restart in live mode (needs `SOLANA_PRIVATE_KEY`)           |
 | `pump-sentry sell <mint>`  | manual full exit, no restart                                  |
+| `pump-sentry pause`        | kill switch: halt new entries; open positions keep managing   |
+| `pump-sentry resume`       | clear the kill switch                                         |
 | `pump-sentry run`          | foreground (debugging)                                        |
 | `pump-sentry upgrade`      | install latest release                                        |
 | `pump-sentry init-config`  | write the default `config.toml` (`CONFIG_FILE` overrides path) |
 
-State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.
+State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, day-state, kill-switch marker, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.
 
 Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fees + tips + 0.05 reserve. A **WSOL** float is only needed for token-paired quotes.
 
@@ -60,7 +62,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 | Section     | Keys                                                                                                                                                                                                 | Defaults                                                           |
 |-------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
 | `network`   | `mainnet_rpc_url`, `mainnet_wss_rpc_url`, `yellowstone_endpoint`*, `commitment`, `tick_interval_ms`, `vault_tick_interval_ms`, `fetch_concurrency`, `backfill_sig_limit`, `reconnect_backoff_max_ms` | public RPC / `confirmed` / `1000` / `5000` / `32` / `100` / `5000` |
-| `trading`   | `start_balance`, `fee_bps`, `notional_usd`, `max_open_positions`, `mint_cooldown_secs`, `max_daily_loss_usd`, `quote_usd`*, `liquidity_usd`                                                          | `100` / `0` / `10` / `3` / `3600` / `0` (off) / unset / `0`        |
+| `trading`   | `start_balance`, `fee_bps`, `notional_usd`, `max_open_positions`, `max_exposure_usd`, `mint_cooldown_secs`, `max_daily_loss_usd`, `hot_wallet_max_sol`, `quote_usd`*, `liquidity_usd`                  | `100` / `0` / `10` / `3` / `0` (off) / `3600` / `0` (off) / `0` (off) / unset / `0`        |
 | `exits`     | `trail_percent`, `runner_trail_percent`                                                                                                                                                              | `5` / `20`                                                         |
 | `gate`      | `gate_window_secs`, `gate_min_buyers`, `gate_poll_ms`, `dev_min_age_secs`, `dev_max_prior_launches`, `dev_screen_sample_txs`, `dev_sig_limit`                                                        | `10` / `5` / `2000` / `3600` / `1` / `20` / `100`                  |
 | `risk`      | `strategy_mode`, `runner_moonbag_percent`, `inference_endpoint`, `inference_model`, `inference_timeout_ms`, `inference_headers`                                                                      | `adaptive` / `20` / local / `llama3.2:1b` / `300` / unset          |
@@ -72,6 +74,8 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 
 - `fetch_concurrency` bounds parallel `getTransaction` fetches (lower on metered RPC; `0` refuses at boot); `backfill_sig_limit` caps sigs per reconnect backfill (`0` disables it); `reconnect_backoff_max_ms` caps reconnect backoff (raise on flaky sockets).
 - `strategy_mode`: `adaptive` runs the profile verbatim; `scalp` clamps TP to +25…+35%; `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
+- Risk limits (all optional, `0` = off; exits are never blocked by any of them): `notional_usd` caps one ticket, `max_open_positions` caps concurrent positions (paper + live-held mints), `max_exposure_usd` caps total open exposure in USD (paper cost basis + one ticket per unpaired live bag — a bag carries no stored USD basis), `max_daily_loss_usd` halts entries past the day's realized loss. The day-loss tally persists in `~/.pump-sentry/day-state.json`, so a restart cannot reset either the tally or the cap it enforces; live-held custody is restored from the WAL and counts against heat/exposure after a restart too.
+- `hot_wallet_max_sol`: entries refuse (buy preflight) while the wallet holds more SOL than this. The operator bounds what an un-swept wallet or a leaked key can lose; `sell`/exits never consult it. Sweeping is the fix, not raising the cap.
 - `inference_headers`: optional extra headers, one or more comma-separated as `"Name: value, Other: value"` (e.g. OpenCode Go requires `x-opencode-session` for routing/cache); empty (default) sends none. Values may contain `:` (first-colon split) but not `,` (entry separator); repeats resolve last-wins. Malformed and transport-owned entries are skipped with a warning naming the header only (never the value). `authorization`/`user-agent`/framing headers are refused — auth stays in `INFERENCE_API_KEY` env, the user agent is owned.
 
 Settings that live **outside** the file (env-only, never in `config.toml`):
@@ -155,7 +159,9 @@ fetch_concurrency = 64           # fewer throttled drops in bursts
 [trading]
 notional_usd = 25.0              # exposure $75 at 3 open — size the breaker to match
 max_open_positions = 3           # more concurrent mouths ($75 exposure + costs)
+max_exposure_usd = 75.0          # cap total exposure at the same $75 (optional; 0 = off)
 max_daily_loss_usd = 8.0         # ~11% of exposure, same ratio as base
+hot_wallet_max_sol = 1.0         # optional: buys refuse above this wallet balance
 mint_cooldown_secs = 1800        # faster re-entry; still no instant revenge trades
 
 [gate]
@@ -187,7 +193,10 @@ Live env (all env-only): `SOLANA_PRIVATE_KEY` on a **dedicated** wallet,
 `YELLOWSTONE_TOKEN`, optional `INFERENCE_API_KEY`. Fund native SOL per
 `ops/RUNBOOK.md` §2 (trade + fees + tips + 0.05 reserve), verify Discord
 cards actually arrive (Hermes timeouts observed), and keep `notional_usd`
-small until the execution gap line says otherwise.
+small until the execution gap line says otherwise. Prefer
+`SOLANA_PRIVATE_KEY_FILE` (the bot **refuses** a key file that is
+group/world readable) and set `hot_wallet_max_sol` so the wallet never
+sits above what you are willing to lose.
 
 ## Safety
 
@@ -195,6 +204,7 @@ small until the execution gap line says otherwise.
 
 - Paper-only without `--live`/`IS_LIVE=true`. Live needs a dedicated wallet, small `notional_usd`, `max_daily_loss_usd>0`, `sim_strict=true`.
 - Exits never block: TP/SL/trailing/timeout + manual `sell`; the day-loss breaker halts entries only.
+- `pump-sentry pause` is the emergency kill switch: no new entry opens (the marker is polled every gate round, no restart needed), while exits, runner/moonbag scale-outs, and `sell <mint>` keep managing open positions. `pump-sentry resume` re-arms entries. The marker survives restarts.
 
 **What it refuses (fail-closed, no funds move):**
 
@@ -208,7 +218,7 @@ small until the execution gap line says otherwise.
 ```
 src/               # cli (supervisor) / settings / pipeline (orchestrator) / live (sizing+dispatch)
                    # gate (watchlist+opens) / live_mirror (live dispatch) / follow (migration watch) / wal (custody log)
-                   # money (validated Bps/Percent units)
+                   # day_state (restart-persistent day-loss tally) / money (validated Bps/Percent units)
 crates/listener/   # WS ingestion + parser + screening + quorum gate
 crates/executor/   # live swaps via Jito (only with --live)
 crates/curve|auditor|risk-engine|simulator|ids|alert|migration/

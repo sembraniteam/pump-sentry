@@ -47,6 +47,8 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("trading", "max_open_positions", "MAX_OPEN_POSITIONS"),
     ("trading", "mint_cooldown_secs", "MINT_COOLDOWN_SECS"),
     ("trading", "max_daily_loss_usd", "MAX_DAILY_LOSS_USD"),
+    ("trading", "max_exposure_usd", "MAX_EXPOSURE_USD"),
+    ("trading", "hot_wallet_max_sol", "HOT_WALLET_MAX_SOL"),
     ("trading", "quote_usd", "QUOTE_USD"),
     ("trading", "liquidity_usd", "LIQUIDITY_USD"),
     ("exits", "trail_percent", "TRAIL_PERCENT"),
@@ -115,9 +117,11 @@ reconnect_backoff_max_ms = 5000  # (reconnect backoff cap; raise on flaky free-t
 start_balance = 100.0       # (virtual paper cash, USD)
 fee_bps = 0.0               # (extra commission/side; venue 125bps already in fills)
 notional_usd = 10.0         # (paper size per trade, USD)
-max_open_positions = 3      # (exposure cap)
+max_open_positions = 3      # (max concurrent positions: paper + live-held mints)
+max_exposure_usd = 0.0      # (0 = off; total open exposure cap: paper basis + one ticket per unpaired live bag)
 mint_cooldown_secs = 3600   # (per-mint re-entry cooldown)
-max_daily_loss_usd = 0.0    # (0 = off; live requires >0)
+max_daily_loss_usd = 0.0    # (0 = off; live requires >0; survives restarts via day-state.json)
+hot_wallet_max_sol = 0.0    # (0 = off; live: entries refuse while the wallet holds more SOL than this)
 quote_usd = ""              # (TEST-ONLY price override; empty = unset)
 liquidity_usd = 0.0         # (reserve-read fallback; 0 = fail-closed)
 

@@ -21,6 +21,26 @@ pub fn default_pid_file() -> PathBuf {
         .map(|d| d.join("bot.pid"))
         .unwrap_or_else(|| PathBuf::from("logs/bot.pid"))
 }
+
+/// Kill-switch marker filename in the state dir.
+pub const ENTRIES_PAUSED_FILE: &str = "entries-paused";
+
+/// State file next to the daemon log (WAL, day-state, kill switch):
+/// one directory holds everything the operator inspects, and a
+/// `LOG_FILE` override keeps them together.
+pub fn state_file_beside_log(log_file: &Path, name: &str) -> PathBuf {
+    log_file
+        .parent()
+        .map(|d| d.join(name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Kill-switch marker path: while the file exists, no new entry opens.
+pub fn entries_paused_path() -> PathBuf {
+    let (_, log_file) = resolve_paths();
+    state_file_beside_log(&log_file, ENTRIES_PAUSED_FILE)
+}
+
 /// Default `logs` line count.
 pub const DEFAULT_LOG_LINES: usize = 100;
 /// SIGTERM grace before SIGKILL.
@@ -46,6 +66,8 @@ Commands:
   logs [-n N] [--follow]  Show the last N log lines (default 100)
   run [--live]            Run in the foreground (for debugging)
   sell <mint>             Queue a manual full exit for one mint now
+  pause                   Kill switch: halt new entries (open positions keep managing)
+  resume                  Clear the kill switch (entries may open again)
   init-config             Write ~/.pump-sentry/config.toml when missing
   upgrade                 Install the latest release (refuses when behind nothing or daemon runs; --allow-unverified to skip checksum)
   help                    Show this help
@@ -60,6 +82,7 @@ Options:
 Env:
   IS_LIVE=true            Same as --live.  LOG_FILE / PID_FILE override the default paths.
   SOLANA_PRIVATE_KEY      Base58 keypair (required for live mode).
+  SOLANA_PRIVATE_KEY_FILE Owner-only (0600) file holding the keypair; preferred over the env var.
 
 Examples:
   pump-sentry start
@@ -67,6 +90,7 @@ Examples:
   pump-sentry logs -n 50 --follow
   pump-sentry restart --live
   pump-sentry sell <mint>
+  pump-sentry pause
   pump-sentry stop
 ";
 
@@ -104,6 +128,10 @@ pub enum CliAction {
     Sell {
         mint: String,
     },
+    /// Kill switch: halt new entries (open positions keep managing).
+    Pause,
+    /// Clear the kill switch.
+    Resume,
     /// Usage; `Some` is the cause.
     Help {
         error: Option<String>,
@@ -144,6 +172,8 @@ pub fn parse_cli(args: &[String]) -> CliAction {
             },
             mint => CliAction::Sell { mint: mint.to_string() },
         },
+        "pause" => CliAction::Pause,
+        "resume" => CliAction::Resume,
         "help" | "--help" | "-h" => CliAction::Help { error: None },
         "" => CliAction::Help {
             error: Some(
@@ -658,6 +688,9 @@ pub fn cmd_restart(live: bool) -> ! {
 /// `status`: one line on liveness.
 pub fn cmd_status() -> ! {
     let (pid_file, log_file) = resolve_paths();
+    let paused_note = state_file_beside_log(&log_file, ENTRIES_PAUSED_FILE)
+        .exists()
+        .then(|| "entries PAUSED via kill switch; `pump-sentry resume` clears it".to_string());
     match running_daemon(&pid_file) {
         Some(info) => {
             println!(
@@ -667,6 +700,9 @@ pub fn cmd_status() -> ! {
                 info.started_at,
                 log_file.display()
             );
+            if let Some(note) = paused_note {
+                println!("{note}");
+            }
             std::process::exit(0);
         }
         None => {
@@ -675,6 +711,9 @@ pub fn cmd_status() -> ! {
                 println!("stopped (stale pid {} cleaned; log {})", stale.pid, log_file.display());
             } else {
                 println!("stopped (log {})", log_file.display());
+            }
+            if let Some(note) = paused_note {
+                println!("{note}");
             }
             std::process::exit(1);
         }
@@ -852,6 +891,50 @@ pub fn cmd_sell(mint: &str) {
         std::process::exit(1);
     }
     println!("manual sell queued for {mint} (daemon drains it on its next round)");
+}
+
+/// Kill switch on: write the marker. New entries halt within one gate
+/// round; open positions, exits, and `sell` are unaffected, and the
+/// marker survives restarts until `resume`.
+pub fn cmd_pause() -> ! {
+    let path = entries_paused_path();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = format!("paused by `pump-sentry pause` at unix_ts={}\n", unix_secs());
+    if let Err(e) = write_private_file(&path, body.as_bytes()) {
+        eprintln!("cannot write kill-switch marker {}: {e}", path.display());
+        std::process::exit(1);
+    }
+    println!(
+        "entries paused (marker {}): no new position opens; open positions keep managing (exits, `sell <mint>`). Resume with `pump-sentry resume`.",
+        path.display()
+    );
+    std::process::exit(0);
+}
+
+/// Kill switch off: remove the marker.
+pub fn cmd_resume() -> ! {
+    let path = entries_paused_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!("entries resumed (removed {})", path.display());
+            std::process::exit(0);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "entries were not paused (no {}); nothing to resume",
+                path.display()
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("cannot remove kill-switch marker {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Mint in a sell-request body. `None` on mismatch — including a `mint`
@@ -1247,6 +1330,8 @@ mod tests {
             CliAction::Start { live: true }
         );
         assert_eq!(parse_cli(&argv(&["bot", "stop"])), CliAction::Stop);
+        assert_eq!(parse_cli(&argv(&["bot", "pause"])), CliAction::Pause);
+        assert_eq!(parse_cli(&argv(&["bot", "resume"])), CliAction::Resume);
         assert_eq!(
             parse_cli(&argv(&["bot", "restart", "--live"])),
             CliAction::Restart { live: true }
@@ -1322,6 +1407,23 @@ mod tests {
             parse_cli(&argv(&["bot", "frobnicate"])),
             CliAction::Help { error: Some(_) }
         ));
+    }
+
+    #[test]
+    fn state_files_sit_beside_the_log() {
+        assert_eq!(
+            state_file_beside_log(Path::new("/tmp/ps/bot.log"), ENTRIES_PAUSED_FILE),
+            PathBuf::from("/tmp/ps/entries-paused")
+        );
+        assert_eq!(
+            state_file_beside_log(Path::new("/tmp/ps/bot.log"), "day-state.json"),
+            PathBuf::from("/tmp/ps/day-state.json")
+        );
+        // Bare filename: the state file stays bare too.
+        assert_eq!(
+            state_file_beside_log(Path::new("bot.log"), ENTRIES_PAUSED_FILE),
+            PathBuf::from(ENTRIES_PAUSED_FILE)
+        );
     }
 
     #[test]

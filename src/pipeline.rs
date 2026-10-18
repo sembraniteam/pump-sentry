@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alert::{Alerter, CardCtx};
 use auditor::{RugCheckClient, RugCheckError, RugCheckReport};
@@ -20,7 +21,10 @@ use crate::live::{BuyFill, LiveBuyParams, LiveError, LivePosition, LiveSellParam
 use crate::live::escalated_tip;
 use crate::live_mirror::{LiveExecution, breaker_headline, live_base_mint};
 use crate::follow::FollowState;
-pub use crate::gate::{DailyBreaker, GateState};
+pub use crate::gate::GateState;
+#[cfg(test)]
+pub use crate::gate::DailyBreaker;
+use crate::day_state::DayBook;
 #[cfg(test)]
 pub use crate::gate::LaunchRequest;
 #[cfg(test)]
@@ -386,8 +390,12 @@ pub struct Pipeline<
     pub screener: S,
     /// Gate state.
     pub gate_state: Mutex<GateState>,
-    /// Day-loss breaker.
-    pub daily: Mutex<DailyBreaker>,
+    /// Kill switch: while set, no new entry opens (exits, manual sells,
+    /// and pending-buy rechecks keep running). Polled from the marker
+    /// file by `run_pipeline`; set here so tests can flip it directly.
+    pub entries_paused: AtomicBool,
+    /// Day-loss breaker (persisted: a restart never resets the day).
+    pub daily: Mutex<DayBook>,
     /// Strategy.
     pub strategy: StrategyMode,
     /// Alerts; `None` silences.
@@ -403,7 +411,9 @@ pub const CURVE_TICK_STALE_SECS: u64 = 120;
 
 
 impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
-    /// Build shared state.
+    /// Build shared state. `day_state` is the day-loss tally file
+    /// (`None` = in-memory only); the breaker resumes today's loss
+    /// from it so a restart cannot reset the limit.
     #[allow(clippy::too_many_arguments)]
     pub fn shared(
         settings: Settings,
@@ -416,12 +426,14 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         alerts: Option<T>,
         vaults: VaultTicker,
         sol_feed: Arc<SolUsdFeed>,
+        day_state: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         let gate = EntryGate::new(settings.gate_window_secs, settings.gate_min_buyers);
         let strategy = settings.strategy_mode.parse().unwrap_or_else(|e| {
             warn!(mode = %settings.strategy_mode, error = %e, "bad strategy mode; using adaptive");
             StrategyMode::Adaptive
         });
+        let boot_now = now_secs();
         Arc::new(Self {
             settings,
             auditor,
@@ -434,7 +446,8 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             followed: Mutex::new(HashMap::new()),
             screener,
             gate_state: Mutex::new(GateState::new(gate)),
-            daily: Mutex::new(DailyBreaker::new(now_secs())),
+            entries_paused: AtomicBool::new(false),
+            daily: Mutex::new(DayBook::open(day_state, boot_now)),
             strategy,
             alerts,
             vaults,
@@ -492,6 +505,17 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         mints.sort();
         mints.dedup();
         mints
+    }
+
+    /// Flip the entry kill switch. Logs the edge only: the daemon polls
+    /// the marker file every gate round, so steady state stays quiet.
+    pub fn set_entries_paused(&self, paused: bool) {
+        let was = self.entries_paused.swap(paused, Ordering::Relaxed);
+        if paused && !was {
+            warn!("KILL SWITCH: entries paused — no new position opens; open-position management (exits, runner/moonbag scale-outs, `sell <mint>`) keeps running");
+        } else if !paused && was {
+            info!("kill switch cleared: entries resume");
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 //! Entry gate: watchlist, quorum polling, confirmed opens.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use alert::Alerter;
 use auditor::RugCheckError;
@@ -825,13 +826,20 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let trail_percent = req.trail_percent;
         let creator = req.creator;
         let sol = req.sol;
-        // Breaker first: past cap, no new risk. One card per day;
+        // Kill switch first: an operator stop preempts every other
+        // check and touches nothing but new risk. Exits, scale-outs,
+        // and `sell <mint>` are owned elsewhere and keep running.
+        if self.entries_paused.load(Ordering::Relaxed) {
+            info!(%mint, "kill switch: entries paused; skipping open");
+            return;
+        }
+        // Breaker next: past cap, no new risk. One card per day;
         // the heartbeat carries the halted state after that.
         let (tripped, fire, day_net) = {
             let mut daily = self.daily.lock().await;
             let (tripped, fire) =
                 daily.halt_state(self.settings.max_daily_loss_usd, now_secs());
-            (tripped, fire, daily.day_net)
+            (tripped, fire, daily.day_net())
         };
         if tripped {
             warn!(%mint, cap = self.settings.max_daily_loss_usd, day_net, "daily loss breaker tripped; skipping open");
@@ -856,9 +864,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // already paired with paper count once.
         {
             let mut paper_mints = std::collections::HashSet::new();
+            let mut paper_locked = 0.0;
             for id in portfolio.position_ids() {
                 if let Some(p) = portfolio.position(id) {
                     paper_mints.insert(p.mint.clone());
+                    // Basis actually invested (floored size at fill).
+                    paper_locked += p.entry_notional;
                 }
             }
             let live_extra = self
@@ -873,6 +884,20 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             {
                 info!(%mint, max = self.settings.max_open_positions, live_extra, "heat limit (incl. live-held mints): skipping");
                 return;
+            }
+            // Total exposure in USD counts the same two sides: paper
+            // cost basis, plus one ticket per unpaired live bag (a bag
+            // carries no stored USD basis; one ticket is the estimate
+            // heat already uses). The prospective ticket is included.
+            let cap = self.settings.max_exposure_usd;
+            if cap.is_finite() && cap > 0.0 {
+                let deployed = paper_locked + live_extra as f64 * self.settings.notional_usd;
+                let prospective = deployed + self.settings.notional_usd;
+                if prospective > cap {
+                    info!(%mint, deployed, cap, ticket = self.settings.notional_usd,
+                        "exposure cap: skipping open");
+                    return;
+                }
             }
         }
         if portfolio

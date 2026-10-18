@@ -61,6 +61,30 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - Risk flow: `risk-engine` profile → `strategy` rewrite (`adaptive`/`scalp`/`runner`) → `simulator` exits
   (TP/SL/trailing/
   timeout/moonbag scale-outs with breakeven ratchet + timeout lift).
+- Risk limits (all optional, `0` = off; none of them ever blocks an
+  exit): `notional_usd` (one ticket), `max_open_positions`
+  (concurrent; live-held mints count), `max_exposure_usd` (paper cost
+  basis + one ticket per unpaired live bag — bags store no USD basis,
+  that estimate is deliberate and mirrors heat), `max_daily_loss_usd`
+  (realized day loss), `hot_wallet_max_sol` (buy preflight refuses
+  above it, off the same balance read as solvency; never on sells).
+  The day tally persists in `day-state.json` (`src/day_state.rs`: atomic
+  tmp+rename via `cli::write_private_file`, `#[serde(default)]` fields,
+  missing/corrupt = fresh day loudly) and is seeded at boot — a restart
+  must never reset a limit (live custody already outlives restarts via
+  the WAL). Paper's book is in-memory by design; the tally is not.
+- Kill switch = `entries-paused` marker file, polled every gate round
+  by `run_pipeline` (edge-logged via `Pipeline::set_entries_paused`)
+  and checked FIRST in `open_tracked` — the single entry choke point, so
+  confirm/re-buy/override paths all pass through it. Entries halt;
+  exits, runner/moonbag scale-outs, the sell resend guard,
+  parked-bag recovery, and `sell <mint>` keep running, and the marker
+  survives restarts (`pause`/`resume` in `cli.rs`). Do NOT add a second
+  pause check site; a marker left behind must fail closed (paused), and
+  `status` reports it.
+- `SOLANA_PRIVATE_KEY_FILE` must be owner-only: `load_from_env` refuses
+  any group/other permission bit BEFORE reading (a world-readable key is
+  a leaked key). `hot_wallet_max_sol` bounds what a leak can lose.
 - Serde parsing goes through DTOs everywhere (wire, fixtures, WAL): test
   fixtures decode with the same DTOs as production. Shared helpers live in
   `crates/{executor,listener,migration}/src/test_fixture.rs`;

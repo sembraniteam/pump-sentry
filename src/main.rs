@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod day_state;
 mod follow;
 mod gate;
 mod live;
@@ -44,6 +45,8 @@ async fn main() {
         cli::CliAction::Status => cli::cmd_status(),
         cli::CliAction::Logs { lines, follow } => cli::cmd_logs(lines, follow).await,
         cli::CliAction::Sell { mint } => cli::cmd_sell(&mint),
+        cli::CliAction::Pause => cli::cmd_pause(),
+        cli::CliAction::Resume => cli::cmd_resume(),
         cli::CliAction::Upgrade { allow_unverified } => cli::cmd_upgrade(allow_unverified),
         cli::CliAction::InitConfig => {
             let path = config::resolve_config_path();
@@ -69,10 +72,13 @@ async fn main() {
 /// WAL path next to the log file.
 fn live_wal_path() -> std::path::PathBuf {
     let (_, log_file) = cli::resolve_paths();
-    log_file
-        .parent()
-        .map(|d| d.join("live-wal.jsonl"))
-        .unwrap_or_else(|| "live-wal.jsonl".into())
+    cli::state_file_beside_log(&log_file, "live-wal.jsonl")
+}
+
+/// Day-loss tally path next to the log file (survives restarts).
+fn day_state_path() -> std::path::PathBuf {
+    let (_, log_file) = cli::resolve_paths();
+    cli::state_file_beside_log(&log_file, day_state::DAY_STATE_FILE)
 }
 
 /// Boot replay of the WAL (live only): restores stranded custody.
@@ -631,14 +637,23 @@ async fn run_pipeline(live_arg: bool) {
 
     // Live stack (fatal on misconfig).
     let live = if live_mode {
+        // Hot-wallet ceiling in lamports (`0` = off): buys refuse while
+        // the wallet holds more, so a leaked key or an un-swept wallet
+        // can only lose what the operator allows to sit there. Exits
+        // never consult it.
+        let hot_cap = settings.hot_wallet_cap_lamports();
         let wallet = match WalletGuard::load_from_env() {
             Ok(wallet) => wallet,
             Err(e) => {
                 eprintln!("live mode requires SOLANA_PRIVATE_KEY: {e}");
                 std::process::exit(1);
             }
-        };
+        }
+        .with_hot_wallet_cap(hot_cap);
         info!(payer = %wallet.pubkey(), "live wallet loaded");
+        if hot_cap > 0 {
+            info!(cap_sol = settings.hot_wallet_max_sol, "hot-wallet cap armed: entries refuse while the wallet holds more SOL (sweep the excess)");
+        }
         if settings.sim_strict {
             info!("strict preflight on: unproven simulations refuse to dispatch");
         }
@@ -695,6 +710,16 @@ async fn run_pipeline(live_arg: bool) {
                 _ => {
                     warn!("no WSOL float at {} — token-paired quotes need one (SOL-pair buys pay native SOL and are unaffected).", report.wsol_ata);
                 }
+            }
+            if hot_cap > 0
+                && let Some(balance) = report.native_balance
+                && balance > hot_cap
+            {
+                warn!(
+                    balance_sol = balance as f64 / ids::LAMPORTS_PER_SOL as f64,
+                    cap_sol = settings.hot_wallet_max_sol,
+                    "hot wallet OVER its cap: every buy preflight refuses until the excess is swept (exits and `sell <mint>` keep working)"
+                );
             }
         }
         Some(LiveTrader::new(
@@ -769,7 +794,14 @@ async fn run_pipeline(live_arg: bool) {
         alerts,
         vault_ticker.clone(),
         sol_feed,
+        Some(day_state_path()),
     );
+
+    // Kill switch: the marker file halts entries without a restart.
+    // Polled below each gate round; flip the state now so boot tells
+    // the truth on the first log line.
+    let paused_path = cli::entries_paused_path();
+    pipeline.set_entries_paused(paused_path.exists());
 
     // Crash replay (live only).
     if live_mode {
@@ -891,7 +923,7 @@ async fn run_pipeline(live_arg: bool) {
                         pipeline.settings.max_daily_loss_usd,
                         settings::now_secs(),
                     );
-                    (halted, daily.day_net)
+                    (halted, daily.day_net())
                 };
                 let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
                     mode: if live_mode { "live" } else { "paper" },
@@ -998,6 +1030,10 @@ async fn run_pipeline(live_arg: bool) {
                 }
             }
             _ = gate_timer.tick() => {
+                // Kill switch: entries halt while the marker exists.
+                // Polled here (one stat per round) so a flip needs no
+                // restart; the edge is logged once.
+                pipeline.set_entries_paused(paused_path.exists());
                 // Ingestion-ban edges: card on trip (stop hammering,
                 // check token/quota, or clear yellowstone_endpoint for
                 // WS mode), note on recovery. The latch lives in the

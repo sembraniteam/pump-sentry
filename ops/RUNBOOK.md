@@ -7,11 +7,18 @@ moves real SOL: do every item in order, skip nothing.
 
 Tunables live in `~/.pump-sentry/config.toml` by category (auto-created; the file is the only source, secrets stay in env).
 
-- [ ] `max_daily_loss_usd>0` — day-loss breaker (exits always work).
+- [ ] `max_daily_loss_usd>0` — day-loss breaker (exits always work); the
+  tally persists in `day-state.json`, so a restart never resets it.
 - [ ] `sim_strict=true` — unproven sims refuse instead of warn-and-proceed.
 - [ ] `jito_tip_lamports>0` — tipless bundles may never land.
 - [ ] `commitment=confirmed|finalized` — `processed` is refused (reorgable prints).
 - [ ] `quote_usd` unset — static fallback is paper-only and refused live.
+- [ ] Key file `0600` — `SOLANA_PRIVATE_KEY_FILE` must not be group/other
+  readable; boot refuses it (`chmod 600 <file>` is the fix). Prefer the
+  file over `SOLANA_PRIVATE_KEY` (env leaks into `/proc`, `ps`, children).
+- [ ] `hot_wallet_max_sol` set — buys refuse while the wallet holds more.
+  Fund the wallet at or below the cap (see §2) and sweep any excess;
+  never raise the cap to "make the buy fit".
 - [ ] `mainnet_v3_17_simulates` GREEN on this exact binary
   (`MAINNET_LAYOUT=1 cargo test -p executor --test mainnet_layout_acceptance -- --ignored`).
 - [ ] `mainnet_bundle_acceptance` GREEN (Jito base64 wire proof, $0 probe:
@@ -42,13 +49,20 @@ legs are checked per trade by solvency).
 A WSOL float funds **token-paired quotes only**. Boot fails closed
 below the scaled requirement and warns loudly on zero WSOL.
 
+`hot_wallet_max_sol` (optional) sits **above** `required_native`: it is
+the ceiling that bounds what a leaked key or an un-swept wallet can
+lose, not a funding floor. Buys refuse above it (boot warns); exits and
+`sell` never consult it.
+
 ## 3. Start / stop / inspect
 
 ```sh
 pump-sentry start --live   # daemon; state in ~/.pump-sentry/
-pump-sentry status          # running? (pid, mode, log)
+pump-sentry status          # running? (pid, mode, log; flags a pause)
 pump-sentry logs -n 50      # tail; --follow to follow
 pump-sentry sell <mint>     # manual full exit now (only way parked bags leave)
+pump-sentry pause           # kill switch: halt new entries (see below)
+pump-sentry resume          # clear the kill switch
 pump-sentry stop            # SIGTERM, 30s drain, snapshot, SIGKILL past 45s
 ```
 
@@ -59,12 +73,66 @@ closes the paper position in paper mode (cards always state the mode).
 deleted only after the live leg settles (sold / manual-parked /
 nothing held). A kept file is normal while the live leg still holds.
 
+### Kill switch: stop new entries without stopping the bot
+
+```sh
+pump-sentry pause           # write the marker; entries halt within one gate round
+pump-sentry status          # "entries PAUSED ..." confirms it
+pump-sentry resume          # remove the marker; entries re-arm
+```
+
+What `pause` does (and does not do):
+
+- Halts **every new open**: the check is the first step of the single
+  open choke point, so no path (confirm flow, re-buy, override) slips
+  past it. The marker is polled every gate round (~2s); no restart.
+- Open positions keep managing: TP/SL/trailing/timeout, runner and
+  moonbag scale-outs, the sell resend guard, parked-bag recovery, and
+  `sell <mint>` all keep running. A held bag still stops out normally.
+- The watch/audit/confirm pipeline keeps running; candidates that
+  confirm while paused are skipped at the open (not queued).
+- All other limits stay in force: `notional_usd`, `max_open_positions`,
+  `max_exposure_usd`, `max_daily_loss_usd`, `hot_wallet_max_sol`.
+- The marker survives `stop`/`start`/`restart` and crashes: the bot
+  comes back paused until `resume`. If the state dir is lost (fresh VM,
+  `--purge`), it comes back **unpaused** — check `status` after a
+  rebuild or reinstall.
+
+### Separately: managing open positions while paused
+
+The switch governs entries only; these are the steps for what is
+already held.
+
+1. Watch them: `pump-sentry logs --follow` — exits keep printing and
+   closing positions; this IS management, not a stalled bot.
+2. Force one out: `pump-sentry sell <mint>` (full exit, mode per the
+   daemon; drains in ~15 gate rounds). Repeat per mint.
+3. Verify: expect the mint's ATA balance to go to zero; the WAL retires
+   its tracked line only after the live leg settles (§4/§5). A parked
+   manual note lingers by design until the bag is really gone.
+4. No-market bag: if the pool holds no liquidity, nothing can sell at
+   any price — the bot keeps the bag, books no fill, and holds heat.
+   Exit by hand when a market returns (the `sell` request stays queued).
+5. Then decide: `resume` (limits still apply, so a busted day or an
+   over-cap wallet still blocks entries) or `stop` (a stopped bot runs
+   **no** management either — only stop for maintenance, and restart
+   before leaving positions unattended).
+
 ## 4. Reading state (shutdown snapshot + WAL)
 
 - `~/.pump-sentry/shutdown-<ts>.json`: `paper_open`, `live_tracked`
   (base mints — suffixed `#2`/`#late` duplicates collapse here),
   `watchlist_pending`, `clean`. `clean:false` means fills are UNKNOWN —
   look every tracked mint up on the explorer before restarting.
+- `~/.pump-sentry/day-state.json`: the day-loss tally (`day`,
+  `day_net`, `halt_alerted_day`), rewritten atomically (owner-only)
+  after every closed trade and seeded at boot — a restart never resets
+  the day. Delete it ONLY to deliberately forgive today's loss (entries
+  re-arm and the day's halt card can fire again). A corrupt/missing file
+  degrades to a fresh day, loudly in the log.
+- `~/.pump-sentry/entries-paused`: the kill-switch marker. Presence =
+  no new entries (see §3). It is not a lockfile: removing it by hand
+  resumes entries at the next gate round, same as `pump-sentry resume`.
 - `~/.pump-sentry/live-wal.jsonl`: append-only custody log, fsync'd
   per line. **Never delete it** unless every tracked/manual bag is
   verified exited on-chain; boot replays it into pending/positions/
@@ -98,7 +166,7 @@ The supervisor also rotates ≥50 MB logs at start time as a backstop.
 
 | Symptom                       | Likely cause                                                         | Action                                                            |
 |-------------------------------|----------------------------------------------------------------------|-------------------------------------------------------------------|
-| No entries for hours          | Gate quorums unmet / day-loss tripped / public RPC throttled (drops) | `logs`, heartbeat card, use dedicated RPC                         |
+| No entries for hours          | Gate quorums unmet / day-loss tripped / pause marker present / exposure or hot-wallet cap reached / public RPC throttled (drops) | `logs`, `status` (flags a pause), heartbeat card, use dedicated RPC |
 | `diverged` alerts             | Live buy skipped/failed, paper uncovered                             | Review, fund, or accept paper-only                                |
 | Exits stalled, SOL/USD stale  | Price feed down (DexScreener; Jupiter retired)                           | By design (no static fallback); exits resume on recovery          |
 | `zero-liquidity tick` warns   | Curve/pool drained (a tick carries parsed reserves, so this is a real empty market, not a read miss) | By design: no fee-only fiction for a stop-loss. The bag stays held (paper and live, heat stays occupied, breaker books nothing) and exits resume on a priced tick; migration closes bypass. Last resort: `sell <mint>` |
@@ -136,6 +204,9 @@ same rules.
 - Secrets enter via env only, never via `config.toml` (no file mapping exists).
 - Keypair buffers are zeroized; both secrets are scrubbed from process env right after load.
 - Secrets never reach logs: bearer redacted, URL queries stripped, keypair has no `Debug`.
+- Live boot **refuses** a `SOLANA_PRIVATE_KEY_FILE` with any group/other
+  permission bit (checked before a byte is read; the error names the
+  `chmod 600` fix). A world-readable key is treated as already leaked.
 
 **Operator rules (the bot cannot do these for you):**
 - Never `export SECRET=...` inline — it lands in shell history AND in
@@ -144,6 +215,9 @@ same rules.
   `INFERENCE_API_KEY_FILE`, `YELLOWSTONE_TOKEN_FILE`): 0600 files
   the bot reads once at boot. Fallback: `read -s`, a `0600` env file,
   or the OS keychain.
+- Keep the hot wallet funded at or below `hot_wallet_max_sol`: that cap
+  is the blast radius if the key leaks. Buys refuse above it — sweep the
+  excess, don't raise the cap.
 - Scope RPC keys per use, with IP allowlists where offered. A key pasted into `config.toml` makes that file a secret: keep `~/.pump-sentry/` `0700` (new config files are `0600` from birth).
 - Keep inference on localhost; a remote plain-http endpoint with a key set raises a `cleartext` boot warning — treat it as a finding (live refuses it outright).
 

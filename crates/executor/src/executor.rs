@@ -1600,6 +1600,10 @@ impl SwapExecutor {
             .wallet
             .assert_solvency(&self.rpc, trade_lamports, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
             .await?;
+        // Hot-wallet ceiling (`HOT_WALLET_MAX_SOL`): buys refuse while
+        // the wallet sits above it. Same balance read, no extra RPC,
+        // and sell preflights never consult it.
+        self.wallet.check_hot_wallet_cap(balance)?;
         info!(mint = %order.mint, balance, max_cost = final_max, "buy pre-flight ok");
         let Some(state) = curve_state.as_ref() else {
             return Err(ExecutorError::BadOrder(

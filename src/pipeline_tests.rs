@@ -675,6 +675,7 @@ fn pipeline_engined(
         alerts,
         vaults,
         SolUsdFeed::new_for_test(150.0),
+        None,
     )
 }
 
@@ -748,6 +749,7 @@ fn pipeline_alerted(
         alerts,
         vaults,
         SolUsdFeed::new_for_test(150.0),
+        None,
     )
 }
 
@@ -1174,7 +1176,7 @@ async fn daily_breaker_blocks_opens_but_not_exits() {
     assert!(pipe.portfolio.lock().await.position(id).is_none());
     // The exit loss still feeds the breaker even though recording now
     // happens after the portfolio guard is released (lock-order fix).
-    assert!(pipe.daily.lock().await.day_net < -10.0);
+    assert!(pipe.daily.lock().await.day_net() < -10.0);
 }
 
 #[tokio::test]
@@ -1253,6 +1255,145 @@ async fn heat_counts_live_held_mints() {
     .await;
     pipe.poll_gates().await;
     assert!(pipe.portfolio.lock().await.position_ids().is_empty());
+}
+
+#[tokio::test]
+async fn kill_switch_pauses_entries_but_not_exits() {
+    // The marker halts new risk only: a held position keeps managing
+    // (exits, scale-outs) and clearing the switch re-arms entries.
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(tick(MINT, 2.0));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        funded(),
+        screener,
+        None,
+    );
+    let dev = dev_wallet();
+    let launch = LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev,
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    };
+    pipe.set_entries_paused(true);
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "paused: nothing opens"
+    );
+
+    // Clearing the switch (marker removed, flag flips) re-arms entries.
+    pipe.set_entries_paused(false);
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+
+    // Paused again with a position open: the stop-loss still fires.
+    pipe.set_entries_paused(true);
+    let id = pipe.portfolio.lock().await.position_ids()[0];
+    let mut stop = tick(MINT, 2.0);
+    stop.price_usd = 1.0; // -50% << -8% SL.
+    pipe.on_tick(&stop).await;
+    assert!(
+        pipe.portfolio.lock().await.position(id).is_none(),
+        "paused: exits keep running"
+    );
+}
+
+#[tokio::test]
+async fn exposure_cap_bounds_total_tickets() {
+    // Cap in USD, not in count: one paper ticket (basis 10 on MINT_A)
+    // plus one unpaired live bag (counted as one ticket) leaves no room
+    // for a third at cap 25; a wider cap admits it.
+    async fn seed(pipe: &Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>) {
+        pipe.portfolio
+            .lock()
+            .await
+            .open_position_params(&simulator::OpenPositionParams {
+                mint: MINT_A,
+                side: Side::Long,
+                quote: 2.0,
+                notional_usd: 10.0,
+                liquidity_usd: 1e9,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: now_secs(),
+            })
+            .expect("manual paper ticket");
+        pipe.exec.live_manual.lock().await.insert(
+            MINT_B.to_string(),
+            LivePosition {
+                mint: pk(MINT_B),
+                curve: pk(CURVE),
+                assoc_curve: pk(ASSOC),
+                amount_tokens: 1_000,
+                creator: None,
+            },
+        );
+    }
+    fn build(
+        cap: f64,
+    ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
+        let mut settings = Settings::from_map(&HashMap::new());
+        settings.notional_usd = 10.0;
+        settings.max_exposure_usd = cap;
+        pipeline_screened(
+            settings,
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick(MINT, 2.0)),
+            funded(),
+            StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+            Some(StubLive::working()),
+        )
+    }
+    let dev = dev_wallet();
+    let launch = LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev,
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    };
+
+    let pipe = build(25.0);
+    seed(&pipe).await;
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "cap 25: 20 deployed + one ticket does not fit"
+    );
+
+    let pipe = build(40.0);
+    seed(&pipe).await;
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    let portfolio = pipe.portfolio.lock().await;
+    assert_eq!(portfolio.position_ids().len(), 2, "cap 40 admits the ticket");
+    assert!(
+        portfolio
+            .position_ids()
+            .iter()
+            .filter_map(|id| portfolio.position(*id))
+            .any(|p| p.mint == MINT),
+        "the candidate opened"
+    );
 }
 
 #[tokio::test]
@@ -2105,7 +2246,7 @@ async fn synthetic_override_pnl_skips_breaker() {
     assert_eq!(portfolio.history().len(), 1);
     assert!(portfolio.history()[0].net_pnl > 0.0);
     drop(portfolio);
-    assert_eq!(pipe.daily.lock().await.day_net, 0.0);
+    assert_eq!(pipe.daily.lock().await.day_net(), 0.0);
 }
 
 #[tokio::test]
@@ -2706,7 +2847,7 @@ async fn paper_only_stop_fires_on_realizable_and_nets_bleed() {
     assert!((portfolio.total_dispatch_usd() - (open_leg + close_leg)).abs() < 1e-6);
     // Breaker sees edge net of BOTH legs: the open leg booked at
     // open, the close leg netted at close.
-    let day_net = pipe.daily.lock().await.day_net;
+    let day_net = pipe.daily.lock().await.day_net();
     assert!((day_net - (trade.net_pnl - trade.dispatch_usd - open_leg)).abs() < 1e-6);
 }
 
@@ -3315,7 +3456,7 @@ async fn live_sell_retries_on_cooldown_then_gives_up() {
     // stashed while holding stays deferred until the manual exit
     // clears — never flushed into the breaker while live holds.
     assert!(pipe.exec.deferred_pnl.lock().await.contains_key(MINT));
-    assert_eq!(pipe.daily.lock().await.day_net, 0.0);
+    assert_eq!(pipe.daily.lock().await.day_net(), 0.0);
 }
 
 #[tokio::test]
@@ -3357,7 +3498,7 @@ async fn giveup_on_close_tick_defers_breaker_feed() {
     assert!(pipe.portfolio.lock().await.position_ids().is_empty());
     assert!(pipe.exec.live_manual.lock().await.contains_key(MINT));
     assert!(pipe.exec.deferred_pnl.lock().await.contains_key(MINT));
-    assert_eq!(pipe.daily.lock().await.day_net, 0.0);
+    assert_eq!(pipe.daily.lock().await.day_net(), 0.0);
 }
 
 #[tokio::test]
@@ -3392,7 +3533,7 @@ async fn deferred_pnl_flushes_when_live_settles_late() {
     pipe.on_tick(&tick(MINT, 3.0)).await;
     assert!(live.sells().is_empty());
     assert!(pipe.portfolio.lock().await.position_ids().is_empty());
-    assert_eq!(pipe.daily.lock().await.day_net, 0.0);
+    assert_eq!(pipe.daily.lock().await.day_net(), 0.0);
     assert!(pipe.exec.deferred_pnl.lock().await.contains_key(MINT));
     // Recover with a stale cooldown: the no-paper retry path sells
     // and the stashed profit settles into the breaker.
@@ -3404,7 +3545,7 @@ async fn deferred_pnl_flushes_when_live_settles_late() {
     pipe.on_tick(&tick(MINT, 3.0)).await;
     assert_eq!(live.sells(), vec![(MINT.to_string(), 1_000)]);
     assert!(!pipe.exec.deferred_pnl.lock().await.contains_key(MINT));
-    assert!(pipe.daily.lock().await.day_net > 0.0);
+    assert!(pipe.daily.lock().await.day_net() > 0.0);
 }
 
 #[tokio::test]

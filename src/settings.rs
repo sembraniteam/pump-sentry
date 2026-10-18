@@ -43,6 +43,12 @@ pub struct Settings {
     pub max_open_positions: usize,
     /// Day-loss cap in USD (`0` = off). Exits always work.
     pub max_daily_loss_usd: f64,
+    /// Total open-exposure cap in USD (`0` = off): paper cost basis
+    /// plus one ticket per unpaired live bag.
+    pub max_exposure_usd: f64,
+    /// Hot-wallet ceiling in SOL (`0` = off): entries refuse while the
+    /// wallet holds more than this. Exits always work.
+    pub hot_wallet_max_sol: f64,
     /// Per-mint cooldown after close (`0` = off).
     pub mint_cooldown_secs: u64,
     /// Min dev-wallet age in seconds.
@@ -137,6 +143,8 @@ impl std::fmt::Debug for Settings {
             .field("gate_poll_ms", &self.gate_poll_ms)
             .field("max_open_positions", &self.max_open_positions)
             .field("max_daily_loss_usd", &self.max_daily_loss_usd)
+            .field("max_exposure_usd", &self.max_exposure_usd)
+            .field("hot_wallet_max_sol", &self.hot_wallet_max_sol)
             .field("mint_cooldown_secs", &self.mint_cooldown_secs)
             .field("dev_min_age_secs", &self.dev_min_age_secs)
             .field("dev_max_prior_launches", &self.dev_max_prior_launches)
@@ -224,6 +232,8 @@ impl Settings {
             gate_poll_ms: get_int(vars, "GATE_POLL_MS", 2000, &mut notes),
             max_open_positions: get_int(vars, "MAX_OPEN_POSITIONS", 3, &mut notes),
             max_daily_loss_usd: get_float(vars, "MAX_DAILY_LOSS_USD", 0.0, &mut notes),
+            max_exposure_usd: get_float(vars, "MAX_EXPOSURE_USD", 0.0, &mut notes),
+            hot_wallet_max_sol: get_float(vars, "HOT_WALLET_MAX_SOL", 0.0, &mut notes),
             mint_cooldown_secs: get_int(vars, "MINT_COOLDOWN_SECS", 3600, &mut notes),
             dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600, &mut notes),
             dev_max_prior_launches: get_int(vars, "DEV_MAX_PRIOR_LAUNCHES", 1, &mut notes),
@@ -324,6 +334,23 @@ impl Settings {
                 self.max_daily_loss_usd
             ));
         }
+        if self.max_exposure_usd < 0.0 || !self.max_exposure_usd.is_finite() {
+            out.push(format!(
+                "MAX_EXPOSURE_USD={} is invalid; exposure cap disabled",
+                self.max_exposure_usd
+            ));
+        } else if self.max_exposure_usd > 0.0 && self.max_exposure_usd < self.notional_usd {
+            out.push(format!(
+                "MAX_EXPOSURE_USD={} is below NOTIONAL_USD={}: one ticket never fits, the cap blocks every open",
+                self.max_exposure_usd, self.notional_usd
+            ));
+        }
+        if self.hot_wallet_max_sol < 0.0 || !self.hot_wallet_max_sol.is_finite() {
+            out.push(format!(
+                "HOT_WALLET_MAX_SOL={} is invalid; hot-wallet cap disabled",
+                self.hot_wallet_max_sol
+            ));
+        }
         if self.gate_min_buyers == 0 {
             out.push("GATE_MIN_BUYERS=0 behaves as 1 (quorum floor)".to_string());
         }
@@ -392,6 +419,15 @@ impl Settings {
     /// Typed runner moonbag share (`None` when outside 0–100).
     pub fn runner_moonbag(&self) -> Option<crate::money::Percent> {
         crate::money::Percent::new(self.runner_moonbag_percent)
+    }
+
+    /// Hot-wallet ceiling in lamports (`0` = off). Negative, NaN, and
+    /// infinite values read as off (warned in `warnings`).
+    pub fn hot_wallet_cap_lamports(&self) -> u64 {
+        if !self.hot_wallet_max_sol.is_finite() || self.hot_wallet_max_sol <= 0.0 {
+            return 0;
+        }
+        (self.hot_wallet_max_sol * ids::LAMPORTS_PER_SOL as f64).min(u64::MAX as f64) as u64
     }
 
     /// Extra header names only (values may carry routing secrets and
@@ -774,6 +810,49 @@ mod tests {
         // Canonical WSS wins.
         let s = Settings::from_map(&vars(&[("MAINNET_WSS_RPC_URL", "wss://helius/abc")]));
         assert_eq!(s.ws_url, "wss://helius/abc");
+    }
+
+    #[test]
+    fn exposure_and_hot_wallet_caps_parse_and_warn() {
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.max_exposure_usd, 0.0, "off by default");
+        assert_eq!(s.hot_wallet_max_sol, 0.0, "off by default");
+        assert_eq!(s.hot_wallet_cap_lamports(), 0);
+
+        let s = Settings::from_map(&vars(&[
+            ("MAX_EXPOSURE_USD", "150.0"),
+            ("HOT_WALLET_MAX_SOL", "1.5"),
+            ("NOTIONAL_USD", "20.0"),
+        ]));
+        assert_eq!(s.max_exposure_usd, 150.0);
+        assert_eq!(s.hot_wallet_cap_lamports(), 1_500_000_000);
+        assert!(
+            !s.warnings()
+                .iter()
+                .any(|w| w.contains("MAX_EXPOSURE_USD=") || w.contains("HOT_WALLET_MAX_SOL=")),
+            "{:?}",
+            s.warnings()
+        );
+
+        // A cap below one ticket never opens: say so.
+        let w = Settings::from_map(&vars(&[("MAX_EXPOSURE_USD", "5.0")]))
+            .warnings()
+            .join("\n");
+        assert!(w.contains("below NOTIONAL_USD"), "{w}");
+        // Garbage reads as off, loudly — never silently armed.
+        let s = Settings::from_map(&vars(&[("HOT_WALLET_MAX_SOL", "-3")]));
+        assert_eq!(s.hot_wallet_cap_lamports(), 0);
+        assert!(
+            s.warnings().iter().any(|w| w.contains("HOT_WALLET_MAX_SOL=-3")),
+            "{:?}",
+            s.warnings()
+        );
+        let s = Settings::from_map(&vars(&[("MAX_EXPOSURE_USD", "-1")]));
+        assert!(
+            s.warnings().iter().any(|w| w.contains("MAX_EXPOSURE_USD=-1")),
+            "{:?}",
+            s.warnings()
+        );
     }
 
     #[test]
