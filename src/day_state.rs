@@ -56,9 +56,7 @@ pub fn save(path: &Path, state: &DayState) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_vec(state).expect("day state serializes");
-    let tmp = path.with_extension("json.tmp");
-    crate::cli::write_private_file(&tmp, &json)?;
-    std::fs::rename(&tmp, path)
+    crate::cli::atomic_write_private(path, &json)
 }
 
 /// Day-loss breaker with its home on disk: `record` persists (the

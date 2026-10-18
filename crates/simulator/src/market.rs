@@ -6,6 +6,268 @@ use crate::types::{ExitReason, Position, Side};
 /// (95 + 30); custom-tier mints override per mint.
 pub const STANDARD_VENUE_FEE_BPS: f64 = 125.0;
 
+/// Basis-point denominator. Mirror of `ids::BPS_DENOMINATOR` (this
+/// crate stays dependency-free); the parity test in the root crate
+/// pins the two quote paths against each other.
+const BPS_DENOMINATOR: u128 = 10_000;
+/// Lamports per SOL. Mirror of `curve::layout::LAMPORTS_PER_SOL`.
+const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+
+/// Exact bonding-curve execution state for one mint (lamports / base
+/// units).
+///
+/// Mirrors the curve-account fields the dispatch quote math reads
+/// (`executor::quote`), so paper fills and live dispatch floors price
+/// the same curve. Quote math is integer (u128, like the chain); the
+/// only float legs are the USD conversions at the edges. A mint whose
+/// tick carried no reserves quotes on the proxy basis instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurveReserves {
+    /// Virtual SOL reserves, lamports.
+    pub vq_lamports: u64,
+    /// Virtual token reserves, base units.
+    pub vt_base: u64,
+    /// Real (unbought) tokens, base units: the hard buy cap.
+    pub real_tokens: u64,
+    /// Mint decimals (base units per whole token).
+    pub decimals: u8,
+    /// SOL/USD at the quote instant (lamports <-> book USD).
+    pub sol_usd: f64,
+}
+
+/// Mark-to-market quote for one mint.
+#[derive(Debug, Clone, Copy)]
+pub struct Mark {
+    /// Spot USD per whole token.
+    pub price: f64,
+    /// SOL-side depth in USD (proxy basis when `curve` is `None`).
+    pub liquidity_usd: f64,
+    /// Exact curve state for size-aware quotes, when the tick carried
+    /// reserves. `None` = proxy basis only (mocks, synthetic prices).
+    pub curve: Option<CurveReserves>,
+}
+
+impl Mark {
+    /// Spot price with SOL-side depth (proxy basis, no curve state).
+    pub fn new(price: f64, liquidity_usd: f64) -> Self {
+        Self {
+            price,
+            liquidity_usd,
+            curve: None,
+        }
+    }
+
+    /// Price without liquidity or curve state.
+    pub fn price_only(price: f64) -> Self {
+        Self::new(price, f64::NAN)
+    }
+
+    /// Attach exact curve reserves: fills become state- and size-aware.
+    pub fn with_curve(mut self, curve: CurveReserves) -> Self {
+        self.curve = Some(curve);
+        self
+    }
+}
+
+/// Fixed-size entry result: the whole tokens a ticket buys and their
+/// fee-inclusive price (fees are inside the price, never a second
+/// charge).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntryFill {
+    /// Whole tokens bought (sub-token dust floors away).
+    pub quantity: u64,
+    /// Fee-inclusive USD per whole token.
+    pub price: f64,
+}
+
+/// Why an entry cannot be priced as a fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryFillError {
+    /// Inputs unquotable (bad ticket, no SOL/USD, absurd decimals).
+    Unpriceable,
+    /// The size floors to zero whole tokens.
+    Dust,
+    /// The curve cannot absorb the ticket (drained or depleted).
+    Exhausted,
+}
+
+/// `ceil(amount * bps / 10_000)`. Fees round up, as on-chain.
+fn fee_amount(amount: u128, bps: u128) -> Option<u128> {
+    amount
+        .checked_mul(bps)?
+        .checked_add(BPS_DENOMINATOR - 1)
+        .map(|v| v / BPS_DENOMINATOR)
+}
+
+/// `a * b / c` floored.
+fn mul_div(a: u128, b: u128, c: u128) -> Option<u128> {
+    a.checked_mul(b)?.checked_div(c)
+}
+
+/// Venue fee in whole bps. Tiers are integral bps by construction; a
+/// fee >= 100% fails closed (unquotable).
+fn fee_bps(bps: f64) -> Option<u128> {
+    if !bps.is_finite() || bps < 0.0 {
+        return None;
+    }
+    let rounded = bps.round();
+    if rounded >= BPS_DENOMINATOR as f64 {
+        return None;
+    }
+    Some(rounded as u128)
+}
+
+impl CurveReserves {
+    /// Base units per whole token (`None` past 19 decimals).
+    fn scale(&self) -> Option<u64> {
+        10u64.checked_pow(u32::from(self.decimals))
+    }
+
+    /// Tokens out for an exact SOL budget, fee-inclusive. Mirrors
+    /// `executor::quote::buy_tokens_for_exact_in` (single total-fee
+    /// ceil). `None` when the curve cannot absorb the ticket: drained
+    /// reserves, or a fill that would consume every remaining real
+    /// token — the chain refuses that buy, so paper must too.
+    pub fn buy_tokens_base(&self, sol_lamports: u64, fee_bps_per_side: f64) -> Option<u64> {
+        if sol_lamports == 0 || self.vt_base == 0 {
+            return Some(0);
+        }
+        if self.vq_lamports == 0 {
+            return None;
+        }
+        let bps = fee_bps(fee_bps_per_side)?;
+        let sol = u128::from(sol_lamports);
+        let mut net = sol * BPS_DENOMINATOR / (BPS_DENOMINATOR + bps);
+        if net == 0 {
+            return Some(0);
+        }
+        let fees = fee_amount(net, bps)?;
+        if net + fees > sol {
+            net = net.checked_sub(net + fees - sol).filter(|n| *n > 0)?;
+        }
+        let tokens = mul_div(
+            net.checked_sub(1)?,
+            u128::from(self.vt_base),
+            u128::from(self.vq_lamports) + (net - 1),
+        )?;
+        if tokens >= u128::from(self.real_tokens) {
+            return None;
+        }
+        u64::try_from(tokens).ok()
+    }
+
+    /// Fee-inclusive cost of `tokens_base`. Mirrors
+    /// `executor::quote::buy_cost_incl_fees`.
+    pub fn buy_cost_lamports(&self, tokens_base: u64, fee_bps_per_side: f64) -> Option<u64> {
+        if tokens_base == 0 {
+            return Some(0);
+        }
+        if self.vt_base == 0 || self.vq_lamports == 0 {
+            return None;
+        }
+        if u128::from(tokens_base) > u128::from(self.real_tokens) {
+            return None;
+        }
+        let bps = fee_bps(fee_bps_per_side)?;
+        let denom = u128::from(self.vt_base)
+            .checked_sub(u128::from(tokens_base))
+            .filter(|d| *d > 0)?;
+        let cost = mul_div(u128::from(tokens_base), u128::from(self.vq_lamports), denom)?
+            .checked_add(1)?;
+        let total = cost.checked_add(fee_amount(cost, bps)?)?;
+        u64::try_from(total).ok()
+    }
+
+    /// Net SOL proceeds for `tokens_base`, fees deducted. Mirrors
+    /// `executor::quote::sell_out_after_fees`. Sells always absorb
+    /// (bounded impact); a drained curve has no price at all (`None`).
+    pub fn sell_net_lamports(&self, tokens_base: u64, fee_bps_per_side: f64) -> Option<u64> {
+        if tokens_base == 0 {
+            return Some(0);
+        }
+        if self.vt_base == 0 || self.vq_lamports == 0 {
+            return None;
+        }
+        let bps = fee_bps(fee_bps_per_side)?;
+        let gross = mul_div(
+            u128::from(tokens_base),
+            u128::from(self.vq_lamports),
+            u128::from(self.vt_base).checked_add(u128::from(tokens_base))?,
+        )?;
+        let net = gross.checked_sub(fee_amount(gross, bps)?)?;
+        if net == 0 {
+            return None;
+        }
+        u64::try_from(net).ok()
+    }
+
+    /// Exact fee-inclusive entry for a USD ticket: the whole tokens the
+    /// ticket buys at the curve's cost for that (floored) size, and
+    /// their price. Never spends more than the ticket.
+    pub fn buy_fill(
+        &self,
+        notional_usd: f64,
+        fee_bps_per_side: f64,
+    ) -> Result<EntryFill, EntryFillError> {
+        if !notional_usd.is_finite() || notional_usd <= 0.0 {
+            return Err(EntryFillError::Unpriceable);
+        }
+        if !self.sol_usd.is_finite() || self.sol_usd <= 0.0 {
+            return Err(EntryFillError::Unpriceable);
+        }
+        let scale = self.scale().ok_or(EntryFillError::Unpriceable)?;
+        let lamports = (notional_usd / self.sol_usd * LAMPORTS_PER_SOL).floor();
+        if !lamports.is_finite() || lamports <= 0.0 || lamports >= u64::MAX as f64 {
+            return Err(EntryFillError::Unpriceable);
+        }
+        let tokens_base = self
+            .buy_tokens_base(lamports as u64, fee_bps_per_side)
+            .ok_or(EntryFillError::Exhausted)?;
+        let quantity = tokens_base / scale;
+        if quantity == 0 {
+            return Err(EntryFillError::Dust);
+        }
+        // The book holds whole tokens: cost the floored size exactly
+        // (the chain charges cost(tokens), never the nominal ticket).
+        let tokens_used = quantity
+            .checked_mul(scale)
+            .ok_or(EntryFillError::Unpriceable)?;
+        let cost = self
+            .buy_cost_lamports(tokens_used, fee_bps_per_side)
+            .ok_or(EntryFillError::Exhausted)?;
+        let price = cost as f64 / LAMPORTS_PER_SOL * self.sol_usd / quantity as f64;
+        if !price.is_finite() || price <= 0.0 {
+            return Err(EntryFillError::Unpriceable);
+        }
+        Ok(EntryFill { quantity, price })
+    }
+
+    /// Exact fee-deducted exit price for `quantity` whole tokens.
+    /// `None` when the curve has no usable reserves.
+    pub fn sell_fill_price(&self, quantity: u64, fee_bps_per_side: f64) -> Option<f64> {
+        if quantity == 0 || !self.sol_usd.is_finite() || self.sol_usd <= 0.0 {
+            return None;
+        }
+        let scale = self.scale()?;
+        let tokens_base = quantity.checked_mul(scale)?;
+        let net = self.sell_net_lamports(tokens_base, fee_bps_per_side)?;
+        let price = net as f64 / LAMPORTS_PER_SOL * self.sol_usd / quantity as f64;
+        if price.is_finite() && price > 0.0 {
+            Some(price)
+        } else {
+            None
+        }
+    }
+}
+
+/// Opposite side.
+fn flip_side(side: Side) -> Side {
+    match side {
+        Side::Long => Side::Short,
+        Side::Short => Side::Long,
+    }
+}
+
 /// Execution price for paper fills.
 ///
 /// Two fee layers, never confused: `fee_bps` commission on entry/exit
@@ -208,6 +470,74 @@ impl FillModel {
             Side::Short => quote * (1.0 - slip).max(0.0),
         })
     }
+
+    /// Entry fill for `side`: exact curve math from the mark's reserves
+    /// when the tick carried them (Long buys the curve), else the proxy
+    /// basis (`try_fill_price`). Size-aware either way: the ticket buys
+    /// the tokens the curve actually yields, fees inside the price.
+    ///
+    /// `Dust` = the size floors to zero whole tokens; `Exhausted` = the
+    /// curve cannot absorb the ticket (drained or depleted); neither is
+    /// ever booked as a fill.
+    pub fn entry_fill(
+        &self,
+        side: Side,
+        mark: &Mark,
+        notional_usd: f64,
+    ) -> Result<EntryFill, EntryFillError> {
+        if !notional_usd.is_finite() || notional_usd <= 0.0 {
+            return Err(EntryFillError::Unpriceable);
+        }
+        if let (
+            Side::Long,
+            FillModel::BondingCurve {
+                fee_bps_per_side, ..
+            },
+            Some(curve),
+        ) = (side, *self, mark.curve)
+        {
+            return curve.buy_fill(notional_usd, fee_bps_per_side);
+        }
+        let price = self
+            .try_fill_price(side, mark.price, notional_usd, mark.liquidity_usd)
+            .ok_or(EntryFillError::Exhausted)?;
+        let quantity = (notional_usd / price).floor();
+        if !quantity.is_finite() || quantity < 1.0 || quantity >= u64::MAX as f64 {
+            return Err(EntryFillError::Dust);
+        }
+        Ok(EntryFill {
+            quantity: quantity as u64,
+            price,
+        })
+    }
+
+    /// Exit price for `side` (a Long exits by selling into the curve):
+    /// exact fee-deducted curve price from the mark's reserves when the
+    /// tick carried them, else the proxy basis. `None` when unpriceable
+    /// (drained curve, unknown liquidity, bad quote) — the caller holds
+    /// rather than booking a fictitious exit.
+    pub fn exit_price(&self, side: Side, mark: &Mark, quantity: u64) -> Option<f64> {
+        if quantity == 0 || !mark.price.is_finite() || mark.price <= 0.0 {
+            return None;
+        }
+        if let (
+            Side::Long,
+            FillModel::BondingCurve {
+                fee_bps_per_side, ..
+            },
+            Some(curve),
+        ) = (side, *self, mark.curve)
+        {
+            return curve.sell_fill_price(quantity, fee_bps_per_side);
+        }
+        let exit_notional = quantity as f64 * mark.price;
+        let slip =
+            self.try_slip_fraction_for_side(flip_side(side), exit_notional, mark.liquidity_usd)?;
+        Some(match side {
+            Side::Long => mark.price * (1.0 - slip).max(0.0),
+            Side::Short => mark.price * (1.0 + slip),
+        })
+    }
 }
 
 /// Signed return since entry, percent.
@@ -229,9 +559,7 @@ pub fn move_percent(side: Side, entry_price: f64, price: f64) -> f64 {
 pub fn check_exit_realizable(
     fill: &FillModel,
     position: &mut Position,
-    quote: f64,
-    exit_notional_usd: f64,
-    liquidity_usd: f64,
+    mark: &Mark,
     now_secs: u64,
 ) -> Option<ExitReason> {
     // Timeout ignores pricing.
@@ -240,11 +568,7 @@ pub fn check_exit_realizable(
     {
         return Some(ExitReason::Timeout);
     }
-    let flip = match position.side {
-        Side::Long => Side::Short,
-        Side::Short => Side::Long,
-    };
-    let price = fill.try_fill_price(flip, quote, exit_notional_usd, liquidity_usd)?;
+    let price = fill.exit_price(position.side, mark, position.quantity)?;
     check_exit(position, price, now_secs)
 }
 
@@ -289,6 +613,121 @@ pub fn check_exit(position: &mut Position, price: f64, now_secs: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pump.fun launch scale: 30 SOL virtual / 1.073e15 virtual tokens /
+    /// 793.1e12 real tokens, 6 decimals, SOL $200.
+    fn launch_curve() -> CurveReserves {
+        CurveReserves {
+            vq_lamports: 30_000_000_000,
+            vt_base: 1_073_000_000_000_000,
+            real_tokens: 793_100_000_000_000,
+            decimals: 6,
+            sol_usd: 200.0,
+        }
+    }
+
+    #[test]
+    fn curve_buy_prices_state_and_size() {
+        let curve = launch_curve();
+        let fill = curve.buy_fill(10.0, 125.0).expect("priced");
+        // Hand-computed from the chain formula (executor::quote):
+        // net = 50e6*10_000/10_125 = 49_382_716, fee = 617_284,
+        // tokens = (net-1)*vt/(vq+net-1) = 1_763_352_468_753 base units.
+        assert_eq!(fill.quantity, 1_763_352);
+        // Cost is the curve's fee-inclusive price for the floored size,
+        // never the nominal ticket (49_999_986 of 50_000_000 lamports).
+        let invested = fill.price * fill.quantity as f64;
+        assert!(invested <= 10.0, "invested={invested}");
+        assert!(invested > 9.999, "invested={invested}");
+        // Above spot: impact + fee.
+        assert!(
+            fill.price > 5.591_798_695_246_971e-6,
+            "price={}",
+            fill.price
+        );
+    }
+
+    #[test]
+    fn curve_sell_nets_size_impact_and_fee() {
+        let curve = launch_curve();
+        let spot = 5.591_798_695_246_971e-6;
+        let price = curve.sell_fill_price(1_763_352, 125.0).expect("priced");
+        // Hand-computed: gross = 49_220_658, fee = 615_259, net = 48_605_399.
+        assert!(
+            (price - 5.512_841_338_541_596e-6).abs() < 1e-15,
+            "price={price}"
+        );
+        assert!(price < spot, "sell must net under the mark");
+        // A bigger size nets a deeper discount (impact is size-aware).
+        let deeper = curve.sell_fill_price(176_335_200, 125.0).expect("priced");
+        assert!(deeper < price, "deeper={deeper} price={price}");
+    }
+
+    #[test]
+    fn curve_buy_rejects_tickets_the_curve_cannot_absorb() {
+        let curve = launch_curve();
+        assert_eq!(
+            curve.buy_fill(1e12, 125.0).unwrap_err(),
+            EntryFillError::Exhausted
+        );
+        // Drained reserves are unpriceable on both sides.
+        let drained = CurveReserves {
+            vq_lamports: 0,
+            ..launch_curve()
+        };
+        assert_eq!(
+            drained.buy_fill(10.0, 125.0).unwrap_err(),
+            EntryFillError::Exhausted
+        );
+        assert_eq!(drained.sell_fill_price(1_000_000, 125.0), None);
+    }
+
+    #[test]
+    fn curve_fill_floors_sub_token_dust() {
+        // 1000 SOL virtual against 1 whole token: a $0.000001 ticket
+        // buys less than one whole token, so it cannot open.
+        let curve = CurveReserves {
+            vq_lamports: 1_000_000_000_000,
+            vt_base: 1_000_000,
+            real_tokens: 1_000_000_000,
+            decimals: 6,
+            sol_usd: 200.0,
+        };
+        assert_eq!(curve.buy_fill(1e-6, 0.0).unwrap_err(), EntryFillError::Dust);
+    }
+
+    #[test]
+    fn exact_curve_state_overrides_the_proxy_basis() {
+        let fill = FillModel::default();
+        // Liquidity $1: the proxy would refuse a $10 ticket outright.
+        let mark = Mark::new(5.591_798_695_246_971e-6, 1.0).with_curve(launch_curve());
+        let entry = fill
+            .entry_fill(Side::Long, &mark, 10.0)
+            .expect("exact priced");
+        assert_eq!(entry.quantity, 1_763_352);
+        let exit = fill
+            .exit_price(Side::Long, &mark, entry.quantity)
+            .expect("priced");
+        assert!(exit < mark.price, "exit={exit}");
+        // Without reserves the same mark is exhausted, as before.
+        let proxy_only = Mark::new(mark.price, 1.0);
+        assert_eq!(
+            fill.entry_fill(Side::Long, &proxy_only, 10.0),
+            Err(EntryFillError::Exhausted)
+        );
+    }
+
+    #[test]
+    fn proxy_entry_fill_matches_try_fill_price() {
+        let fill = FillModel::default();
+        let mark = Mark::new(1.0, 10_000.0);
+        let got = fill.entry_fill(Side::Long, &mark, 100.0).expect("priced");
+        let price = fill
+            .try_fill_price(Side::Long, 1.0, 100.0, 10_000.0)
+            .expect("priced");
+        assert_eq!(got.price, price);
+        assert_eq!(got.quantity, (100.0 / price).floor() as u64);
+    }
 
     fn long(tp: f64, sl: f64) -> Position {
         Position {
@@ -417,26 +856,26 @@ mod tests {
         let fill = FillModel::default();
         let mut p = long(75.0, -8.0);
         assert_eq!(
-            check_exit_realizable(&fill, &mut p, 1.76, 176.0, 1e9, 1001),
+            check_exit_realizable(&fill, &mut p, &Mark::new(1.76, 1e9), 1001),
             None
         );
         // Gross -7.5% is -8.7% net: SL fires a tick earlier than gross.
         let mut p = long(75.0, -8.0);
         assert_eq!(
-            check_exit_realizable(&fill, &mut p, 0.925, 92.5, 1e9, 1001),
+            check_exit_realizable(&fill, &mut p, &Mark::new(0.925, 1e9), 1001),
             Some(ExitReason::StopLoss)
         );
         // Timeout still fires when the fill is unknowable.
         let mut p = long(75.0, -8.0);
         p.timeout_seconds = 60;
         assert_eq!(
-            check_exit_realizable(&fill, &mut p, f64::NAN, 100.0, 1e9, 1060),
+            check_exit_realizable(&fill, &mut p, &Mark::new(f64::NAN, 1e9), 1060),
             Some(ExitReason::Timeout)
         );
         // ...but nothing else does.
         let mut p = long(75.0, -8.0);
         assert_eq!(
-            check_exit_realizable(&fill, &mut p, f64::NAN, 100.0, 1e9, 1001),
+            check_exit_realizable(&fill, &mut p, &Mark::new(f64::NAN, 1e9), 1001),
             None
         );
     }

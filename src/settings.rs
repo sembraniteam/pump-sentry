@@ -843,13 +843,17 @@ mod tests {
         let s = Settings::from_map(&vars(&[("HOT_WALLET_MAX_SOL", "-3")]));
         assert_eq!(s.hot_wallet_cap_lamports(), 0);
         assert!(
-            s.warnings().iter().any(|w| w.contains("HOT_WALLET_MAX_SOL=-3")),
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("HOT_WALLET_MAX_SOL=-3")),
             "{:?}",
             s.warnings()
         );
         let s = Settings::from_map(&vars(&[("MAX_EXPOSURE_USD", "-1")]));
         assert!(
-            s.warnings().iter().any(|w| w.contains("MAX_EXPOSURE_USD=-1")),
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("MAX_EXPOSURE_USD=-1")),
             "{:?}",
             s.warnings()
         );

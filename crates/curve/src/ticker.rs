@@ -43,6 +43,20 @@ pub enum CurveError {
     NoPrice(String),
 }
 
+/// Exact execution state behind a tick: parsed reserves plus the two
+/// rates a size-aware quote needs (mint decimals, SOL/USD). The
+/// simulator's fill model prices paper entries/exits from this; a
+/// mock may leave it out and price on the proxy basis instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExecState {
+    /// Parsed curve reserves (lamports / base units).
+    pub reserves: BondingCurveReserves,
+    /// Mint decimals (base units per whole token).
+    pub decimals: u8,
+    /// SOL/USD used to price this tick.
+    pub sol_usd: f64,
+}
+
 /// One reserve observation, priced in USD.
 #[derive(Debug, Clone)]
 pub struct PriceTick {
@@ -54,6 +68,8 @@ pub struct PriceTick {
     pub liquidity_usd: f64,
     /// True once migrated.
     pub complete: bool,
+    /// Exact reserves for state-based fills (`None` in mocks).
+    pub exec: Option<ExecState>,
     /// Local unix seconds.
     pub observed_at: u64,
 }
@@ -444,6 +460,11 @@ fn tick_from_account(
         price_usd,
         liquidity_usd: reserves.liquidity_usd(sol_usd),
         complete: reserves.complete,
+        exec: Some(ExecState {
+            reserves,
+            decimals,
+            sol_usd,
+        }),
         observed_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())

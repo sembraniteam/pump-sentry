@@ -133,10 +133,16 @@ already held.
 - `~/.pump-sentry/entries-paused`: the kill-switch marker. Presence =
   no new entries (see §3). It is not a lockfile: removing it by hand
   resumes entries at the next gate round, same as `pump-sentry resume`.
+  The stat fails closed: a marker we cannot read (permissions, I/O)
+  counts as present — fix the file, don't route around it.
 - `~/.pump-sentry/live-wal.jsonl`: append-only custody log, fsync'd
   per line. **Never delete it** unless every tracked/manual bag is
   verified exited on-chain; boot replays it into pending/positions/
-  manual. Corrupt lines are skipped loudly (`skipped` count).
+  manual. Corrupt lines are skipped loudly (`skipped` count). An
+  unreadable WAL refuses live boot outright (custody unknown); a write
+  failure (`live WAL WRITE FAILED` in the log) latches new entries off
+  — exits and `sell <mint>` keep running — until the file is fixed
+  (permissions/disk) and the bot restarts.
 - Boot ends with a per-mint chain check (`verified/unbacked/handed_off/
   excess/unreadable/awaiting_confirm` in the replay log): a mint whose
   replayed claims (`tracked + parked`) exceed the wallet's ATA balance

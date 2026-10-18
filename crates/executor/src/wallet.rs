@@ -362,7 +362,10 @@ mod tests {
         );
         unsafe { env::set_var("SOLANA_PRIVATE_KEY_FILE", &path) };
         let err = WalletGuard::load_from_env().err().expect("refused");
-        assert!(matches!(err, WalletGuardError::InsecureKeyFile { .. }), "{err}");
+        assert!(
+            matches!(err, WalletGuardError::InsecureKeyFile { .. }),
+            "{err}"
+        );
         unsafe { env::remove_var("SOLANA_PRIVATE_KEY_FILE") };
         if let Some(v) = saved {
             unsafe { env::set_var("SOLANA_PRIVATE_KEY", v) };
@@ -381,9 +384,15 @@ mod tests {
         // Unset (default): any balance passes.
         assert!(guard.check_hot_wallet_cap(u64::MAX).is_ok());
         let armed = guard.with_hot_wallet_cap(2_000_000_000);
-        assert!(armed.check_hot_wallet_cap(2_000_000_000).is_ok(), "at the cap passes");
+        assert!(
+            armed.check_hot_wallet_cap(2_000_000_000).is_ok(),
+            "at the cap passes"
+        );
         assert!(armed.check_hot_wallet_cap(1).is_ok());
-        let err = armed.check_hot_wallet_cap(2_000_000_001).err().expect("over cap");
+        let err = armed
+            .check_hot_wallet_cap(2_000_000_001)
+            .err()
+            .expect("over cap");
         assert!(
             matches!(
                 err,

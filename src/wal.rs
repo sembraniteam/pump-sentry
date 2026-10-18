@@ -351,14 +351,22 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     }
 }
 
-/// Read and replay a file. Missing file is empty.
-pub fn replay_file(path: &std::path::Path) -> WalReplay {
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
+/// Read and replay a file. A missing file is an empty WAL; any other
+/// read error is returned: an unreadable WAL means custody state is
+/// UNKNOWN, so boot must refuse instead of replaying it as empty.
+pub fn replay_file(path: &std::path::Path) -> std::io::Result<WalReplay> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalReplay::default());
+        }
+        Err(e) => return Err(e),
+    };
     let replay = replay_lines(raw.lines());
     if replay.skipped > 0 {
         tracing::warn!(file = %path.display(), skipped = replay.skipped, "live WAL has corrupt lines; skipped (inspect the file)");
     }
-    replay
+    Ok(replay)
 }
 
 /// Compact to surviving state. Call once per boot after import.
@@ -480,6 +488,19 @@ mod tests {
         format!(
             r#"{{"t":"manual","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":{amount},"creator":null,"note":"{note}","ts":2}}"#
         )
+    }
+
+    #[test]
+    fn replay_file_missing_is_empty_unreadable_is_error() {
+        // A missing WAL is an empty WAL; an unreadable one is NOT (boot
+        // must refuse live: custody would come back unknown).
+        let dir = std::env::temp_dir().join(format!("pump-sentry-wal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let replay = replay_file(&dir.join("no-such.jsonl")).expect("missing file is empty");
+        assert!(replay.pending.is_empty() && replay.positions.is_empty());
+        // A directory in the WAL's place: EISDIR, not NotFound.
+        assert!(replay_file(&dir).is_err(), "unreadable WAL must error");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

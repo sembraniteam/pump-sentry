@@ -53,6 +53,31 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   `side`), and the ledger debits/invests the floored size, never the
   nominal ticket. Tests asserting quantities use integers; paper↔live
   size parity holds only to sub-token dust (assert bounded, not exact).
+- Paper entries/exits are state-based: `simulator::market`
+  (`CurveReserves`, `entry_fill`/`exit_price`) is the single quote math,
+  mirrored by `src/live.rs` (`plan_buy`/`plan_sell_floor`,
+  `paper_mark_from_tick`) and parity-pinned against `executor::quote`
+  (`paper_curve_math_pins_executor_quote`: single-fee tier bit-for-bit,
+  split tier ≥ chain cost / ≤ chain net inside ≤ 1 lamport). Exact path
+  only for `FillModel::BondingCurve` + Long + curve present; proxy math
+  otherwise. A curve-draining ticket fails closed in paper (`None`) where
+  the chain clamps to `real_tokens` — documented divergence.
+- `simulator::Mark` (spot + book liquidity + optional curve reserves) is
+  the ONE state carrier: `PriceTick.exec` feeds it, `LiveBuyParams` /
+  `LiveSellParams` carry it, so gate, paper book, guard, and dispatch
+  quote exactly the state a position was booked on. Migrated (`complete`)
+  ticks price off stale spot in paper (documented boundary; live pool
+  legs settle at vault reserves). `PortfolioSnapshot` carries
+  `mark_value` + `realizable_value` (`exit_discount_usd` = impact+fee);
+  paper closes log `realizable_vs_mark_bps`, gate cards report the BOOKED
+  entry, never the tick spot.
+- Failed-dispatch costs are honest: only `DeadReason::FailedOnChain`
+  burns base + priority fees (`failed_dispatch_cost_lamports`; the tip
+  rolls back); `NeverForwarded`/`Expired` debit nothing.
+- Never read `self.portfolio` inside a match scrutinee or call arguments
+  on live paths: `live_buy` hoists `venue_fee_bps` into a local BEFORE
+  the match — a scrutinee temporary lives through every arm and deadlocked
+  the pipeline once.
 - `paper_dispatch_legs_usd(tip, priority, sol_usd)` takes 3 args (priority
   leg included; calm-weather floor, documented). Typed units live in
   `src/money.rs` (`Bps`/`Percent`) with `Settings::slippage()` /
@@ -69,7 +94,7 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   (realized day loss), `hot_wallet_max_sol` (buy preflight refuses
   above it, off the same balance read as solvency; never on sells).
   The day tally persists in `day-state.json` (`src/day_state.rs`: atomic
-  tmp+rename via `cli::write_private_file`, `#[serde(default)]` fields,
+  tmp+rename via `cli::atomic_write_private`, `#[serde(default)]` fields,
   missing/corrupt = fresh day loudly) and is seeded at boot — a restart
   must never reset a limit (live custody already outlives restarts via
   the WAL). Paper's book is in-memory by design; the tally is not.
@@ -81,7 +106,9 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   parked-bag recovery, and `sell <mint>` keep running, and the marker
   survives restarts (`pause`/`resume` in `cli.rs`). Do NOT add a second
   pause check site; a marker left behind must fail closed (paused), and
-  `status` reports it.
+  `status` reports it. The marker stat itself fails closed too
+  (`cli::marker_present`: only NotFound = not paused; any other stat
+  error keeps entries halted).
 - `SOLANA_PRIVATE_KEY_FILE` must be owner-only: `load_from_env` refuses
   any group/other permission bit BEFORE reading (a world-readable key is
   a leaked key). `hot_wallet_max_sol` bounds what a leak can lose.
@@ -124,6 +151,15 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   `preflight_sell`, `preflight_sell_raydium`,
   `preflight_sell_pumpswap`). SOL is reconstructed by the funding
   report at boot + per-dispatch solvency, not by the WAL.
+- The WAL is also the fail-closed read/write boundary: `replay_file`
+  returns `Err` for an unreadable file (only NotFound = empty) and live
+  boot REFUSES (`replay_live_wal` in `main.rs`) instead of starting with
+  unknown custody; any write failure (open/append/fsync/serialize)
+  latches `wal_degraded` (`WalSink`, shared across `LiveTrader` clones)
+  and `open_tracked` refuses new entries next to the kill switch until
+  an operator restart with a working WAL — exits, pending rechecks, and
+  `sell <mint>` keep running. State files stage through
+  `cli::atomic_write_private` (owner-only tmp + rename).
 - Ticks with non-positive/NaN liquidity are unpriceable
   (`unpriceable_liquidity`): a delivered tick carries parsed reserves
   (the ticker clamps non-positive to 0), so this is a drained market

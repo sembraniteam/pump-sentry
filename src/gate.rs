@@ -175,6 +175,10 @@ struct TrackedOpen<'a> {
     /// SOL/USD stamped at confirm. Rechecked at use; stale fails closed.
     sol: Option<(f64, u64)>,
     trail_percent: f64,
+    /// Exact curve reserves off the confirm tick: the paper fill and the
+    /// live sizing quote the chain's own math. `None` on synthetic
+    /// (override-priced) opens and mocks.
+    reserves: Option<simulator::CurveReserves>,
 }
 
 /// Log-safe token text: on-chain name/symbol are attacker-controlled,
@@ -638,6 +642,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Ok((tick, fee)) => (Ok(tick), fee),
             Err(e) => (Err(e), None),
         };
+        // Exact reserves off the same read (copied out before the tick
+        // is consumed): paper fills and live sizing both quote them.
+        let exec = tick_result.as_ref().ok().and_then(|t| t.exec);
         // Fallback is paper-only; the flag is the source.
         let Some((entry_quote, liquidity_usd, priced_via_override)) = resolve_entry_with_flag(
             tick_result,
@@ -810,6 +817,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             venue_fee_bps: if priced_via_override { None } else { venue_fee },
             sol,
             trail_percent,
+            // Synthetic (override-priced) opens carry no chain state.
+            reserves: if priced_via_override {
+                None
+            } else {
+                exec.map(|e| crate::live::curve_reserves(&e))
+            },
         })
         .await;
     }
@@ -826,11 +839,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let trail_percent = req.trail_percent;
         let creator = req.creator;
         let sol = req.sol;
+        let reserves = req.reserves;
         // Kill switch first: an operator stop preempts every other
         // check and touches nothing but new risk. Exits, scale-outs,
         // and `sell <mint>` are owned elsewhere and keep running.
         if self.entries_paused.load(Ordering::Relaxed) {
             info!(%mint, "kill switch: entries paused; skipping open");
+            return;
+        }
+        // WAL degraded: a custody write failed, so the claim of record
+        // is broken. No new risk until an operator restart (same choke
+        // point as the kill switch; exits are untouched).
+        if self.exec.live.as_ref().is_some_and(|t| t.wal_degraded()) {
+            warn!(%mint, "live WAL write failed; refusing new entries until restart");
             return;
         }
         // Breaker next: past cap, no new risk. One card per day;
@@ -954,12 +975,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             );
             portfolio.set_paper_dispatch_legs(open_leg, close_leg);
         }
+        // Mark at open: the tick spot plus exact reserves when the tick
+        // carried them (state- and size-aware fill); proxy basis else.
+        let mark = simulator::Mark {
+            price: entry_quote,
+            liquidity_usd,
+            curve: reserves,
+        };
         match portfolio.open_position_params(&simulator::OpenPositionParams {
             mint,
             side: Side::Long,
-            quote: entry_quote,
+            mark,
             notional_usd: self.settings.notional_usd,
-            liquidity_usd,
             tp_percent: profile.tp_percent,
             sl_percent: profile.sl_percent,
             trailing: profile.trailing_stop,
@@ -969,19 +996,26 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             now_secs: now,
         }) {
             Ok(id) => {
+                // Booked execution price (impact + fee inside), never
+                // the raw mark: logs and cards report what the book paid.
+                let booked = portfolio
+                    .position(id)
+                    .map(|p| p.entry_price)
+                    .unwrap_or(entry_quote);
                 // What this open debited (same legs `open_position`
                 // used): the breaker books it now because the close
                 // headline only nets the close leg.
                 let open_leg_usd = portfolio.paper_dispatch_legs().0;
                 let snap = portfolio.snapshot(&HashMap::new());
-                info!(%mint, id, entry = format!("{entry_quote:.10}"),
+                info!(%mint, id, entry = format!("{booked:.10}"),
+                    mark = format!("{entry_quote:.10}"),
                     tp = profile.tp_percent, sl = profile.sl_percent,
                     equity = format!("{:.2}", snap.equity), "paper position opened");
                 // Emit after unlock: never alert under lock.
                 let card = Alerter::format_entry(
                     &self.card_ctx(),
                     mint,
-                    entry_quote,
+                    booked,
                     profile.tp_percent,
                     profile.sl_percent,
                     self.settings.notional_usd,
@@ -1009,16 +1043,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         self.emit(format!("ticker watch failed on {mint}; paper open WITHOUT live cover"));
                     }
                 } else if allow_live {
-                    self.live_buy(
-                        mint,
-                        curve,
-                        assoc_curve,
-                        entry_quote,
-                        liquidity_usd,
-                        sol,
-                        creator,
-                    )
-                    .await;
+                    self.live_buy(mint, curve, assoc_curve, mark, sol, creator)
+                        .await;
                 }
             }
             Err(e) => warn!(%mint, error = %e, "paper open failed"),

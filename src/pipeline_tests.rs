@@ -1,6 +1,10 @@
+use crate::live::{BuyFill, LAMPORTS_PER_SOL, PoolLeg, PoolVenue, VENUE_FEE_BPS};
+use crate::live::{
+    TEST_ASSOC as ASSOC, TEST_CURVE as CURVE, TEST_MINT as MINT, TEST_MINT_A as MINT_A,
+    TEST_MINT_B as MINT_B,
+};
 use crate::pipeline::*;
-use crate::live::{BuyFill, LAMPORTS_PER_SOL, PoolLeg, PoolVenue};
-use crate::live::{TEST_ASSOC as ASSOC, TEST_CURVE as CURVE, TEST_MINT as MINT, TEST_MINT_A as MINT_A, TEST_MINT_B as MINT_B};
+use executor::DeadReason;
 use migration::PoolTick;
 use simulator::Side;
 use simulator::FillModel;
@@ -80,7 +84,13 @@ struct StubLiveInner {
     sell_tips: StdMutex<Vec<u64>>,
     /// Base tip the stub reports (mirrors prod default).
     tip_lamports: u64,
+    /// One knob for both real cost legs (first-touch and the
+    /// landed-and-errored burn). 0 = books nothing, so the paper-only
+    /// accounting assertions keep holding.
+    dispatch_lamports: StdMutex<u64>,
     fail_buys: std::sync::atomic::AtomicBool,
+    /// Simulated dead-buy verdict (dispatch proven dead before landing).
+    dead_buys: StdMutex<Option<DeadReason>>,
     fail_sells: std::sync::atomic::AtomicBool,
     /// Transient sell failures (consume retry budget, unlike `BadOrder`).
     fail_sells_transient: std::sync::atomic::AtomicBool,
@@ -90,6 +100,8 @@ struct StubLiveInner {
     unblock: tokio::sync::Notify,
     /// Mints with a simulated unconfirmed buy (late-confirm hook).
     pending: StdMutex<Vec<String>>,
+    /// Simulated WAL write failure (entries must halt).
+    wal_degraded: std::sync::atomic::AtomicBool,
 }
 
 impl StubLive {
@@ -102,13 +114,16 @@ impl StubLive {
                 pumpswap_sells: StdMutex::new(vec![]),
                 sell_tips: StdMutex::new(vec![]),
                 tip_lamports: 100_000,
+                dispatch_lamports: StdMutex::new(0),
                 fail_buys: std::sync::atomic::AtomicBool::new(false),
+                dead_buys: StdMutex::new(None),
                 fail_sells: std::sync::atomic::AtomicBool::new(false),
                 fail_sells_transient: std::sync::atomic::AtomicBool::new(false),
                 block_mint: StdMutex::new(None),
                 started: StdMutex::new(vec![]),
                 unblock: tokio::sync::Notify::new(),
                 pending: StdMutex::new(vec![]),
+                wal_degraded: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -132,6 +147,11 @@ impl StubLive {
     fn sell_tips(&self) -> Vec<u64> {
         self.inner.sell_tips.lock().expect("lock").clone()
     }
+
+    /// Stated dispatch cost (lamports) for both real cost legs.
+    fn charge_lamports(&self) -> u64 {
+        *self.inner.dispatch_lamports.lock().expect("lock")
+    }
 }
 
 impl BuySink for StubLive {
@@ -146,6 +166,12 @@ impl BuySink for StubLive {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             return Err(LiveError::BadOrder("stubbed failure".to_string()));
+        }
+        if let Some(reason) = *self.inner.dead_buys.lock().expect("lock") {
+            return Err(LiveError::Dead {
+                reason,
+                context: "stubbed dead buy".to_string(),
+            });
         }
         self.inner.buys.lock().expect("lock").push((
             mint.to_string(),
@@ -315,9 +341,16 @@ impl CostLedger for StubLive {
         tip_lamports
     }
 
-    // Stub ledgers book no costs (matches the old composed zero).
+    // One stated number for both real cost legs; 0 (the default) books
+    // nothing, matching the old composed zero.
     fn first_touch_cost_lamports(&self) -> u64 {
-        0
+        self.charge_lamports()
+    }
+
+    // A landed-and-errored dispatch burns base + priority (the tip
+    // rolled back); the same knob prices it so the debit is testable.
+    fn failed_dispatch_cost_lamports(&self) -> u64 {
+        self.charge_lamports()
     }
 }
 
@@ -330,6 +363,12 @@ impl WalSink for StubLive {
     fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {}
 
     fn unrecord_manual(&self, _position: &LivePosition) {}
+
+    fn wal_degraded(&self) -> bool {
+        self.inner
+            .wal_degraded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Canned reserve feed with watch tracking.
@@ -432,6 +471,7 @@ fn tick(mint: &str, price: f64) -> PriceTick {
         price_usd: price,
         liquidity_usd: 30_000.0,
         complete: false,
+        exec: None,
         observed_at: now_secs(),
     }
 }
@@ -809,6 +849,7 @@ fn entry_rejects_degenerate_tick() {
             price_usd: price,
             liquidity_usd: 30_000.0,
             complete: false,
+            exec: None,
             observed_at: 2_000,
         };
         assert_eq!(
@@ -824,6 +865,7 @@ fn entry_rejects_degenerate_tick() {
             price_usd: 2.0,
             liquidity_usd: liq,
             complete: false,
+            exec: None,
             observed_at: 2_000,
         };
         assert_eq!(resolve_entry_with_flag(Ok(bad), Some(9.0), 500.0), None, "liq {liq}");
@@ -1028,9 +1070,8 @@ async fn shutdown_snapshot_lists_open_and_live_state() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            quote: 2.0,
+            mark: simulator::Mark::new(2.0, 1e9),
             notional_usd: 10.0,
-            liquidity_usd: 1e9,
             tp_percent: 75.0,
             sl_percent: -8.0,
             trailing: false,
@@ -1077,9 +1118,8 @@ async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            quote: 2.0,
+            mark: simulator::Mark::new(2.0, 1e9),
             notional_usd: 10.0,
-            liquidity_usd: 1e9,
             tp_percent: 75.0,
             sl_percent: -8.0,
             trailing: false,
@@ -1111,7 +1151,7 @@ async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
         .await
         .snapshot(&HashMap::from([(
             MINT.to_string(),
-            simulator::Mark { price: 2.0, liquidity_usd: 30_000.0 },
+            simulator::Mark::new(2.0, 30_000.0),
         )]));
     let (cash, equity) = pipe.paper_cash_equity().await;
     assert_eq!(cash, snap.cash);
@@ -1158,9 +1198,8 @@ async fn daily_breaker_blocks_opens_but_not_exits() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            quote: 2.0,
+            mark: simulator::Mark::new(2.0, 1e9),
             notional_usd: 10.0,
-            liquidity_usd: 1e9,
             tp_percent: 75.0,
             sl_percent: -8.0,
             trailing: false,
@@ -1309,6 +1348,66 @@ async fn kill_switch_pauses_entries_but_not_exits() {
 }
 
 #[tokio::test]
+async fn wal_degraded_halts_entries_but_not_exits() {
+    // A failed WAL write means custody can no longer be recorded: no
+    // new risk opens (paper or live) until a restart, while a held
+    // position keeps managing. Same choke point as the kill switch.
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+        Some(live.clone()),
+    );
+    let dev = dev_wallet();
+    let launch = LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev,
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    };
+    let set_degraded = |on: bool| {
+        live.inner
+            .wal_degraded
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    };
+    set_degraded(true);
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "degraded WAL: nothing opens"
+    );
+    assert!(
+        live.inner.buys.lock().expect("lock").is_empty(),
+        "degraded WAL: nothing dispatches"
+    );
+
+    // A working WAL (fresh run) re-arms entries.
+    set_degraded(false);
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+
+    // Degraded again with a position open: the stop-loss still fires.
+    set_degraded(true);
+    let id = pipe.portfolio.lock().await.position_ids()[0];
+    let mut stop = tick(MINT, 2.0);
+    stop.price_usd = 1.0; // -50% << -8% SL.
+    pipe.on_tick(&stop).await;
+    assert!(
+        pipe.portfolio.lock().await.position(id).is_none(),
+        "degraded WAL: exits keep running"
+    );
+}
+
+#[tokio::test]
 async fn exposure_cap_bounds_total_tickets() {
     // Cap in USD, not in count: one paper ticket (basis 10 on MINT_A)
     // plus one unpaired live bag (counted as one ticket) leaves no room
@@ -1320,9 +1419,8 @@ async fn exposure_cap_bounds_total_tickets() {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: MINT_A,
                 side: Side::Long,
-                quote: 2.0,
+                mark: simulator::Mark::new(2.0, 1e9),
                 notional_usd: 10.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -2491,9 +2589,8 @@ async fn tick_closes_other_mints_only() {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: MINT_B,
                 side: Side::Long,
-                quote: 2.0,
+                mark: simulator::Mark::new(2.0, 30_000.0),
                 notional_usd: 10.0,
-                liquidity_usd: 30_000.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -2524,9 +2621,8 @@ async fn tick_timeout_closes_stale_position() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            quote: 2.0,
+            mark: simulator::Mark::new(2.0, 30_000.0),
             notional_usd: 10.0,
-            liquidity_usd: 30_000.0,
             tp_percent: 75.0,
             sl_percent: -8.0,
             trailing: false,
@@ -2873,9 +2969,8 @@ async fn manual_sell_closes_both_legs() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: sys,
             side: Side::Long,
-            quote: 2.0,
+            mark: simulator::Mark::new(2.0, 1e9),
             notional_usd: 10.0,
-            liquidity_usd: 1e9,
             tp_percent: 75.0,
             sl_percent: -8.0,
             trailing: false,
@@ -3321,9 +3416,8 @@ async fn heat_cap_blocks_extra_positions() {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: "OTHER",
                 side: Side::Long,
-                quote: 2.0,
+                mark: simulator::Mark::new(2.0, 30_000.0),
                 notional_usd: 10.0,
-                liquidity_usd: 30_000.0,
                 tp_percent: 35.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -3366,9 +3460,8 @@ async fn cooldown_blocks_immediate_reentry() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            quote: 2.0,
+            mark: simulator::Mark::new(2.0, 30_000.0),
             notional_usd: 10.0,
-            liquidity_usd: 30_000.0,
             tp_percent: 35.0,
             sl_percent: -8.0,
             trailing: false,
@@ -3380,7 +3473,12 @@ async fn cooldown_blocks_immediate_reentry() {
         .expect("open");
     let id = portfolio.position_ids()[0];
     portfolio
-        .close_position(id, 2.0, 30_000.0, ExitReason::Manual, now_secs())
+        .close_position(
+            id,
+            &simulator::Mark::new(2.0, 30_000.0),
+            ExitReason::Manual,
+            now_secs(),
+        )
         .expect("close");
     let pipe = pipeline_screened(
         Settings::from_map(&HashMap::new()),
@@ -3663,7 +3761,7 @@ async fn live_sells_for_different_mints_overlap() {
     tokio::time::timeout(secs(10), async {
         tokio::join!(
             async {
-                tokio::time::timeout(secs(5), pipe.live_sell(MINT_A, 3.0, 30_000.0, 1.0))
+                tokio::time::timeout(secs(5), pipe.live_sell(MINT_A, &simulator::Mark::new(3.0, 30_000.0), 1.0))
                     .await
                     .expect("A finishes after release");
             },
@@ -3687,7 +3785,7 @@ async fn live_sells_for_different_mints_overlap() {
                 })
                 .await
                 .expect("A starts");
-                tokio::time::timeout(secs(5), pipe.live_sell(MINT_B, 3.0, 30_000.0, 1.0))
+                tokio::time::timeout(secs(5), pipe.live_sell(MINT_B, &simulator::Mark::new(3.0, 30_000.0), 1.0))
                     .await
                     .expect("B proceeds while A is blocked");
                 live.inner.unblock.notify_waiters();
@@ -3730,4 +3828,252 @@ async fn live_mirror_skipped_when_watch_fails() {
     pipe.poll_gates().await;
     assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
     assert!(live.buys().is_empty());
+}
+
+/// Launch-scale curve state (1.073e15 virtual tokens, 793.1e12 real,
+/// 6 decimals; `vq` is the virtual SOL side in lamports).
+fn launch_reserves(vq: u64) -> curve::BondingCurveReserves {
+    curve::BondingCurveReserves {
+        virtual_token_reserves: 1_073_000_000_000_000,
+        virtual_sol_reserves: vq,
+        real_token_reserves: 793_100_000_000_000,
+        real_sol_reserves: 0,
+        token_total_supply: 1_000_000_000_000_000,
+        complete: false,
+    }
+}
+
+/// The same state as the simulator sees it (stub feed: SOL $150).
+fn launch_mark(vq: u64) -> simulator::CurveReserves {
+    crate::live::curve_reserves(&curve::ExecState {
+        reserves: launch_reserves(vq),
+        decimals: 6,
+        sol_usd: 150.0,
+    })
+}
+
+/// A tick carrying exact reserves, priced at the reserves' own spot.
+fn curve_tick(mint: &str, vq: u64) -> PriceTick {
+    let reserves = launch_reserves(vq);
+    PriceTick {
+        mint: mint.to_string(),
+        curve: CURVE.to_string(),
+        price_usd: reserves.price_usd(6, 150.0).expect("priced"),
+        liquidity_usd: reserves.liquidity_usd(150.0),
+        complete: false,
+        exec: Some(curve::ExecState {
+            reserves,
+            decimals: 6,
+            sol_usd: 150.0,
+        }),
+        observed_at: now_secs(),
+    }
+}
+
+#[tokio::test]
+async fn curve_tick_books_exact_state_based_fills() {
+    // A tick carrying parsed reserves prices the paper fill from the
+    // chain's own math (size impact + venue fee inside the price), and
+    // the exit books the same exact sell — never a proxy estimate.
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(curve_tick(MINT, 200_000_000_000));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        PaperPortfolio::new(100.0, 0.0),
+        screener,
+        None,
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+
+    let expected = launch_mark(200_000_000_000)
+        .buy_fill(10.0, VENUE_FEE_BPS as f64)
+        .expect("priced");
+    let (quantity, entry_price) = {
+        let pf = pipe.portfolio.lock().await;
+        let id = pf.position_ids()[0];
+        let p = pf.position(id).expect("open");
+        (p.quantity, p.entry_price)
+    };
+    assert_eq!(quantity, expected.quantity, "exact curve size");
+    assert!((entry_price - expected.price).abs() < 1e-15);
+
+    // The curve doubles (virtual SOL 200 -> 400): the take-profit clears
+    // and the booked exit prices the exact sell for the sold size.
+    pipe.on_tick(&curve_tick(MINT, 400_000_000_000)).await;
+    let pf = pipe.portfolio.lock().await;
+    assert_eq!(pf.history().len(), 1);
+    let trade = &pf.history()[0];
+    assert_eq!(trade.reason, ExitReason::TakeProfit);
+    assert!(trade.quantity > 0 && trade.quantity <= quantity);
+    let moved = launch_mark(400_000_000_000);
+    let expected_exit = moved
+        .sell_fill_price(trade.quantity, VENUE_FEE_BPS as f64)
+        .expect("priced");
+    assert!(
+        (trade.exit_price - expected_exit).abs() < 1e-15,
+        "exit={} expected={expected_exit}",
+        trade.exit_price
+    );
+    // The exit nets below the moved mark: impact + venue fee.
+    let spot = launch_reserves(400_000_000_000)
+        .price_usd(6, 150.0)
+        .expect("priced");
+    assert!(
+        trade.exit_price < spot,
+        "exit={} spot={spot}",
+        trade.exit_price
+    );
+}
+
+#[tokio::test]
+async fn dead_on_chain_buy_debits_the_actual_burn() {
+    // A buy that landed and errored burned base + priority on-chain
+    // (the tip rolled back); the paper book and the day-loss gate must
+    // book that burn, or the sim looks free exactly when it failed.
+    let live = StubLive::working();
+    *live.inner.dispatch_lamports.lock().expect("lock") = 100_000;
+    live.inner
+        .dead_buys
+        .lock()
+        .expect("lock")
+        .replace(DeadReason::FailedOnChain);
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(tick(MINT, 2.0));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        funded(),
+        screener,
+        Some(live.clone()),
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), pipe.poll_gates())
+        .await
+        .expect("live buy path must complete");
+
+    // Paper position survives, diverged (no live cover)...
+    assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+    assert!(pipe.exec.live_positions.lock().await.is_empty());
+    assert!(pipe.exec.live_diverged.lock().await.contains_key(MINT));
+    // ...and the failed dispatch's burn is debited (stub cost at SOL
+    // $150), never the first-touch cost of a fill that never happened.
+    let burn = live.charge_lamports() as f64 / LAMPORTS_PER_SOL * 150.0;
+    let pf = pipe.portfolio.lock().await;
+    assert!(
+        (pf.total_dispatch_usd() - burn).abs() < 1e-12,
+        "bleed={}",
+        pf.total_dispatch_usd()
+    );
+    drop(pf);
+    assert!((pipe.daily.lock().await.day_net() + burn).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn never_forwarded_buy_debits_nothing() {
+    // A bundle the engine never forwarded (or an expired one) moved no
+    // funds and paid no fees: nothing to debit.
+    let live = StubLive::working();
+    *live.inner.dispatch_lamports.lock().expect("lock") = 100_000;
+    live.inner
+        .dead_buys
+        .lock()
+        .expect("lock")
+        .replace(DeadReason::NeverForwarded);
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(tick(MINT, 2.0));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        funded(),
+        screener,
+        Some(live.clone()),
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), pipe.poll_gates())
+        .await
+        .expect("live buy path must complete");
+    assert!(pipe.exec.live_diverged.lock().await.contains_key(MINT));
+    // The knob is nonzero: a debit here would be visible, and there is
+    // none (nothing moved, nothing was charged).
+    assert_eq!(pipe.portfolio.lock().await.total_dispatch_usd(), 0.0);
+    assert_eq!(pipe.daily.lock().await.day_net(), 0.0);
+}
+
+#[tokio::test]
+async fn live_buy_first_touch_debit_completes() {
+    // The success arm debits the first-touch cost while the buy match
+    // is still in scope. A tier read taken inside the match scrutinee
+    // keeps the book lock held through every arm, so that debit would
+    // deadlock the pipeline (custody recorded, nothing settles). The
+    // timeout turns a reintroduced hang into a failure.
+    let live = StubLive::working();
+    *live.inner.dispatch_lamports.lock().expect("lock") = 100_000;
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(tick(MINT, 2.0));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        funded(),
+        screener,
+        Some(live.clone()),
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), pipe.poll_gates())
+        .await
+        .expect("live buy path must complete");
+    assert_eq!(live.buys().len(), 1);
+    assert_eq!(pipe.exec.live_positions.lock().await.len(), 1);
+    let burn = live.charge_lamports() as f64 / LAMPORTS_PER_SOL * 150.0;
+    let pf = pipe.portfolio.lock().await;
+    assert!(
+        (pf.total_dispatch_usd() - burn).abs() < 1e-12,
+        "bleed={}",
+        pf.total_dispatch_usd()
+    );
 }

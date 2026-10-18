@@ -17,4 +17,4 @@ pub use layout::{
     CurveParseError, PUMP_TOKEN_DECIMALS, TOKEN_SUPPLY_LEN, TOKEN_SUPPLY_OFFSET,
 };
 pub use sol_feed::{DEFAULT_DEX_URL, SOL_MINT, SolUsdFeed};
-pub use ticker::{CurveError, CurveTicker, PriceTick};
+pub use ticker::{CurveError, CurveTicker, ExecState, PriceTick};

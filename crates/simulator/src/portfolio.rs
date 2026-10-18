@@ -1,6 +1,6 @@
 //! Virtual portfolio.
 
-use crate::market::FillModel;
+use crate::market::{EntryFillError, FillModel};
 use crate::types::{ClosedTrade, ExitReason, Position, PositionId, Side};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -82,41 +82,24 @@ impl CloseSlice {
     }
 }
 
-/// Opposite side.
-fn flip_side(side: Side) -> Side {
-    match side {
-        Side::Long => Side::Short,
-        Side::Short => Side::Long,
-    }
-}
-
 /// Finite value or zero.
 fn finite_or_zero(v: f64) -> f64 {
     if v.is_finite() { v } else { 0.0 }
 }
 
-/// Mark-to-market quote for one mint.
-#[derive(Debug, Clone, Copy)]
-pub struct Mark {
-    pub price: f64,
-    pub liquidity_usd: f64,
-}
-
-impl Mark {
-    /// Price without liquidity.
-    pub fn price_only(price: f64) -> Self {
-        Self { price, liquidity_usd: f64::NAN }
-    }
-}
+/// Mark-to-market quote for one mint. Defined in `market` (pricing
+/// engine) and re-exported here for the book's public surface.
+pub use crate::market::Mark;
 
 /// Open-position inputs.
 #[derive(Debug, Clone)]
 pub struct OpenPositionParams<'a> {
     pub mint: &'a str,
     pub side: Side,
-    pub quote: f64,
+    /// Market state at open (spot, depth, and exact curve reserves when
+    /// the tick carried them).
+    pub mark: Mark,
     pub notional_usd: f64,
-    pub liquidity_usd: f64,
     pub tp_percent: f64,
     pub sl_percent: f64,
     pub trailing: bool,
@@ -129,6 +112,11 @@ pub struct OpenPositionParams<'a> {
 /// Accounting snapshot. `realized_pnl` is trade edge only and
 /// excludes dispatch bleed — use `realized_net_pnl()` (edge minus
 /// bleed) for headlines and the breaker, never this field.
+///
+/// `mark_value` prices open positions at the impact-free mark;
+/// `realizable_value` prices them at the exit the book would actually
+/// book (size impact + venue fee). The gap is the liquidation
+/// discount — see [`Self::exit_discount_usd`].
 #[derive(Debug, Clone)]
 pub struct PortfolioSnapshot {
     pub cash: f64,
@@ -136,8 +124,21 @@ pub struct PortfolioSnapshot {
     pub equity: f64,
     pub realized_pnl: f64,
     pub unrealized_pnl: f64,
+    /// Signed mark-to-market value of open positions (no impact/fee).
+    pub mark_value: f64,
+    /// Signed exit value of open positions (size impact + venue fee).
+    pub realizable_value: f64,
     pub open_count: usize,
     pub closed_count: usize,
+}
+
+impl PortfolioSnapshot {
+    /// Mark minus realizable: what exiting the book's full size would
+    /// cost in impact and venue fees right now. Zero when nothing is
+    /// open; negative for a Long book under any impact.
+    pub fn exit_discount_usd(&self) -> f64 {
+        self.mark_value - self.realizable_value
+    }
 }
 
 /// Paper-trading portfolio.
@@ -297,12 +298,11 @@ impl PaperPortfolio {
         &mut self,
         p: &OpenPositionParams<'_>,
     ) -> Result<PositionId, PortfolioError> {
-        let quote = p.quote;
         let notional_usd = p.notional_usd;
         let tp_percent = p.tp_percent;
         let sl_percent = p.sl_percent;
-        if !quote.is_finite() || quote <= 0.0 {
-            return Err(PortfolioError::InvalidPrice(quote));
+        if !p.mark.price.is_finite() || p.mark.price <= 0.0 {
+            return Err(PortfolioError::InvalidPrice(p.mark.price));
         }
         if !notional_usd.is_finite() || notional_usd <= 0.0 {
             return Err(PortfolioError::InvalidNotional(notional_usd));
@@ -316,22 +316,28 @@ impl PaperPortfolio {
         if p.mint.is_empty() {
             return Err(PortfolioError::InvalidMint(p.mint.to_string()));
         }
-        // Execution pricing: reject when the curve cannot absorb the
-        // size instead of printing a fictitious capped fill.
-        let entry_price = self
+        // Execution pricing: exact curve math when the tick carried
+        // reserves, proxy basis otherwise. Reject when the curve cannot
+        // absorb the size instead of printing a fictitious capped fill;
+        // sub-token dust cannot open (live sizes zero dust to a retry,
+        // never to a fill).
+        let fill = match self
             .fill_for_mint(p.mint)
-            .try_fill_price(p.side, quote, notional_usd, p.liquidity_usd)
-            .ok_or(PortfolioError::CurveExhausted {
-                notional: notional_usd,
-                liquidity: p.liquidity_usd,
-            })?;
-        // Whole tokens, floored: sub-token dust cannot open (live sizes
-        // zero dust to a retry, never to a fill).
-        let quantity = (notional_usd / entry_price).floor();
-        if !quantity.is_finite() || quantity < 1.0 || quantity >= u64::MAX as f64 {
-            return Err(PortfolioError::InvalidNotional(notional_usd));
-        }
-        let quantity = quantity as u64;
+            .entry_fill(p.side, &p.mark, notional_usd)
+        {
+            Ok(fill) => fill,
+            Err(EntryFillError::Dust) => {
+                return Err(PortfolioError::InvalidNotional(notional_usd));
+            }
+            Err(_) => {
+                return Err(PortfolioError::CurveExhausted {
+                    notional: notional_usd,
+                    liquidity: p.mark.liquidity_usd,
+                });
+            }
+        };
+        let entry_price = fill.price;
+        let quantity = fill.quantity;
         // Debit what is actually invested (floored size at the filled
         // price), never the nominal ticket: the old f64 size made them
         // identical, the integer size leaves up to one token unspent.
@@ -395,12 +401,11 @@ impl PaperPortfolio {
     pub fn close_position(
         &mut self,
         id: PositionId,
-        quote: f64,
-        liquidity_usd: f64,
+        mark: &Mark,
         reason: ExitReason,
         now_secs: u64,
     ) -> Result<ClosedTrade, PortfolioError> {
-        self.settle(id, 1.0, quote, liquidity_usd, reason, now_secs)
+        self.settle(id, 1.0, mark, reason, now_secs)
     }
 
     /// Close a fraction.
@@ -408,47 +413,45 @@ impl PaperPortfolio {
         &mut self,
         id: PositionId,
         fraction: f64,
-        quote: f64,
-        liquidity_usd: f64,
+        mark: &Mark,
         reason: ExitReason,
         now_secs: u64,
     ) -> Result<ClosedTrade, PortfolioError> {
         if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
             return Err(PortfolioError::InvalidFraction(fraction));
         }
-        self.settle(id, fraction, quote, liquidity_usd, reason, now_secs)
+        self.settle(id, fraction, mark, reason, now_secs)
     }
 
     fn settle(
         &mut self,
         id: PositionId,
         fraction: f64,
-        quote: f64,
-        liquidity_usd: f64,
+        mark: &Mark,
         reason: ExitReason,
         now_secs: u64,
     ) -> Result<ClosedTrade, PortfolioError> {
-        if !quote.is_finite() || quote <= 0.0 {
-            return Err(PortfolioError::InvalidPrice(quote));
+        if !mark.price.is_finite() || mark.price <= 0.0 {
+            return Err(PortfolioError::InvalidPrice(mark.price));
         }
-        // Execution pricing guard: long exits past the curve have no
-        // price (unbounded impact). Peek before mutating.
+        // Execution pricing guard: an unpriced exit (drained curve,
+        // unpriceable basis) is caught before mutating. Priced on the
+        // same fill the slice will book (floored part quantity).
         {
             let position = self
                 .positions
                 .get(&id)
                 .ok_or(PortfolioError::PositionNotFound(id))?;
-            let exit_size = position.quantity as f64 * fraction * quote;
-            let probe = self.fill_for_mint(&position.mint).try_fill_price(
-                flip_side(position.side),
-                quote,
-                exit_size,
-                liquidity_usd,
-            );
-            if probe.is_none() {
+            let slice_qty = if fraction >= 1.0 {
+                position.quantity
+            } else {
+                (position.quantity as f64 * fraction).floor() as u64
+            };
+            let opposed = self.fill_for_mint(&position.mint);
+            if slice_qty > 0 && opposed.exit_price(position.side, mark, slice_qty).is_none() {
                 return Err(PortfolioError::CurveExhausted {
-                    notional: exit_size,
-                    liquidity: liquidity_usd,
+                    notional: slice_qty as f64 * mark.price,
+                    liquidity: mark.liquidity_usd,
                 });
             }
         }
@@ -459,8 +462,7 @@ impl PaperPortfolio {
                 .ok_or(PortfolioError::PositionNotFound(id))?;
             let trade = self.book(
                 &CloseSlice::whole(&position),
-                quote,
-                liquidity_usd,
+                mark,
                 reason,
                 now_secs,
             )?;
@@ -480,7 +482,7 @@ impl PaperPortfolio {
         if slice.quantity == 0 {
             return Err(PortfolioError::InvalidFraction(fraction));
         }
-        let trade = self.book(&slice, quote, liquidity_usd, reason, now_secs)?;
+        let trade = self.book(&slice, mark, reason, now_secs)?;
         if let Some(open) = self.positions.get_mut(&id) {
             open.quantity -= slice.quantity;
             open.entry_notional -= slice.entry_notional;
@@ -514,26 +516,19 @@ impl PaperPortfolio {
     fn book(
         &mut self,
         slice: &CloseSlice,
-        quote: f64,
-        liquidity_usd: f64,
+        mark: &Mark,
         reason: ExitReason,
         now_secs: u64,
     ) -> Result<ClosedTrade, PortfolioError> {
         // Execution pricing, uncapped: the settle probe above priced
-        // the identical notional, so this agrees with the trigger by
-        // construction and can only fail on buy-side exhaustion.
-        let exit_notional_probe = slice.quantity as f64 * quote;
+        // the identical slice, so this agrees with the trigger by
+        // construction and can only fail on an unpriced exit.
         let exit_price = self
             .fill_for_mint(&slice.mint)
-            .try_fill_price(
-                flip_side(slice.side),
-                quote,
-                exit_notional_probe,
-                liquidity_usd,
-            )
+            .exit_price(slice.side, mark, slice.quantity)
             .ok_or(PortfolioError::CurveExhausted {
-                notional: exit_notional_probe,
-                liquidity: liquidity_usd,
+                notional: slice.quantity as f64 * mark.price,
+                liquidity: mark.liquidity_usd,
             })?;
         let exit_notional = slice.quantity as f64 * exit_price;
         let exit_fee = self.fee_for(exit_notional);
@@ -593,22 +588,13 @@ impl PaperPortfolio {
     pub fn check_exit_realizable(
         &mut self,
         id: PositionId,
-        quote: f64,
-        liquidity_usd: f64,
+        mark: &Mark,
         now_secs: u64,
     ) -> Option<ExitReason> {
         let mint = self.positions.get(&id)?.mint.clone();
         let fill = self.fill_for_mint(&mint);
         let position = self.positions.get_mut(&id)?;
-        let exit_notional = position.quantity as f64 * quote;
-        crate::market::check_exit_realizable(
-            &fill,
-            position,
-            quote,
-            exit_notional,
-            liquidity_usd,
-            now_secs,
-        )
+        crate::market::check_exit_realizable(&fill, position, mark, now_secs)
     }
 
     /// Net PnL of closed trades.
@@ -620,41 +606,46 @@ impl PaperPortfolio {
     pub fn snapshot(&self, marks: &HashMap<String, Mark>) -> PortfolioSnapshot {
         let mut locked = 0.0;
         let mut unrealized = 0.0;
+        let mut mark_value = 0.0;
+        let mut realizable_value = 0.0;
         for position in self.positions.values() {
             let basis = match position.side {
                 Side::Long => position.entry_notional,
                 Side::Short => -position.entry_notional,
             };
             locked += basis;
-            let value = match marks.get(&position.mint) {
+            let (mark_v, value) = match marks.get(&position.mint) {
                 Some(mark) if mark.price.is_finite() && mark.price > 0.0 => {
-                    let exit_size = position.quantity as f64 * mark.price;
-                    // Same uncapped execution pricing as settlement, so
-                    // marks and books agree. Unpriceable (buy-side
-                    // exhaustion) holds the basis instead of a fiction.
-                    match self.fill_for_mint(&position.mint).try_slip_fraction_for_side(
-                        flip_side(position.side),
-                        exit_size,
-                        mark.liquidity_usd,
+                    let mark_v = match position.side {
+                        Side::Long => position.quantity as f64 * mark.price,
+                        Side::Short => -(position.quantity as f64 * mark.price),
+                    };
+                    // Same execution pricing as settlement (exact curve
+                    // state when the mark carries it), so marks and
+                    // books agree. Unpriceable holds the basis instead
+                    // of a fiction.
+                    match self.fill_for_mint(&position.mint).exit_price(
+                        position.side,
+                        mark,
+                        position.quantity,
                     ) {
-                        Some(slip) => {
-                            let exit_price = match position.side {
-                                Side::Long => mark.price * (1.0 - slip).max(0.0),
-                                Side::Short => mark.price * (1.0 + slip),
-                            };
+                        Some(exit_price) => {
                             let exit_notional = position.quantity as f64 * exit_price;
                             let exit_fee = self.fee_for(exit_notional);
-                            match position.side {
+                            let value = match position.side {
                                 Side::Long => exit_notional - exit_fee,
                                 Side::Short => -(exit_notional + exit_fee),
-                            }
+                            };
+                            (mark_v, value)
                         }
-                        None => basis,
+                        None => (mark_v, basis),
                     }
                 }
-                _ => basis,
+                _ => (basis, basis),
             };
             unrealized += value - basis;
+            mark_value += mark_v;
+            realizable_value += value;
         }
         PortfolioSnapshot {
             cash: self.cash,
@@ -662,6 +653,8 @@ impl PaperPortfolio {
             equity: self.cash + locked + unrealized,
             realized_pnl: self.realized_pnl(),
             unrealized_pnl: unrealized,
+            mark_value,
+            realizable_value,
             open_count: self.positions.len(),
             closed_count: self.closed_total,
         }
@@ -693,9 +686,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1_000_000.0),
                 notional_usd: 40.0,
-                liquidity_usd: 1_000_000.0,
                 tp_percent: 60.0,
                 sl_percent: -8.0,
                 trailing: true,
@@ -706,7 +698,13 @@ mod tests {
             })
             .expect("open");
         let trade = pf
-            .close_partial_position(id, 0.8, 1.7, 1_000_000.0, ExitReason::TakeProfit, 1001)
+            .close_partial_position(
+                id,
+                0.8,
+                &Mark::new(1.7, 1_000_000.0),
+                ExitReason::TakeProfit,
+                1001,
+            )
             .expect("scale out");
         assert_eq!(trade.fraction_closed, 0.8);
         let runner = pf.position(id).expect("runner");
@@ -718,9 +716,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "M2",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1_000_000.0),
                 notional_usd: 10.0,
-                liquidity_usd: 1_000_000.0,
                 tp_percent: 60.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -730,7 +727,7 @@ mod tests {
                 now_secs: 1001,
             })
             .expect("open2");
-        pf.close_position(id2, 2.0, 1_000_000.0, ExitReason::TakeProfit, 1002)
+        pf.close_position(id2, &Mark::new(2.0, 1_000_000.0), ExitReason::TakeProfit, 1002)
             .expect("full close");
         assert!(pf.position(id2).is_none());
     }
@@ -742,9 +739,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1_000_000.0),
                 notional_usd: 40.0,
-                liquidity_usd: 1_000_000.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -757,7 +753,7 @@ mod tests {
         assert_eq!(pf.cash(), 60.0);
 
         let trade = pf
-            .close_position(id, 2.0, 1_000_000.0, ExitReason::Manual, 1100)
+            .close_position(id, &Mark::new(2.0, 1_000_000.0), ExitReason::Manual, 1100)
             .expect("close");
         assert_eq!(trade.gross_pnl, 40.0);
         assert_eq!(trade.net_pnl, 40.0);
@@ -774,9 +770,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 50.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -788,7 +783,7 @@ mod tests {
             .expect("open");
         assert!((pf.cash() - 49.50).abs() < 1e-9);
         let trade = pf
-            .close_position(id, 1.0, 1e9, ExitReason::Manual, 1)
+            .close_position(id, &Mark::new(1.0, 1e9), ExitReason::Manual, 1)
             .expect("close");
         assert!((trade.fees - 1.0).abs() < 1e-9);
         assert!((trade.net_pnl + 1.0).abs() < 1e-9);
@@ -802,9 +797,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Short,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 50.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -817,7 +811,7 @@ mod tests {
         assert!((pf.cash() - 149.50).abs() < 1e-9, "cash={}", pf.cash());
         assert_eq!(pf.position(id).expect("p").quantity, 50);
         let trade = pf
-            .close_position(id, 1.0, 1e9, ExitReason::Manual, 1)
+            .close_position(id, &Mark::new(1.0, 1e9), ExitReason::Manual, 1)
             .expect("close");
         assert!((trade.gross_pnl).abs() < 1e-9, "gross={}", trade.gross_pnl);
         assert!((trade.fees - 1.0).abs() < 1e-9, "fees={}", trade.fees);
@@ -828,9 +822,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Short,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 50.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -844,7 +837,7 @@ mod tests {
         marks.insert("MINT".to_string(), Mark::price_only(1.0));
         let snap = pf2.snapshot(&marks);
         let trade2 = pf2
-            .close_position(id2, 1.0, 1e9, ExitReason::Manual, 1)
+            .close_position(id2, &Mark::new(1.0, 1e9), ExitReason::Manual, 1)
             .expect("close");
         assert!((pf2.cash() - snap.equity).abs() < 1e-9);
         assert!((trade2.net_pnl + 1.0).abs() < 1e-9);
@@ -857,9 +850,8 @@ mod tests {
             pf.open_position_params(&OpenPositionParams {
                 mint: "M",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 200.0,
-                liquidity_usd: 1e9,
                 tp_percent: 1.0,
                 sl_percent: -1.0,
                 trailing: false,
@@ -874,9 +866,8 @@ mod tests {
             pf.open_position_params(&OpenPositionParams {
                 mint: "M",
                 side: Side::Long,
-                quote: 0.0,
+                mark: Mark::new(0.0, 1e9),
                 notional_usd: 10.0,
-                liquidity_usd: 1e9,
                 tp_percent: 1.0,
                 sl_percent: -1.0,
                 trailing: false,
@@ -891,9 +882,8 @@ mod tests {
             pf.open_position_params(&OpenPositionParams {
                 mint: "M",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: -5.0,
-                liquidity_usd: 1e9,
                 tp_percent: 1.0,
                 sl_percent: -1.0,
                 trailing: false,
@@ -905,7 +895,7 @@ mod tests {
             Err(PortfolioError::InvalidNotional(_))
         ));
         assert!(matches!(
-            pf.close_position(999, 1.0, 1e9, ExitReason::Manual, 0),
+            pf.close_position(999, &Mark::new(1.0, 1e9), ExitReason::Manual, 0),
             Err(PortfolioError::PositionNotFound(999))
         ));
     }
@@ -917,9 +907,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 5_000.0),
                 notional_usd: 50.0,
-                liquidity_usd: 5_000.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -940,9 +929,8 @@ mod tests {
         pf.open_position_params(&OpenPositionParams {
             mint: "A",
             side: Side::Long,
-            quote: 1.0,
+            mark: Mark::new(1.0, 1e9),
             notional_usd: 40.0,
-            liquidity_usd: 1e9,
             tp_percent: 75.0,
             sl_percent: -8.0,
             trailing: false,
@@ -953,7 +941,14 @@ mod tests {
         })
         .expect("open");
         let mut marks = HashMap::new();
-        marks.insert("A".to_string(), Mark { price: 1.5, liquidity_usd: 1e9 });
+        marks.insert(
+            "A".to_string(),
+            Mark {
+                price: 1.5,
+                liquidity_usd: 1e9,
+                curve: None,
+            },
+        );
         let snap = pf.snapshot(&marks);
         assert_eq!(snap.cash, 60.0);
         assert_eq!(snap.locked, 40.0);
@@ -969,9 +964,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "A",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 5_000.0),
                 notional_usd: 40.0,
-                liquidity_usd: 5_000.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -982,7 +976,14 @@ mod tests {
             })
             .expect("open");
         let mut marks = HashMap::new();
-        marks.insert("A".to_string(), Mark { price: 1.5, liquidity_usd: 5_000.0 });
+        marks.insert(
+            "A".to_string(),
+            Mark {
+                price: 1.5,
+                liquidity_usd: 5_000.0,
+                curve: None,
+            },
+        );
         let snap = pf.snapshot(&marks);
         let naive = (1.5 - pf.position(id).expect("p").entry_price)
             * pf.position(id).expect("p").quantity as f64;
@@ -994,7 +995,7 @@ mod tests {
         let entry_fee =
             pf.position(id).expect("p").entry_notional * 100.0 / 10_000.0;
         let trade = pf
-            .close_position(id, 1.5, 5_000.0, ExitReason::Manual, 1)
+            .close_position(id, &Mark::new(1.5, 5_000.0), ExitReason::Manual, 1)
             .expect("close");
         assert!((trade.net_pnl - (snap.unrealized_pnl - entry_fee)).abs() < 1e-9);
         assert!((pf.cash() - snap.equity).abs() < 1e-9);
@@ -1002,9 +1003,8 @@ mod tests {
         pf2.open_position_params(&OpenPositionParams {
             mint: "B",
             side: Side::Long,
-            quote: 1.0,
+            mark: Mark::new(1.0, 1e9),
             notional_usd: 10.0,
-            liquidity_usd: 1e9,
             tp_percent: 75.0,
             sl_percent: -8.0,
             trailing: false,
@@ -1017,7 +1017,14 @@ mod tests {
         let empty: HashMap<String, Mark> = HashMap::new();
         assert_eq!(pf2.snapshot(&empty).unrealized_pnl, 0.0);
         let mut nan_marks = HashMap::new();
-        nan_marks.insert("B".to_string(), Mark { price: f64::NAN, liquidity_usd: 5_000.0 });
+        nan_marks.insert(
+            "B".to_string(),
+            Mark {
+                price: f64::NAN,
+                liquidity_usd: 5_000.0,
+                curve: None,
+            },
+        );
         assert_eq!(pf2.snapshot(&nan_marks).unrealized_pnl, 0.0);
     }
 
@@ -1028,9 +1035,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 50.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1046,7 +1052,12 @@ mod tests {
         };
         assert_eq!(reason, Some(ExitReason::TakeProfit));
         let trade = pf
-            .close_position(id, 1.80, 1e9, reason.unwrap_or(ExitReason::Manual), 10)
+            .close_position(
+                id,
+                &Mark::new(1.80, 1e9),
+                reason.unwrap_or(ExitReason::Manual),
+                10,
+            )
             .expect("close");
         assert_eq!(trade.reason, ExitReason::TakeProfit);
         assert!((trade.net_pnl - 40.0).abs() < 1e-9);
@@ -1061,9 +1072,8 @@ mod tests {
                 .open_position_params(&OpenPositionParams {
                     mint: "M",
                     side: Side::Long,
-                    quote: 1.0,
+                    mark: Mark::new(1.0, 1e9),
                     notional_usd: 10.0,
-                    liquidity_usd: 1e9,
                     tp_percent: 75.0,
                     sl_percent: -8.0,
                     trailing: false,
@@ -1073,7 +1083,7 @@ mod tests {
                     now_secs: i,
                 })
                 .expect("open");
-            pf.close_position(id, 0.9, 1e9, ExitReason::StopLoss, i + 1)
+            pf.close_position(id, &Mark::new(0.9, 1e9), ExitReason::StopLoss, i + 1)
                 .expect("close");
         }
         assert!((pf.realized_pnl() + 2.0).abs() < 1e-9);
@@ -1090,9 +1100,8 @@ mod tests {
                     pf.open_position_params(&OpenPositionParams {
                         mint: "M",
                         side: Side::Long,
-                        quote: 1.0,
+                        mark: Mark::new(1.0, 1e9),
                         notional_usd: 10.0,
-                        liquidity_usd: 1e9,
                         tp_percent: tp,
                         sl_percent: sl,
                         trailing: false,
@@ -1119,9 +1128,8 @@ mod tests {
         pf.open_position_params(&OpenPositionParams {
             mint: "MINT",
             side: Side::Long,
-            quote: 1.0,
+            mark: Mark::new(1.0, 1e9),
             notional_usd: 40.0,
-            liquidity_usd: 1e9,
             tp_percent: 75.0,
             sl_percent: -8.0,
             trailing: false,
@@ -1138,7 +1146,7 @@ mod tests {
         let mut pf = funded();
         let id = open_40_at_1(&mut pf);
         let part = pf
-            .close_partial_position(id, 0.8, 2.0, 1e9, ExitReason::TakeProfit, 1100)
+            .close_partial_position(id, 0.8, &Mark::new(2.0, 1e9), ExitReason::TakeProfit, 1100)
             .expect("partial");
         assert_eq!(part.fraction_closed, 0.8);
         assert_eq!(part.quantity, 32);
@@ -1152,7 +1160,7 @@ mod tests {
         assert_eq!((open.tp_percent, open.sl_percent), (75.0, 0.0));
 
         let rest = pf
-            .close_partial_position(id, 1.0, 2.0, 1e9, ExitReason::TakeProfit, 1200)
+            .close_partial_position(id, 1.0, &Mark::new(2.0, 1e9), ExitReason::TakeProfit, 1200)
             .expect("rest");
         assert_eq!(rest.fraction_closed, 1.0);
         assert!(pf.position(id).is_none());
@@ -1166,7 +1174,7 @@ mod tests {
         let mut pf = funded();
         let id = open_40_at_1(&mut pf);
         assert_eq!(pf.position(id).expect("p").sl_percent, -8.0);
-        pf.close_partial_position(id, 0.8, 2.0, 1e9, ExitReason::TakeProfit, 1)
+        pf.close_partial_position(id, 0.8, &Mark::new(2.0, 1e9), ExitReason::TakeProfit, 1)
             .expect("partial");
         assert_eq!(pf.position(id).expect("runner").sl_percent, 0.0);
     }
@@ -1176,12 +1184,12 @@ mod tests {
         let mut pf = funded();
         let id = open_40_at_1(&mut pf);
         pf.position_mut(id).expect("p").sl_percent = 5.0;
-        pf.close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::TakeProfit, 1)
+        pf.close_partial_position(id, 0.5, &Mark::new(2.0, 1e9), ExitReason::TakeProfit, 1)
             .expect("partial");
         assert_eq!(pf.position(id).expect("p").sl_percent, 5.0);
 
         let id2 = open_40_at_1(&mut pf);
-        pf.close_partial_position(id2, 0.5, 2.0, 1e9, ExitReason::Manual, 1)
+        pf.close_partial_position(id2, 0.5, &Mark::new(2.0, 1e9), ExitReason::Manual, 1)
             .expect("partial");
         assert_eq!(pf.position(id2).expect("p").sl_percent, -8.0);
     }
@@ -1193,9 +1201,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "M",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 10.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: true,
@@ -1205,13 +1212,13 @@ mod tests {
                 now_secs: 0,
             })
             .expect("open");
-        pf.close_partial_position(id, 0.5, 1.5, 1e9, ExitReason::Manual, 1)
+        pf.close_partial_position(id, 0.5, &Mark::new(1.5, 1e9), ExitReason::Manual, 1)
             .expect("partial");
         let p = pf.position(id).expect("runner");
         assert_eq!(p.sl_percent, -8.0);
         assert_eq!(p.timeout_seconds, 90);
         assert_eq!(p.moonbag_percent, 20.0);
-        pf.close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::TakeProfit, 2)
+        pf.close_partial_position(id, 0.5, &Mark::new(2.0, 1e9), ExitReason::TakeProfit, 2)
             .expect("partial");
         let p = pf.position(id).expect("runner");
         assert_eq!(p.sl_percent, 0.0);
@@ -1226,9 +1233,8 @@ mod tests {
             pf.open_position_params(&OpenPositionParams {
                 mint: "",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 10.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1248,9 +1254,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "M",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 10.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: true,
@@ -1275,9 +1280,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "STD",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 100.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1291,9 +1295,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "CUSTOM",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 100.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1323,10 +1326,7 @@ mod tests {
         let base = pf.snapshot(&HashMap::new());
         for price in [0.0, -2.0, f64::NAN] {
             let mut marks = HashMap::new();
-            marks.insert(
-                "MINT".to_string(),
-                Mark { price, liquidity_usd: 1e9 },
-            );
+            marks.insert("MINT".to_string(), Mark::new(price, 1e9));
             let snap = pf.snapshot(&marks);
             assert_eq!(snap.unrealized_pnl, base.unrealized_pnl, "price {price}");
         }
@@ -1339,9 +1339,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Short,
-                quote: 2.0,
+                mark: Mark::new(2.0, 1e9),
                 notional_usd: 40.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1353,7 +1352,7 @@ mod tests {
             .expect("open");
         assert_eq!(pf.position(id).expect("p").quantity, 20);
         let part = pf
-            .close_partial_position(id, 0.5, 1.0, 1e9, ExitReason::TakeProfit, 1)
+            .close_partial_position(id, 0.5, &Mark::new(1.0, 1e9), ExitReason::TakeProfit, 1)
             .expect("partial");
         assert_eq!(part.quantity, 10);
         assert_eq!(part.gross_pnl, 10.0);
@@ -1370,9 +1369,8 @@ mod tests {
             pf.open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 100.0,
+                mark: Mark::new(100.0, 1e9),
                 notional_usd: 10.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1388,9 +1386,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 1.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1402,7 +1399,7 @@ mod tests {
             .expect("one token opens");
         assert_eq!(pf.position(id).expect("p").quantity, 1);
         assert!(matches!(
-            pf.close_partial_position(id, 0.5, 1.0, 1e9, ExitReason::Manual, 1),
+            pf.close_partial_position(id, 0.5, &Mark::new(1.0, 1e9), ExitReason::Manual, 1),
             Err(PortfolioError::InvalidFraction(_))
         ));
         // Whole-token partials still settle exactly (no float remainder).
@@ -1410,9 +1407,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "M2",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 10.0,
-                liquidity_usd: 1e9,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1423,7 +1419,7 @@ mod tests {
             })
             .expect("ten tokens open");
         let part = pf
-            .close_partial_position(id2, 0.3, 1.0, 1e9, ExitReason::Manual, 1)
+            .close_partial_position(id2, 0.3, &Mark::new(1.0, 1e9), ExitReason::Manual, 1)
             .expect("partial");
         assert_eq!(part.quantity, 3);
         assert_eq!(pf.position(id2).expect("p").quantity, 7);
@@ -1436,14 +1432,14 @@ mod tests {
         for bad in [0.0, -0.5, 1.5, f64::NAN, f64::INFINITY] {
             assert!(
                 matches!(
-                    pf.close_partial_position(id, bad, 2.0, 1e9, ExitReason::Manual, 0),
+                    pf.close_partial_position(id, bad, &Mark::new(2.0, 1e9), ExitReason::Manual, 0),
                     Err(PortfolioError::InvalidFraction(_))
                 ),
                 "fraction={bad}"
             );
         }
         assert!(matches!(
-            pf.close_partial_position(999, 0.5, 2.0, 1e9, ExitReason::Manual, 0),
+            pf.close_partial_position(999, 0.5, &Mark::new(2.0, 1e9), ExitReason::Manual, 0),
             Err(PortfolioError::PositionNotFound(999))
         ));
         assert_eq!(pf.position(id).expect("p").quantity, 40);
@@ -1458,7 +1454,7 @@ mod tests {
         // Open leg bled from cash.
         assert!((pf.cash() - (60.0 - 0.30)).abs() < 1e-9, "cash={}", pf.cash());
         let trade = pf
-            .close_position(id, 2.0, 1e9, ExitReason::Manual, 1100)
+            .close_position(id, &Mark::new(2.0, 1e9), ExitReason::Manual, 1100)
             .expect("close");
         // Close leg pro-rata on the trade; edge untouched.
         assert!((trade.dispatch_usd - 0.05).abs() < 1e-9);
@@ -1474,7 +1470,7 @@ mod tests {
         pf.set_paper_dispatch_legs(0.0, 0.10);
         let id = open_40_at_1(&mut pf);
         let part = pf
-            .close_partial_position(id, 0.5, 2.0, 1e9, ExitReason::Manual, 1100)
+            .close_partial_position(id, 0.5, &Mark::new(2.0, 1e9), ExitReason::Manual, 1100)
             .expect("partial");
         assert!((part.dispatch_usd - 0.05).abs() < 1e-9);
     }
@@ -1486,7 +1482,7 @@ mod tests {
         let id = open_40_at_1(&mut pf);
         assert_eq!(pf.cash(), 60.0);
         let trade = pf
-            .close_position(id, 2.0, 1e9, ExitReason::Manual, 1100)
+            .close_position(id, &Mark::new(2.0, 1e9), ExitReason::Manual, 1100)
             .expect("close");
         assert_eq!(trade.dispatch_usd, 0.0);
         assert_eq!(pf.cash(), 140.0);
@@ -1517,9 +1513,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 10.0,
-                liquidity_usd: 1e9,
                 tp_percent: 100.0,
                 sl_percent: -50.0,
                 trailing: false,
@@ -1530,7 +1525,7 @@ mod tests {
             })
             .expect("open");
         let trade = pf
-            .close_position(id, 1.02, 1e9, ExitReason::Manual, 1)
+            .close_position(id, &Mark::new(1.02, 1e9), ExitReason::Manual, 1)
             .expect("close");
         assert!(trade.net_pnl > 0.0);
         pf.debit_dispatch_cost(0.34);
@@ -1545,9 +1540,8 @@ mod tests {
             pf.open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 10_000.0),
                 notional_usd: 10_000_000.0,
-                liquidity_usd: 10_000.0,
                 tp_percent: 100.0,
                 sl_percent: -50.0,
                 trailing: false,
@@ -1564,9 +1558,8 @@ mod tests {
                     pf.open_position_params(&OpenPositionParams {
                         mint: "MINT",
                         side: Side::Long,
-                        quote: 1.0,
+                        mark: Mark::new(1.0, 1e9),
                         notional_usd: 10.0,
-                        liquidity_usd: 1e9,
                         tp_percent: 100.0,
                         sl_percent: bad_sl,
                         trailing: false,
@@ -1592,9 +1585,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 100.0,
-                liquidity_usd: 1e9,
                 tp_percent: 100.0,
                 sl_percent: -50.0,
                 trailing: false,
@@ -1608,11 +1600,11 @@ mod tests {
         // capped fiction): the realizable SL fires here because true
         // proceeds are ~-92%, not -25%.
         assert_eq!(
-            pf.check_exit_realizable(id, 1.0, 10.0, 1),
+            pf.check_exit_realizable(id, &Mark::new(1.0, 10.0), 1),
             Some(ExitReason::StopLoss)
         );
         let trade = pf
-            .close_position(id, 1.0, 10.0, ExitReason::StopLoss, 1)
+            .close_position(id, &Mark::new(1.0, 10.0), ExitReason::StopLoss, 1)
             .expect("close");
         assert!(
             trade.exit_price < 0.5,
@@ -1630,9 +1622,8 @@ mod tests {
             .open_position_params(&OpenPositionParams {
                 mint: "MINT",
                 side: Side::Short,
-                quote: 1.0,
+                mark: Mark::new(1.0, 1e9),
                 notional_usd: 100.0,
-                liquidity_usd: 1e9,
                 tp_percent: 100.0,
                 sl_percent: -50.0,
                 trailing: false,
@@ -1644,7 +1635,7 @@ mod tests {
             .expect("open");
         let qty = pf.positions.get(&id).expect("open").quantity as f64;
         let trade = pf
-            .close_position(id, 1.0, 200.0, ExitReason::Manual, 1)
+            .close_position(id, &Mark::new(1.0, 200.0), ExitReason::Manual, 1)
             .expect("close");
         // Exit notional drifts off round 100 by the entry fee; price
         // the true size, not a nominal one.
@@ -1672,9 +1663,8 @@ mod tests {
                 .open_position_params(&OpenPositionParams {
                     mint: "MINT",
                     side: Side::Long,
-                    quote: 1.0,
+                    mark: Mark::new(1.0, 1e9),
                     notional_usd: 10.0,
-                    liquidity_usd: 1e9,
                     tp_percent: 100.0,
                     sl_percent: -50.0,
                     trailing: false,
@@ -1684,7 +1674,7 @@ mod tests {
                     now_secs: i as u64,
                 })
                 .expect("open");
-            pf.close_position(id, 1.0, 1e9, ExitReason::Manual, i as u64)
+            pf.close_position(id, &Mark::new(1.0, 1e9), ExitReason::Manual, i as u64)
                 .expect("close");
         }
         let _ = HashMap::<String, ()>::new();
@@ -1693,5 +1683,69 @@ mod tests {
         assert!(snap.realized_pnl.is_finite());
         assert_eq!(snap.closed_count, n);
         assert_eq!(pf.win_rate(), Some(0.0));
+    }
+
+    /// Pump.fun launch scale: 30 SOL virtual / 1.073e15 virtual tokens /
+    /// 793.1e12 real tokens, 6 decimals, SOL $200.
+    fn launch_curve() -> crate::market::CurveReserves {
+        crate::market::CurveReserves {
+            vq_lamports: 30_000_000_000,
+            vt_base: 1_073_000_000_000_000,
+            real_tokens: 793_100_000_000_000,
+            decimals: 6,
+            sol_usd: 200.0,
+        }
+    }
+
+    #[test]
+    fn exact_curve_open_and_close_are_state_based() {
+        let mut pf = PaperPortfolio::new(100.0, 0.0);
+        let spot = 5.591_798_695_246_971e-6;
+        let mark = Mark::new(spot, 6_000.0).with_curve(launch_curve());
+        let id = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "MINT",
+                side: Side::Long,
+                mark,
+                notional_usd: 10.0,
+                tp_percent: 100.0,
+                sl_percent: -50.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 0,
+                moonbag_percent: 0.0,
+                now_secs: 1000,
+            })
+            .expect("exact open");
+        let position = pf.position(id).expect("open").clone();
+        // Exact curve size, not a proxy estimate; fee inside the price.
+        assert_eq!(position.quantity, 1_763_352);
+        assert!(
+            position.entry_price > spot,
+            "entry={}",
+            position.entry_price
+        );
+        assert!(position.entry_notional <= 10.0);
+
+        // Marks price the impact-free spot; equity books the realizable
+        // exit (size impact + venue fee) — the discount is explicit.
+        let marks = HashMap::from([("MINT".to_string(), mark)]);
+        let snap = pf.snapshot(&marks);
+        assert!(snap.realizable_value < snap.mark_value);
+        assert!((snap.unrealized_pnl - (snap.realizable_value - snap.locked)).abs() < 1e-9);
+        assert!(
+            (snap.exit_discount_usd() - (snap.mark_value - snap.realizable_value)).abs() < 1e-12
+        );
+        assert!(snap.exit_discount_usd() > 0.0);
+
+        // The close books the same exact sell the snapshot priced.
+        let expected_exit = launch_curve()
+            .sell_fill_price(1_763_352, 125.0)
+            .expect("priced");
+        let trade = pf
+            .close_position(id, &mark, ExitReason::Manual, 1100)
+            .expect("close");
+        assert!((trade.exit_price - expected_exit).abs() < 1e-15);
+        assert!(trade.exit_price < spot);
     }
 }

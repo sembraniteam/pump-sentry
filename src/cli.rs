@@ -41,6 +41,17 @@ pub fn entries_paused_path() -> PathBuf {
     state_file_beside_log(&log_file, ENTRIES_PAUSED_FILE)
 }
 
+/// True when an operator marker at `path` is present. Fail closed: a
+/// stat error other than "not found" (permissions, I/O, a path that
+/// is not a directory) counts as present, so a marker we cannot rule
+/// out still halts entries instead of running through it.
+pub fn marker_present(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Default `logs` line count.
 pub const DEFAULT_LOG_LINES: usize = 100;
 /// SIGTERM grace before SIGKILL.
@@ -688,8 +699,7 @@ pub fn cmd_restart(live: bool) -> ! {
 /// `status`: one line on liveness.
 pub fn cmd_status() -> ! {
     let (pid_file, log_file) = resolve_paths();
-    let paused_note = state_file_beside_log(&log_file, ENTRIES_PAUSED_FILE)
-        .exists()
+    let paused_note = marker_present(&state_file_beside_log(&log_file, ENTRIES_PAUSED_FILE))
         .then(|| "entries PAUSED via kill switch; `pump-sentry resume` clears it".to_string());
     match running_daemon(&pid_file) {
         Some(info) => {
@@ -828,11 +838,19 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 /// Request path next to the log (`sell-<mint>.json`).
 pub fn sell_request_path(log_file: &Path, mint: &str) -> PathBuf {
-    let name = format!("sell-{mint}.json");
-    log_file
-        .parent()
-        .map(|d| d.join(&name))
-        .unwrap_or_else(|| PathBuf::from(name))
+    state_file_beside_log(log_file, &format!("sell-{mint}.json"))
+}
+
+/// Owner-only atomic write: staged temp beside the target, then
+/// rename. A failed write removes the staging file and leaves any
+/// existing target untouched (state files are never half-written).
+pub fn atomic_write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("part");
+    let staged = write_private_file(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged
 }
 
 /// Pending sell requests, sorted by mint.
@@ -880,13 +898,7 @@ pub fn cmd_sell(mint: &str) {
     }
     let path = sell_request_path(&log_file, mint);
     let body = format!("{{\"mint\":\"{mint}\",\"ts\":{}}}", unix_secs());
-    let tmp = path.with_extension("json.part");
-    let staged = match write_private_file(&tmp, body.as_bytes()) {
-        Ok(()) => std::fs::rename(&tmp, &path),
-        Err(e) => Err(e),
-    };
-    if let Err(e) = staged {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = atomic_write_private(&path, body.as_bytes()) {
         eprintln!("cannot queue sell request {}: {e}", path.display());
         std::process::exit(1);
     }
@@ -1424,6 +1436,38 @@ mod tests {
             state_file_beside_log(Path::new("bot.log"), ENTRIES_PAUSED_FILE),
             PathBuf::from(ENTRIES_PAUSED_FILE)
         );
+    }
+
+    #[test]
+    fn marker_present_fails_closed_and_atomic_write_stages() {
+        let dir = std::env::temp_dir().join(format!("pump-cli-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let marker = dir.join(ENTRIES_PAUSED_FILE);
+        assert!(!marker_present(&marker), "no marker: not paused");
+        write_private_file(&marker, b"paused\n").expect("write marker");
+        assert!(marker_present(&marker), "marker present");
+        // An undecidable stat (a path whose parent is a file) counts
+        // as present: a marker we cannot rule out must halt entries.
+        let file = dir.join("not-a-dir");
+        write_private_file(&file, b"").expect("write file");
+        assert!(
+            marker_present(&file.join(ENTRIES_PAUSED_FILE)),
+            "unstatable marker fails closed"
+        );
+
+        // Atomic write: target lands with the staged bytes, the staging
+        // file is gone, and no half-written target can exist.
+        let target = dir.join("day-state.json");
+        atomic_write_private(&target, b"{\"day\":1}").expect("atomic write");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read back"),
+            "{\"day\":1}"
+        );
+        assert!(
+            !target.with_extension("part").exists(),
+            "staging file retired"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

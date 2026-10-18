@@ -151,6 +151,10 @@ pub trait CostLedger {
 
     /// First-buy cost (dispatch plus rent). Debit on buys only.
     fn first_touch_cost_lamports(&self) -> u64;
+
+    /// What a landed-and-errored dispatch actually charged: base plus
+    /// priority (the tip transfer rolled back with the failed tx).
+    fn failed_dispatch_cost_lamports(&self) -> u64;
 }
 
 /// Custody event log. Prod writes WAL-first; stubs record calls for
@@ -169,6 +173,11 @@ pub trait WalSink {
     /// Retire a manual bag taken for exit (call AFTER taking): without
     /// this, a crash before compaction replays the bag as a ghost.
     fn unrecord_manual(&self, position: &LivePosition);
+
+    /// True once a WAL write failed this run: the claim of record is
+    /// broken, so no new entry may open until a restart (exits and
+    /// `sell <mint>` keep running).
+    fn wal_degraded(&self) -> bool;
 }
 
 /// Umbrella bound for the full live contract. New code depends on the
@@ -232,6 +241,10 @@ impl CostLedger for LiveTrader {
     fn first_touch_cost_lamports(&self) -> u64 {
         self.first_touch_cost_lamports()
     }
+
+    fn failed_dispatch_cost_lamports(&self) -> u64 {
+        self.failed_dispatch_cost_lamports()
+    }
 }
 
 impl WalSink for LiveTrader {
@@ -249,6 +262,10 @@ impl WalSink for LiveTrader {
 
     fn unrecord_manual(&self, position: &LivePosition) {
         self.unrecord_manual(position)
+    }
+
+    fn wal_degraded(&self) -> bool {
+        self.wal_degraded()
     }
 }
 
@@ -676,22 +693,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // previous mark also tells whether this tick continues a
         // drained episode: exits defer and the notice is per episode,
         // not per tick (a drain can last many rounds).
+        // Exact execution state for this tick: reserves feed state- and
+        // size-aware fills (paper entries and exits here, live sizing
+        // and floors at dispatch).
+        let mark = crate::live::paper_mark_from_tick(tick);
         let was_drained = {
             let mut marks = self.last_marks.lock().await;
             let was = marks
                 .get(&tick.mint)
                 .is_some_and(|(mark, _)| unpriceable_liquidity(mark.liquidity_usd));
             if !tick.complete {
-                marks.insert(
-                    tick.mint.clone(),
-                    (
-                        Mark {
-                            price: tick.price_usd,
-                            liquidity_usd: tick.liquidity_usd,
-                        },
-                        tick.observed_at,
-                    ),
-                );
+                marks.insert(tick.mint.clone(), (mark, tick.observed_at));
             }
             was
         };
@@ -731,8 +743,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 if unpriceable {
                     self.report_drained(&tick.mint, tick.liquidity_usd, was_drained, "live exit");
                 } else {
-                    self.live_sell(&tick.mint, tick.price_usd, tick.liquidity_usd, 1.0)
-                        .await;
+                    self.live_sell(&tick.mint, &mark, 1.0).await;
                 }
             }
             self.recheck_live_pending().await;
@@ -782,12 +793,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     Some(ExitReason::Manual)
                 } else {
                     // Realizable basis: triggers agree with settlement.
-                    portfolio.check_exit_realizable(
-                        id,
-                        tick.price_usd,
-                        tick.liquidity_usd,
-                        tick.observed_at,
-                    )
+                    portfolio.check_exit_realizable(id, &mark, tick.observed_at)
                 };
                 let Some(reason) = reason else { continue };
                 // Moonbag TP scales out once.
@@ -803,8 +809,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 match portfolio.close_partial_position(
                     id,
                     exit_fraction,
-                    tick.price_usd,
-                    tick.liquidity_usd,
+                    &mark,
                     reason,
                     tick.observed_at,
                 ) {
@@ -817,10 +822,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         // model exit; the live leg settles (or defers) below.
                         gap_notes.push((trade.exit_price, trade.quantity));
                         let is_moonbag_exit = trade.fraction_closed < 1.0;
+                        // What the exit actually netted vs the mark:
+                        // size impact + venue fee, the liquidation
+                        // discount the book realized.
+                        let vs_mark_bps = if mark.price > 0.0 {
+                            (trade.exit_price / mark.price - 1.0) * 10_000.0
+                        } else {
+                            f64::NAN
+                        };
                         let equity = portfolio.snapshot(&card_marks).equity;
                         info!(mint = %tick.mint, id, reason = ?trade.reason,
                         net = format!("{:+.2}", headline),
                         pct = format!("{:+.2}%", trade.net_pnl_percent),
+                        realizable_vs_mark_bps = format!("{:+.0}", vs_mark_bps),
                         "paper position closed");
                         closed_cards.push((
                             format!("{:?}", trade.reason),
@@ -867,8 +881,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         // Live first, breaker second: unsettled live defers the feed.
         let live_settled = if closed_fraction > 0.0 {
-            self.live_sell(&tick.mint, tick.price_usd, tick.liquidity_usd, closed_fraction)
-                .await
+            self.live_sell(&tick.mint, &mark, closed_fraction).await
         } else {
             true
         };

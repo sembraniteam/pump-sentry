@@ -88,7 +88,19 @@ async fn replay_live_wal(
 ) {
     use crate::wal;
     let path = live_wal_path();
-    let replay = wal::replay_file(&path);
+    // An unreadable WAL is not an empty WAL: custody (bags, pending
+    // buys, resend guard) would come back UNKNOWN, so live must not
+    // start blind — refuse, loudly, and let the operator fix the file.
+    let replay = match wal::replay_file(&path) {
+        Ok(replay) => replay,
+        Err(e) => {
+            eprintln!(
+                "cannot read live WAL {}: {e}\nlive custody is unknown without it (bags, pending buys, sell guards) — refusing to run live.\nFix permissions/ownership on that file, then retry.",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    };
     if replay.pending.is_empty()
         && replay.positions.is_empty()
         && replay.manual.is_empty()
@@ -652,7 +664,10 @@ async fn run_pipeline(live_arg: bool) {
         .with_hot_wallet_cap(hot_cap);
         info!(payer = %wallet.pubkey(), "live wallet loaded");
         if hot_cap > 0 {
-            info!(cap_sol = settings.hot_wallet_max_sol, "hot-wallet cap armed: entries refuse while the wallet holds more SOL (sweep the excess)");
+            info!(
+                cap_sol = settings.hot_wallet_max_sol,
+                "hot-wallet cap armed: entries refuse while the wallet holds more SOL (sweep the excess)"
+            );
         }
         if settings.sim_strict {
             info!("strict preflight on: unproven simulations refuse to dispatch");
@@ -801,7 +816,7 @@ async fn run_pipeline(live_arg: bool) {
     // Polled below each gate round; flip the state now so boot tells
     // the truth on the first log line.
     let paused_path = cli::entries_paused_path();
-    pipeline.set_entries_paused(paused_path.exists());
+    pipeline.set_entries_paused(cli::marker_present(&paused_path));
 
     // Crash replay (live only).
     if live_mode {
@@ -1033,7 +1048,7 @@ async fn run_pipeline(live_arg: bool) {
                 // Kill switch: entries halt while the marker exists.
                 // Polled here (one stat per round) so a flip needs no
                 // restart; the edge is logged once.
-                pipeline.set_entries_paused(paused_path.exists());
+                pipeline.set_entries_paused(cli::marker_present(&paused_path));
                 // Ingestion-ban edges: card on trip (stop hammering,
                 // check token/quota, or clear yellowstone_endpoint for
                 // WS mode), note on recovery. The latch lives in the

@@ -3,7 +3,8 @@
 use crate::settings::now_secs;
 use crate::wal;
 use executor::{
-    BuyOrder, BundleStatus, DispatchVerdict, ExecutorError, JitoReceipt, SellOrder, SwapExecutor,
+    BundleStatus, BuyOrder, DeadReason, DispatchVerdict, ExecutorError, JitoReceipt, SellOrder,
+    SwapExecutor,
 };
 use futures_util::stream::StreamExt;
 use ids::{ATA_RENT_LAMPORTS, BASE_TX_FEE_LAMPORTS};
@@ -41,6 +42,12 @@ pub enum LiveError {
     /// Accepted but never confirmed. `Confirmed failure` means no fill.
     #[error("unconfirmed live fill: {0}")]
     Unconfirmed(String),
+    /// Dispatch proven dead before landing. Only `FailedOnChain` cost
+    /// money: the chain charged the base + priority fee (the tip
+    /// transfer rolls back with the failed transaction); never-forwarded
+    /// and expired dispatches paid nothing.
+    #[error("dead live dispatch ({reason}): {context}")]
+    Dead { reason: DeadReason, context: String },
     /// Timed out with no signature: fill unknown, needs review.
     /// Boxed for `clippy::result_large_err`.
     #[error("unknown dispatch fill: {reason}")]
@@ -123,12 +130,12 @@ pub struct LiveBuyParams {
     pub assoc_curve: Pubkey,
     /// Exposure in USD.
     pub notional_usd: f64,
-    /// Price in USD per token.
-    pub price_usd: f64,
     /// SOL price in USD.
     pub sol_usd: f64,
-    /// Curve liquidity in USD (zero pays fee-only).
-    pub liquidity_usd: f64,
+    /// Market state: spot, book liquidity, and (when the confirm tick
+    /// carried it) the exact curve reserves. One carrier, so the paper
+    /// book, the guard, and live sizing quote the same state.
+    pub mark: simulator::Mark,
     /// Fee tier. `None` is standard.
     pub venue_fee_bps: Option<f64>,
     pub creator: Option<Pubkey>,
@@ -149,9 +156,11 @@ pub struct LiveBuyPlan {
 #[derive(Debug, Clone, Copy)]
 pub struct LiveSellParams<'a> {
     pub position: &'a LivePosition,
-    pub price_usd: f64,
+    /// Market state at the exit tick: the floor quotes the same spot,
+    /// liquidity, and (when present) exact reserves the paper book
+    /// settles against.
+    pub mark: simulator::Mark,
     pub sol_usd: f64,
-    pub liquidity_usd: f64,
     /// Fee tier. `None` is standard.
     pub venue_fee_bps: Option<f64>,
     /// Jito tip (congestion-aware; caller computes via `effective_tip`).
@@ -261,6 +270,48 @@ pub fn paper_dispatch_legs_usd(
     )
 }
 
+/// Exact model quote state from a tick's parsed curve account. The one
+/// adapter between the wire-side tick (`curve::ExecState`) and the
+/// simulator's quote input (`simulator::CurveReserves`): plain field
+/// copies, no math (the model owns the quote formula).
+pub fn curve_reserves(exec: &curve::ExecState) -> simulator::CurveReserves {
+    simulator::CurveReserves {
+        vq_lamports: exec.reserves.virtual_sol_reserves,
+        vt_base: exec.reserves.virtual_token_reserves,
+        real_tokens: exec.reserves.real_token_reserves,
+        decimals: exec.decimals,
+        sol_usd: exec.sol_usd,
+    }
+}
+
+/// Market mark for one tick: spot, depth, and the exact curve state
+/// when the tick carried parsed reserves. Single tick→model adapter, so
+/// paper fills, live sizing, and snapshots price the same state.
+pub fn mark_from_tick(tick: &curve::PriceTick) -> simulator::Mark {
+    simulator::Mark {
+        price: tick.price_usd,
+        liquidity_usd: tick.liquidity_usd,
+        curve: tick.exec.as_ref().map(curve_reserves),
+    }
+}
+
+/// Mark for paper settlement on a tick: like [`mark_from_tick`], except
+/// a migrated (complete) curve carries no reserves — the live venue is
+/// the pool then, and the curve's reserves are a stale snapshot, not a
+/// market. Migration closes book the stale curve spot by design
+/// (documented boundary; the live pool leg settles at vault reserves).
+pub fn paper_mark_from_tick(tick: &curve::PriceTick) -> simulator::Mark {
+    let mark = mark_from_tick(tick);
+    if tick.complete {
+        simulator::Mark {
+            curve: None,
+            ..mark
+        }
+    } else {
+        mark
+    }
+}
+
 /// Observed buy fill priced in USD (entry-gap calibration reading).
 /// Pure observation — no judgment. The tracker computes the signed
 /// gap vs the paper quote (single owner of gap math, like exits).
@@ -342,13 +393,13 @@ fn fee_inclusive_cost(base_lamports: u64, fee_bps_per_side: f64) -> Option<u64> 
 /// bad inputs, curve exhaustion, or overflow (fail-closed).
 pub fn plan_buy(
     notional_usd: f64,
-    price_usd: f64,
     sol_usd: f64,
     slippage_bps: u64,
-    liquidity_usd: f64,
     fee_bps_per_side: f64,
     decimals: u8,
+    mark: &simulator::Mark,
 ) -> Option<LiveBuyPlan> {
+    let price_usd = mark.price;
     if !notional_usd.is_finite() || notional_usd <= 0.0 {
         return None;
     }
@@ -364,12 +415,32 @@ pub fn plan_buy(
     if decimals > 18 {
         return None;
     }
-    // Paper parity: size from the uncapped execution fill. `None` when
-    // the curve cannot absorb the size (`notional >= liquidity`, like
-    // `PaperPortfolio::open_position_params` -> `CurveExhausted`) — no
-    // capped fiction.
+    // Exact state when the tick carried reserves: the chain's own
+    // inverse and cost, identical to the paper book's entry fill (up to
+    // whole-token dust) and to the dispatch-time guard. `None` when the
+    // curve cannot absorb the ticket — no capped fiction.
+    if let Some(curve) = mark.curve {
+        let lamports = notional_usd / sol_usd * LAMPORTS_PER_SOL;
+        let base = u64_from_f64_floor(lamports)?;
+        let amount_tokens = curve.buy_tokens_base(base, fee_bps_per_side)?;
+        if amount_tokens == 0 {
+            return None;
+        }
+        let max_sol_cost = apply_slippage_ceiling(
+            curve.buy_cost_lamports(amount_tokens, fee_bps_per_side)?,
+            slippage_bps,
+        )?;
+        return Some(LiveBuyPlan {
+            amount_tokens,
+            max_sol_cost,
+        });
+    }
+    // Proxy basis (tests, synthetic prices): size from the uncapped
+    // execution fill. `None` when the curve cannot absorb the size
+    // (`notional >= liquidity`, like `PaperPortfolio::open_position_params`
+    // -> `CurveExhausted`) — no capped fiction.
     let fill = FillModel::default().with_venue_fee_bps(fee_bps_per_side);
-    let slip = fill.try_slip_fraction_for_side(Side::Long, notional_usd, liquidity_usd)?;
+    let slip = fill.try_slip_fraction_for_side(Side::Long, notional_usd, mark.liquidity_usd)?;
     let scale = 10f64.powi(decimals as i32);
     let amount_f = (notional_usd / price_usd / (1.0 + slip) * scale).floor();
     let amount_tokens = u64_from_f64_floor(amount_f)?;
@@ -394,14 +465,13 @@ pub fn plan_buy(
 /// authorizes any price).
 pub fn plan_sell_floor(
     amount_tokens: u64,
-    price_usd: f64,
     sol_usd: f64,
     slippage_bps: u64,
-    liquidity_usd: f64,
     fee_bps_per_side: f64,
     decimals: u8,
+    mark: &simulator::Mark,
 ) -> Option<u64> {
-    if amount_tokens == 0 || !price_usd.is_finite() || price_usd <= 0.0 {
+    if amount_tokens == 0 || !mark.price.is_finite() || mark.price <= 0.0 {
         return None;
     }
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
@@ -416,14 +486,27 @@ pub fn plan_sell_floor(
     if decimals > 18 {
         return None;
     }
+    // Exact state when the exit tick carried reserves: fee-deducted net
+    // for the actual size, then the floor under slippage — the same sell
+    // math the paper book books and the executor re-quotes at dispatch.
+    // Unpriceable (drained curve) fails closed.
+    if let Some(curve) = mark.curve {
+        let net = curve.sell_net_lamports(amount_tokens, fee_bps_per_side)?;
+        if net == 0 {
+            return None;
+        }
+        let floor = (u128::from(net) * (u128::from(BPS_DENOMINATOR) - u128::from(slippage_bps))
+            / u128::from(BPS_DENOMINATOR)) as u64;
+        return if floor == 0 { None } else { Some(floor) };
+    }
     let scale = 10f64.powi(decimals as i32);
-    // Paper parity: floor from uncapped modeled proceeds. `None` when
-    // the proceeds are unpriceable (bad/unknown liquidity) — no capped
-    // fiction.
-    let gross_notional = amount_tokens as f64 / scale * price_usd;
+    // Proxy basis (tests, synthetic prices): floor from uncapped modeled
+    // proceeds. `None` when the proceeds are unpriceable (bad/unknown
+    // liquidity) — no capped fiction.
+    let gross_notional = amount_tokens as f64 / scale * mark.price;
     let slip = FillModel::default()
         .with_venue_fee_bps(fee_bps_per_side)
-        .try_slip_fraction_for_side(Side::Short, gross_notional, liquidity_usd)?;
+        .try_slip_fraction_for_side(Side::Short, gross_notional, mark.liquidity_usd)?;
     let lamports = gross_notional * (1.0 - slip).max(0.0) / sol_usd * LAMPORTS_PER_SOL;
     // Same `>=` edge as `plan_buy` (cast saturates).
     if !lamports.is_finite() || lamports <= 0.0 || lamports >= u64::MAX as f64 {
@@ -458,6 +541,9 @@ pub struct LiveTrader {
     compute_unit_limit: u32,
     /// WAL path (`None` disables IO).
     wal_path: Option<PathBuf>,
+    /// WAL write failures latch entries off: the claim of record is
+    /// broken until an operator restart. Shared (clones agree).
+    wal_degraded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Unconfirmed buys, re-polled until settled or out of tries.
     pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
     /// Recent mark prices per mint for volatility-adaptive slippage.
@@ -536,8 +622,9 @@ pub struct PendingRecheck {
 pub enum RecheckOutcome {
     /// Landed: track it and automate exits.
     Confirmed,
-    /// Errored on-chain: nothing held, drop it.
-    FailedOnChain,
+    /// Provably dead: nothing held, drop it. `FailedOnChain` burned
+    /// base + priority on-chain (the tip rolled back).
+    Dead(DeadReason),
     /// Still unknown: keep for next round.
     StillUnknown,
     /// Out of tries: drop and escalate.
@@ -555,6 +642,7 @@ impl LiveTrader {
             priority_fee_micro_lamports: 0,
             compute_unit_limit: 0,
             wal_path: None,
+            wal_degraded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             marks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             vol_window_secs: 0,
             vol_extra_cap_bps: 0,
@@ -677,6 +765,13 @@ impl LiveTrader {
             .saturating_add(BASE_TX_FEE_LAMPORTS)
     }
 
+    /// What a dispatch that landed and errored actually charged: base
+    /// plus priority. The tip transfer executes only on success, so a
+    /// failed tx rolls it back and this is the honest burn.
+    pub fn failed_dispatch_cost_lamports(&self) -> u64 {
+        self.dispatch_cost_for_tip(0)
+    }
+
     /// First-buy cost: dispatch plus one ATA rent.
     pub fn first_touch_cost_lamports(&self) -> u64 {
         self.dispatch_cost_lamports()
@@ -792,7 +887,9 @@ impl LiveTrader {
                     }
                     tracing::warn!(%mint, %bundle_id, "WAL replay: prior sell unresolved; resends hold until it resolves");
                 }
-                PriorSell::Landed => tracing::warn!(%mint, %bundle_id, "WAL replay: prior sell ALREADY LANDED on-chain; not seeding a hold — ledger may be stale, inspect"),
+                PriorSell::Landed => {
+                    tracing::warn!(%mint, %bundle_id, "WAL replay: prior sell ALREADY LANDED on-chain; not seeding a hold — ledger may be stale, inspect")
+                }
                 PriorSell::Dead => {}
             }
         }
@@ -897,7 +994,7 @@ impl LiveTrader {
                     DispatchVerdict::Dead(reason) => {
                         tracing::warn!(mint = %entry.position.mint, bundle = %entry.bundle_id, %reason,
                             "pending LIVE buy provably dead; no fill");
-                        RecheckOutcome::FailedOnChain
+                        RecheckOutcome::Dead(reason)
                     }
                     DispatchVerdict::Unknown(why) => {
                         let attempts = entry.attempts.saturating_add(1);
@@ -1009,25 +1106,27 @@ impl LiveTrader {
         &self,
         req: &LiveBuyParams,
     ) -> Result<(LivePosition, String, Option<BuyFill>), LiveError> {
-        let (mint, curve, assoc_curve, notional_usd, price_usd, sol_usd) = (
-            req.mint, req.curve, req.assoc_curve, req.notional_usd, req.price_usd, req.sol_usd,
+        let (mint, curve, assoc_curve, notional_usd, sol_usd) = (
+            req.mint,
+            req.curve,
+            req.assoc_curve,
+            req.notional_usd,
+            req.sol_usd,
         );
+        let price_usd = req.mark.price;
         let creator = req.creator;
         // String-boundary uses (marks, pending map, logs) derive once
         // from the validated key; dispatch uses the `Pubkey` directly.
         let mint_str = mint.to_string();
         let plan = plan_buy(
             notional_usd,
-            price_usd,
             sol_usd,
             self.effective_slippage_bps(&mint_str, now_secs()),
-            req.liquidity_usd,
             req.venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
             req.decimals,
+            &req.mark,
         )
-        .ok_or_else(|| {
-            LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}"))
-        })?;
+        .ok_or_else(|| LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}")))?;
         self.note_mark(&mint_str, price_usd, now_secs());
         // Bound once: the order and the gap math must agree on the tip
         // paid (a second oracle read could drift between the two).
@@ -1115,10 +1214,10 @@ impl LiveTrader {
                 Self::untrack_pending(&self.pending, &mint_str);
                 // Proven no-fill: retire the line so boot skips it.
                 self.write_wal_settled(&receipt.bundle_id);
-                Err(LiveError::Unconfirmed(format!(
-                    "buy bundle {} Confirmed failure: {reason}; no fill",
-                    receipt.bundle_id
-                )))
+                Err(LiveError::Dead {
+                    reason,
+                    context: format!("buy bundle {}; no fill", receipt.bundle_id),
+                })
             }
             DispatchVerdict::Unknown(why) => {
                 // May land late: keep for recheck, never resend.
@@ -1171,7 +1270,9 @@ impl LiveTrader {
         }
     }
 
-    /// Append one line (best-effort, synced).
+    /// Append one line (synced). A failure cannot undo the dispatch
+    /// that already happened, but it latches entries off: no further
+    /// live risk may open while custody cannot be recorded.
     fn wal_append(&self, line: String) {
         let Some(path) = self.wal_path.as_ref() else {
             return;
@@ -1192,23 +1293,42 @@ impl LiveTrader {
         match opts.open(path) {
             Ok(mut f) => {
                 if writeln!(f, "{line}").is_err() || f.sync_all().is_err() {
-                    tracing::warn!("live WAL append/fsync failed (non-fatal)");
+                    self.mark_wal_degraded("append/fsync failed");
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "live WAL unwritable (non-fatal)"),
+            Err(e) => self.mark_wal_degraded(&format!("open failed: {e}")),
         }
     }
 
-    /// Append one typed line (best-effort, synced). No-op without a WAL
-    /// path; a serialize failure would be an engine bug, so it is
-    /// warned instead of swallowed or panicked on.
+    /// Latch a WAL write failure. The current dispatch stands (it is
+    /// already sent and tracked in memory); from here no new entry may
+    /// open until an operator restart with a working WAL.
+    fn mark_wal_degraded(&self, why: &str) {
+        use std::sync::atomic::Ordering;
+        if self.wal_degraded.swap(true, Ordering::Relaxed) {
+            tracing::error!(reason = why, "live WAL write still failing");
+        } else {
+            tracing::error!(
+                reason = why,
+                "live WAL WRITE FAILED: claim of record broken; new entries halted until restart (exits and `sell <mint>` keep running)"
+            );
+        }
+    }
+
+    /// True once a WAL write failed this run (see `mark_wal_degraded`).
+    pub fn wal_degraded(&self) -> bool {
+        self.wal_degraded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Append one typed line (synced). No-op without a WAL path; a
+    /// serialize failure would be an engine bug: latched, not panicked.
     fn wal_record(&self, line: &wal::WalLine) {
         if self.wal_path.is_none() {
             return;
         }
         match serde_json::to_string(line) {
             Ok(json) => self.wal_append(json),
-            Err(e) => tracing::warn!(error = %e, "live WAL line serialize failed (non-fatal)"),
+            Err(e) => self.mark_wal_degraded(&format!("serialize failed: {e}")),
         }
     }
 
@@ -1376,15 +1496,14 @@ impl LiveTrader {
         let slip = self.effective_slippage_bps(&mint_str, now_secs());
         let floor = plan_sell_floor(
             position.amount_tokens,
-            req.price_usd,
             req.sol_usd,
             slip,
-            req.liquidity_usd,
             req.venue_fee_bps.unwrap_or(VENUE_FEE_BPS as f64),
             req.decimals,
+            &req.mark,
         )
         .ok_or_else(|| LiveError::BadOrder(format!("cannot floor sell of {}", position.mint)))?;
-        self.note_mark(&mint_str, req.price_usd, now_secs());
+        self.note_mark(&mint_str, req.mark.price, now_secs());
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
             self.executor.sell_jito(&SellOrder {
@@ -1442,10 +1561,10 @@ impl LiveTrader {
                 // resend guard must not pay a status query for it, nor
                 // hold a resend for a bundle that cannot compete.
                 self.clear_sell_bundle(mint);
-                Err(LiveError::Unconfirmed(format!(
-                    "{label} bundle {} dead ({reason}); still holding",
-                    receipt.bundle_id
-                )))
+                Err(LiveError::Dead {
+                    reason,
+                    context: format!("{label} bundle {}; still holding", receipt.bundle_id),
+                })
             }
             DispatchVerdict::Unknown(why) => Err(LiveError::Unconfirmed(format!(
                 "{label} bundle {} unconfirmed after {:?} ({why}); still holding",
@@ -1613,9 +1732,28 @@ mod tests {
         assert_eq!(bare.effective_tip(9).await, 0);
     }
 
+    /// Proxy-basis test mark (spot + book liquidity, no curve state).
+    fn mark(price_usd: f64, liquidity_usd: f64) -> simulator::Mark {
+        simulator::Mark::new(price_usd, liquidity_usd)
+    }
+
+    /// Test mark carrying exact curve state.
+    fn curve_mark(
+        price_usd: f64,
+        liquidity_usd: f64,
+        curve: simulator::CurveReserves,
+    ) -> simulator::Mark {
+        simulator::Mark {
+            price: price_usd,
+            liquidity_usd,
+            curve: Some(curve),
+        }
+    }
+
     #[test]
     fn buy_plan_math() {
-        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 6).expect("plan");
+        let plan =
+            plan_buy(10.0, 150.0, 200, 125.0, 6, &mark(0.000_004_2, 30_000.0)).expect("plan");
         assert_eq!(plan.amount_tokens, 2_350_783_728_484);
         // Fee-inclusive cost 67_500_001 (single-ceil 67_500_000 plus the
         // double-ceil cover lamport), guarded at +200bps.
@@ -1639,8 +1777,9 @@ mod tests {
 
     #[test]
     fn buy_plan_custom_fee_sizes_and_funds_at_tier() {
-        let std = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 6).expect("std");
-        let cus = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 345.0, 6).expect("custom");
+        let std = plan_buy(10.0, 150.0, 200, 125.0, 6, &mark(0.000_004_2, 30_000.0)).expect("std");
+        let cus =
+            plan_buy(10.0, 150.0, 200, 345.0, 6, &mark(0.000_004_2, 30_000.0)).expect("custom");
         assert!(cus.amount_tokens < std.amount_tokens);
         assert!(cus.max_sol_cost > std.max_sol_cost);
         use simulator::{PaperPortfolio, Side};
@@ -1650,9 +1789,8 @@ mod tests {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 0.000_004_2,
+                mark: simulator::Mark::new(0.000_004_2, 30_000.0),
                 notional_usd: 10.0,
-                liquidity_usd: 30_000.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1674,18 +1812,18 @@ mod tests {
         // (`CurveExhausted`): a buy at/above liquidity is unpriceable,
         // never a capped fill.
         assert_eq!(
-            plan_buy(30_000.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 6),
+            plan_buy(30_000.0, 150.0, 200, 125.0, 6, &mark(0.000_004_2, 30_000.0)),
             None
         );
         assert_eq!(
-            plan_buy(60_000.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 6),
+            plan_buy(60_000.0, 150.0, 200, 125.0, 6, &mark(0.000_004_2, 30_000.0)),
             None
         );
         // Just below still prices.
-        assert!(plan_buy(29_999.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 6).is_some());
+        assert!(plan_buy(29_999.0, 150.0, 200, 125.0, 6, &mark(0.000_004_2, 30_000.0)).is_some());
         // Unknown liquidity is unpriceable too.
         assert_eq!(
-            plan_buy(10.0, 0.000_004_2, 150.0, 200, f64::NAN, 125.0, 6),
+            plan_buy(10.0, 150.0, 200, 125.0, 6, &mark(0.000_004_2, f64::NAN)),
             None
         );
         // ... and the paper leg agrees (CurveExhausted, not a fill).
@@ -1695,9 +1833,8 @@ mod tests {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 0.000_004_2,
+                mark: simulator::Mark::new(0.000_004_2, 30_000.0),
                 notional_usd: 30_000.0,
-                liquidity_usd: 30_000.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1712,12 +1849,13 @@ mod tests {
 
     #[test]
     fn plan_buy_threads_decimals() {
-        let six = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 6).expect("plan");
-        let nine = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 9).expect("plan");
+        let six = plan_buy(10.0, 150.0, 200, 125.0, 6, &mark(0.000_004_2, 30_000.0)).expect("plan");
+        let nine =
+            plan_buy(10.0, 150.0, 200, 125.0, 9, &mark(0.000_004_2, 30_000.0)).expect("plan");
         assert_eq!(nine.amount_tokens / 1000, six.amount_tokens);
         assert_eq!(nine.max_sol_cost, six.max_sol_cost);
         assert_eq!(
-            plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 19),
+            plan_buy(10.0, 150.0, 200, 125.0, 19, &mark(0.000_004_2, 30_000.0)),
             None
         );
     }
@@ -1736,28 +1874,49 @@ mod tests {
 
     #[test]
     fn buy_plan_rejects_degenerate() {
-        assert_eq!(plan_buy(0.0, 1.0, 150.0, 200, 30_000.0, 125.0, 6), None);
-        assert_eq!(plan_buy(10.0, 0.0, 150.0, 200, 30_000.0, 125.0, 6), None);
-        assert_eq!(plan_buy(10.0, 1.0, 0.0, 200, 30_000.0, 125.0, 6), None);
         assert_eq!(
-            plan_buy(f64::NAN, 1.0, 150.0, 200, 30_000.0, 125.0, 6),
+            plan_buy(0.0, 150.0, 200, 125.0, 6, &mark(1.0, 30_000.0)),
             None
         );
-        assert_eq!(plan_buy(1e-12, 1.0, 150.0, 200, 30_000.0, 125.0, 6), None);
-        assert_eq!(plan_buy(10.0, 1.0, 150.0, 200, 30_000.0, f64::NAN, 6), None);
-        assert_eq!(plan_buy(10.0, 1.0, 150.0, 200, 30_000.0, -1.0, 6), None);
+        assert_eq!(
+            plan_buy(10.0, 150.0, 200, 125.0, 6, &mark(0.0, 30_000.0)),
+            None
+        );
+        assert_eq!(
+            plan_buy(10.0, 0.0, 200, 125.0, 6, &mark(1.0, 30_000.0)),
+            None
+        );
+        assert_eq!(
+            plan_buy(f64::NAN, 150.0, 200, 125.0, 6, &mark(1.0, 30_000.0)),
+            None
+        );
+        assert_eq!(
+            plan_buy(1e-12, 150.0, 200, 125.0, 6, &mark(1.0, 30_000.0)),
+            None
+        );
+        assert_eq!(
+            plan_buy(10.0, 150.0, 200, f64::NAN, 6, &mark(1.0, 30_000.0)),
+            None
+        );
+        assert_eq!(
+            plan_buy(10.0, 150.0, 200, -1.0, 6, &mark(1.0, 30_000.0)),
+            None
+        );
     }
 
     #[test]
     fn sell_floor_math() {
-        let floor = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 125.0, 6).expect("floor");
+        let floor =
+            plan_sell_floor(1_000_000, 150.0, 200, 125.0, 6, &mark(2.0, 30_000.0)).expect("floor");
         assert_eq!(floor, 12_902_461);
     }
 
     #[test]
     fn sell_floor_custom_fee_floors_lower() {
-        let std = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 125.0, 6).expect("std");
-        let cus = plan_sell_floor(1_000_000, 2.0, 150.0, 200, 30_000.0, 345.0, 6).expect("custom");
+        let std =
+            plan_sell_floor(1_000_000, 150.0, 200, 125.0, 6, &mark(2.0, 30_000.0)).expect("std");
+        let cus =
+            plan_sell_floor(1_000_000, 150.0, 200, 345.0, 6, &mark(2.0, 30_000.0)).expect("custom");
         assert!(cus < std, "custom {cus} vs std {std}");
     }
 
@@ -1774,35 +1933,50 @@ mod tests {
 
     #[test]
     fn buy_plan_rejects_overflow() {
-        assert_eq!(plan_buy(1e20, 1e-10, 150.0, 200, 30_000.0, 125.0, 6), None);
-        assert_eq!(plan_buy(1e13, 1e6, 150.0, 200, 30_000.0, 125.0, 6), None);
+        assert_eq!(
+            plan_buy(1e20, 150.0, 200, 125.0, 6, &mark(1e-10, 30_000.0)),
+            None
+        );
+        assert_eq!(
+            plan_buy(1e13, 150.0, 200, 125.0, 6, &mark(1e6, 30_000.0)),
+            None
+        );
     }
 
     #[test]
     fn sell_floor_rejects_zero_floor() {
         assert_eq!(
-            plan_sell_floor(1_000_000, 2.0, 150.0, 10_000, 30_000.0, 125.0, 6),
+            plan_sell_floor(1_000_000, 150.0, 10_000, 125.0, 6, &mark(2.0, 30_000.0)),
             None
         );
         assert_eq!(
-            plan_sell_floor(1_000_000, 2.0, 150.0, 10_001, 30_000.0, 125.0, 6),
+            plan_sell_floor(1_000_000, 150.0, 10_001, 125.0, 6, &mark(2.0, 30_000.0)),
             None
         );
-        assert_eq!(plan_sell_floor(1, 1e-9, 1e9, 200, 30_000.0, 125.0, 6), None);
+        assert_eq!(
+            plan_sell_floor(1, 1e9, 200, 125.0, 6, &mark(1e-9, 30_000.0)),
+            None
+        );
     }
 
     #[test]
     fn sell_floor_slippage_floors_in_integers() {
         // Unknown liquidity is unpriceable: fail closed, no fee-only guess.
-        assert_eq!(plan_sell_floor(1, 0.2, 150.0, 0, f64::NAN, 125.0, 6), None);
-        assert_eq!(plan_sell_floor(1, 0.2, 150.0, 0, -1.0, 125.0, 6), None);
+        assert_eq!(
+            plan_sell_floor(1, 150.0, 0, 125.0, 6, &mark(0.2, f64::NAN)),
+            None
+        );
+        assert_eq!(
+            plan_sell_floor(1, 150.0, 0, 125.0, 6, &mark(0.2, -1.0)),
+            None
+        );
         // Exact one-token proceeds: the slippage haircut floors in integers.
         assert_eq!(
-            plan_sell_floor(1_000_000, 150.0, 150.0, 0, 0.0, 0.0, 6),
+            plan_sell_floor(1_000_000, 150.0, 0, 0.0, 6, &mark(150.0, 0.0)),
             Some(1_000_000_000)
         );
         assert_eq!(
-            plan_sell_floor(1_000_000, 150.0, 150.0, 1, 0.0, 0.0, 6),
+            plan_sell_floor(1_000_000, 150.0, 1, 0.0, 6, &mark(150.0, 0.0)),
             Some(999_900_000)
         );
         let floored = (10_001u64 as u128 * (10_000 - 1) as u128 / 10_000) as u64;
@@ -1812,23 +1986,23 @@ mod tests {
     #[test]
     fn sell_floor_rejects_degenerate() {
         assert_eq!(
-            plan_sell_floor(0, 2.0, 150.0, 200, 30_000.0, 125.0, 6),
+            plan_sell_floor(0, 150.0, 200, 125.0, 6, &mark(2.0, 30_000.0)),
             None
         );
         assert_eq!(
-            plan_sell_floor(100, 0.0, 150.0, 200, 30_000.0, 125.0, 6),
+            plan_sell_floor(100, 150.0, 200, 125.0, 6, &mark(0.0, 30_000.0)),
             None
         );
         assert_eq!(
-            plan_sell_floor(u64::MAX, 1e12, 1e-6, 0, 30_000.0, 125.0, 6),
+            plan_sell_floor(u64::MAX, 1e-6, 0, 125.0, 6, &mark(1e12, 30_000.0)),
             None
         );
         assert_eq!(
-            plan_sell_floor(100, 2.0, 150.0, 200, 30_000.0, f64::NAN, 6),
+            plan_sell_floor(100, 150.0, 200, f64::NAN, 6, &mark(2.0, 30_000.0)),
             None
         );
         assert_eq!(
-            plan_sell_floor(100, 2.0, 150.0, 200, 30_000.0, -1.0, 6),
+            plan_sell_floor(100, 150.0, 200, -1.0, 6, &mark(2.0, 30_000.0)),
             None
         );
     }
@@ -1842,9 +2016,8 @@ mod tests {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: "MINT",
                 side: Side::Long,
-                quote: 0.000_004_2,
+                mark: simulator::Mark::new(0.000_004_2, 30_000.0),
                 notional_usd: 10.0,
-                liquidity_usd: 30_000.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
                 trailing: false,
@@ -1855,9 +2028,11 @@ mod tests {
             })
             .expect("open");
         let qty = paper.position(id).expect("pos").quantity;
-        let plan = plan_buy(10.0, 0.000_004_2, 150.0, 200, 30_000.0, 125.0, 6).expect("plan");
+        let plan =
+            plan_buy(10.0, 150.0, 200, 125.0, 6, &mark(0.000_004_2, 30_000.0)).expect("plan");
         assert!((plan.amount_tokens as i128 - qty as i128 * 1_000_000).abs() < 1_000_000);
-        let floor = plan_sell_floor(1_000_000, 3.0, 150.0, 200, 30_000.0, 125.0, 6).expect("floor");
+        let floor =
+            plan_sell_floor(1_000_000, 150.0, 200, 125.0, 6, &mark(3.0, 30_000.0)).expect("floor");
         let gross = 1_000_000_f64 / 1e6 * 3.0 / 150.0 * LAMPORTS_PER_SOL;
         assert!((floor as f64) < gross, "floor {floor} vs gross {gross}");
         assert!((floor as f64) > gross * 0.9, "floor {floor} vs gross {gross}");
@@ -1918,6 +2093,32 @@ mod tests {
         )
         .expect("executor");
         LiveTrader::new(exec, 200, tip_lamports).with_dispatch_fees(unit_limit, unit_price)
+    }
+
+    #[test]
+    fn wal_write_failure_latches_entries_off() {
+        // A WAL write failure cannot unsend the dispatch, but it must
+        // latch: no further entry opens while custody is unrecorded.
+        let dir = std::env::temp_dir().join(format!("pump-live-wal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        // A WAL path under a regular file: create_dir_all and open both
+        // fail, so every append is a write failure.
+        let blocked = dir.join("not-a-dir");
+        std::fs::write(&blocked, b"").expect("file");
+        let trader = cost_trader(10_000, 0, 0).with_wal(blocked.join("wal.jsonl"));
+        assert!(!trader.wal_degraded(), "clean start");
+        trader.acknowledge_buy(
+            &LivePosition {
+                mint: test_pubkey(7),
+                curve: test_pubkey(8),
+                assoc_curve: test_pubkey(9),
+                amount_tokens: 1_000,
+                creator: None,
+            },
+            "B1",
+        );
+        assert!(trader.wal_degraded(), "failed write latches entries off");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2007,6 +2208,158 @@ mod tests {
         assert_eq!(
             bare.first_touch_cost_lamports(),
             BASE_TX_FEE_LAMPORTS + ATA_RENT_LAMPORTS
+        );
+    }
+
+    /// Paper fills quote the same curve the chain does: pin the
+    /// simulator's integer mirrors against `executor::quote` on the
+    /// shared domain. A single fee leg (creatorless curve) matches bit
+    /// for bit; a split tier differs by at most one lamport (paper
+    /// ceils the total once, the chain ceils each leg — the documented
+    /// single-ceil convention, always conservative on the guard side).
+    #[test]
+    fn paper_curve_math_pins_executor_quote() {
+        use executor::quote::{
+            CurveView, QuoteKind, buy_cost_incl_fees, buy_tokens_for_exact_in, sell_out_after_fees,
+        };
+        use executor::{FeeSchedule, FeesBps};
+        let sched = |proto: u64, creator: u64| {
+            let leg = FeesBps {
+                lp: 0,
+                protocol: proto,
+                creator,
+            };
+            FeeSchedule {
+                tiers: vec![(0u128, leg)],
+                stable: vec![(0u128, leg)],
+                flat: leg,
+                exotic: FeesBps::default(),
+            }
+        };
+        const VQ: u64 = 30_000_000_000;
+        const VT: u64 = 1_073_000_000_000_000;
+        const REAL: u64 = 793_100_000_000_000;
+        const SUPPLY: u64 = 1_000_000_000_000_000;
+        let view = CurveView {
+            vt: VT,
+            vq: VQ,
+            real_tokens: REAL,
+            coin_creator_fee_bps: 0,
+            creator_is_default: false,
+            quote: QuoteKind::SolLike,
+        };
+        let curve = simulator::CurveReserves {
+            vq_lamports: VQ,
+            vt_base: VT,
+            real_tokens: REAL,
+            decimals: 6,
+            sol_usd: 200.0,
+        };
+        for tier in [0u64, 1, 125, 250, 1000] {
+            for sol in [1u64, 999, 10_000, 50_000_000, 200_000_000, 5_000_000_000] {
+                // One fee leg: bit-for-bit on all three operations.
+                let one = sched(tier, 0);
+                let paper_tokens = curve.buy_tokens_base(sol, tier as f64).expect("absorbed");
+                let chain_tokens =
+                    buy_tokens_for_exact_in(&one, false, &view, SUPPLY, sol).expect("chain");
+                assert_eq!(paper_tokens, chain_tokens, "tier={tier} sol={sol}");
+                let paper_cost = curve
+                    .buy_cost_lamports(paper_tokens, tier as f64)
+                    .expect("cost");
+                assert_eq!(
+                    paper_cost,
+                    buy_cost_incl_fees(&one, false, &view, SUPPLY, paper_tokens)
+                        .expect("chain cost"),
+                    "tier={tier} sol={sol}"
+                );
+                assert_eq!(
+                    curve
+                        .sell_net_lamports(paper_tokens, tier as f64)
+                        .expect("net"),
+                    sell_out_after_fees(&one, false, &view, SUPPLY, paper_tokens)
+                        .expect("chain net"),
+                    "tier={tier} sol={sol}"
+                );
+                // Split tier: two ceils vs one, bounded by a lamport on
+                // the cost side; the token count can shift by one
+                // lamport of curve depth (vt/vq base units).
+                let split = sched(tier / 2, tier - tier / 2);
+                let chain_tokens =
+                    buy_tokens_for_exact_in(&split, false, &view, SUPPLY, sol).expect("chain");
+                let headroom = (VT / VQ) + 2;
+                assert!(
+                    paper_tokens.abs_diff(chain_tokens) <= headroom,
+                    "tier={tier} sol={sol}: paper={paper_tokens} chain={chain_tokens}"
+                );
+                let chain_cost =
+                    buy_cost_incl_fees(&split, false, &view, SUPPLY, paper_tokens).expect("cost");
+                assert!(
+                    chain_cost >= paper_cost && chain_cost - paper_cost <= 1,
+                    "tier={tier} sol={sol}: paper={paper_cost} chain={chain_cost}"
+                );
+                let paper_net = curve
+                    .sell_net_lamports(paper_tokens, tier as f64)
+                    .expect("net");
+                let chain_net =
+                    sell_out_after_fees(&split, false, &view, SUPPLY, paper_tokens).expect("net");
+                assert!(
+                    paper_net >= chain_net && paper_net - chain_net <= 1,
+                    "tier={tier} sol={sol}: paper={paper_net} chain={chain_net}"
+                );
+            }
+        }
+        // A curve-draining ticket: the chain clamps its token output to
+        // the real remainder, paper refuses outright (a drain means
+        // migration, and paper cannot price the venue that follows).
+        let draining = 5_000_000_000_000u64;
+        assert_eq!(curve.buy_tokens_base(draining, 125.0), None);
+        assert!(buy_tokens_for_exact_in(&sched(125, 0), false, &view, SUPPLY, draining).is_ok());
+    }
+
+    /// Sizing with reserves quotes the chain's own math: the plan's
+    /// tokens and spend guard come from `CurveReserves`, and the sell
+    /// floor prices the exact net for the size (never a proxy estimate).
+    #[test]
+    fn exact_reserves_drive_plan_buy_and_sell_floor() {
+        let curve = simulator::CurveReserves {
+            vq_lamports: 30_000_000_000,
+            vt_base: 1_073_000_000_000_000,
+            real_tokens: 793_100_000_000_000,
+            decimals: 6,
+            sol_usd: 150.0,
+        };
+        let exact = curve_mark(4.2e-6, 20_000.0, curve);
+        let plan = plan_buy(10.0, 150.0, 200, 125.0, 6, &exact).expect("plan");
+        let lamports = (10.0f64 / 150.0 * LAMPORTS_PER_SOL).floor() as u64;
+        assert_eq!(
+            plan.amount_tokens,
+            curve.buy_tokens_base(lamports, 125.0).expect("tokens")
+        );
+        let cost = curve
+            .buy_cost_lamports(plan.amount_tokens, 125.0)
+            .expect("cost");
+        assert_eq!(
+            plan.max_sol_cost,
+            apply_slippage_ceiling(cost, 200).expect("ceiling")
+        );
+        assert!(plan.max_sol_cost > cost);
+        let floor =
+            plan_sell_floor(plan.amount_tokens, 150.0, 200, 125.0, 6, &exact).expect("floor");
+        let net = curve
+            .sell_net_lamports(plan.amount_tokens, 125.0)
+            .expect("net");
+        assert_eq!(floor, (u128::from(net) * 9_800 / 10_000) as u64);
+        assert!(floor > 0 && floor < net);
+        // Drained reserves price nothing on either side (fail closed).
+        let drained = simulator::CurveReserves {
+            vq_lamports: 0,
+            ..curve
+        };
+        let dead = curve_mark(4.2e-6, 20_000.0, drained);
+        assert_eq!(plan_buy(10.0, 150.0, 200, 125.0, 6, &dead), None);
+        assert_eq!(
+            plan_sell_floor(plan.amount_tokens, 150.0, 200, 125.0, 6, &dead),
+            None
         );
     }
 }
