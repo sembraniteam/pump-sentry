@@ -53,6 +53,11 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("trading", "mint_cooldown_secs", "MINT_COOLDOWN_SECS"),
     ("trading", "max_daily_loss_usd", "MAX_DAILY_LOSS_USD"),
     ("trading", "max_exposure_usd", "MAX_EXPOSURE_USD"),
+    (
+        "trading",
+        "max_expected_entry_gap_usd",
+        "MAX_EXPECTED_ENTRY_GAP_USD",
+    ),
     ("trading", "hot_wallet_max_sol", "HOT_WALLET_MAX_SOL"),
     ("trading", "quote_usd", "QUOTE_USD"),
     ("trading", "liquidity_usd", "LIQUIDITY_USD"),
@@ -125,6 +130,7 @@ fee_bps = 0.0               # (extra commission/side; venue 125bps already in fi
 notional_usd = 10.0         # (paper size per trade, USD)
 max_open_positions = 3      # (max concurrent positions: paper + live-held mints)
 max_exposure_usd = 0.0      # (0 = off; total open exposure cap: paper basis + one ticket per unpaired live bag)
+max_expected_entry_gap_usd = 0.0  # (0 = off; refuse opens whose ticket shape bled worse than this USD in settled live fills)
 mint_cooldown_secs = 3600   # (per-mint re-entry cooldown)
 max_daily_loss_usd = 0.0    # (0 = off; live requires >0; survives restarts via day-state.json)
 hot_wallet_max_sol = 0.0    # (0 = off; live: entries refuse while the wallet holds more SOL than this)

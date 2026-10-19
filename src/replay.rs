@@ -124,6 +124,11 @@ pub struct Metrics {
     entry_gap_total_usd: f64,
     exit_gaps: usize,
     exit_gap_total_usd: f64,
+    /// Per-venue gap tables `(count, total)`: which dispatch path bled.
+    /// Pre-dimension lines (empty venue) read as "unknown" so the rows
+    /// always sum back to the leg totals above — never silent drops.
+    entry_gap_by_venue: HashMap<String, (usize, f64)>,
+    exit_gap_by_venue: HashMap<String, (usize, f64)>,
     live_cost_usd: f64,
     /// Live estimate: paper edges (live mode) + settled exit gaps −
     /// UNPAIRED dispatch debits. Paired tips ride inside their gap.
@@ -521,13 +526,33 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                 debit_cost(&mut m, *debit_usd, !*settle_paired);
             }
             JournalLine::SellGiveUp { .. } => m.live_sell_giveups += 1,
-            JournalLine::Gap { leg, gap_usd, .. } => {
+            JournalLine::Gap {
+                leg,
+                gap_usd,
+                venue,
+                ..
+            } => {
+                // Pre-dimension lines carry no venue: "unknown" keeps
+                // the rows summing back to the leg totals.
+                let venue = if venue.is_empty() { "unknown" } else { venue };
                 if leg == "entry" {
                     m.entry_gaps += 1;
                     m.entry_gap_total_usd += gap_usd;
+                    let e = m
+                        .entry_gap_by_venue
+                        .entry(venue.to_string())
+                        .or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 += gap_usd;
                 } else {
                     m.exit_gaps += 1;
                     m.exit_gap_total_usd += gap_usd;
+                    let e = m
+                        .exit_gap_by_venue
+                        .entry(venue.to_string())
+                        .or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 += gap_usd;
                     // The exit gap pairs the recorded paper close:
                     // live realized = paper edge + settled gap
                     // (exit tip inside the gap).
@@ -641,6 +666,8 @@ fn print_metrics(m: &Metrics) {
         "execution gap: entry n={} total {:+.4} USD | exit n={} total {:+.4} USD (lower bound: tick proxy, excl. intra-bundle slip; see FillGap docs)",
         m.entry_gaps, m.entry_gap_total_usd, m.exit_gaps, m.exit_gap_total_usd,
     );
+    print_gap_venues("entry", &m.entry_gap_by_venue);
+    print_gap_venues("exit", &m.exit_gap_by_venue);
     println!(
         "committed costs {:+.4} USD (recorded debits at actuals) | live net PnL ESTIMATE {:+.4} USD (paper edge + settled exit gaps − unpaired dispatch debits)",
         m.live_cost_usd, m.live_net_estimate,
@@ -649,6 +676,14 @@ fn print_metrics(m: &Metrics) {
     println!(
         "Paper numbers describe the simulator only. Paper win rate is NOT evidence that live trades profit — judge live profitability by the live bucket alone."
     );
+}
+
+fn print_gap_venues(leg: &str, table: &HashMap<String, (usize, f64)>) {
+    let mut rows: Vec<(&String, &(usize, f64))> = table.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    for (venue, (n, total)) in rows {
+        println!("  {leg} gap venue {venue}: n={n} total {total:+.4} USD");
+    }
 }
 
 #[cfg(test)]
@@ -1086,9 +1121,45 @@ mod tests {
                 tip_usd: Some(tip),
                 // gap_usd = (settle-paper)*qty − tip: delta 0 → −tip.
                 gap_usd,
+                venue: "curve".into(),
+                liquidity_usd: 50_000.0,
             });
         }
         lines
+    }
+
+    #[test]
+    fn metrics_buckets_gaps_by_venue() {
+        let gap = |leg: &str, venue: &str, gap_usd: f64| JournalLine::Gap {
+            ts: 3_000,
+            mint: "M".into(),
+            leg: leg.into(),
+            paper_price_usd: 1.0,
+            realized_price_usd: 1.0,
+            qty_tokens: 10.0,
+            tip_usd: None,
+            gap_usd,
+            venue: venue.into(),
+            liquidity_usd: 50_000.0,
+        };
+        let lines = vec![
+            gap("entry", "curve", -0.5),
+            gap("exit", "curve", -1.0),
+            gap("exit", "pumpswap", -5.0),
+            // Pre-dimension lines read as "unknown", never dropped:
+            // rows sum back to the leg totals.
+            gap("exit", "", -2.0),
+        ];
+        let m = metrics(&lines);
+        assert_eq!(m.entry_gaps, 1);
+        assert_eq!(m.exit_gaps, 3);
+        assert!((m.exit_gap_total_usd + 8.0).abs() < 1e-9);
+        assert_eq!(m.entry_gap_by_venue.get("curve"), Some(&(1, -0.5)));
+        assert_eq!(m.exit_gap_by_venue.get("curve"), Some(&(1, -1.0)));
+        assert_eq!(m.exit_gap_by_venue.get("pumpswap"), Some(&(1, -5.0)));
+        assert_eq!(m.exit_gap_by_venue.get("unknown"), Some(&(1, -2.0)));
+        let rows: usize = m.exit_gap_by_venue.values().map(|(n, _)| n).sum();
+        assert_eq!(rows, m.exit_gaps);
     }
 
     #[test]

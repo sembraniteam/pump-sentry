@@ -227,6 +227,15 @@ pub enum JournalLine {
         qty_tokens: f64,
         tip_usd: Option<f64>,
         gap_usd: f64,
+        /// Dispatch path that settled (`curve` | `pumpswap` |
+        /// `raydium`; `""` on pre-dimension lines). Feeds the
+        /// venue-bucketed replay aggregates.
+        #[serde(default)]
+        venue: String,
+        /// SOL-side depth at settle (0.0 = unknown, e.g. pre-dimension
+        /// lines). Feeds the liquidity buckets.
+        #[serde(default)]
+        liquidity_usd: f64,
     },
     /// Heartbeat equity snapshot (paper book). Drawdown evidence.
     Equity {

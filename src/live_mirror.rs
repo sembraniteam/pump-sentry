@@ -11,6 +11,15 @@ use executor::DeadReason;
 /// and never pretends to measure bundle slippage. Entry legs have
 /// their own record (`EntryGap`, from landed balances — strictly more
 /// direct). Read averages as a LOWER BOUND on live drag, never the total.
+/// One settled exit gap: model close vs live settle, plus the
+/// dimensions execution intelligence aggregates by. `venue` is the
+/// dispatch path that settled (`curve` | `pumpswap` | `raydium`);
+/// `liquidity_usd` is the SOL-side depth at settle time;
+/// `notional_usd` is qty × paper price (the ticket size this gap
+/// prices). Together they answer "what kind of trade bled" without
+/// re-deriving anything outside this tracker. (No settle timestamp:
+/// exit timing is pool-driven and never tabled — per-hour analysis
+/// covers entries only; offline forensics keeps `JournalLine::Gap.ts`.)
 #[derive(Debug, Clone)]
 pub struct FillGap {
     pub mint: String,
@@ -21,6 +30,9 @@ pub struct FillGap {
     /// `(settle - paper) * qty - tip`: negative means live did worse.
     /// Long-only pipeline, so the sign needs no side adjustment.
     pub gap_usd: f64,
+    pub venue: String,
+    pub liquidity_usd: f64,
+    pub notional_usd: f64,
 }
 
 /// One settled entry gap: paper-booked entry vs landed fill.
@@ -38,6 +50,14 @@ pub struct EntryGap {
     pub qty_tokens: f64,
     /// `(paper - fill) * qty`: negative means live paid more.
     pub gap_usd: f64,
+    /// Dispatch path that filled (`curve` — buys never ride pools;
+    /// recorded anyway so the schema stays uniform).
+    pub venue: String,
+    /// SOL-side depth at decision time.
+    pub liquidity_usd: f64,
+    /// Ticket size this gap prices (qty × paper price).
+    pub notional_usd: f64,
+    pub ts: u64,
 }
 
 /// `(count, avg, total)` over a retained window; zero-count yields zeros.
@@ -71,6 +91,65 @@ const MAX_PENDING_NOTES_PER_MINT: usize = 8;
 /// Gap history cap (calibration window, not a position limit).
 pub const FILL_GAP_CAP: usize = 128;
 
+/// Notional (USD) bucket bounds: 5 buckets from 4 edges. Sized for
+/// $10–75 tickets: sub-$10 dust, retail bands, whale.
+const SIZE_BOUNDS_USD: [f64; 4] = [10.0, 25.0, 50.0, 100.0];
+/// Liquidity (USD) bucket bounds: 4 buckets from 3 edges, log-spaced
+/// across drained-to-deep curves.
+const LIQ_BOUNDS_USD: [f64; 3] = [1_000.0, 10_000.0, 100_000.0];
+/// Samples below this in a cell read as "unknown", never as zero:
+/// a thin cell must not refuse entries (or reassure about them).
+pub const MIN_GAP_SAMPLES: usize = 3;
+
+/// Bucket index: first bound the value stays under, else last bucket.
+/// Non-finite/negative values bucket 0 (drained/unknown reads fail
+/// closed downstream anyway; here they just don't earn precision).
+fn size_bucket(notional_usd: f64) -> usize {
+    if !notional_usd.is_finite() {
+        return 0;
+    }
+    SIZE_BOUNDS_USD
+        .iter()
+        .position(|b| notional_usd < *b)
+        .unwrap_or(SIZE_BOUNDS_USD.len())
+}
+
+fn liq_bucket(liquidity_usd: f64) -> usize {
+    if !liquidity_usd.is_finite() {
+        return 0;
+    }
+    LIQ_BOUNDS_USD
+        .iter()
+        .position(|b| liquidity_usd < *b)
+        .unwrap_or(LIQ_BOUNDS_USD.len())
+}
+
+/// Hour of day (UTC) for timing analysis.
+fn hour_of(ts: u64) -> usize {
+    (ts / 3_600 % 24) as usize
+}
+
+/// One aggregated cell: borrowed view over a window scan, never
+/// stored — the windows stay the single source, so staleness can only
+/// ever be as old as `FILL_GAP_CAP` settles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GapCell {
+    pub n: usize,
+    pub avg_gap_usd: f64,
+    pub total_gap_usd: f64,
+}
+
+fn cell_of(n: usize, total: f64) -> Option<GapCell> {
+    if n == 0 {
+        return None;
+    }
+    Some(GapCell {
+        n,
+        avg_gap_usd: total / n as f64,
+        total_gap_usd: total,
+    })
+}
+
 impl FillGapTracker {
     /// Empty tracker.
     pub fn new() -> Self {
@@ -101,12 +180,16 @@ impl FillGapTracker {
     /// Live settled a sale. Returns the gap when a paper close was
     /// pending; `None` settles nothing. Consumes the oldest unmatched
     /// note (FIFO). Non-finite settles keep the pending notes for the
-    /// next round instead of recording garbage.
+    /// next round instead of recording garbage. Venue and liquidity
+    /// are observed at settle (the dispatch path just ran, the tick
+    /// mark is fresh) — never reconstructed later.
     pub fn note_live_settle(
         &mut self,
         mint: &str,
         settle_price_usd: f64,
         tip_usd: f64,
+        venue: &str,
+        liquidity_usd: f64,
     ) -> Option<FillGap> {
         if !settle_price_usd.is_finite() || !tip_usd.is_finite() {
             return None;
@@ -127,6 +210,9 @@ impl FillGapTracker {
             qty_tokens,
             tip_usd,
             gap_usd,
+            venue: venue.to_string(),
+            liquidity_usd,
+            notional_usd: qty_tokens as f64 * paper_price_usd,
         };
         self.total_gap_usd += gap_usd;
         self.gaps.push_back(gap.clone());
@@ -146,12 +232,18 @@ impl FillGapTracker {
     /// callers pass observation + paper quote, never a precomputed gap.
     /// `None` (returned as no record) on any non-finite input or
     /// non-positive price/qty — calibration skips, never fabricates.
+    /// Seven observation fields ride one call (paper + fill + shape);
+    /// the struct would split what the tracker owns together.
+    #[allow(clippy::too_many_arguments)]
     pub fn note_entry_gap(
         &mut self,
         mint: &str,
         paper_price_usd: f64,
         fill_price_usd: f64,
         qty_tokens: f64,
+        venue: &str,
+        liquidity_usd: f64,
+        ts: u64,
     ) -> Option<EntryGap> {
         if !paper_price_usd.is_finite()
             || !fill_price_usd.is_finite()
@@ -172,6 +264,10 @@ impl FillGapTracker {
             fill_price_usd,
             qty_tokens,
             gap_usd,
+            venue: venue.to_string(),
+            liquidity_usd,
+            notional_usd: qty_tokens * paper_price_usd,
+            ts,
         };
         self.entry_total_gap_usd += gap_usd;
         self.entry_gaps.push_back(gap.clone());
@@ -184,6 +280,155 @@ impl FillGapTracker {
     /// `(filled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
     pub fn entry_stats(&self) -> (usize, f64, f64) {
         summarize(self.entry_gaps.len(), self.entry_total_gap_usd)
+    }
+
+    /// Per-venue exit aggregates over the retained window, in first-seen
+    /// order: `(venue, n, avg, total)`. Derived from the window on every
+    /// call (O(cap)) — no parallel counters to drift or go stale.
+    pub fn venue_exit_stats(&self) -> Vec<(String, usize, f64, f64)> {
+        let mut order: Vec<String> = Vec::new();
+        let mut acc: HashMap<String, (usize, f64)> = HashMap::new();
+        for gap in &self.gaps {
+            let entry = acc.entry(gap.venue.clone()).or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 += gap.gap_usd;
+            if !order.contains(&gap.venue) {
+                order.push(gap.venue.clone());
+            }
+        }
+        order
+            .into_iter()
+            .filter_map(|venue| {
+                let (n, total) = acc.remove(&venue)?;
+                cell_of(n, total).map(|c| (venue, c.n, c.avg_gap_usd, c.total_gap_usd))
+            })
+            .collect()
+    }
+
+    /// Per-venue entry aggregates, same shape as [`Self::venue_exit_stats`].
+    pub fn venue_entry_stats(&self) -> Vec<(String, usize, f64, f64)> {
+        let mut order: Vec<String> = Vec::new();
+        let mut acc: HashMap<String, (usize, f64)> = HashMap::new();
+        for gap in &self.entry_gaps {
+            let entry = acc.entry(gap.venue.clone()).or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 += gap.gap_usd;
+            if !order.contains(&gap.venue) {
+                order.push(gap.venue.clone());
+            }
+        }
+        order
+            .into_iter()
+            .filter_map(|venue| {
+                let (n, total) = acc.remove(&venue)?;
+                cell_of(n, total).map(|c| (venue, c.n, c.avg_gap_usd, c.total_gap_usd))
+            })
+            .collect()
+    }
+
+    /// Costliest (venue, size, liquidity) exit cell in the window:
+    /// `(venue, size_idx, liq_idx, cell)`. Cells below
+    /// [`MIN_GAP_SAMPLES`] never win — a thin cell must not page the
+    /// operator or refuse entries. `None` when no cell qualifies.
+    pub fn worst_exit_cell(&self) -> Option<(String, usize, usize, GapCell)> {
+        let mut cells: HashMap<(String, usize, usize), (usize, f64)> = HashMap::new();
+        for gap in &self.gaps {
+            let key = (
+                gap.venue.clone(),
+                size_bucket(gap.notional_usd),
+                liq_bucket(gap.liquidity_usd),
+            );
+            let entry = cells.entry(key).or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 += gap.gap_usd;
+        }
+        cells
+            .into_iter()
+            .filter(|(_, (n, _))| *n >= MIN_GAP_SAMPLES)
+            .filter_map(|((venue, size, liq), (n, total))| {
+                cell_of(n, total).map(|c| (venue, size, liq, c))
+            })
+            .min_by(|a, b| {
+                a.3
+                    .avg_gap_usd
+                    .partial_cmp(&b.3.avg_gap_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// Same as [`Self::worst_exit_cell`] for the entry window.
+    pub fn worst_entry_cell(&self) -> Option<(String, usize, usize, GapCell)> {
+        let mut cells: HashMap<(String, usize, usize), (usize, f64)> = HashMap::new();
+        for gap in &self.entry_gaps {
+            let key = (
+                gap.venue.clone(),
+                size_bucket(gap.notional_usd),
+                liq_bucket(gap.liquidity_usd),
+            );
+            let entry = cells.entry(key).or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 += gap.gap_usd;
+        }
+        cells
+            .into_iter()
+            .filter(|(_, (n, _))| *n >= MIN_GAP_SAMPLES)
+            .filter_map(|((venue, size, liq), (n, total))| {
+                cell_of(n, total).map(|c| (venue, size, liq, c))
+            })
+            .min_by(|a, b| {
+                a.3
+                    .avg_gap_usd
+                    .partial_cmp(&b.3.avg_gap_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// Expected entry gap (USD) for a ticket of this shape: the cell
+    /// average, or `None` below [`MIN_GAP_SAMPLES`] (unknown reads as
+    /// unknown — the entry gate allows on unknown, refuses only on
+    /// proven bleed). Entry window only: exits never block.
+    pub fn expected_entry_gap_usd(
+        &self,
+        venue: &str,
+        notional_usd: f64,
+        liquidity_usd: f64,
+    ) -> Option<f64> {
+        let (mut n, mut total) = (0usize, 0.0f64);
+        let (size, liq) = (size_bucket(notional_usd), liq_bucket(liquidity_usd));
+        for gap in &self.entry_gaps {
+            if gap.venue == venue
+                && size_bucket(gap.notional_usd) == size
+                && liq_bucket(gap.liquidity_usd) == liq
+            {
+                n += 1;
+                total += gap.gap_usd;
+            }
+        }
+        if n < MIN_GAP_SAMPLES {
+            return None;
+        }
+        Some(total / n as f64)
+    }
+
+    /// Hourly entry-gap aggregates (UTC hour → cell), for timing
+    /// analysis. Exit timing is pool-driven and never gates entries,
+    /// so only the entry window is tabled.
+    pub fn entry_hour_stats(&self) -> [(usize, f64, f64); 24] {
+        let mut acc = [(0usize, 0.0f64); 24];
+        for gap in &self.entry_gaps {
+            let slot = &mut acc[hour_of(gap.ts)];
+            slot.0 += 1;
+            slot.1 += gap.gap_usd;
+        }
+        let mut out = [(0usize, 0.0f64, 0.0f64); 24];
+        for (i, (n, total)) in acc.iter().enumerate() {
+            out[i] = if *n == 0 {
+                (0, 0.0, 0.0)
+            } else {
+                (*n, total / *n as f64, *total)
+            };
+        }
+        out
     }
 
     /// Drop a pending note without settling (lifecycle eviction).
@@ -472,12 +717,16 @@ impl<L> LiveExecution<L> {
         mint: &str,
         settle_price_usd: f64,
         tip_usd: f64,
+        venue: &str,
+        liquidity_usd: f64,
     ) -> Option<FillGap> {
-        let gap = self
-            .gaps
-            .lock()
-            .await
-            .note_live_settle(mint, settle_price_usd, tip_usd);
+        let gap = self.gaps.lock().await.note_live_settle(
+            mint,
+            settle_price_usd,
+            tip_usd,
+            venue,
+            liquidity_usd,
+        );
         if let Some(ref gap) = gap {
             info!(mint = %gap.mint, paper = gap.paper_price_usd, settle = gap.settle_price_usd,
                 qty = gap.qty_tokens, tip = format!("{:.4}", gap.tip_usd),
@@ -507,12 +756,18 @@ impl<L> LiveExecution<L> {
         paper_price_usd: f64,
         fill_price_usd: f64,
         qty_tokens: f64,
+        venue: &str,
+        liquidity_usd: f64,
     ) -> Option<EntryGap> {
-        let gap = self
-            .gaps
-            .lock()
-            .await
-            .note_entry_gap(mint, paper_price_usd, fill_price_usd, qty_tokens);
+        let gap = self.gaps.lock().await.note_entry_gap(
+            mint,
+            paper_price_usd,
+            fill_price_usd,
+            qty_tokens,
+            venue,
+            liquidity_usd,
+            crate::settings::now_secs(),
+        );
         if let Some(ref gap) = gap {
             info!(mint = %gap.mint, paper = gap.paper_price_usd, fill = gap.fill_price_usd,
                 qty = gap.qty_tokens,
@@ -525,6 +780,47 @@ impl<L> LiveExecution<L> {
     /// `(filled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
     pub async fn entry_gap_stats(&self) -> (usize, f64, f64) {
         self.gaps.lock().await.entry_stats()
+    }
+
+    /// Per-venue exit aggregates for the heartbeat: `(venue, n, avg, total)`.
+    pub async fn venue_exit_stats(&self) -> Vec<(String, usize, f64, f64)> {
+        self.gaps.lock().await.venue_exit_stats()
+    }
+
+    /// Per-venue entry aggregates for the heartbeat.
+    pub async fn venue_entry_stats(&self) -> Vec<(String, usize, f64, f64)> {
+        self.gaps.lock().await.venue_entry_stats()
+    }
+
+    /// Costliest exit cell `(venue, size_idx, liq_idx, cell)`; `None`
+    /// when no cell has enough samples to trust.
+    pub async fn worst_exit_cell(&self) -> Option<(String, usize, usize, GapCell)> {
+        self.gaps.lock().await.worst_exit_cell()
+    }
+
+    /// Costliest entry cell; `None` when no cell qualifies.
+    pub async fn worst_entry_cell(&self) -> Option<(String, usize, usize, GapCell)> {
+        self.gaps.lock().await.worst_entry_cell()
+    }
+
+    /// Hourly entry aggregates (UTC hour → `(n, avg, total)`).
+    pub async fn entry_hour_stats(&self) -> [(usize, f64, f64); 24] {
+        self.gaps.lock().await.entry_hour_stats()
+    }
+
+    /// Expected entry gap (USD) for a ticket of this shape, or `None`
+    /// below [`MIN_GAP_SAMPLES`] (unknown is unknown — the entry gate
+    /// allows on unknown). Entry window only: exits never block.
+    pub async fn expected_entry_gap_usd(
+        &self,
+        venue: &str,
+        notional_usd: f64,
+        liquidity_usd: f64,
+    ) -> Option<f64> {
+        self.gaps
+            .lock()
+            .await
+            .expected_entry_gap_usd(venue, notional_usd, liquidity_usd)
     }
 
     /// Pending-buy count for the heartbeat (unconfirmed fills).
@@ -771,9 +1067,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // Skipped when unobservable (late-confirm path never
                 // carries one either) — absence is documented, not hidden.
                 let entry_gap = if let Some(fill) = entry_fill {
-                    self.exec
-                        .note_entry_gap(mint, entry_quote, fill.fill_price_usd, fill.tokens)
-                        .await
+                    self.exec.note_entry_gap(
+                        mint,
+                        entry_quote,
+                        fill.fill_price_usd,
+                        fill.tokens,
+                        // Buys never ride pool legs (no pool-buy path
+                        // exists): the venue is structural, not read.
+                        "curve",
+                        mark.liquidity_usd,
+                    )
+                    .await
                 } else {
                     None
                 };
@@ -787,6 +1091,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         qty_tokens: entry_gap.qty_tokens,
                         tip_usd: None,
                         gap_usd: entry_gap.gap_usd,
+                        venue: entry_gap.venue,
+                        liquidity_usd: entry_gap.liquidity_usd,
                     });
                 }
                 // First-touch cost feeds the day-loss gate.
@@ -1249,7 +1555,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // shared proxy (see `FillGap` docs for what this omits).
                 let gap = self
                     .exec
-                    .note_gap_live_settle(mint, price_usd, tip_usd)
+                    .note_gap_live_settle(mint, price_usd, tip_usd, venue_tag, mark.liquidity_usd)
                     .await;
                 // Dispatch record: what was sent, at what, costing what.
                 if let Some(j) = self.journal() {
@@ -1277,6 +1583,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             qty_tokens: gap.qty_tokens as f64,
                             tip_usd: Some(gap.tip_usd),
                             gap_usd: gap.gap_usd,
+                            venue: gap.venue,
+                            liquidity_usd: gap.liquidity_usd,
                         });
                     }
                 }
@@ -1554,29 +1862,33 @@ mod tests {
         let mut t = FillGapTracker::new();
         assert_eq!(t.stats(), (0, 0.0, 0.0));
         // Unmatched settle records nothing (orphan legs, never fabricated).
-        assert!(t.note_live_settle("M", 1.0, 0.05).is_none());
+        assert!(t.note_live_settle("M", 1.0, 0.05, "curve", 50_000.0).is_none());
         assert_eq!(t.stats(), (0, 0.0, 0.0));
         // Degenerate paper notes are ignored.
         t.note_paper_close("M", f64::NAN, 10);
         t.note_paper_close("M", 0.0, 10);
         t.note_paper_close("M", 1.0, 0);
-        assert!(t.note_live_settle("M", 1.0, 0.05).is_none());
+        assert!(t.note_live_settle("M", 1.0, 0.05, "curve", 50_000.0).is_none());
         // Paper 2.0 x 10 tokens, live settles 1.9 + 0.05 tip:
         // (1.9 - 2.0) * 10 - 0.05 = -1.05.
         t.note_paper_close("M", 2.0, 10);
-        let gap = t.note_live_settle("M", 1.9, 0.05).expect("gap");
+        let gap = t
+            .note_live_settle("M", 1.9, 0.05, "curve", 50_000.0)
+            .expect("gap");
         assert_eq!(gap.qty_tokens, 10);
         assert!((gap.gap_usd + 1.05).abs() < 1e-9, "gap={}", gap.gap_usd);
         // Consumed: a second settle without a new paper note is orphan.
-        assert!(t.note_live_settle("M", 1.9, 0.05).is_none());
+        assert!(t.note_live_settle("M", 1.9, 0.05, "curve", 50_000.0).is_none());
         let (n, avg, total) = t.stats();
         assert_eq!(n, 1);
         assert!((avg + 1.05).abs() < 1e-9);
         assert!((total + 1.05).abs() < 1e-9);
         // Non-finite settle keeps the pending note for the next round.
         t.note_paper_close("N", 3.0, 5);
-        assert!(t.note_live_settle("N", f64::NAN, 0.05).is_none());
-        let gap = t.note_live_settle("N", 3.0, 0.05).expect("kept");
+        assert!(t.note_live_settle("N", f64::NAN, 0.05, "curve", 50_000.0).is_none());
+        let gap = t
+            .note_live_settle("N", 3.0, 0.05, "curve", 50_000.0)
+            .expect("kept");
         assert!((gap.gap_usd + 0.05).abs() < 1e-9);
     }
 
@@ -1585,7 +1897,8 @@ mod tests {
         let mut t = FillGapTracker::new();
         for _ in 0..(FILL_GAP_CAP + 10) {
             t.note_paper_close("M", 1.0, 1);
-            t.note_live_settle("M", 1.0, 0.0).expect("gap");
+            t.note_live_settle("M", 1.0, 0.0, "curve", 50_000.0)
+                .expect("gap");
         }
         // Bounded history; totals still accumulate (windowed avg, full sum).
         assert_eq!(t.gaps.len(), FILL_GAP_CAP);
@@ -1598,15 +1911,23 @@ mod tests {
         let mut t = FillGapTracker::new();
         assert_eq!(t.entry_stats(), (0, 0.0, 0.0));
         // Degenerate inputs record nothing.
-        assert!(t.note_entry_gap("M", f64::NAN, 1.0, 10.0).is_none());
-        assert!(t.note_entry_gap("M", 1.0, 0.0, 10.0).is_none());
-        assert!(t.note_entry_gap("M", 1.0, 1.0, 0.0).is_none());
+        assert!(t.note_entry_gap("M", f64::NAN, 1.0, 10.0, "curve", 50_000.0, 1_000).is_none());
+        assert!(t.note_entry_gap("M", 1.0, 0.0, 10.0, "curve", 50_000.0, 1_000).is_none());
+        assert!(t.note_entry_gap("M", 1.0, 1.0, 0.0, "curve", 50_000.0, 1_000).is_none());
         assert_eq!(t.entry_stats(), (0, 0.0, 0.0));
         // Paper 0.0000042, landed 0.0000045 over 2.35M tokens: live
         // paid more, so the gap is negative like the exit leg
         // ((0.0000042 - 0.0000045) * 2_350_000 = -0.705).
         let gap = t
-            .note_entry_gap("M", 0.000_004_2, 0.000_004_5, 2_350_000.0)
+            .note_entry_gap(
+                "M",
+                0.000_004_2,
+                0.000_004_5,
+                2_350_000.0,
+                "curve",
+                50_000.0,
+                1_000,
+            )
             .expect("gap");
         assert!((gap.gap_usd + 0.705).abs() < 1e-9, "gap={}", gap.gap_usd);
         let (n, avg, total) = t.entry_stats();
@@ -1622,13 +1943,132 @@ mod tests {
         let mut t = FillGapTracker::new();
         t.note_paper_close("M", 2.0, 8);
         t.note_paper_close("M", 3.0, 2);
-        let first = t.note_live_settle("M", 1.9, 0.0).expect("first leg");
+        let first = t
+            .note_live_settle("M", 1.9, 0.0, "curve", 50_000.0)
+            .expect("first leg");
         assert_eq!((first.paper_price_usd, first.qty_tokens), (2.0, 8));
-        let second = t.note_live_settle("M", 2.9, 0.0).expect("second leg");
+        let second = t
+            .note_live_settle("M", 2.9, 0.0, "curve", 50_000.0)
+            .expect("second leg");
         assert_eq!((second.paper_price_usd, second.qty_tokens), (3.0, 2));
-        assert!(t.note_live_settle("M", 2.9, 0.0).is_none());
+        assert!(t
+            .note_live_settle("M", 2.9, 0.0, "curve", 50_000.0)
+            .is_none());
         let (n, _, _) = t.stats();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn venue_stats_split_exit_and_entry() {
+        let mut t = FillGapTracker::new();
+        // Two curve exits at -1.0 each, one pumpswap exit at -5.0.
+        for _ in 0..2 {
+            t.note_paper_close("C", 2.0, 10);
+            t.note_live_settle("C", 1.9, 0.0, "curve", 50_000.0)
+                .expect("curve gap");
+        }
+        t.note_paper_close("P", 2.0, 10);
+        t.note_live_settle("P", 1.5, 0.0, "pumpswap", 5_000.0)
+            .expect("pool gap");
+        let exits = t.venue_exit_stats();
+        assert_eq!(exits.len(), 2);
+        assert_eq!(exits[0].0, "curve");
+        assert_eq!(exits[0].1, 2);
+        assert!((exits[0].2 + 1.0).abs() < 1e-9, "avg={}", exits[0].2);
+        assert_eq!(exits[1].0, "pumpswap");
+        assert!((exits[1].3 + 5.0).abs() < 1e-9, "total={}", exits[1].3);
+        // Entries aggregate separately (buys are structurally curve).
+        t.note_entry_gap("E", 1.0, 1.1, 10.0, "curve", 50_000.0, 1_000)
+            .expect("entry gap");
+        let entries = t.venue_entry_stats();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "curve");
+        assert!((entries[0].3 + 1.0).abs() < 1e-9, "total={}", entries[0].3);
+    }
+
+    #[test]
+    fn worst_cell_needs_min_samples() {
+        let mut t = FillGapTracker::new();
+        // Costly cell: $20 ticket on a $500-liq curve, gap -2.0 each.
+        // notional = 10 tokens × $2 = $20 → size bucket 1;
+        // $500 liq → liq bucket 0.
+        for i in 0..2 {
+            t.note_paper_close(&format!("M{i}"), 2.0, 10);
+            t.note_live_settle(&format!("M{i}"), 1.8, 0.0, "curve", 500.0)
+                .expect("gap");
+        }
+        // Thin cell must not win: unknown reads as unknown, never as
+        // a verdict the operator (or a gate) could act on.
+        assert!(t.worst_exit_cell().is_none());
+        t.note_paper_close("M2", 2.0, 10);
+        t.note_live_settle("M2", 1.8, 0.0, "curve", 500.0)
+            .expect("gap");
+        let (venue, size, liq, cell) = t.worst_exit_cell().expect("cell");
+        assert_eq!(venue, "curve");
+        assert_eq!((size, liq), (1, 0));
+        assert_eq!(cell.n, 3);
+        assert!((cell.avg_gap_usd + 2.0).abs() < 1e-9, "avg={}", cell.avg_gap_usd);
+        // Entry window has no samples yet: no twin verdict either.
+        assert!(t.worst_entry_cell().is_none());
+    }
+
+    #[test]
+    fn expected_entry_gap_unknown_until_proven() {
+        let mut t = FillGapTracker::new();
+        // $20 ticket (10 × $2 paper) on $50k liq, gap -0.5 each.
+        for _ in 0..2 {
+            t.note_entry_gap("M", 2.0, 2.05, 10.0, "curve", 50_000.0, 1_000)
+                .expect("gap");
+        }
+        assert!(t.expected_entry_gap_usd("curve", 20.0, 50_000.0).is_none());
+        t.note_entry_gap("M", 2.0, 2.05, 10.0, "curve", 50_000.0, 1_000)
+            .expect("gap");
+        let exp = t
+            .expected_entry_gap_usd("curve", 20.0, 50_000.0)
+            .expect("proven");
+        assert!((exp + 0.5).abs() < 1e-9, "exp={exp}");
+        // A whale ticket on the same curve is a different cell: unknown.
+        assert!(t.expected_entry_gap_usd("curve", 200.0, 50_000.0).is_none());
+        // Same shape on a venue that never filled: unknown.
+        assert!(
+            t.expected_entry_gap_usd("raydium", 20.0, 50_000.0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn entry_hour_stats_bucket_utc() {
+        let mut t = FillGapTracker::new();
+        t.note_entry_gap("A", 1.0, 1.1, 10.0, "curve", 50_000.0, 0)
+            .expect("gap");
+        t.note_entry_gap("B", 1.0, 1.2, 10.0, "curve", 50_000.0, 5 * 3_600)
+            .expect("gap");
+        t.note_entry_gap("C", 1.0, 1.3, 10.0, "curve", 50_000.0, 5 * 3_600 + 59)
+            .expect("gap");
+        let hours = t.entry_hour_stats();
+        assert_eq!(hours[0].0, 1);
+        assert!((hours[0].1 + 1.0).abs() < 1e-9, "avg={}", hours[0].1);
+        assert_eq!(hours[5].0, 2);
+        assert!((hours[5].2 + 5.0).abs() < 1e-9, "total={}", hours[5].2);
+        assert_eq!(hours[6].0, 0);
+        assert_eq!((hours[6].1, hours[6].2), (0.0, 0.0));
+    }
+
+    #[test]
+    fn gap_buckets_follow_documented_edges() {
+        // Size: [10, 25, 50, 100] → 5 buckets; liq: [1k, 10k, 100k] → 4.
+        assert_eq!((size_bucket(9.99), size_bucket(10.0)), (0, 1));
+        assert_eq!((size_bucket(99.99), size_bucket(100.0)), (3, 4));
+        assert_eq!(size_bucket(10_000.0), 4);
+        assert_eq!((liq_bucket(999.0), liq_bucket(1_000.0)), (0, 1));
+        assert_eq!(liq_bucket(1_000_000.0), 3);
+        // Non-finite/negative reads bucket 0 (drained/unknown earns no
+        // precision; downstream fail-closed is owned elsewhere).
+        assert_eq!(size_bucket(f64::NAN), 0);
+        assert_eq!(liq_bucket(-1.0), 0);
+        // UTC hour wraps at midnight.
+        assert_eq!(hour_of(0), 0);
+        assert_eq!(hour_of(24 * 3_600 + 3_600), 1);
     }
 
     #[tokio::test]

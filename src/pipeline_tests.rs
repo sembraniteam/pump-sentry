@@ -1218,6 +1218,129 @@ async fn daily_breaker_blocks_opens_but_not_exits() {
     assert!(pipe.daily.lock().await.day_net() < -10.0);
 }
 
+/// Ticket shape under test: default $10 notional on the $30k test
+/// tick. Seeds must land in that same cell ($10 = $2 paper × 5
+/// tokens; $30k liq), or the gate reads a different cell.
+type BleedPipe = Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>>;
+
+fn bleed_pipe(cap_usd: f64) -> BleedPipe {
+    let mut settings = Settings::from_map(&HashMap::new());
+    settings.max_expected_entry_gap_usd = cap_usd;
+    pipeline_screened(
+        settings,
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+        None,
+    )
+}
+
+async fn seed_entry_bleed(pipe: &BleedPipe, samples: usize, fill_price: f64) {
+    for i in 0..samples {
+        pipe.exec
+            .gaps
+            .lock()
+            .await
+            .note_entry_gap(
+                &format!("SEED{i}"),
+                2.0,
+                fill_price,
+                5.0,
+                "curve",
+                30_000.0,
+                1_000 + i as u64,
+            )
+            .expect("seed gap");
+    }
+}
+
+async fn launch_once(pipe: &BleedPipe) {
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+}
+
+#[tokio::test]
+async fn entry_bleed_cap_blocks_only_proven_bleeders() {
+    // Proven bleed worse than the cap: nothing opens ($2 paper, $3
+    // fill × 5 tokens = -$5.00 per ticket against a $1 cap).
+    let pipe = bleed_pipe(1.0);
+    seed_entry_bleed(&pipe, 3, 3.0).await;
+    launch_once(&pipe).await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "proven bleed must refuse the open"
+    );
+
+    // The refusal never touches exits: a manually opened position
+    // still stop-losses out through the same tick path.
+    let id = pipe
+        .portfolio
+        .lock()
+        .await
+        .open_position_params(&simulator::OpenPositionParams {
+            mint: MINT,
+            side: Side::Long,
+            mark: simulator::Mark::new(2.0, 1e9),
+            notional_usd: 10.0,
+            tp_percent: 75.0,
+            sl_percent: -8.0,
+            trailing: false,
+            trail_percent: 0.0,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+            now_secs: now_secs(),
+        })
+        .expect("manual open");
+    let mut stop = tick(MINT, 2.0);
+    stop.price_usd = 1.0; // -50% << -8% SL.
+    pipe.on_tick(&stop).await;
+    assert!(
+        pipe.portfolio.lock().await.position(id).is_none(),
+        "bleed cap must never block an exit"
+    );
+
+    // Thin cell (2 samples < floor): unknown allows, never refuses.
+    let pipe = bleed_pipe(1.0);
+    seed_entry_bleed(&pipe, 2, 3.0).await;
+    launch_once(&pipe).await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "thin cell is unknown, not a verdict"
+    );
+
+    // Proven bleed within the cap (-$0.50 vs $1): opens.
+    let pipe = bleed_pipe(1.0);
+    seed_entry_bleed(&pipe, 3, 2.1).await;
+    launch_once(&pipe).await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "tolerable bleed opens"
+    );
+
+    // Cap off (0): proven bleed opens — measurement without refusal.
+    let pipe = bleed_pipe(0.0);
+    seed_entry_bleed(&pipe, 3, 3.0).await;
+    launch_once(&pipe).await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "cap off disables the gate"
+    );
+}
+
 #[tokio::test]
 async fn confirm_flow_opens_with_measured_velocity() {
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));

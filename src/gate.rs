@@ -903,6 +903,28 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
             return;
         }
+        // Execution-intelligence gate: this ticket shape's settled
+        // entry gaps say what live really paid over paper. Proven bleed
+        // (a cell with enough settled samples) worse than the cap
+        // refuses the open — costs would eat the edge before the trade
+        // starts. Unknown (thin cell) always allows: absence of evidence
+        // is not evidence of bleed. Same choke point as the kill switch
+        // (entries only; exits, scale-outs, `sell <mint>` untouched),
+        // and the window sheds stale evidence on its own. Buys are
+        // structurally curve (no pool-buy path), so the venue is fixed.
+        let bleed_cap = self.settings.max_expected_entry_gap_usd;
+        if bleed_cap.is_finite()
+            && bleed_cap > 0.0
+            && let Some(exp) = self
+                .exec
+                .expected_entry_gap_usd("curve", self.settings.notional_usd, liquidity_usd)
+                .await
+            && exp < -bleed_cap
+        {
+            info!(%mint, expected_gap_usd = format!("{exp:+.4}"), cap_usd = bleed_cap,
+                "entry bleed cap: this ticket shape bled worse than cap; skipping open");
+            return;
+        }
         let mut portfolio = self.portfolio.lock().await;
         // Heat + per-mint cooldown.
         if portfolio.position_ids().len() >= self.settings.max_open_positions {
@@ -967,6 +989,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             info!(%mint, "mint in cooldown; skipping");
             return;
+        }
+        // Entry-gap calibration for this ticket shape, for opens that
+        // survived every gate above (the bleed-cap refusal already ran
+        // at the choke point): proven bleed is logged, unknown stays
+        // silent. Buys are structurally curve, so the venue is fixed.
+        if let Some(exp) = self
+            .exec
+            .expected_entry_gap_usd("curve", self.settings.notional_usd, liquidity_usd)
+            .await
+        {
+            info!(%mint, ticket_usd = self.settings.notional_usd, liquidity_usd,
+                expected_gap_usd = format!("{exp:+.4}"),
+                "entry gap calibration: this ticket shape bled live before");
         }
         // Tier read with the tick. Custom tiers reprice paper like live.
         if let Some(bps) = req.venue_fee_bps {

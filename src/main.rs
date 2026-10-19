@@ -1156,6 +1156,38 @@ async fn run_pipeline(live_arg: bool) {
                 if egap_n > 0 {
                     info!("entry gap (negative = live paid more): n={egap_n} avg={egap_avg:+.4} total={egap_total:+.4} USD (paper quote vs landed fill)");
                 }
+                // Execution-gap dimensions: which dispatch path bled, at
+                // what ticket shape. Log-only calibration (never cards,
+                // never gates) — thin cells stay silent via the sample
+                // floor inside the tracker.
+                for (venue, n, avg, total) in pipeline.exec.venue_exit_stats().await {
+                    info!("exit gap by venue: {venue} n={n} avg={avg:+.4} total={total:+.4} USD");
+                }
+                for (venue, n, avg, total) in pipeline.exec.venue_entry_stats().await {
+                    info!("entry gap by venue: {venue} n={n} avg={avg:+.4} total={total:+.4} USD");
+                }
+                if let Some((venue, size, liq, cell)) = pipeline.exec.worst_exit_cell().await {
+                    info!("worst exit cell: venue={venue} size_bkt={size} liq_bkt={liq} n={} avg={:+.4} total={:+.4} USD",
+                        cell.n, cell.avg_gap_usd, cell.total_gap_usd);
+                }
+                if let Some((venue, size, liq, cell)) = pipeline.exec.worst_entry_cell().await {
+                    info!("worst entry cell: venue={venue} size_bkt={size} liq_bkt={liq} n={} avg={:+.4} total={:+.4} USD",
+                        cell.n, cell.avg_gap_usd, cell.total_gap_usd);
+                }
+                {
+                    let hours = pipeline.exec.entry_hour_stats().await;
+                    let mut worst: Option<(usize, usize, f64, f64)> = None;
+                    for (h, (n, avg, total)) in hours.iter().enumerate() {
+                        if *n >= crate::live_mirror::MIN_GAP_SAMPLES
+                            && worst.is_none_or(|(_, _, wavg, _)| *avg < wavg)
+                        {
+                            worst = Some((h, *n, *avg, *total));
+                        }
+                    }
+                    if let Some((h, n, avg, total)) = worst {
+                        info!("worst entry hour (UTC): {h:02} n={n} avg={avg:+.4} total={total:+.4} USD");
+                    }
+                }
                 // Congestion pricing vs the paper calm-floor: paper legs
                 // pay base tip only, live pays up to worst_4x per
                 // dispatch under congestion. Read paper edge net of the

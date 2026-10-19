@@ -49,6 +49,11 @@ pub struct Settings {
     /// Total open-exposure cap in USD (`0` = off): paper cost basis
     /// plus one ticket per unpaired live bag.
     pub max_exposure_usd: f64,
+    /// Proven-bleed entry cap in USD per ticket (`0` = off): refuses an
+    /// open when this ticket shape's settled entry-gap cell averages
+    /// worse than this (live paid more than paper by more than the
+    /// cap). Thin cells (unknown) always allow; exits never block.
+    pub max_expected_entry_gap_usd: f64,
     /// Hot-wallet ceiling in SOL (`0` = off): entries refuse while the
     /// wallet holds more than this. Exits always work.
     pub hot_wallet_max_sol: f64,
@@ -155,6 +160,10 @@ impl std::fmt::Debug for Settings {
             .field("max_open_positions", &self.max_open_positions)
             .field("max_daily_loss_usd", &self.max_daily_loss_usd)
             .field("max_exposure_usd", &self.max_exposure_usd)
+            .field(
+                "max_expected_entry_gap_usd",
+                &self.max_expected_entry_gap_usd,
+            )
             .field("hot_wallet_max_sol", &self.hot_wallet_max_sol)
             .field("mint_cooldown_secs", &self.mint_cooldown_secs)
             .field("dev_min_age_secs", &self.dev_min_age_secs)
@@ -245,6 +254,12 @@ impl Settings {
             max_open_positions: get_int(vars, "MAX_OPEN_POSITIONS", 3, &mut notes),
             max_daily_loss_usd: get_float(vars, "MAX_DAILY_LOSS_USD", 0.0, &mut notes),
             max_exposure_usd: get_float(vars, "MAX_EXPOSURE_USD", 0.0, &mut notes),
+            max_expected_entry_gap_usd: get_float(
+                vars,
+                "MAX_EXPECTED_ENTRY_GAP_USD",
+                0.0,
+                &mut notes,
+            ),
             hot_wallet_max_sol: get_float(vars, "HOT_WALLET_MAX_SOL", 0.0, &mut notes),
             mint_cooldown_secs: get_int(vars, "MINT_COOLDOWN_SECS", 3600, &mut notes),
             dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600, &mut notes),
@@ -355,6 +370,12 @@ impl Settings {
             out.push(format!(
                 "MAX_EXPOSURE_USD={} is below NOTIONAL_USD={}: one ticket never fits, the cap blocks every open",
                 self.max_exposure_usd, self.notional_usd
+            ));
+        }
+        if self.max_expected_entry_gap_usd < 0.0 || !self.max_expected_entry_gap_usd.is_finite() {
+            out.push(format!(
+                "MAX_EXPECTED_ENTRY_GAP_USD={} is invalid; entry bleed cap disabled",
+                self.max_expected_entry_gap_usd
             ));
         }
         if self.hot_wallet_max_sol < 0.0 || !self.hot_wallet_max_sol.is_finite() {
@@ -912,6 +933,30 @@ mod tests {
             s.warnings()
                 .iter()
                 .any(|w| w.contains("MAX_EXPOSURE_USD=-1")),
+            "{:?}",
+            s.warnings()
+        );
+    }
+
+    #[test]
+    fn entry_bleed_cap_parses_and_warns() {
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.max_expected_entry_gap_usd, 0.0, "off by default");
+        let s = Settings::from_map(&vars(&[("MAX_EXPECTED_ENTRY_GAP_USD", "0.75")]));
+        assert_eq!(s.max_expected_entry_gap_usd, 0.75);
+        assert!(
+            !s.warnings()
+                .iter()
+                .any(|w| w.contains("MAX_EXPECTED_ENTRY_GAP_USD")),
+            "{:?}",
+            s.warnings()
+        );
+        // Garbage reads as disabled, loudly — never silently armed.
+        let s = Settings::from_map(&vars(&[("MAX_EXPECTED_ENTRY_GAP_USD", "-1")]));
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("MAX_EXPECTED_ENTRY_GAP_USD=-1")),
             "{:?}",
             s.warnings()
         );
