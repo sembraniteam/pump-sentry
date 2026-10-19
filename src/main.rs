@@ -270,13 +270,17 @@ struct BootCustodyCounts {
 /// the WAL surgery. Read-only — a mismatch pages the operator and
 /// keeps the claims; custody is never auto-corrected or auto-exited
 /// here (the per-dispatch preflights own dispatch, the boot reconcile
-/// owns boot, this owns drift between them).
+/// owns boot, this owns drift between them). Returns the mints whose
+/// chain balance falls short of the claims: the supervisor latches
+/// those as an entry pause until a later recheck passes (recovery is
+/// a passing re-check, never elapsed time).
 async fn custody_recheck(
     pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
-) {
+) -> Vec<String> {
     let Some(trader) = pipeline.exec.live.as_ref() else {
-        return;
+        return Vec::new();
     };
+    let mut short = Vec::new();
     // Snapshot per mint under the locks; read the chain without them.
     let mut claims: BTreeMap<Pubkey, MintClaims> = BTreeMap::new();
     for pos in pipeline.exec.live_positions.lock().await.values() {
@@ -308,9 +312,11 @@ async fn custody_recheck(
             BootCustody::SuppressTracked { .. } => {
                 warn!(%mint, tracked = claim.tracked, manual = claim.manual, chain,
                     "custody recheck: chain holds LESS than claims (tokens moved out, or a stale/bankrupt RPC answered); NO auto-exit on unverified size — inspect before trusting the book");
+                short.push(mint.to_string());
             }
         }
     }
+    short
 }
 
 async fn reconcile_boot_custody(
@@ -942,6 +948,10 @@ async fn run_pipeline(live_arg: bool) {
     let mut last_logs_advance = boot_ts;
     // Custody-recheck stamp (live mode): mid-run drift check cadence.
     let mut last_custody_check = settings::now_secs();
+    // Latched ledger shorts (live mode): mints whose chain balance
+    // fell short of the claims at the last recheck. Refreshed only by
+    // a passing recheck — the pause outlives the timer by design.
+    let mut ledger_shorts: Vec<String> = Vec::new();
     /// Mid-run custody drift check cadence (boot reconcile owns boot).
     const CUSTODY_RECHECK_SECS: u64 = 1_800;
     /// Oldest-open warn threshold: paper timeouts are minutes; an open
@@ -1062,14 +1072,17 @@ async fn run_pipeline(live_arg: bool) {
                 }
                 // Custody recheck (live only, every CUSTODY_RECHECK_SECS):
                 // WAL claims per mint vs the chain ATA balance. Boot
-                // reconcile owns boot; this catches mid-run drift.
+                // reconcile owns boot; this catches mid-run drift. A
+                // short ledger latches the entry pause until a later
+                // recheck passes — recovery is a passing re-check,
+                // never elapsed time.
                 if live_mode
                     && settings::now_secs()
                         .saturating_sub(last_custody_check)
                         >= CUSTODY_RECHECK_SECS
                 {
                     last_custody_check = settings::now_secs();
-                    custody_recheck(&pipeline).await;
+                    ledger_shorts = custody_recheck(&pipeline).await;
                 }
                 let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
                     mode: if live_mode { "live" } else { "paper" },
@@ -1155,6 +1168,12 @@ async fn run_pipeline(live_arg: bool) {
                 let (egap_n, egap_avg, egap_total) = pipeline.exec.entry_gap_stats().await;
                 if egap_n > 0 {
                     info!("entry gap (negative = live paid more): n={egap_n} avg={egap_avg:+.4} total={egap_total:+.4} USD (paper quote vs landed fill)");
+                }
+                // Fill-rate trip input (trailing settled outcomes; thin
+                // windows stay silent via the sample floor inside the
+                // tracker — unknown reads as unknown, never as healthy).
+                if let Some(rate) = pipeline.exec.buy_fill_rate().await {
+                    info!("buy fill rate (trailing settled outcomes): {:.0}% (floor {:.0}%)", rate * 100.0, pipeline.settings.min_fill_rate_pct);
                 }
                 // Execution-gap dimensions: which dispatch path bled, at
                 // what ticket shape. Log-only calibration (never cards,
@@ -1254,9 +1273,11 @@ async fn run_pipeline(live_arg: bool) {
                 // source is unhealthy — no decisions from stale data.
                 // Same choke point as the kill switch (`open_tracked`),
                 // separate state; exits keep running either way.
-                let mut reasons: Vec<&str> = Vec::new();
+                // Recovery is a passing re-check of every reason below,
+                // never elapsed time: nothing here resumes on a timer.
+                let mut reasons: Vec<String> = Vec::new();
                 if pool.degraded() {
-                    reasons.push("rpc pool has no healthy endpoint");
+                    reasons.push("rpc pool has no healthy endpoint".to_string());
                 }
                 // Feed grace: a boot that never priced yet is startup,
                 // not degradation; losing a HAD price pauses immediately.
@@ -1264,10 +1285,10 @@ async fn run_pipeline(live_arg: bool) {
                     && (sol_feed_view.has_ever_priced()
                         || settings::now_secs().saturating_sub(boot_ts) > FEED_NEVER_GRACE_SECS)
                 {
-                    reasons.push("SOL/USD feed stale");
+                    reasons.push("SOL/USD feed stale".to_string());
                 }
                 if banned {
-                    reasons.push("listener ingestion banned (blind)");
+                    reasons.push("listener ingestion banned (blind)".to_string());
                 }
                 // Stall covers both modes (the ban latch is geyser-only):
                 // launches are seconds apart, so a long silence is a
@@ -1279,7 +1300,45 @@ async fn run_pipeline(live_arg: bool) {
                         last_logs_seen = logs;
                         last_logs_advance = now;
                     } else if now.saturating_sub(last_logs_advance) > LISTENER_STALL_SECS {
-                        reasons.push("listener stalled (no logs)");
+                        reasons.push("listener stalled (no logs)".to_string());
+                    }
+                }
+                // Ledger short vs chain (live mode): the latched custody
+                // recheck verdict — refreshed only by a passing recheck,
+                // so the pause outlives the audit timer by design.
+                if !ledger_shorts.is_empty() {
+                    reasons.push(format!("ledger short vs chain: {}", ledger_shorts.join(",")));
+                }
+                // Execution-quality trips (live evidence): a collapsing
+                // buy fill rate or a widening paper-vs-live gap pauses
+                // entries until the windows themselves read healthy
+                // again. Thin windows read as unknown, never as trips.
+                if let Some(rate) = pipeline.exec.buy_fill_rate().await {
+                    let floor = pipeline.settings.min_fill_rate_pct;
+                    if floor.is_finite() && floor > 0.0 && rate * 100.0 < floor {
+                        reasons.push(format!(
+                            "buy fill rate {:.0}% below floor {:.0}%",
+                            rate * 100.0,
+                            floor
+                        ));
+                    }
+                }
+                {
+                    let (_, exit_avg, _) = pipeline.exec.gap_stats().await;
+                    let cap = pipeline.settings.max_avg_exit_gap_usd;
+                    if cap.is_finite() && cap > 0.0 && exit_avg < -cap {
+                        reasons.push(format!(
+                            "avg exit gap {exit_avg:+.4} USD worse than -{cap:.4}"
+                        ));
+                    }
+                }
+                {
+                    let (_, entry_avg, _) = pipeline.exec.entry_gap_stats().await;
+                    let cap = pipeline.settings.max_avg_entry_gap_usd;
+                    if cap.is_finite() && cap > 0.0 && entry_avg < -cap {
+                        reasons.push(format!(
+                            "avg entry gap {entry_avg:+.4} USD worse than -{cap:.4}"
+                        ));
                     }
                 }
                 pipeline.set_data_degraded(!reasons.is_empty(), &reasons);

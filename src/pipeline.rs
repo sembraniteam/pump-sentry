@@ -630,7 +630,7 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
     /// Flip the data-degrade pause (supervisor-owned; see `data_paused`).
     /// Edge-logged like the kill switch; `reasons` name the unhealthy
     /// sources on the rising edge and stay quiet in steady state.
-    pub fn set_data_degraded(&self, degraded: bool, reasons: &[&str]) {
+    pub fn set_data_degraded(&self, degraded: bool, reasons: &[String]) {
         let was = self.data_paused.swap(degraded, Ordering::Relaxed);
         if degraded && !was {
             warn!(

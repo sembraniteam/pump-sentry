@@ -107,7 +107,9 @@ What `pause` does (and does not do):
   confirm while paused are skipped at the open (not queued).
 - All other limits stay in force: `notional_usd`, `max_open_positions`,
   `max_exposure_usd`, `max_daily_loss_usd`, `max_expected_entry_gap_usd`,
-  `max_top_holder_pct`, `hot_wallet_max_sol`.
+  `max_top_holder_pct`, `hot_wallet_max_sol`, plus the execution trips
+  below (`min_fill_rate_pct`, `max_avg_exit_gap_usd`,
+  `max_avg_entry_gap_usd`, ledger-short latch).
 - The marker survives `stop`/`start`/`restart` and crashes: the bot
   comes back paused until `resume`. If the state dir is lost (fresh VM,
   `--purge`), it comes back **unpaused** — check `status` after a
@@ -125,6 +127,24 @@ heartbeat card and the log edge lines. Do not `resume` against it: there
 is no marker to clear. Fix the named source (RPC endpoints, token/quota,
 feed) and entries re-arm on their own; a boot that never priced gets a
 5-minute grace before this trips.
+
+### Separately: execution-quality trips (same pause, live evidence)
+
+Beyond unhealthy sources, the supervisor pauses entries on live-measured
+trouble — same choke point, same `DATA DEGRADED` card, exits untouched:
+
+- **Buy fill rate** below `min_fill_rate_pct` (default 50; `0` = off)
+  over the trailing settled outcomes (thin windows never trip).
+- **Paper-vs-live gap** wider than `max_avg_exit_gap_usd` /
+  `max_avg_entry_gap_usd` (both `0` = off; calibrate in USD per ticket).
+- **Ledger short vs chain**: a custody recheck found the chain holding
+  less than the claims. Latched until a later recheck passes (every 30
+  min) — the pause outlives the timer by design.
+
+Recovery is always a passing re-check, never elapsed time: the card
+clears when every reason reads healthy again. Do not `resume` against
+these either — fix the cause (congestion, pool depth, custody hole),
+then let the windows re-prove health.
 
 ### Separately: managing open positions while paused
 

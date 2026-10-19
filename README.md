@@ -89,7 +89,12 @@ evidence-based: pool outage (sampler-confirmed, never a single blip),
 lost SOL/USD price (a boot that never priced gets a 5-minute grace;
 losing a had price pauses at once), banned ingestion, or a stream silent
 for 30 minutes (covers WS mode too — launches are seconds apart, so
-silence is a dead stream, never a quiet chain).
+silence is a dead stream, never a quiet chain). Live evidence trips the
+same pause: buy fill rate below `min_fill_rate_pct` over trailing settled
+outcomes, paper-vs-live gap averages worse than `max_avg_exit_gap_usd` /
+`max_avg_entry_gap_usd` (both off until calibrated in USD per ticket),
+or a ledger balance short of the claims. Thin windows never trip;
+recovery is always a passing re-check, never elapsed time.
 
 Stream gaps are counted, not hidden: geyser backfill sheds windows past
 its slot cap (`slot_gaps_shed`); WS backfill pages up to 3 signature
@@ -101,7 +106,9 @@ keeps every stamp, so the file names all its writers; `day-state.json`
 carries a schema version (a newer writer's file degrades to a fresh day,
 loudly, never adopting guessed numbers). Every 30 minutes live mode
 re-checks WAL claims per mint against the chain ATA balance — read-only;
-mismatches page the operator, nothing auto-corrects. The heartbeat card
+mismatches page the operator, nothing auto-corrects. A short ledger
+(balance below claims) additionally latches the entry pause until a later
+recheck passes. The heartbeat card
 carries the health view: RPC `n/m ok · failovers`, data state, oldest
 open age, stream gaps shed, and windowed GiveUps; a position overdue past
 its own timeout warns log-only (runner lifts respected).
@@ -183,6 +190,10 @@ notional_usd = 20.0                  # $10 tickets drown in ~6% fixed bleed;
 max_open_positions = 2               # fewer concurrent mouths (~$40 exposure + costs)
 max_daily_loss_usd = 5.0             # breaker is a live boot requirement;
                                      # ~12% of exposure; raise only from burn-in data
+min_fill_rate_pct = 50.0             # keep: pauses entries while fills collapse
+max_top_holder_pct = 0.0             # keep off until holder data says otherwise
+max_avg_exit_gap_usd = 0.0           # keep off: calibrate from the heartbeat
+max_avg_entry_gap_usd = 0.0          # gap averages before arming either trip
 
 [gate]
 gate_window_secs = 15                # default 10 loses to RugCheck indexing
@@ -276,6 +287,7 @@ sits above what you are willing to lose.
 **What it refuses (fail-closed, no funds move):**
 
 - Audit rejects, fresh/serial insiders, non-6-decimal mints, no-quorum timeouts, dev dumps, bundled supply monopolies, unconfirmed fills (re-polled, never assumed).
+- Ticket shapes with proven entry bleed, over-concentrated top holders (both opt-in caps, thin evidence always allows).
 - Post-migration exits route through the validated pool leg (Token-2022 vaults refuse fail-closed).
 
 **Paper is cost-honest, not live-identical:** the ledger nets venue fees plus dispatch bleed (priority fee included, calm-weather floor), and the heartbeat reports the running paper-vs-live execution gap. Size live expectations from that gap, never from the paper equity curve alone.

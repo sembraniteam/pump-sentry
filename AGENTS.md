@@ -110,7 +110,10 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   entry bleed from `FillGapTracker::expected_entry_gap_usd`; unknown
   cells always allow, never refuse), `max_top_holder_pct` (top-10 supply
   share from `Screener::top_holder_pct`; unreadable refuses while armed),
-  `hot_wallet_max_sol` (buy preflight refuses
+  `min_fill_rate_pct` (trailing buy-fill trip, thin windows unknown),
+  `max_avg_exit_gap_usd` / `max_avg_entry_gap_usd` (windowed paper-vs-live
+  gap trips; the tracker totals now follow the retained window so the
+  average stays windowed), `hot_wallet_max_sol` (buy preflight refuses
   above it, off the same balance read as solvency; never on sells).
   The day tally persists in `day-state.json` (`src/day_state.rs`: atomic
   tmp+rename via `cli::atomic_write_private`, `#[serde(default)]` fields,
@@ -287,7 +290,11 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   signature list (cheap) up to `BACKFILL_MAX_PAGES=3` seeking the seen
   boundary (`classify_backfill_page`, oldest-of-page rule); past the cap
   with unseen beyond it counts `backfill_pages_capped` (lost, unknown
-  count — never silently). Exits and `sell <mint>` keep running;
+  count — never silently). Execution-quality trips ride the same flag:
+  buy fill rate below `min_fill_rate_pct`, windowed paper-vs-live gap
+  worse than `max_avg_exit_gap_usd` / `max_avg_entry_gap_usd`, and the
+  latched ledger-short verdict (refreshed only by a passing custody
+  recheck, never by elapsed time). Exits and `sell <mint>` keep running;
   recovery clears the pause automatically. The operator's marker file
   and this flag stay separate states (operator vs system).
 - WAL carries a per-boot `Meta` stamp (`wal::WAL_SCHEMA_VERSION`,

@@ -1568,7 +1568,7 @@ async fn data_degrade_pauses_entries_but_not_exits() {
         symbol: "TEST",
         slot: 5000,
     };
-    pipe.set_data_degraded(true, &["test source down"]);
+    pipe.set_data_degraded(true, &["test source down".to_string()]);
     assert!(pipe.data_degraded());
     pipe.on_launch(&launch).await;
     pipe.poll_gates().await;
@@ -1585,7 +1585,7 @@ async fn data_degrade_pauses_entries_but_not_exits() {
     assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
 
     // Degraded again with a position open: the stop-loss still fires.
-    pipe.set_data_degraded(true, &["test source down"]);
+    pipe.set_data_degraded(true, &["test source down".to_string()]);
     let id = pipe.portfolio.lock().await.position_ids()[0];
     let mut stop = tick(MINT, 2.0);
     stop.price_usd = 1.0; // -50% << -8% SL.

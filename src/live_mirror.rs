@@ -217,7 +217,11 @@ impl FillGapTracker {
         self.total_gap_usd += gap_usd;
         self.gaps.push_back(gap.clone());
         while self.gaps.len() > FILL_GAP_CAP {
-            self.gaps.pop_front();
+            // Shed precision, not honesty: the running total tracks
+            // the retained window, so the average stays windowed.
+            if let Some(old) = self.gaps.pop_front() {
+                self.total_gap_usd -= old.gap_usd;
+            }
         }
         Some(gap)
     }
@@ -272,7 +276,11 @@ impl FillGapTracker {
         self.entry_total_gap_usd += gap_usd;
         self.entry_gaps.push_back(gap.clone());
         while self.entry_gaps.len() > FILL_GAP_CAP {
-            self.entry_gaps.pop_front();
+            // Same window discipline as the exit leg: the total tracks
+            // what the window retains.
+            if let Some(old) = self.entry_gaps.pop_front() {
+                self.entry_total_gap_usd -= old.gap_usd;
+            }
         }
         Some(gap)
     }
@@ -443,6 +451,55 @@ impl Default for FillGapTracker {
     }
 }
 
+/// Rolling buy-outcome window for the fill-rate trip. `true` = landed
+/// fill (`confirmed`), `false` = proven miss (`dead`, `giveup`).
+/// Terminal outcomes only: "unknown" legs are still being rechecked
+/// and must neither prove nor disprove dispatch health. Bounded like
+/// the gap windows: shedding loses precision, never custody.
+pub struct FillOutcomeTracker {
+    outcomes: VecDeque<bool>,
+}
+
+/// Outcome window (calibration depth, not a position limit).
+pub const FILL_OUTCOME_CAP: usize = 32;
+
+/// Outcomes below this read as "unknown", never as a rate: a thin
+/// window must not pause entries (or reassure about them).
+pub const MIN_FILL_OUTCOMES: usize = 5;
+
+impl FillOutcomeTracker {
+    /// Empty tracker.
+    pub fn new() -> Self {
+        Self {
+            outcomes: VecDeque::new(),
+        }
+    }
+
+    /// Record one terminal buy outcome. Oldest sheds past the cap.
+    pub fn note(&mut self, filled: bool) {
+        self.outcomes.push_back(filled);
+        while self.outcomes.len() > FILL_OUTCOME_CAP {
+            self.outcomes.pop_front();
+        }
+    }
+
+    /// Fill rate over the retained window (`None` below
+    /// [`MIN_FILL_OUTCOMES`]). Settles only, no pending legs.
+    pub fn fill_rate(&self) -> Option<f64> {
+        if self.outcomes.len() < MIN_FILL_OUTCOMES {
+            return None;
+        }
+        let filled = self.outcomes.iter().filter(|o| **o).count();
+        Some(filled as f64 / self.outcomes.len() as f64)
+    }
+}
+
+impl Default for FillOutcomeTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 use std::sync::Arc;
 
 use alert::Alerter;
@@ -508,6 +565,8 @@ pub struct LiveExecution<L = LiveTrader> {
     pub giveup_stamps: Mutex<Vec<u64>>,
     /// Paper-vs-live execution gaps (calibration signal).
     pub gaps: Mutex<FillGapTracker>,
+    /// Terminal buy outcomes (fill-rate trip signal).
+    pub outcomes: Mutex<FillOutcomeTracker>,
 }
 
 impl<L> LiveExecution<L> {
@@ -524,6 +583,7 @@ impl<L> LiveExecution<L> {
             live_sell_locks: Mutex::new(HashMap::new()),
             giveup_stamps: Mutex::new(Vec::new()),
             gaps: Mutex::new(FillGapTracker::new()),
+            outcomes: Mutex::new(FillOutcomeTracker::new()),
         }
     }
 
@@ -740,6 +800,19 @@ impl<L> LiveExecution<L> {
     /// diverged paper, drained book). Calibration data, not custody.
     pub async fn clear_gap(&self, mint: &str) {
         self.gaps.lock().await.pending_remove(mint);
+    }
+
+    /// Record one terminal buy outcome for the fill-rate trip.
+    /// Single choke with the journal line below: every recorded
+    /// outcome feeds the trip, journal or not.
+    pub async fn note_buy_outcome(&self, filled: bool) {
+        self.outcomes.lock().await.note(filled);
+    }
+
+    /// Rolling buy fill rate (`None` below [`MIN_FILL_OUTCOMES`]).
+    /// Settles only — pending legs never dilute the window.
+    pub async fn buy_fill_rate(&self) -> Option<f64> {
+        self.outcomes.lock().await.fill_rate()
     }
 
     /// `(settled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
@@ -1121,7 +1194,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     // buy gets exactly one outcome line, so confirmed
                     // counts include at-dispatch confirms (the debit is
                     // NOT repeated — the Attempt line owns it).
-                    self.journal_buy_outcome(mint, Some(bundle.clone()), "confirmed", None, None);
+                    self.journal_buy_outcome(mint, Some(bundle.clone()), "confirmed", None, None).await;
                 }
                 warn!(%mint, "LIVE buy dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_buy(&self.card_ctx(), mint, &bundle, amount));
@@ -1129,7 +1202,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Err(LiveError::UnknownDispatch { position, reason }) => {
                 // No signature: fill unknown, park manual.
                 warn!(%mint, error = %reason, "LIVE buy dispatch unknown; parked for manual review (may hold — check mint activity on explorer, no signature exists)");
-                self.journal_buy_outcome(mint, None, "unknown", Some(reason.to_string()), None);
+                self.journal_buy_outcome(mint, None, "unknown", Some(reason.to_string()), None).await;
                 trader.record_manual(&position, "dispatch-unknown");
                 self.exec.park_manual(mint.to_string(), *position).await;
                 self.emit(format!("LIVE buy dispatch unknown on {mint}; MANUAL REVIEW REQUIRED (fill unknown)"));
@@ -1145,7 +1218,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.debit_dispatch_usd(usd).await;
                 }
                 warn!(%mint, %reason, error = %context, "LIVE buy provably dead (no fill); paper still open but DIVERGED");
-                self.journal_buy_outcome(mint, None, "dead", Some(context.clone()), debit);
+                self.journal_buy_outcome(mint, None, "dead", Some(context.clone()), debit).await;
                 self.exec.mark_diverged(mint, context).await;
                 self.emit(format!(
                     "LIVE buy provably dead on {mint} ({reason}); paper open WITHOUT live cover"
@@ -1154,12 +1227,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Err(LiveError::Unconfirmed(msg)) => {
                 // Pending stays with recheck; GiveUp parks it.
                 warn!(%mint, error = %msg, "LIVE buy unconfirmed; tracked as pending, rechecking");
-                self.journal_buy_outcome(mint, None, "unknown", Some(msg), None);
+                self.journal_buy_outcome(mint, None, "unknown", Some(msg), None).await;
             }
             Err(e) => {
                 // No fill: paper stays open but diverged.
                 warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
-                self.journal_buy_outcome(mint, None, "unknown", Some(e.to_string()), None);
+                self.journal_buy_outcome(mint, None, "unknown", Some(e.to_string()), None).await;
                 self.exec.mark_diverged(mint, e.to_string()).await;
                 self.emit(format!("LIVE buy failed on {mint} ({e}); paper open WITHOUT live cover"));
             }
@@ -1179,7 +1252,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     }
 
     /// Decision record: terminal/recheck state for a pending live buy.
-    fn journal_buy_outcome(
+    async fn journal_buy_outcome(
         &self,
         mint: &str,
         bundle: Option<String>,
@@ -1187,6 +1260,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         detail: Option<String>,
         debit_usd: Option<f64>,
     ) {
+        // Fill-rate signal first, journal or not: the tracker is the
+        // trip source, the journal line only the record. Terminal
+        // outcomes only — "unknown" legs are still rechecking.
+        match verdict {
+            "confirmed" => self.exec.note_buy_outcome(true).await,
+            "dead" | "giveup" => self.exec.note_buy_outcome(false).await,
+            _ => {}
+        }
         if let Some(j) = self.journal() {
             j.append(&JournalLine::BuyOutcome {
                 ts: now_secs(),
@@ -1246,7 +1327,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             "confirmed",
                             Some("late confirm parked as manual (still held)".to_string()),
                             None,
-                        );
+                        ).await;
                         trader.record_manual(&recheck.position, &recheck.bundle_id);
                         self.exec
                             .park_manual(
@@ -1275,7 +1356,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         "confirmed",
                         None,
                         confirmed_debit,
-                    );
+                    ).await;
                     warn!(mint = %mint, "LIVE buy confirmed late; now tracked with exits");
                     self.emit(Alerter::format_live_buy(&self.card_ctx(), &mint, &recheck.bundle_id, amount));
                 }
@@ -1298,7 +1379,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         "dead",
                         Some(reason.to_string()),
                         dead_debit,
-                    );
+                    ).await;
                 }
                 RecheckOutcome::StillUnknown => {
                     warn!(mint = %mint, bundle = %recheck.bundle_id, "pending LIVE buy still unconfirmed; keeping for next round");
@@ -1308,7 +1389,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         "unknown",
                         None,
                         None,
-                    );
+                    ).await;
                 }
                 RecheckOutcome::GiveUp => {
                     // No verdict: may hold, park manual.
@@ -1319,7 +1400,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         "giveup",
                         Some(format!("sig {}", recheck.signature)),
                         None,
-                    );
+                    ).await;
                     trader.record_manual(&recheck.position, &recheck.signature);
                     self.exec.park_manual(mint.clone(), recheck.position).await;
                     self.exec.note_giveup(now_secs()).await;
@@ -1900,10 +1981,58 @@ mod tests {
             t.note_live_settle("M", 1.0, 0.0, "curve", 50_000.0)
                 .expect("gap");
         }
-        // Bounded history; totals still accumulate (windowed avg, full sum).
+        // Bounded history; the total tracks the retained window, so
+        // the average stays windowed (all gaps are 0.0 here).
         assert_eq!(t.gaps.len(), FILL_GAP_CAP);
-        let (n, _, _) = t.stats();
+        let (n, avg, total) = t.stats();
         assert_eq!(n, FILL_GAP_CAP);
+        assert_eq!((avg, total), (0.0, 0.0));
+    }
+
+    #[test]
+    fn fill_gap_average_stays_windowed_past_cap() {
+        // Shed legs must leave the total: 10 settles at gap -1.0, then
+        // FILL_GAP_CAP settles at gap 0.0. A full-sum total would read
+        // avg -10/128; the windowed total reads 0.0.
+        let mut t = FillGapTracker::new();
+        for _ in 0..10 {
+            t.note_paper_close("M", 2.0, 1);
+            t.note_live_settle("M", 1.0, 0.0, "curve", 50_000.0)
+                .expect("gap");
+        }
+        for _ in 0..FILL_GAP_CAP {
+            t.note_paper_close("M", 1.0, 1);
+            t.note_live_settle("M", 1.0, 0.0, "curve", 50_000.0)
+                .expect("gap");
+        }
+        let (n, avg, total) = t.stats();
+        assert_eq!(n, FILL_GAP_CAP);
+        assert!((avg).abs() < 1e-9, "avg={avg}");
+        assert!(total.abs() < 1e-9, "total={total}");
+    }
+
+    #[test]
+    fn fill_outcome_tracker_rates_settles_only() {
+        let mut t = FillOutcomeTracker::new();
+        // Thin windows read as unknown, never as a rate.
+        for filled in [true, true, true, true] {
+            t.note(filled);
+        }
+        assert_eq!(t.fill_rate(), None);
+        // 4/5 filled: 80%.
+        t.note(false);
+        assert_eq!(t.fill_rate(), Some(0.8));
+        // Window caps at FILL_OUTCOME_CAP: old outcomes shed.
+        for _ in 0..FILL_OUTCOME_CAP {
+            t.note(false);
+        }
+        assert_eq!(t.fill_rate(), Some(0.0));
+        // Recovers as fills land again (recovery is a passing
+        // window, never elapsed time).
+        for _ in 0..FILL_OUTCOME_CAP {
+            t.note(true);
+        }
+        assert_eq!(t.fill_rate(), Some(1.0));
     }
 
     #[test]

@@ -59,6 +59,19 @@ pub struct Settings {
     /// Unreadable holdings refuse while armed (fail-closed); exits never
     /// block.
     pub max_top_holder_pct: f64,
+    /// Buy fill-rate floor in percent (`0` = off): the supervisor pauses
+    /// entries while the trailing settled-outcome window fills below
+    /// this. Thin windows read as unknown, never as trips; recovery is
+    /// a passing re-check, never elapsed time.
+    pub min_fill_rate_pct: f64,
+    /// Paper-vs-live exit-gap trip in USD (`0` = off): the supervisor
+    /// pauses entries while the retained-window average exit gap runs
+    /// worse than this (negative = live did worse). Now-windowed
+    /// averages only; recovery is a healthy re-check, never a timer.
+    pub max_avg_exit_gap_usd: f64,
+    /// Same as `max_avg_exit_gap_usd` for the entry leg (paper quote vs
+    /// landed fill). `0` = off.
+    pub max_avg_entry_gap_usd: f64,
     /// Hot-wallet ceiling in SOL (`0` = off): entries refuse while the
     /// wallet holds more than this. Exits always work.
     pub hot_wallet_max_sol: f64,
@@ -170,6 +183,9 @@ impl std::fmt::Debug for Settings {
                 &self.max_expected_entry_gap_usd,
             )
             .field("max_top_holder_pct", &self.max_top_holder_pct)
+            .field("min_fill_rate_pct", &self.min_fill_rate_pct)
+            .field("max_avg_exit_gap_usd", &self.max_avg_exit_gap_usd)
+            .field("max_avg_entry_gap_usd", &self.max_avg_entry_gap_usd)
             .field("hot_wallet_max_sol", &self.hot_wallet_max_sol)
             .field("mint_cooldown_secs", &self.mint_cooldown_secs)
             .field("dev_min_age_secs", &self.dev_min_age_secs)
@@ -267,6 +283,9 @@ impl Settings {
                 &mut notes,
             ),
             max_top_holder_pct: get_float(vars, "MAX_TOP_HOLDER_PCT", 0.0, &mut notes),
+            min_fill_rate_pct: get_float(vars, "MIN_FILL_RATE_PCT", 50.0, &mut notes),
+            max_avg_exit_gap_usd: get_float(vars, "MAX_AVG_EXIT_GAP_USD", 0.0, &mut notes),
+            max_avg_entry_gap_usd: get_float(vars, "MAX_AVG_ENTRY_GAP_USD", 0.0, &mut notes),
             hot_wallet_max_sol: get_float(vars, "HOT_WALLET_MAX_SOL", 0.0, &mut notes),
             mint_cooldown_secs: get_int(vars, "MINT_COOLDOWN_SECS", 3600, &mut notes),
             dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600, &mut notes),
@@ -394,6 +413,27 @@ impl Settings {
             out.push(format!(
                 "MAX_TOP_HOLDER_PCT={} exceeds 100%: no holding can refuse, the cap never fires",
                 self.max_top_holder_pct
+            ));
+        }
+        if self.min_fill_rate_pct < 0.0
+            || self.min_fill_rate_pct > 100.0
+            || !self.min_fill_rate_pct.is_finite()
+        {
+            out.push(format!(
+                "MIN_FILL_RATE_PCT={} is invalid (want 0-100); fill-rate trip disabled",
+                self.min_fill_rate_pct
+            ));
+        }
+        if self.max_avg_exit_gap_usd < 0.0 || !self.max_avg_exit_gap_usd.is_finite() {
+            out.push(format!(
+                "MAX_AVG_EXIT_GAP_USD={} is invalid; exit-gap trip disabled",
+                self.max_avg_exit_gap_usd
+            ));
+        }
+        if self.max_avg_entry_gap_usd < 0.0 || !self.max_avg_entry_gap_usd.is_finite() {
+            out.push(format!(
+                "MAX_AVG_ENTRY_GAP_USD={} is invalid; entry-gap trip disabled",
+                self.max_avg_entry_gap_usd
             ));
         }
         if self.hot_wallet_max_sol < 0.0 || !self.hot_wallet_max_sol.is_finite() {
@@ -958,7 +998,6 @@ mod tests {
 
     #[test]
     fn entry_bleed_cap_parses_and_warns() {
-
         let s = Settings::from_map(&HashMap::new());
         assert_eq!(s.max_expected_entry_gap_usd, 0.0, "off by default");
         let s = Settings::from_map(&vars(&[("MAX_EXPECTED_ENTRY_GAP_USD", "0.75")]));
@@ -1008,6 +1047,41 @@ mod tests {
             .warnings()
             .join("\n");
         assert!(w.contains("never fires"), "{w}");
+    }
+
+    #[test]
+    fn execution_trip_knobs_parse_and_warn() {
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.min_fill_rate_pct, 50.0, "armed by default");
+        assert_eq!(s.max_avg_exit_gap_usd, 0.0, "off by default");
+        assert_eq!(s.max_avg_entry_gap_usd, 0.0, "off by default");
+        let s = Settings::from_map(&vars(&[
+            ("MIN_FILL_RATE_PCT", "75"),
+            ("MAX_AVG_EXIT_GAP_USD", "0.5"),
+            ("MAX_AVG_ENTRY_GAP_USD", "0.25"),
+        ]));
+        assert_eq!(s.min_fill_rate_pct, 75.0);
+        assert_eq!(s.max_avg_exit_gap_usd, 0.5);
+        assert_eq!(s.max_avg_entry_gap_usd, 0.25);
+        assert!(
+            !s.warnings().iter().any(|w| w.contains("MIN_FILL_RATE_PCT")
+                || w.contains("MAX_AVG_EXIT_GAP_USD")
+                || w.contains("MAX_AVG_ENTRY_GAP_USD")),
+            "{:?}",
+            s.warnings()
+        );
+        // Out-of-range reads as disabled, loudly.
+        for (key, val) in [
+            ("MIN_FILL_RATE_PCT", "-1"),
+            ("MIN_FILL_RATE_PCT", "101"),
+            ("MAX_AVG_EXIT_GAP_USD", "-0.5"),
+            ("MAX_AVG_ENTRY_GAP_USD", "-0.5"),
+        ] {
+            let w = Settings::from_map(&vars(&[(key, val)]))
+                .warnings()
+                .join("\n");
+            assert!(w.contains(key), "{key}={val}: {w}");
+        }
     }
 
     #[test]
