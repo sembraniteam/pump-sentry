@@ -308,6 +308,45 @@ impl GateState {
     }
 }
 
+/// Assemble the risk-model input: confirm pricing plus the
+/// structured tape. Pure free function (unit-pinned): the analyst
+/// sees the same numbers the logs show. The hard gates around the
+/// call stay independent — the model can only tighten (PASS/temper)
+/// through the shared profile, never bypass a refusal.
+#[allow(clippy::too_many_arguments)]
+fn confirm_metrics(
+    liquidity_usd: f64,
+    buyers: u32,
+    trust: f64,
+    score: u32,
+    venue_fee: Option<f64>,
+    creation_slot_buys: Option<u32>,
+    cluster_pct: Option<f64>,
+    volume_usd: Option<f64>,
+    micro: MicroSignals,
+    top_holder_pct: Option<f64>,
+) -> TokenMetrics {
+    TokenMetrics {
+        liquidity_usd,
+        buy_velocity_5s: buyers,
+        dev_reputation: trust,
+        rugcheck_score: score,
+        venue_fee_bps: venue_fee,
+        creation_slot_buys,
+        cluster_pct,
+        // Unmeasured: no reserve field carries curve progress; the
+        // prompt assumes its spread prior when absent.
+        curve_progress: None,
+        volume_usd,
+        buy_ratio: micro.buy_ratio,
+        unique_traders: micro.unique_traders,
+        top_wallet_share_pct: micro.top_wallet_share_pct,
+        creator_net_base: micro.creator_net_base,
+        velocity_delta: micro.velocity_delta,
+        top_holder_pct,
+    }
+}
+
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
 
     /// Watchlisted mint count.
@@ -747,26 +786,32 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return;
             }
         }
-        // Holder concentration, only when armed (`0` = off, costing no
-        // reads): the ten largest holders own this % of supply. Over
-        // the cap — or unreadable while armed — drops the signal
-        // (fail-closed); exits and held bags are untouched.
+        // Holder concentration: the ten largest holders own this % of
+        // supply. Read once per confirm for BOTH consumers: the armed
+        // cap refuses over-cap (or unreadable-while-armed) fail-closed,
+        // and the risk model always receives the reading as context
+        // (`None` when unreadable and unarmed — unknown, never zero).
+        // Exits and held bags are untouched either way.
         let holder_cap = self.settings.max_top_holder_pct;
-        if holder_cap > 0.0 && holder_cap.is_finite() {
-            match self.screener.top_holder_pct(mint).await {
-                Ok(pct) if pct <= holder_cap => {
-                    info!(%mint, top10_pct = format!("{pct:.1}"), "holder concentration within cap");
-                }
-                Ok(pct) => {
+        let armed = holder_cap > 0.0 && holder_cap.is_finite();
+        let top_holder_pct = match self.screener.top_holder_pct(mint).await {
+            Ok(pct) => {
+                if armed && pct > holder_cap {
                     warn!(%mint, top10_pct = format!("{pct:.1}"), cap = holder_cap, "holder concentration over cap; dropping signal");
                     return;
                 }
-                Err(e) => {
+                info!(%mint, top10_pct = format!("{pct:.1}"), "holder concentration read");
+                Some(pct)
+            }
+            Err(e) => {
+                if armed {
                     warn!(%mint, error = %ids::redact_urls_in_text(&e.to_string()), "holder concentration unreadable while cap armed; dropping signal (fail-closed)");
                     return;
                 }
+                debug!(%mint, error = %ids::redact_urls_in_text(&e.to_string()), "holder concentration unreadable; model reads unknown");
+                None
             }
-        }
+        };
 
         // Confirm-time insider re-screen: dev history goes stale
         // between watchlist intake and quorum (serial launchers, fresh
@@ -815,27 +860,23 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             };
             score
         };
-        let metrics = TokenMetrics {
+        let metrics = confirm_metrics(
             liquidity_usd,
-            buy_velocity_5s: buyers,
-            dev_reputation: trust,
-            rugcheck_score: score,
-            venue_fee_bps: venue_fee,
-            creation_slot_buys: req.creation_slot_buys,
-            cluster_pct: req.cluster_pct,
-            // Unmeasured: no reserve field carries curve progress; the
-            // prompt assumes its spread prior when absent.
-            curve_progress: None,
-            // Confirming tape spot-priced at the confirm quote (the
-            // 6-decimal sizing basis is proven above): `None` on an
-            // empty tape, never a zero that reads as "no demand".
-            volume_usd: if req.tape_base_units > 0 {
+            buyers,
+            trust,
+            score,
+            venue_fee,
+            req.creation_slot_buys,
+            req.cluster_pct,
+            if req.tape_base_units > 0 {
                 let v = req.tape_base_units as f64 / 1_000_000.0 * entry_quote;
                 v.is_finite().then_some(v)
             } else {
                 None
             },
-        };
+            req.micro,
+            top_holder_pct,
+        );
         // Model call timed: entry latency is sniper budget (raise
         // INFERENCE_TIMEOUT_MS only knowing it costs entry price).
         let started = std::time::Instant::now();
@@ -1271,8 +1312,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hard_cap_sheds_the_oldest_intake() {
-        let signal = |intake_secs: u64| PendingSignal {
+    fn confirm_metrics_carries_the_structured_tape() {
+        let micro = MicroSignals {
+            buys: 6,
+            sells: 2,
+            buy_ratio: Some(0.75),
+            buy_volume_base: 6_000_000,
+            sell_volume_base: 1_000_000,
+            unique_traders: 5,
+            top_wallet_share_pct: Some(40.0),
+            creator_net_base: -500_000,
+            velocity_delta: Some(0.3),
+        };
+        let m = confirm_metrics(
+            30_000.0,
+            6,
+            0.9,
+            120,
+            Some(125.0),
+            Some(3),
+            Some(9.0),
+            Some(1_250.0),
+            micro,
+            Some(22.0),
+        );
+        assert_eq!(m.liquidity_usd, 30_000.0);
+        assert_eq!(m.buy_velocity_5s, 6);
+        assert_eq!(m.volume_usd, Some(1_250.0));
+        assert_eq!(m.buy_ratio, Some(0.75));
+        assert_eq!(m.unique_traders, 5);
+        assert_eq!(m.top_wallet_share_pct, Some(40.0));
+        assert_eq!(m.creator_net_base, -500_000);
+        assert_eq!(m.velocity_delta, Some(0.3));
+        assert_eq!(m.top_holder_pct, Some(22.0));
+        // Unknowns stay unknown (null), never zero-as-data.
+        let empty = MicroSignals {
+            buys: 0,
+            sells: 0,
+            buy_ratio: None,
+            buy_volume_base: 0,
+            sell_volume_base: 0,
+            unique_traders: 0,
+            top_wallet_share_pct: None,
+            creator_net_base: 0,
+            velocity_delta: None,
+        };
+        let m = confirm_metrics(30_000.0, 5, 0.9, 120, None, None, None, None, empty, None);
+        assert_eq!(m.buy_ratio, None);
+        assert_eq!(m.top_holder_pct, None);
+        assert_eq!(m.velocity_delta, None);
+    }
+
+    #[test]
+    fn hard_cap_sheds_the_oldest_intake() {        let signal = |intake_secs: u64| PendingSignal {
             curve: "C".to_string(),
             creator: None,
             assoc_curve: "A".to_string(),

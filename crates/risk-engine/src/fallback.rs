@@ -124,6 +124,12 @@ mod tests {
             cluster_pct: None,
             curve_progress: None,
             volume_usd: None,
+            buy_ratio: None,
+            unique_traders: 0,
+            top_wallet_share_pct: None,
+            creator_net_base: 0,
+            velocity_delta: None,
+            top_holder_pct: None,
         }
     }
 

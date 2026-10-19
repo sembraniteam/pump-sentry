@@ -500,7 +500,14 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   `response_format {"type":"json_object"}`); no provider-specific fields,
   no Groq support (removed — don't re-add). Undecodable output → PASS;
   timeout → heuristic fallback (`FALLBACK_TIMEOUT` 300ms default,
-  `MAX_TIMEOUT` 2s clamp).
+  `MAX_TIMEOUT` 2s clamp). The model is a second screener, never a gate
+  override: `confirm_metrics` (`src/gate.rs`, pure, unit-pinned) feeds it
+  the structured tape (`MicroSignals` + `top_holder_pct` + volume) and
+  the profile flows through the same `open_tracked` choke as every
+  refusal — a model BUY cannot pass a tripped breaker, cap, or pause.
+  Prompt rules only tighten (PASS/temper on wash, concentration,
+  insider distribution, fading velocity); the heuristic keeps the
+  velocity screen and ignores the newer context fields.
 - Measured latency per decision: gpt-oss-120b ~1.7–2.1s (mostly
   timeout→fallback at the 2s clamp), qwen3.8-27b ~0.3s (fits). Remote
   gateways need `inference_timeout_ms` raised (README `[risk]` example).

@@ -46,6 +46,28 @@ pub struct TokenMetrics {
     /// inside the window printed at their own prices, not today's spot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_usd: Option<f64>,
+    /// Confirm-round buy share (`None` = empty tape). High values alone
+    /// are not organic-buying proof — wash quoting prints buys too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_ratio: Option<f64>,
+    /// Distinct transacting wallets in the confirming round.
+    pub unique_traders: u32,
+    /// Largest single wallet's share of round base volume, percent
+    /// (`None` = empty tape). A no-RPC concentration proxy, not
+    /// related-wallet forensics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_wallet_share_pct: Option<f64>,
+    /// Signed dev+creator flow in base units (buys minus sells):
+    /// negative means insiders distributed into the round.
+    pub creator_net_base: i64,
+    /// Buyer-count acceleration into confirm, buyers/s (`None` =
+    /// no previous round). Negative means the tape is fading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity_delta: Option<f64>,
+    /// Top-10 holder share of supply, percent (`None` = unreadable).
+    /// Whale-held supply caps upside conviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_holder_pct: Option<f64>,
 }
 
 /// Model output: TP/SL plus exit policy.
@@ -132,7 +154,7 @@ pub const MAX_TIMEOUT_SECS: u64 = 3600;
 pub const MIN_TIMEOUT_SECS: u64 = 1;
 
 /// System instruction sent to the model.
-pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Thin trailing volume (low volume_usd) against high velocity is the same suspect wash: tape without size is quoting, not demand — prefer PASS. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.\nOutput schema (exact key names and types): {\"action\":\"BUY\" or \"PASS\",\"tp_percent\":number,\"sl_percent\":number,\"trailing_stop\":boolean,\"timeout_seconds\":integer,\"moonbag_percent\":number}. For PASS use \"action\":\"PASS\" with all other fields 0 or false.";
+pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Thin trailing volume (low volume_usd) against high velocity is the same suspect wash: tape without size is quoting, not demand — prefer PASS. Concentrated round flow (high top_wallet_share_pct) or a high buy_ratio with few unique_traders is quoting concentration, not breadth — prefer PASS or the moderate band, never high-momentum TP. Insiders distributing into the round (negative creator_net_base) or a fading tape (negative velocity_delta) tempers momentum reads: prefer PASS or the moderate band. Whale-held supply (high top_holder_pct) caps upside conviction the same way: never high-momentum TP. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.\nOutput schema (exact key names and types): {\"action\":\"BUY\" or \"PASS\",\"tp_percent\":number,\"sl_percent\":number,\"trailing_stop\":boolean,\"timeout_seconds\":integer,\"moonbag_percent\":number}. For PASS use \"action\":\"PASS\" with all other fields 0 or false.";
 
 /// Inference input payload: the skill's `INPUT PAYLOAD` keys. Unknowns
 /// ship as `null`, never omitted — the model reads absent/null as
@@ -148,6 +170,12 @@ struct InputPayload {
     cluster_pct: Option<f64>,
     curve_progress: Option<f64>,
     volume_usd: Option<f64>,
+    buy_ratio: Option<f64>,
+    unique_traders: u32,
+    top_wallet_share_pct: Option<f64>,
+    creator_net_base: i64,
+    velocity_delta: Option<f64>,
+    top_holder_pct: Option<f64>,
 }
 
 impl TokenMetrics {
@@ -163,6 +191,12 @@ impl TokenMetrics {
             cluster_pct: self.cluster_pct,
             curve_progress: self.curve_progress,
             volume_usd: self.volume_usd,
+            buy_ratio: self.buy_ratio,
+            unique_traders: self.unique_traders,
+            top_wallet_share_pct: self.top_wallet_share_pct,
+            creator_net_base: self.creator_net_base,
+            velocity_delta: self.velocity_delta,
+            top_holder_pct: self.top_holder_pct,
         };
         // Plain scalars only: serialization cannot fail.
         serde_json::to_string(&payload).expect("input payload serializes")
@@ -190,6 +224,12 @@ mod tests {
             cluster_pct: None,
             curve_progress: None,
             volume_usd: Some(1_250.0),
+            buy_ratio: Some(0.85),
+            unique_traders: 12,
+            top_wallet_share_pct: Some(18.0),
+            creator_net_base: 500_000,
+            velocity_delta: Some(0.4),
+            top_holder_pct: Some(22.0),
         };
         let value: serde_json::Value =
             serde_json::from_str(&metrics.to_input_payload()).expect("valid JSON");
@@ -199,6 +239,12 @@ mod tests {
         assert_eq!(value["rugcheck_score"], 120);
         assert_eq!(value["venue_fee_bps"], 125.0);
         assert_eq!(value["volume_usd"], 1_250.0);
+        assert_eq!(value["buy_ratio"], 0.85);
+        assert_eq!(value["unique_traders"], 12);
+        assert_eq!(value["top_wallet_share_pct"], 18.0);
+        assert_eq!(value["creator_net_base"], 500_000);
+        assert_eq!(value["velocity_delta"], 0.4);
+        assert_eq!(value["top_holder_pct"], 22.0);
     }
 
     #[test]
