@@ -141,6 +141,14 @@ pub struct ListenerStats {
     pub dropped_full: AtomicU64,
     /// Candidates dropped with no free fetch permit.
     pub dropped_throttled: AtomicU64,
+    /// Reconnect gaps older than the backfill slot cap: the missed
+    /// window is shed (stale launches unactionable). Tracked so the
+    /// heartbeat shows how much of the stream was actually lost.
+    pub slot_gaps_shed: AtomicU64,
+    /// WS reconnect backfills that hit the page cap with unseen history
+    /// still beyond it: launches were lost, count unknown (the list was
+    /// cut, not the fetches). One increment per capped backfill.
+    pub backfill_pages_capped: AtomicU64,
     /// Ingestion-ban latch: the consecutive-429 circuit breaker tripped
     /// (geyser). Set on trip, cleared on recovery; the binary watches
     /// the rising edge (Discord card) because the listener owns no
@@ -170,6 +178,10 @@ pub struct ListenerStatsSnapshot {
     pub dropped_full: u64,
     /// See [`ListenerStats::dropped_throttled`].
     pub dropped_throttled: u64,
+    /// See [`ListenerStats::slot_gaps_shed`].
+    pub slot_gaps_shed: u64,
+    /// See [`ListenerStats::backfill_pages_capped`].
+    pub backfill_pages_capped: u64,
 }
 
 impl ListenerStats {
@@ -190,6 +202,8 @@ impl ListenerStats {
             events_emitted: self.events_emitted.load(Ordering::Relaxed),
             dropped_throttled: self.dropped_throttled.load(Ordering::Relaxed),
             dropped_full: self.dropped_full.load(Ordering::Relaxed),
+            slot_gaps_shed: self.slot_gaps_shed.load(Ordering::Relaxed),
+            backfill_pages_capped: self.backfill_pages_capped.load(Ordering::Relaxed),
         }
     }
 
@@ -200,6 +214,14 @@ impl ListenerStats {
     /// Read logs-seen count.
     pub fn logs_seen(&self) -> u64 {
         self.logs_seen.load(Ordering::Relaxed)
+    }
+    /// Increment helper (single atomic op).
+    pub fn inc_slot_gaps_shed(&self) {
+        self.slot_gaps_shed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Increment helper (single atomic op).
+    pub fn inc_backfill_pages_capped(&self) {
+        self.backfill_pages_capped.fetch_add(1, Ordering::Relaxed);
     }
     /// Increment candidate counter.
     pub fn inc_candidates(&self) {

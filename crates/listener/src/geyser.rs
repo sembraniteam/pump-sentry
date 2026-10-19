@@ -479,6 +479,11 @@ impl GeyserSubscriber {
             return;
         }
         if skipped > 0 {
+            // The missed window is shed, not backfilled: count it so
+            // the heartbeat shows how much of the stream was lost.
+            for _ in 0..skipped {
+                self.stats.inc_slot_gaps_shed();
+            }
             warn!(
                 skipped,
                 from,

@@ -9,6 +9,7 @@ pub mod instructions;
 pub mod quote;
 pub mod jito;
 pub mod raydium;
+pub mod rpc_pool;
 #[cfg(test)]
 mod test_fixture;
 pub mod wallet;

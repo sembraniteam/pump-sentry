@@ -40,6 +40,18 @@ pub struct WalSellPending {
 /// bundles cannot still be inflight (Jito drops them in minutes).
 pub const SELL_PENDING_SEED_WINDOW_SECS: u64 = 900;
 
+/// One schema stamp seen in the file: writer provenance per boot.
+/// Retained through compaction so the file carries its full writer
+/// history (one small line per boot — bounded by restart count, and
+/// restarts are the very thing being audited).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WalMeta {
+    pub schema: u32,
+    #[serde(default)]
+    pub version: String,
+    pub ts: u64,
+}
+
 /// Boot state.
 #[derive(Debug, Default, Clone)]
 pub struct WalReplay {
@@ -49,6 +61,8 @@ pub struct WalReplay {
     pub manual: Vec<WalManual>,
     /// Unsettled sell dispatches (guard seeds).
     pub sell_pending: Vec<WalSellPending>,
+    /// Schema stamps in file order (provenance, never custody).
+    pub meta: Vec<WalMeta>,
     /// Corrupt lines skipped.
     pub skipped: usize,
 }
@@ -146,7 +160,25 @@ pub enum WalLine {
         #[serde(default)]
         ts: Option<u64>,
     },
+    /// Schema stamp, written once per boot. Carries NO custody: it is
+    /// provenance for versioning/forensics. Old binaries skip unknown
+    /// tags (counted in `skipped`, never half-adopted) so the stamp is
+    /// forward-compatible in both directions.
+    Meta {
+        /// WAL schema version ([`WAL_SCHEMA_VERSION`] at write time).
+        schema: u32,
+        /// Writer version string (crate version at write time).
+        #[serde(default)]
+        version: String,
+        /// Boot stamp (unix secs).
+        ts: u64,
+    },
 }
+
+/// Current WAL schema version. Bump only for a wire-shape change that
+/// replay must distinguish (missing load-bearing fields stay behind
+/// `#[serde(default)]`, which needs no bump).
+pub const WAL_SCHEMA_VERSION: u32 = 1;
 
 /// Position from WAL fields. Corrupt addresses skip the line (counted):
 /// the writer only emits canonical base58 or null, so unparseable means
@@ -186,6 +218,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
     // same sell twice (two writers pre-fix); without this a partial
     // exit replays twice and the held runner vanishes from tracking.
     let mut seen_sells: HashSet<String> = HashSet::new();
+    let mut meta: Vec<WalMeta> = Vec::new();
     let mut skipped = 0usize;
     // Same-mint bags merge by summing amounts: custody cares about
     // the total held, and per-bundle granularity would ripple into
@@ -329,6 +362,19 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     }
                 }
             }
+            WalLine::Meta {
+                schema,
+                version,
+                ts,
+            } => {
+                // Provenance only: no custody to fold — but retained so
+                // compaction keeps the file's writer history.
+                meta.push(WalMeta {
+                    schema,
+                    version,
+                    ts,
+                });
+            }
         }
     }
     WalReplay {
@@ -347,6 +393,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 },
             )
             .collect(),
+        meta,
         skipped,
     }
 }
@@ -374,6 +421,18 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
     let mut out = String::new();
     let now = crate::settings::now_secs();
     let creator = |c: Option<&solana_pubkey::Pubkey>| c.map(|c| c.to_string());
+    // Writer history first: compaction must not erase provenance (the
+    // fresh session appends its own stamp after this returns).
+    for m in &replay.meta {
+        push_line(
+            &mut out,
+            &WalLine::Meta {
+                schema: m.schema,
+                version: m.version.clone(),
+                ts: m.ts,
+            },
+        );
+    }
     for p in &replay.pending {
         push_line(
             &mut out,
@@ -501,6 +560,124 @@ mod tests {
         // A directory in the WAL's place: EISDIR, not NotFound.
         assert!(replay_file(&dir).is_err(), "unreadable WAL must error");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn torn_final_line_is_skipped_custody_intact() {
+        // Crash mid-append: the last line is a JSON prefix without a
+        // trailing newline. The line is damage (counted, never
+        // half-adopted); the settled custody before it survives.
+        let full = position_line(TMINT, 1000, "B1");
+        let torn = full[..full.len() / 2].to_string();
+        let replay = replay_lines([full, torn].iter().map(String::as_str));
+        assert_eq!(replay.skipped, 1, "torn line is counted, not adopted");
+        assert_eq!(replay.positions.len(), 1);
+        assert_eq!(replay.positions[0].amount_tokens, 1000);
+    }
+
+    #[test]
+    fn meta_line_is_provenance_not_custody() {
+        // The schema stamp decodes and folds as a no-op; it never
+        // creates custody and is never counted as damage.
+        let meta = WalLine::Meta {
+            schema: WAL_SCHEMA_VERSION,
+            version: "test".to_string(),
+            ts: 7,
+        };
+        let meta = serde_json::to_string(&meta).expect("meta serializes");
+        let replay = replay_lines(
+            [
+                position_line(TMINT, 1000, "B1"),
+                meta,
+                position_line(TMINT, 500, "B2"),
+            ]
+            .iter()
+            .map(String::as_str),
+        );
+        assert_eq!(replay.skipped, 0);
+        assert_eq!(replay.positions.len(), 1);
+        assert_eq!(replay.positions[0].amount_tokens, 1500);
+        // ...but it IS retained for compaction (writer history).
+        assert_eq!(
+            replay.meta,
+            vec![WalMeta {
+                schema: WAL_SCHEMA_VERSION,
+                version: "test".to_string(),
+                ts: 7
+            }]
+        );
+    }
+
+    #[test]
+    fn future_meta_schema_still_replays_custody() {
+        // A NEWER writer's stamp (schema > ours) is not ours to adopt,
+        // but it must not poison the file: the custody lines around it
+        // still replay (downgrade reads the ledger, just flags it).
+        let future = r#"{"t":"meta","schema":999,"version":"0.0.0","ts":7}"#;
+        let replay = replay_lines(
+            [position_line(TMINT, 1000, "B1"), future.to_string()]
+                .iter()
+                .map(String::as_str),
+        );
+        assert_eq!(replay.skipped, 0);
+        assert_eq!(replay.positions.len(), 1);
+    }
+
+    #[test]
+    fn garbage_lines_are_skipped_without_poisoning() {
+        let replay = replay_lines(
+            [
+                position_line(TMINT, 1000, "B1"),
+                "\u{0}\u{1}not json at all".to_string(),
+                "{\"t\":\"pending\"}".to_string(), // missing load-bearing fields
+                position_line(TMINT, 250, "B2"),
+            ]
+            .iter()
+            .map(String::as_str),
+        );
+        assert_eq!(replay.skipped, 2);
+        assert_eq!(replay.positions.len(), 1);
+        assert_eq!(replay.positions[0].amount_tokens, 1250);
+    }
+
+    #[test]
+    fn torn_write_file_recovery_uses_the_same_rules() {
+        // File-level crash recovery: a torn append inside a real file
+        // skips the damage and keeps the settled custody (the file
+        // layer must agree with the line layer).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("wal.jsonl");
+        let full = position_line(TMINT, 1000, "B1");
+        let torn = &full[..full.len() / 2];
+        std::fs::write(&path, format!("{full}\n{torn}\n")).expect("write WAL");
+        let replay = replay_file(&path).expect("torn WAL is readable");
+        assert_eq!(replay.skipped, 1);
+        assert_eq!(replay.positions.len(), 1);
+        assert_eq!(replay.positions[0].amount_tokens, 1000);
+    }
+
+    #[test]
+    fn compaction_preserves_meta_history() {
+        // Compaction rewrites custody but keeps every stamp: the file
+        // always names all its writers, not just the last session.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("wal.jsonl");
+        let meta_old = serde_json::to_string(&WalLine::Meta {
+            schema: WAL_SCHEMA_VERSION,
+            version: "0.7.1".to_string(),
+            ts: 5,
+        })
+        .expect("meta serializes");
+        let full = position_line(TMINT, 1000, "B1");
+        std::fs::write(&path, format!("{meta_old}\n{full}\n")).expect("write WAL");
+        let replay = replay_file(&path).expect("readable");
+        assert_eq!(replay.meta.len(), 1);
+        compact_file(&path, &replay);
+        let reread = replay_file(&path).expect("compacted file readable");
+        assert_eq!(reread.meta.len(), 1, "stamp survives compaction");
+        assert_eq!(reread.meta[0].version, "0.7.1");
+        assert_eq!(reread.positions.len(), 1);
+        assert_eq!(reread.positions[0].amount_tokens, 1000);
     }
 
     #[test]

@@ -16,6 +16,9 @@ pub const DEFAULT_INFERENCE_ENDPOINT: &str = "http://127.0.0.1:11434/v1/chat/com
 pub struct Settings {
     pub ws_url: String,
     pub http_url: String,
+    /// Read-path failover endpoints (first = primary `http_url`).
+    /// Dispatch never fans out — these harden READS only.
+    pub fallback_rpc_urls: Vec<String>,
     /// Yellowstone gRPC endpoint ("" = unset → WS ingestion).
     pub yellowstone_endpoint: String,
     /// `processed` | `confirmed` | `finalized`.
@@ -130,6 +133,14 @@ impl std::fmt::Debug for Settings {
         f.debug_struct("Settings")
             .field("ws_url", &ids::redact_endpoint(&self.ws_url))
             .field("http_url", &ids::redact_endpoint(&self.http_url))
+            .field(
+                "fallback_rpc_urls",
+                &self
+                    .fallback_rpc_urls
+                    .iter()
+                    .map(|u| ids::redact_endpoint(u))
+                    .collect::<Vec<_>>(),
+            )
             .field("yellowstone_endpoint", &ids::redact_endpoint(&self.yellowstone_endpoint))
             .field("commitment", &self.commitment)
             .field("start_balance", &self.start_balance)
@@ -219,6 +230,7 @@ impl Settings {
         Self {
             ws_url: parse_wss_url(vars, &mut notes),
             http_url: parse_rpc_url(vars, &mut notes),
+            fallback_rpc_urls: parse_fallback_rpc_urls(vars, &mut notes),
             yellowstone_endpoint: parse_yellowstone_url(vars, &mut notes),
             commitment: get_string(vars, "COMMITMENT", "confirmed"),
             start_balance: get_float(vars, "START_BALANCE", 100.0, &mut notes),
@@ -566,6 +578,29 @@ fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
     }
 }
 
+/// Comma-separated read-failover endpoints (`MAINNET_RPC_URLS_FALLBACK`
+/// or TOML `fallback_rpc_urls`); empty = primary only (today's shape).
+fn parse_fallback_rpc_urls(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Vec<String> {
+    let clean = |v: &String| v.replace('\\', "").trim().to_string();
+    let Some(raw) = vars
+        .get("MAINNET_RPC_URLS_FALLBACK")
+        .map(clean)
+        .filter(|v| !v.is_empty())
+    else {
+        return Vec::new();
+    };
+    let urls: Vec<String> = raw
+        .split(',')
+        .map(|s| clean(&s.to_string()))
+        .filter(|u| !u.is_empty())
+        .collect();
+    if urls.is_empty() {
+        notes
+            .push("MAINNET_RPC_URLS_FALLBACK is set but empty; reads run primary-only".to_string());
+    }
+    urls
+}
+
 /// Yellowstone gRPC endpoint. Empty (unset) selects WS ingestion;
 /// non-empty must look like an `http(s)://host` URL (gRPC dials off
 /// the scheme; full validation happens at connect). No legacy alias,
@@ -765,9 +800,32 @@ mod tests {
     }
 
     #[test]
+    fn fallback_rpc_urls_parse_comma_list() {
+        let mut vars = HashMap::new();
+        vars.insert(
+            "MAINNET_RPC_URLS_FALLBACK".to_string(),
+            " https://a.example , ,https://b.example ".to_string(),
+        );
+        let s = Settings::from_map(&vars);
+        assert_eq!(
+            s.fallback_rpc_urls,
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+        // Blank value = unset, not one empty endpoint.
+        let mut blank = HashMap::new();
+        blank.insert("MAINNET_RPC_URLS_FALLBACK".to_string(), "  ".to_string());
+        let s = Settings::from_map(&blank);
+        assert!(s.fallback_rpc_urls.is_empty());
+    }
+
+    #[test]
     fn defaults_are_sane() {
         let s = Settings::from_map(&HashMap::new());
         assert_eq!(s.commitment, "confirmed");
+        assert!(s.fallback_rpc_urls.is_empty());
         assert_eq!(s.start_balance, 100.0);
         assert_eq!(s.fee_bps, 0.0);
         assert_eq!(s.gate_window_secs, 10);

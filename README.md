@@ -68,6 +68,44 @@ live profitability — judge live by the live bucket alone. An exit whose input
 tick line is missing reports as *unverifiable* and fails the exit code (fail
 closed, never assumed).
 
+## Resilience
+
+Reads are redundant, dispatch is not. Every RPC read (executor, tickers,
+screener, backfill) shares one client wrapping a failover pool: a failed
+or hung attempt retries on the next healthy endpoint (6s light / 25s
+block-weight budgets, under the callers' 10s outers so a hung primary
+actually fails over), latency is tracked per endpoint, and a 10s sampler
+doubles as health check plus staleness detector (a primary lagging the
+freshest peer goes stale; disagreeing views flag inconsistent). One
+logical read hits exactly one endpoint at a time — never an all-endpoints
+broadcast — and dispatch never rides the pool: one decision, one Jito
+bundle, one endpoint.
+
+When a critical source is unhealthy the bot stops deciding instead of
+deciding on stale data. A supervisor pauses entries through the same
+choke point as the kill switch (`open_tracked`; exits and `sell <mint>`
+keep running, recovery clears it automatically). Triggers, all
+evidence-based: pool outage (sampler-confirmed, never a single blip),
+lost SOL/USD price (a boot that never priced gets a 5-minute grace;
+losing a had price pauses at once), banned ingestion, or a stream silent
+for 30 minutes (covers WS mode too — launches are seconds apart, so
+silence is a dead stream, never a quiet chain).
+
+Stream gaps are counted, not hidden: geyser backfill sheds windows past
+its slot cap (`slot_gaps_shed`); WS backfill pages up to 3 signature
+pages and counts capped remainders (`backfill_pages_capped`).
+
+Custody is re-verified, not just replayed: the live WAL stamps a schema
+line per boot (provenance only — old binaries skip it) and compaction
+keeps every stamp, so the file names all its writers; `day-state.json`
+carries a schema version (a newer writer's file degrades to a fresh day,
+loudly, never adopting guessed numbers). Every 30 minutes live mode
+re-checks WAL claims per mint against the chain ATA balance — read-only;
+mismatches page the operator, nothing auto-corrects. The heartbeat card
+carries the health view: RPC `n/m ok · failovers`, data state, oldest
+open age, stream gaps shed, and windowed GiveUps; a position overdue past
+its own timeout warns log-only (runner lifts respected).
+
 ## Uninstall
 
 ```sh
@@ -86,7 +124,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 
 | Section     | Keys                                                                                                                                                                                                 | Defaults                                                           |
 |-------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
-| `network`   | `mainnet_rpc_url`, `mainnet_wss_rpc_url`, `yellowstone_endpoint`*, `commitment`, `tick_interval_ms`, `vault_tick_interval_ms`, `fetch_concurrency`, `backfill_sig_limit`, `reconnect_backoff_max_ms` | public RPC / `confirmed` / `1000` / `5000` / `32` / `100` / `5000` |
+| `network`   | `mainnet_rpc_url`, `mainnet_rpc_urls_fallback`, `mainnet_wss_rpc_url`, `yellowstone_endpoint`*, `commitment`, `tick_interval_ms`, `vault_tick_interval_ms`, `fetch_concurrency`, `backfill_sig_limit`, `reconnect_backoff_max_ms` | public RPC / `[]` (primary-only) / `confirmed` / `1000` / `5000` / `32` / `100` / `5000` |
 | `trading`   | `start_balance`, `fee_bps`, `notional_usd`, `max_open_positions`, `max_exposure_usd`, `mint_cooldown_secs`, `max_daily_loss_usd`, `hot_wallet_max_sol`, `quote_usd`*, `liquidity_usd`                  | `100` / `0` / `10` / `3` / `0` (off) / `3600` / `0` (off) / `0` (off) / unset / `0`        |
 | `exits`     | `trail_percent`, `runner_trail_percent`                                                                                                                                                              | `5` / `20`                                                         |
 | `gate`      | `gate_window_secs`, `gate_min_buyers`, `gate_poll_ms`, `dev_min_age_secs`, `dev_max_prior_launches`, `dev_screen_sample_txs`, `dev_sig_limit`                                                        | `10` / `5` / `2000` / `3600` / `1` / `20` / `100`                  |
@@ -97,7 +135,8 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 - `quote_usd` is test-only.
 - `yellowstone_endpoint`: non-empty selects Yellowstone gRPC ingestion instead of WS (x-token via `YELLOWSTONE_TOKEN` env, never the file).
 
-- `fetch_concurrency` bounds parallel `getTransaction` fetches (lower on metered RPC; `0` refuses at boot); `backfill_sig_limit` caps sigs per reconnect backfill (`0` disables it); `reconnect_backoff_max_ms` caps reconnect backoff (raise on flaky sockets).
+- `fetch_concurrency` bounds parallel `getTransaction` fetches (lower on metered RPC; `0` refuses at boot); `backfill_sig_limit` caps signatures per backfill page (`0` disables backfill) — the WS reconnect backfill pages the signature list up to 3 pages seeking the last seen signature, past the cap with unseen history beyond it the remainder counts as lost (`backfill_pages_capped`, warn) instead of paging forever; `reconnect_backoff_max_ms` caps reconnect backoff (raise on flaky sockets).
+- `mainnet_rpc_urls_fallback` (or `MAINNET_RPC_URLS_FALLBACK`, comma-separated): read-path failover endpoints behind the one shared RPC client — primary first, next only after an attempt fails (failover, never broadcast). Reads only: order dispatch stays single-path Jito and never fans out. Empty (default) keeps today's primary-only shape.
 - `strategy_mode`: `adaptive` runs the profile verbatim; `scalp` clamps TP to +25…+35%; `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
 - Risk limits (all optional, `0` = off; exits are never blocked by any of them): `notional_usd` caps one ticket, `max_open_positions` caps concurrent positions (paper + live-held mints), `max_exposure_usd` caps total open exposure in USD (paper cost basis + one ticket per unpaired live bag — a bag carries no stored USD basis), `max_daily_loss_usd` halts entries past the day's realized loss. The day-loss tally persists in `~/.pump-sentry/day-state.json`, so a restart cannot reset either the tally or the cap it enforces; live-held custody is restored from the WAL and counts against heat/exposure after a restart too.
 - `hot_wallet_max_sol`: entries refuse (buy preflight) while the wallet holds more SOL than this. The operator bounds what an un-swept wallet or a leaked key can lose; `sell`/exits never consult it. Sweeping is the fix, not raising the cap.
@@ -131,6 +170,8 @@ watchlist→open ratio) before funding anything.
 [network]
 mainnet_rpc_url = "https://..."      # dedicated (Helius): public RPC drops
                                      # candidates and truncates quorum reads (observed)
+mainnet_rpc_urls_fallback = []       # optional second RPC for read failover
+                                     # (reads only; dispatch stays single-path)
 mainnet_wss_rpc_url = ""             # unused while Yellowstone is set
 yellowstone_endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
                                      # x-token via YELLOWSTONE_TOKEN env, never here
@@ -244,6 +285,7 @@ sits above what you are willing to lose.
 ```
 src/               # cli (supervisor) / settings / pipeline (orchestrator) / live (sizing+dispatch)
                    # gate (watchlist+opens) / live_mirror (live dispatch) / follow (migration watch) / wal (custody log)
+                   # journal (decision record) / replay (offline verifier)
                    # day_state (restart-persistent day-loss tally) / money (validated Bps/Percent units)
 crates/listener/   # WS ingestion + parser + screening + quorum gate
 crates/executor/   # live swaps via Jito (only with --live)

@@ -1348,6 +1348,60 @@ async fn kill_switch_pauses_entries_but_not_exits() {
 }
 
 #[tokio::test]
+async fn data_degrade_pauses_entries_but_not_exits() {
+    // Same choke point as the kill switch, separate (supervisor-owned)
+    // state: unhealthy data halts new risk only — a held position keeps
+    // managing, and recovery (all sources healthy) re-arms entries.
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(tick(MINT, 2.0));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        funded(),
+        screener,
+        None,
+    );
+    let dev = dev_wallet();
+    let launch = LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev,
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    };
+    pipe.set_data_degraded(true, &["test source down"]);
+    assert!(pipe.data_degraded());
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "degraded: nothing opens"
+    );
+
+    // Recovery clears it: entries re-arm without an operator marker.
+    pipe.set_data_degraded(false, &[]);
+    assert!(!pipe.data_degraded());
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+
+    // Degraded again with a position open: the stop-loss still fires.
+    pipe.set_data_degraded(true, &["test source down"]);
+    let id = pipe.portfolio.lock().await.position_ids()[0];
+    let mut stop = tick(MINT, 2.0);
+    stop.price_usd = 1.0; // -50% << -8% SL.
+    pipe.on_tick(&stop).await;
+    assert!(
+        pipe.portfolio.lock().await.position(id).is_none(),
+        "degraded: exits keep running"
+    );
+}
+
+#[tokio::test]
 async fn wal_degraded_halts_entries_but_not_exits() {
     // A failed WAL write means custody can no longer be recorded: no
     // new risk opens (paper or live) until a restart, while a held

@@ -852,6 +852,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             info!(%mint, "kill switch: entries paused; skipping open");
             return;
         }
+        // Data degrade: a critical source (RPC pool / SOL feed /
+        // listener) is unhealthy — refusing to decide on it is the
+        // whole point. Same choke point as the kill switch; exits are
+        // untouched and the supervisor clears it on recovery.
+        if self.data_paused.load(Ordering::Relaxed) {
+            warn!(%mint, "data degraded: entries paused; skipping open");
+            return;
+        }
         // WAL degraded: a custody write failed, so the claim of record
         // is broken. No new risk until an operator restart (same choke
         // point as the kill switch; exits are untouched).

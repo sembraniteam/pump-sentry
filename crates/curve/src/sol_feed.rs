@@ -219,6 +219,13 @@ impl SolUsdFeed {
         self.price().is_none()
     }
 
+    /// True once any price was ever recorded. Distinguishes "feed lost"
+    /// (degrade: stop deciding) from "never had one since boot"
+    /// (grace: the supervisor allows a boot window before pausing).
+    pub fn has_ever_priced(&self) -> bool {
+        self.inner.updated_at.load(Ordering::Relaxed) != 0
+    }
+
     /// Force-set price. Updates timestamp to now.
     pub fn set_price(&self, price: f64) {
         if price.is_finite() && price > 0.0 {
@@ -301,6 +308,24 @@ mod tests {
         let feed = SolUsdFeed::new_for_test(150.0);
         assert_eq!(feed.price(), Some(150.0));
         assert!(!feed.is_stale());
+        assert!(feed.has_ever_priced());
+    }
+
+    #[test]
+    fn ever_priced_distinguishes_boot_from_loss() {
+        // Never priced since boot: startup, not degradation (the
+        // supervisor grants it a grace window).
+        let feed = SolUsdFeed::new(&DEFAULT_DEX_URL, 120, Duration::from_secs(30));
+        assert!(!feed.has_ever_priced());
+        assert!(feed.is_stale());
+        feed.set_price(200.0);
+        assert!(feed.has_ever_priced());
+        // Aged out afterwards: lost a HAD price — degrade immediately.
+        feed.inner
+            .updated_at
+            .store(now_secs().saturating_sub(9999), Ordering::Relaxed);
+        assert!(feed.is_stale());
+        assert!(feed.has_ever_priced(), "history survives staleness");
     }
 
     #[test]

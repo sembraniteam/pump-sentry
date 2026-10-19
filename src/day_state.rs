@@ -13,6 +13,11 @@ pub const DAY_STATE_FILE: &str = "day-state.json";
 /// Persisted scalars.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DayState {
+    /// File schema version. `0` = written before versioning existed
+    /// (defaultable). A file from a NEWER schema is not ours to
+    /// interpret — it degrades to a fresh day, loudly.
+    #[serde(default)]
+    pub schema: u32,
     /// UTC day bucket (`unix_secs / 86_400`).
     pub day: u64,
     /// Realized net PnL within `day` (negative = losing).
@@ -22,6 +27,10 @@ pub struct DayState {
     #[serde(default)]
     pub halt_alerted_day: u64,
 }
+
+/// Current file schema. Bump on any shape change that old readers
+/// must not adopt (they refuse newer numbers, never guess).
+pub const DAY_STATE_SCHEMA: u32 = 1;
 
 /// Load the tally. `None` (fresh day) when missing, corrupt, or
 /// non-finite; only real damage warns — a first boot is silent.
@@ -35,6 +44,11 @@ pub fn load(path: &Path) -> Option<DayState> {
         }
     };
     match serde_json::from_str::<DayState>(&raw) {
+        Ok(state) if state.schema > DAY_STATE_SCHEMA => {
+            tracing::warn!(file = %path.display(), schema = state.schema, ours = DAY_STATE_SCHEMA,
+                "day-state written by a NEWER version; refusing to adopt its numbers — day-loss tally starts fresh (upgrade the binary or delete the file)");
+            None
+        }
         Ok(state) if state.day_net.is_finite() => Some(state),
         Ok(state) => {
             tracing::warn!(file = %path.display(), day_net = state.day_net, "day-state carries a non-finite tally; day-loss starts fresh");
@@ -130,6 +144,7 @@ impl DayBook {
             return;
         };
         let state = DayState {
+            schema: DAY_STATE_SCHEMA,
             day: self.breaker.day,
             day_net: self.breaker.day_net,
             halt_alerted_day: self.breaker.halt_alerted_day,
@@ -158,12 +173,32 @@ mod tests {
     fn save_load_roundtrips() {
         let path = scratch("roundtrip").join(DAY_STATE_FILE);
         let state = DayState {
+            schema: DAY_STATE_SCHEMA,
             day: 20_000,
             day_net: -12.5,
             halt_alerted_day: 20_000,
         };
         save(&path, &state).expect("save");
         assert_eq!(load(&path), Some(state));
+    }
+
+    #[test]
+    fn newer_schema_refuses_to_adopt_numbers() {
+        // A future writer's file is not ours to interpret: fresh day,
+        // loudly — never a guessed tally.
+        let dir = scratch("future");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(DAY_STATE_FILE);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"schema\":{},\"day\":{},\"day_net\":-99.0,\"halt_alerted_day\":0}}",
+                DAY_STATE_SCHEMA + 1,
+                20_000
+            ),
+        )
+        .expect("write");
+        assert_eq!(load(&path), None, "newer schema degrades to fresh day");
     }
 
     #[test]
@@ -175,10 +210,11 @@ mod tests {
         std::fs::write(&path, "{not json").expect("write");
         assert_eq!(load(&path), None, "corrupt file is a fresh day");
         std::fs::write(&path, "{\"day\":1,\"day_net\":-3.0}").expect("write");
-        // Older files predate the card marker.
+        // Older files predate the card marker AND the schema field.
         assert_eq!(
             load(&path),
             Some(DayState {
+                schema: 0,
                 day: 1,
                 day_net: -3.0,
                 halt_alerted_day: 0

@@ -12,6 +12,7 @@ name = "executor"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = "0.1"
 solana-client = "4.3"
 solana-commitment-config = "3.1"
 solana-hash = "4.7"
@@ -22,6 +23,8 @@ solana-signature = "3"
 solana-signer = "3.0"
 solana-transaction = "4.3"
 solana-transaction-status = { version = "4.3.0", features = ["agave-unstable-api"] }
+solana-rpc-client = "4.3"
+solana-rpc-client-api = "4.3.0"
 ids = { path = "../ids" }
 curve = { path = "../curve" }
 migration = { path = "../migration" }
@@ -35,7 +38,7 @@ reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["time", "sync"] }
+tokio = { version = "1", features = ["time", "sync", "rt"] }
 tracing = "0.1"
 url = "2"
 zeroize = "1"
@@ -44,7 +47,6 @@ zeroize = "1"
 listener = { path = "../listener" }
 migration = { path = "../migration" }
 solana-message = "4"
-solana-rpc-client-api = "4.3.0"
 solana-instruction-error = "2"
 solana-transaction-error = "3.4"
 tokio = { version = "1", features = ["full"] }

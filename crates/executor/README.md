@@ -7,8 +7,26 @@ Guarded wallet, exact instruction builders, Jito bundles. Not wired into paper p
 - Legacy/18/v2 shapes deleted; cashback/complete/creatorless curves fail closed.
 - Wallet: env-only secret (zeroized), 0.05 SOL floor; tips refresh ≤15min.
 
+## Read-path redundancy (`rpc_pool`)
+
+The one shared `RpcClient` wraps `RpcPool`: sequential failover across
+endpoints (never an all-endpoints broadcast), per-endpoint latency
+tracking, and a background sampler that doubles as health check and
+slot-staleness/inconsistency detector. Attempt budgets are per-method
+(6s light / 25s block-weight) and sit under the callers' 10s outers, so
+a hung primary actually fails over. `degraded()` is hysteresis-gated —
+sampler-confirmed only, never a single blip (a lone cooldown is a
+read-level fail-closed, not a pause).
+
+No dispatch fan-out, ever: the pool hardens READS (balances, confirms,
+blockhashes, quotes) only. Order execution stays single-path Jito;
+executed-once semantics belong to the send/confirm guards, not to
+redundancy. Configure fallbacks via `mainnet_rpc_urls_fallback`
+(`MAINNET_RPC_URLS_FALLBACK`); empty keeps primary-only.
+
 ```sh
 cargo test -p executor
+RPC_POOL_ACCEPTANCE=1 cargo test -p executor --test rpc_pool_acceptance -- --ignored --nocapture  # $0 read-only pool proof (dead-primary failover + sampler vs real RPC)
 JITO_ACCEPTANCE=1 cargo test -p executor --test jito_acceptance -- --ignored --nocapture  # $0 bundle proof
 MAINNET_LAYOUT=1 cargo test -p executor --test mainnet_layout_acceptance -- --ignored --nocapture  # $0 v3 sim proof
 RAYDIUM_ACCEPTANCE=1 cargo test -p executor --test raydium_authority_acceptance -- --ignored --nocapture  # $0 exit proof

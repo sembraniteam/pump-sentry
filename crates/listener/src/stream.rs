@@ -33,7 +33,12 @@ use tracing::{debug, info, warn};
 
 /// Seen-signature cap. Past it, half is evicted.
 const SEEN_SIG_CAP: usize = 4_000;
-
+/// Backfill list pages per reconnect. The LIST calls are cheap; the tx
+/// fetches stay bounded downstream. Past the cap with no seen boundary
+/// the remainder is counted lost (`backfill_pages_capped`), not paged
+/// forever: an unbounded catch-up would replay ancient launches the
+/// gate must not act on.
+const BACKFILL_MAX_PAGES: usize = 3;
 /// Handshake deadline. A hung handshake must reconnect, not stall.
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -154,6 +159,31 @@ impl Drop for LogSubscription {
     }
 }
 
+/// Classify one newest-first signature page against the seen set.
+/// Returns the unseen `(signature, slot)` pairs oldest-first plus
+/// whether the page's OLDEST entry is seen (the paging boundary: seen
+/// there means older pages hold nothing new). Errored entries are
+/// never collected. Pure for unit pinning.
+fn classify_backfill_page(
+    page: &[solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature],
+    seen: &std::collections::HashSet<String>,
+) -> (Vec<(String, u64)>, bool) {
+    let mut unseen = Vec::new();
+    for info in page.iter().rev() {
+        if info.err.is_some() {
+            continue;
+        }
+        if seen.contains(&info.signature) {
+            continue;
+        }
+        unseen.push((info.signature.clone(), info.slot));
+    }
+    let oldest_seen = page
+        .last()
+        .is_some_and(|oldest| seen.contains(&oldest.signature));
+    (unseen, oldest_seen)
+}
+
 impl PumpFunListener {
     /// Build from config (checks URLs and commitment).
     pub fn new(config: ListenerConfig) -> Result<Self, ListenerError> {
@@ -231,58 +261,109 @@ impl PumpFunListener {
             Ok(p) => p,
             Err(_) => return,
         };
-        let sigs = match tokio::time::timeout(
-            Duration::from_secs(30),
-            rpc.get_signatures_for_address_with_config(
-                &pump,
-                solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
-                    before: None,
-                    until: None,
-                    limit: Some(self.config.backfill_sig_limit.max(1)),
-                    commitment: Some(commitment),
-                },
-            ),
-        )
-        .await
-        {
-            Ok(Ok(sigs)) => sigs,
-            Ok(Err(e)) => {
-                warn!(error = %ids::strip_error_url(&e.to_string()), "backfill signature page failed; gap stays");
-                return;
-            }
-            Err(_) => {
-                warn!("backfill signature page timed out; gap stays");
-                return;
-            }
-        };
-        // Oldest first: quorum follows chain order.
-        let mut missed = 0u32;
-        for info in sigs.iter().rev() {
-            if info.err.is_some() {
-                continue;
-            }
-            let fresh = match self.seen.lock() {
-                Ok(guard) => !guard.contains(&info.signature),
-                Err(_) => true,
+        // Page the signature LIST (cheap) up to the page cap looking
+        // for the seen boundary; the tx fetches stay bounded downstream
+        // (semaphore + drop counters). One page used to silently cut
+        // older missed launches when the gap outgrew the limit.
+        let limit = self.config.backfill_sig_limit.max(1);
+        let mut before: Option<Signature> = None;
+        let mut unseen: Vec<(String, u64)> = Vec::new();
+        let mut boundary_found = false;
+        for _ in 0..BACKFILL_MAX_PAGES {
+            let page = match tokio::time::timeout(
+                Duration::from_secs(30),
+                rpc.get_signatures_for_address_with_config(
+                    &pump,
+                    solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                        before,
+                        until: None,
+                        limit: Some(limit),
+                        commitment: Some(commitment),
+                    },
+                ),
+            )
+            .await
+            {
+                Ok(Ok(sigs)) => sigs,
+                Ok(Err(e)) => {
+                    warn!(error = %ids::strip_error_url(&e.to_string()), "backfill signature page failed; gap stays");
+                    return;
+                }
+                Err(_) => {
+                    warn!("backfill signature page timed out; gap stays");
+                    return;
+                }
             };
-            if !fresh {
-                continue;
+            if page.is_empty() {
+                boundary_found = true; // list exhausted: nothing older
+                break;
             }
-            self.mark_seen(&info.signature);
-            missed += 1;
+            let saturated = page.len() >= limit;
+            // Within a page every unseen sig is collected (a seen sig
+            // among them is just skipped, never a stop: socket drops can
+            // leave a newer sig unseen above an older seen one). The
+            // paging boundary is the page's OLDEST entry (last in
+            // newest-first order): seen there means older pages hold
+            // nothing new.
+            let (fresh, oldest_seen) = match self.seen.lock() {
+                Ok(guard) => classify_backfill_page(&page, &guard),
+                // Poisoned lock: treat everything as fresh (same as the
+                // live path's lenient read) rather than losing the gap.
+                Err(_) => classify_backfill_page(&page, &Default::default()),
+            };
+            for (sig, slot) in fresh {
+                self.mark_seen(&sig);
+                unseen.push((sig, slot));
+            }
+            if oldest_seen {
+                boundary_found = true; // seen floor: older pages are clean
+                break;
+            }
+            if !saturated {
+                boundary_found = true; // short page: list exhausted
+                break;
+            }
+            before = page
+                .last()
+                .and_then(|info| info.signature.parse::<Signature>().ok());
+            if before.is_none() {
+                boundary_found = true; // unparsable cursor: stop paging
+                break;
+            }
+        }
+        if !boundary_found {
+            // Every page saturated with no seen boundary: unseen history
+            // extends beyond the paged window — older gap launches are
+            // LOST (not backfilled), count unknown. Loud by design.
+            self.stats.inc_backfill_pages_capped();
+            warn!(
+                pages = BACKFILL_MAX_PAGES,
+                limit,
+                recovered = unseen.len(),
+                "backfill hit the page cap with unseen history beyond it; older gap launches are LOST"
+            );
+        }
+        // Oldest first globally: quorum follows chain order.
+        unseen.reverse();
+        let missed = unseen.len() as u32;
+        for (sig, slot) in unseen {
             let tx_clone = tx.clone();
             let rpc_clone = Arc::clone(rpc);
             let stats_clone = Arc::clone(&self.stats);
             let sem_clone = Arc::clone(semaphore);
             let seen_clone = Arc::clone(&self.seen);
-            let sig = info.signature.clone();
-            let slot = info.slot;
             let Some(commitment) = self.config.commitment_config() else {
                 continue;
             };
             tokio::spawn(async move {
                 fetch_and_emit(
-                    &sig, slot, &rpc_clone, &tx_clone, &stats_clone, &sem_clone, commitment,
+                    &sig,
+                    slot,
+                    &rpc_clone,
+                    &tx_clone,
+                    &stats_clone,
+                    &sem_clone,
+                    commitment,
                     seen_clone,
                 )
                 .await;
@@ -897,6 +978,24 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
+    fn sig_page(
+        sigs: &[(&str, u64)],
+    ) -> Vec<solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature> {
+        sigs.iter()
+            .map(|(sig, slot)| {
+                solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature {
+                    signature: sig.to_string(),
+                    slot: *slot,
+                    err: None,
+                    memo: None,
+                    block_time: None,
+                    confirmation_status: None,
+                    transaction_index: None,
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn backoff_caps_at_config() {
         for attempt in [0u32, 1, 5, 10, 100] {
@@ -919,6 +1018,142 @@ mod tests {
             "custom cap must exceed default: {d:?}"
         );
         assert_eq!(backoff_duration(0, 0), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn backfill_page_collects_unseen_oldest_first() {
+        // Newest-first page with an interleaved seen sig: the unseen
+        // come out oldest-first and the seen one never stops the scan.
+        let page = sig_page(&[("new", 3), ("mid", 2), ("old", 1)]);
+        let seen: std::collections::HashSet<String> = ["mid".to_string()].into_iter().collect();
+        let (unseen, oldest_seen) = classify_backfill_page(&page, &seen);
+        assert_eq!(unseen, vec![("old".to_string(), 1), ("new".to_string(), 3)]);
+        assert!(!oldest_seen, "oldest is unseen: keep paging");
+    }
+
+    #[test]
+    fn backfill_page_boundary_is_the_oldest_entry() {
+        // Oldest seen: older pages hold nothing new — stop paging.
+        let page = sig_page(&[("new", 3), ("old", 1)]);
+        let seen: std::collections::HashSet<String> = ["old".to_string()].into_iter().collect();
+        let (unseen, oldest_seen) = classify_backfill_page(&page, &seen);
+        assert_eq!(unseen, vec![("new".to_string(), 3)]);
+        assert!(oldest_seen);
+        // Nothing seen at all: no boundary — the next page may hold more.
+        let (unseen, oldest_seen) =
+            classify_backfill_page(&page, &std::collections::HashSet::new());
+        assert_eq!(unseen.len(), 2);
+        assert!(!oldest_seen);
+        // Empty page: no unseen, but the list is exhausted (boundary).
+        // The caller treats empty as boundary-found before classifying.
+        let (unseen, _) = classify_backfill_page(&[], &std::collections::HashSet::new());
+        assert!(unseen.is_empty());
+    }
+
+    /// Live acceptance: real paged signature lists chain newest-first,
+    /// and the classifier pins errored entries on real data.
+    /// NEVER in normal `cargo test` (`#[ignore]`). Run explicitly:
+    /// `LISTENER_ACCEPTANCE=1 cargo test -p listener backfill_pages_chain -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn backfill_pages_chain_newest_first_on_mainnet() {
+        if std::env::var("LISTENER_ACCEPTANCE").as_deref() != Ok("1") {
+            eprintln!("skipped: set LISTENER_ACCEPTANCE=1 to run the live listener probe");
+            return;
+        }
+        let rpc = Arc::new(RpcClient::new_with_commitment(
+            crate::types::DEFAULT_HTTP_RPC_URL.to_string(),
+            CommitmentConfig::confirmed(),
+        ));
+        let pump = Pubkey::from_str(PUMP_PROGRAM_ID_STR).expect("pump program");
+        let fetch = |before: Option<Signature>| {
+            let rpc = Arc::clone(&rpc);
+            async move {
+                rpc.get_signatures_for_address_with_config(
+                    &pump,
+                    solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                        before,
+                        until: None,
+                        limit: Some(5),
+                        commitment: Some(CommitmentConfig::confirmed()),
+                    },
+                )
+                .await
+            }
+        };
+        let page1 = fetch(None).await.expect("page 1 lists");
+        assert_eq!(page1.len(), 5, "pump program is hot: full pages");
+        let oldest1 = page1.last().expect("nonempty");
+        // Newest-first within the page (the paging cursor assumption).
+        for pair in page1.windows(2) {
+            assert!(
+                pair[0].slot >= pair[1].slot,
+                "page must arrive newest-first"
+            );
+        }
+        let before: Signature = oldest1.signature.parse().expect("cursor parses");
+        let page2 = fetch(Some(before)).await.expect("page 2 lists");
+        assert_eq!(page2.len(), 5);
+        assert!(
+            page2.first().expect("nonempty").slot <= oldest1.slot,
+            "page 2 continues at or below page 1's oldest slot"
+        );
+        let seen1: std::collections::HashSet<String> =
+            page1.iter().map(|i| i.signature.clone()).collect();
+        assert!(
+            page2.iter().all(|i| !seen1.contains(&i.signature)),
+            "cursor pages do not overlap"
+        );
+        // The classifier on the real page: every non-errored entry is
+        // unseen-collected, errored ones skipped, no boundary (all new).
+        let err_count = page1.iter().filter(|i| i.err.is_some()).count();
+        let (unseen, oldest_seen) =
+            classify_backfill_page(&page1, &std::collections::HashSet::new());
+        assert_eq!(
+            unseen.len(),
+            page1.len() - err_count,
+            "errored entries skipped, rest collected oldest-first"
+        );
+        assert!(!oldest_seen, "nothing seen: keep paging");
+        eprintln!(
+            "paging: page1 oldest slot={} page2 newest slot={} err_in_page1={err_count}",
+            oldest1.slot,
+            page2.first().expect("nonempty").slot
+        );
+    }
+
+    /// Live acceptance: the real socket ingests pump-program logs.
+    /// NEVER in normal `cargo test` (`#[ignore]`). Run explicitly:
+    /// `LISTENER_ACCEPTANCE=1 cargo test -p listener live_socket_ingestion -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_socket_ingestion_flows_on_mainnet() {
+        if std::env::var("LISTENER_ACCEPTANCE").as_deref() != Ok("1") {
+            eprintln!("skipped: set LISTENER_ACCEPTANCE=1 to run the live listener probe");
+            return;
+        }
+        // The production binary installs the rustls provider at boot
+        // (`main.rs`); unit-test binaries must do it themselves or
+        // every wss:// connect panics inside rustls.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_rx, stats, handle) =
+            PumpFunListener::subscribe_with_rpc(ListenerConfig::default(), None)
+                .await
+                .expect("subscribe on public WS");
+        // Keep the receiver alive: dropping it closes the channel and
+        // the loop exits ("downstream closed"). Events unneeded —
+        // counters are the assertion surface.
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        let seen = stats.logs_seen();
+        let candidates = stats.candidates.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("socket: logs_seen={seen} candidates={candidates} in 35s");
+        assert!(
+            seen > 0,
+            "pump program is the hottest on chain: silence means a dead socket"
+        );
+        drop(_rx); // close: the loop must exit on its own past this
+        drop(stats);
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
     }
 
     #[test]

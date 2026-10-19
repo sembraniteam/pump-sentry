@@ -33,6 +33,11 @@ pub enum ConfigError {
 /// environment for them anymore: the file is the only source.
 pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("network", "mainnet_rpc_url", "MAINNET_RPC_URL"),
+    (
+        "network",
+        "mainnet_rpc_urls_fallback",
+        "MAINNET_RPC_URLS_FALLBACK",
+    ),
     ("network", "mainnet_wss_rpc_url", "MAINNET_WSS_RPC_URL"),
     ("network", "yellowstone_endpoint", "YELLOWSTONE_ENDPOINT"),
     ("network", "commitment", "COMMITMENT"),
@@ -104,6 +109,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# pump-sentry config — auto-created o
 [network]
 # Dedicated RPC recommended; empty falls back to the public endpoint.
 mainnet_rpc_url = ""        # dedicated RPC recommended; empty = public endpoint
+mainnet_rpc_urls_fallback = [] # read-path failover endpoints (comma list via MAINNET_RPC_URLS_FALLBACK); READS ONLY — dispatch never fans out
 mainnet_wss_rpc_url = ""    # empty = public endpoint
 yellowstone_endpoint = ""   # Yellowstone gRPC (https URL); non-empty REPLACES ws ingestion (x-token via YELLOWSTONE_TOKEN env, never here)
 commitment = "confirmed"    # (confirmed|finalized; processed is refused live)

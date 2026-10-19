@@ -109,6 +109,11 @@ async fn replay_live_wal(
         && replay.manual.is_empty()
         && replay.sell_pending.is_empty()
     {
+        // Fresh WAL: stamp the writer even with nothing to replay, so
+        // versioning evidence exists from the first session onward.
+        if let Some(trader) = pipeline.exec.live.as_ref() {
+            trader.wal_write_meta(crate::settings::now_secs());
+        }
         return;
     }
     let mut watched: Vec<(String, String)> = Vec::new();
@@ -121,6 +126,9 @@ async fn replay_live_wal(
     }
     wal::compact_file(&path, &replay);
     if let Some(trader) = pipeline.exec.live.as_ref() {
+        // Compaction rewrote the file; the stamp goes in after it so
+        // the fresh session's schema/writer provenance survives.
+        trader.wal_write_meta(crate::settings::now_secs());
         // Seed before the pending move below (borrow discipline).
         let recent = replay.recent_sell_pending(crate::settings::now_secs());
         n_pending = trader.import_pending(replay.pending);
@@ -257,6 +265,54 @@ struct BootCustodyCounts {
 /// Mints with an unconfirmed buy are skipped (the late-confirm recheck
 /// still owns their claim). An unreadable balance warns and keeps the
 /// claims tracked (dispatch preflights still fail closed).
+/// Mid-run custody recheck (live mode, every `CUSTODY_RECHECK_SECS`):
+/// the same claims-vs-chain classifier as the boot reconcile, minus
+/// the WAL surgery. Read-only — a mismatch pages the operator and
+/// keeps the claims; custody is never auto-corrected or auto-exited
+/// here (the per-dispatch preflights own dispatch, the boot reconcile
+/// owns boot, this owns drift between them).
+async fn custody_recheck(
+    pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
+) {
+    let Some(trader) = pipeline.exec.live.as_ref() else {
+        return;
+    };
+    // Snapshot per mint under the locks; read the chain without them.
+    let mut claims: BTreeMap<Pubkey, MintClaims> = BTreeMap::new();
+    for pos in pipeline.exec.live_positions.lock().await.values() {
+        let claim = claims.entry(pos.mint).or_default();
+        claim.tracked = claim.tracked.saturating_add(pos.amount_tokens);
+    }
+    for pos in pipeline.exec.live_manual.lock().await.values() {
+        let claim = claims.entry(pos.mint).or_default();
+        claim.manual = claim.manual.saturating_add(pos.amount_tokens);
+    }
+    for (mint, claim) in claims {
+        if trader.has_pending_for(&mint.to_string()) {
+            continue; // late-confirm recheck owns the pending claim
+        }
+        let chain = match trader.observe_token_balance(&mint).await {
+            Ok(chain) => chain.unwrap_or(0),
+            Err(e) => {
+                warn!(%mint, error = %e,
+                    "custody recheck: balance unreadable; claims kept (preflights still fail closed)");
+                continue;
+            }
+        };
+        match boot_custody(claim.tracked, claim.manual, chain) {
+            BootCustody::Keep => {}
+            BootCustody::Excess => {
+                warn!(%mint, tracked = claim.tracked, manual = claim.manual, chain,
+                    "custody recheck: chain holds MORE than claims (unexplained excess — re-buy while parked? transfer in?); verify on explorer");
+            }
+            BootCustody::SuppressTracked { .. } => {
+                warn!(%mint, tracked = claim.tracked, manual = claim.manual, chain,
+                    "custody recheck: chain holds LESS than claims (tokens moved out, or a stale/bankrupt RPC answered); NO auto-exit on unverified size — inspect before trusting the book");
+            }
+        }
+    }
+}
+
 async fn reconcile_boot_custody(
     pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
 ) -> BootCustodyCounts {
@@ -555,12 +611,16 @@ async fn run_pipeline(live_arg: bool) {
     // One RPC connection pool per process: ticker, screener, vaults,
     // executor, and the WS backfill/fetch share this instead of opening
     // five uncoordinated pools (rate-limit pressure + retry storms).
-    let shared_rpc = Arc::new(
-        solana_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
-            settings.http_url.clone(),
-            commitment,
-        ),
-    );
+    // The pool wraps the read failover INSIDE the one shared client —
+    // primary first, next healthy endpoint only after an attempt fails
+    // (reads only; dispatch stays Jito-only and single-path).
+    let pool = executor::rpc_pool::RpcPool::build({
+        let mut urls = vec![settings.http_url.clone()];
+        urls.extend(settings.fallback_rpc_urls.iter().cloned());
+        urls
+    });
+    pool.spawn_sampler();
+    let shared_rpc = pool.client(commitment);
     // One SOL/USD feed for pricing plus sizing.
     let sol_feed = curve::SolUsdFeed::with_defaults();
     let sol_handle = sol_feed.clone().spawn();
@@ -814,6 +874,9 @@ async fn run_pipeline(live_arg: bool) {
         );
     }
 
+    // Supervisor's read view of the SOL feed (the owned clone moves
+    // into the pipeline; staleness polling needs its own handle).
+    let sol_feed_view = Arc::clone(&sol_feed);
     let pipeline = Pipeline::shared(
         settings,
         auditor,
@@ -871,6 +934,30 @@ async fn run_pipeline(live_arg: bool) {
     // Polled here — not in the 6h heartbeat — so a fresh ban pages
     // within seconds instead of next heartbeat.
     let mut ingestion_banned_seen = false;
+    // Data-degrade card mirror (rising-edge card, same policy).
+    let mut data_degraded_seen = false;
+    // Listener-stall mirror: last logs_seen advance (both modes; the
+    // ban latch is geyser-only, silence covers WS too).
+    let mut last_logs_seen = 0u64;
+    let mut last_logs_advance = boot_ts;
+    // Custody-recheck stamp (live mode): mid-run drift check cadence.
+    let mut last_custody_check = settings::now_secs();
+    /// Mid-run custody drift check cadence (boot reconcile owns boot).
+    const CUSTODY_RECHECK_SECS: u64 = 1_800;
+    /// Oldest-open warn threshold: paper timeouts are minutes; an open
+    /// position older than this reads as a stuck exit (log-only).
+    const STALE_OPEN_WARN_SECS: u64 = 3_600;
+    /// GiveUp window surfaced in the heartbeat (kegagalan buy/sell).
+    const GIVEUP_HEARTBEAT_WINDOW_SECS: u64 = 3_600;
+    /// SOL-feed boot grace: a feed that never priced since boot pauses
+    /// entries only after this (a fresh boot without a price yet is
+    /// normal startup, not degradation; losing an HAD price is).
+    const FEED_NEVER_GRACE_SECS: u64 = 300;
+    /// Listener stall: no log seen for this long means the stream is
+    /// dead in both modes (geyser ban has its own latch; WS has none —
+    /// pump.fun launches are seconds apart, so 30 silent minutes is
+    /// never a quiet chain; a chain halt also correctly pauses entries).
+    const LISTENER_STALL_SECS: u64 = 1_800;
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     // Saturation drops are latency signal: an exit delayed a tick is
     // slippage paper never pays, so they ride the heartbeat.
@@ -959,6 +1046,31 @@ async fn run_pipeline(live_arg: bool) {
                     );
                     (halted, daily.day_net())
                 };
+                let rpc_snap = pool.snapshot();
+                let oldest_open_age =
+                    pipeline.oldest_open_age_secs(settings::now_secs()).await;
+                let giveups_window =
+                    pipeline.exec.giveups_since(GIVEUP_HEARTBEAT_WINDOW_SECS, settings::now_secs()).await as u64;
+                // Positions outliving their OWN timeouts by hours read as
+                // stuck exits (drained pools, guard holds) — log-only
+                // warn per the alert burn-in doctrine (never a card).
+                // Overdue (not raw age) respects runner timeout lifts.
+                let overdue =
+                    pipeline.oldest_open_overdue_secs(settings::now_secs()).await;
+                if overdue > STALE_OPEN_WARN_SECS {
+                    warn!("oldest open position {overdue}s past its timeout (> {STALE_OPEN_WARN_SECS}s overdue): exits stuck? check pool depth / pending rechecks before assuming the book is live");
+                }
+                // Custody recheck (live only, every CUSTODY_RECHECK_SECS):
+                // WAL claims per mint vs the chain ATA balance. Boot
+                // reconcile owns boot; this catches mid-run drift.
+                if live_mode
+                    && settings::now_secs()
+                        .saturating_sub(last_custody_check)
+                        >= CUSTODY_RECHECK_SECS
+                {
+                    last_custody_check = settings::now_secs();
+                    custody_recheck(&pipeline).await;
+                }
                 let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
                     mode: if live_mode { "live" } else { "paper" },
                     uptime_secs: settings::now_secs().saturating_sub(boot_ts),
@@ -976,6 +1088,15 @@ async fn run_pipeline(live_arg: bool) {
                     strategy: pipeline.strategy.as_str(),
                     cash_usd: cash,
                     equity_usd: equity,
+                    data_paused: pipeline.data_degraded(),
+                    rpc_endpoints: rpc_snap.endpoints,
+                    rpc_healthy: rpc_snap.healthy,
+                    rpc_failover_reads: rpc_snap.failover_reads,
+                    rpc_inconsistent: rpc_snap.inconsistent,
+                    oldest_open_age_secs: oldest_open_age,
+                    stream_gaps_shed: snap.slot_gaps_shed,
+                    stream_pages_capped: snap.backfill_pages_capped,
+                    giveups_window,
                 });
                 // Equity-curve record (drawdown / expectation evidence).
                 if let Some(j) = pipeline.journal() {
@@ -1096,6 +1217,49 @@ async fn run_pipeline(live_arg: bool) {
                     ingestion_banned_seen = false;
                     warn!("ingestion ban lifted: geyser subscription accepted again");
                     pipeline.emit("Ingestion recovered: geyser subscription accepted again.".to_string());
+                }
+                // Data-degrade supervisor: entries pause while a critical
+                // source is unhealthy — no decisions from stale data.
+                // Same choke point as the kill switch (`open_tracked`),
+                // separate state; exits keep running either way.
+                let mut reasons: Vec<&str> = Vec::new();
+                if pool.degraded() {
+                    reasons.push("rpc pool has no healthy endpoint");
+                }
+                // Feed grace: a boot that never priced yet is startup,
+                // not degradation; losing a HAD price pauses immediately.
+                if sol_feed_view.is_stale()
+                    && (sol_feed_view.has_ever_priced()
+                        || settings::now_secs().saturating_sub(boot_ts) > FEED_NEVER_GRACE_SECS)
+                {
+                    reasons.push("SOL/USD feed stale");
+                }
+                if banned {
+                    reasons.push("listener ingestion banned (blind)");
+                }
+                // Stall covers both modes (the ban latch is geyser-only):
+                // launches are seconds apart, so a long silence is a
+                // dead stream, never a quiet chain.
+                {
+                    let now = settings::now_secs();
+                    let logs = stats_task.logs_seen();
+                    if logs != last_logs_seen {
+                        last_logs_seen = logs;
+                        last_logs_advance = now;
+                    } else if now.saturating_sub(last_logs_advance) > LISTENER_STALL_SECS {
+                        reasons.push("listener stalled (no logs)");
+                    }
+                }
+                pipeline.set_data_degraded(!reasons.is_empty(), &reasons);
+                if !reasons.is_empty() && !data_degraded_seen {
+                    data_degraded_seen = true;
+                    pipeline.emit(format!(
+                        "DATA DEGRADED — entries paused: {} . No decisions from unhealthy data; open-position management keeps running.",
+                        reasons.join(", ")
+                    ));
+                } else if reasons.is_empty() && data_degraded_seen {
+                    data_degraded_seen = false;
+                    pipeline.emit("Data sources healthy again: entries resume.".to_string());
                 }
                 // Manual-sell drain every 15th round.
                 gate_rounds = gate_rounds.wrapping_add(1);

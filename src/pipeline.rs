@@ -418,6 +418,11 @@ pub struct Pipeline<
     /// and pending-buy rechecks keep running). Polled from the marker
     /// file by `run_pipeline`; set here so tests can flip it directly.
     pub entries_paused: AtomicBool,
+    /// Data-degrade pause: while set, a critical data source (RPC pool,
+    /// SOL/USD feed, listener ingestion) is unhealthy and entries refuse
+    /// to decide on it — same choke point as the kill switch, separate
+    /// state (the operator owns the marker; the supervisor owns this).
+    pub data_paused: AtomicBool,
     /// Day-loss breaker (persisted: a restart never resets the day).
     pub daily: Mutex<DayBook>,
     /// Strategy.
@@ -475,6 +480,7 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             screener,
             gate_state: Mutex::new(GateState::new(gate)),
             entries_paused: AtomicBool::new(false),
+            data_paused: AtomicBool::new(false),
             daily: Mutex::new(DayBook::open(day_state, boot_now)),
             strategy,
             alerts,
@@ -548,6 +554,39 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             .collect()
     }
 
+    /// Age (secs) of the oldest open paper position; 0 when none open.
+    /// Open positions outliving their timeouts by hours read as stuck
+    /// exits (drained pools, guard holds), not slow exits.
+    pub async fn oldest_open_age_secs(&self, now_secs: u64) -> u64 {
+        let portfolio = self.portfolio.lock().await;
+        portfolio
+            .position_ids()
+            .iter()
+            .filter_map(|id| portfolio.position(*id))
+            .map(|p| now_secs.saturating_sub(p.opened_at))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Seconds past its own timeout of the most overdue open position;
+    /// 0 when none open or none overdue. Unlike the raw age this
+    /// respects runner timeout lifts: an intentionally long hold is
+    /// not "stuck" until it outlives its own exit horizon.
+    pub async fn oldest_open_overdue_secs(&self, now_secs: u64) -> u64 {
+        let portfolio = self.portfolio.lock().await;
+        portfolio
+            .position_ids()
+            .iter()
+            .filter_map(|id| portfolio.position(*id))
+            .map(|p| {
+                now_secs
+                    .saturating_sub(p.opened_at)
+                    .saturating_sub(p.timeout_seconds)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Live mints (suffixed keys report as base).
     pub async fn live_tracked_mints(&self) -> Vec<String>
     where
@@ -577,6 +616,25 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         } else if !paused && was {
             info!("kill switch cleared: entries resume");
         }
+    }
+
+    /// Flip the data-degrade pause (supervisor-owned; see `data_paused`).
+    /// Edge-logged like the kill switch; `reasons` name the unhealthy
+    /// sources on the rising edge and stay quiet in steady state.
+    pub fn set_data_degraded(&self, degraded: bool, reasons: &[&str]) {
+        let was = self.data_paused.swap(degraded, Ordering::Relaxed);
+        if degraded && !was {
+            warn!(
+                reasons = ?reasons,
+                "DATA DEGRADED: entries paused — no decisions from unhealthy data; open-position management keeps running"
+            );
+        } else if !degraded && was {
+            info!("data sources healthy again: entries resume");
+        }
+    }
+
+    pub fn data_degraded(&self) -> bool {
+        self.data_paused.load(Ordering::Relaxed)
     }
 }
 

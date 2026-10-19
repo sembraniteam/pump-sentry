@@ -112,6 +112,19 @@ What `pause` does (and does not do):
   `--purge`), it comes back **unpaused** — check `status` after a
   rebuild or reinstall.
 
+### Separately: the automatic data-degrade pause
+
+Besides your marker, the bot pauses entries by itself when a critical
+source is unhealthy — dead RPC pool, lost SOL/USD price, banned
+ingestion, or a stream silent 30 minutes. Same choke point as the kill
+switch (exits, scale-outs, and `sell <mint>` keep running), separate
+state: one `DATA DEGRADED` card names the reason and recovery clears it
+automatically. `status` does not show it (marker-file only) — read the
+heartbeat card and the log edge lines. Do not `resume` against it: there
+is no marker to clear. Fix the named source (RPC endpoints, token/quota,
+feed) and entries re-arm on their own; a boot that never priced gets a
+5-minute grace before this trips.
+
 ### Separately: managing open positions while paused
 
 The switch governs entries only; these are the steps for what is
@@ -138,12 +151,14 @@ already held.
   (base mints — suffixed `#2`/`#late` duplicates collapse here),
   `watchlist_pending`, `clean`. `clean:false` means fills are UNKNOWN —
   look every tracked mint up on the explorer before restarting.
-- `~/.pump-sentry/day-state.json`: the day-loss tally (`day`,
-  `day_net`, `halt_alerted_day`), rewritten atomically (owner-only)
-  after every closed trade and seeded at boot — a restart never resets
-  the day. Delete it ONLY to deliberately forgive today's loss (entries
-  re-arm and the day's halt card can fire again). A corrupt/missing file
-  degrades to a fresh day, loudly in the log.
+- `~/.pump-sentry/day-state.json`: the day-loss tally (`schema`,
+  `day`, `day_net`, `halt_alerted_day`), rewritten atomically
+  (owner-only) after every closed trade and seeded at boot — a restart
+  never resets the day. Delete it ONLY to deliberately forgive today's
+  loss (entries re-arm and the day's halt card can fire again). A
+  corrupt/missing file degrades to a fresh day, loudly in the log; a
+  file from a NEWER schema version is refused the same way (upgrade the
+  binary instead of guessing its numbers).
 - `~/.pump-sentry/entries-paused`: the kill-switch marker. Presence =
   no new entries (see §3). It is not a lockfile: removing it by hand
   resumes entries at the next gate round, same as `pump-sentry resume`.
@@ -156,7 +171,12 @@ already held.
   unreadable WAL refuses live boot outright (custody unknown); a write
   failure (`live WAL WRITE FAILED` in the log) latches new entries off
   — exits and `sell <mint>` keep running — until the file is fixed
-  (permissions/disk) and the bot restarts.
+  (permissions/disk) and the bot restarts. Every boot stamps one `meta`
+  line (schema + writer version, provenance only) and compaction keeps
+  every stamp, so the file names all its writers. Every 30 minutes live
+  mode additionally re-checks WAL claims per mint against the chain ATA
+  balance (read-only): a mismatch warns and pages — verify on the
+  explorer, never auto-correct.
 - Boot ends with a per-mint chain check (`verified/unbacked/handed_off/
   excess/unreadable/awaiting_confirm` in the replay log): a mint whose
   replayed claims (`tracked + parked`) exceed the wallet's ATA balance
@@ -195,12 +215,13 @@ The supervisor also rotates ≥50 MB logs at start time as a backstop.
 
 | Symptom                       | Likely cause                                                         | Action                                                            |
 |-------------------------------|----------------------------------------------------------------------|-------------------------------------------------------------------|
-| No entries for hours          | Gate quorums unmet / day-loss tripped / pause marker present / exposure or hot-wallet cap reached / public RPC throttled (drops) | `logs`, `status` (flags a pause), heartbeat card, use dedicated RPC |
+| No entries for hours          | Gate quorums unmet / day-loss tripped / pause marker present / data-degrade auto-pause (no marker — see `DATA DEGRADED` row) / exposure or hot-wallet cap reached / public RPC throttled (drops) | `logs`, `status` (flags a pause marker, not the auto-pause), heartbeat card, use dedicated RPC |
+| `DATA DEGRADED` card, entries paused without marker | RPC pool down / SOL/USD feed lost / ingestion banned / stream stalled 30 min | Fix the named source (endpoints, token/quota, feed); re-arms automatically — no marker to clear, do not `resume` against it |
 | `diverged` alerts             | Live buy skipped/failed, paper uncovered                             | Review, fund, or accept paper-only                                |
 | Exits stalled, SOL/USD stale  | Price feed down (DexScreener; Jupiter retired)                           | By design (no static fallback); exits resume on recovery          |
 | `zero-liquidity tick` warns   | Curve/pool drained (a tick carries parsed reserves, so this is a real empty market, not a read miss) | By design: no fee-only fiction for a stop-loss. The bag stays held (paper and live, heat stays occupied, breaker books nothing) and exits resume on a priced tick; migration closes bypass. Last resort: `sell <mint>` |
 | `MANUAL REVIEW REQUIRED`      | Unknown fill / retries exhausted                                     | Explorer first, then `sell <mint>`                                |
-| `INGESTION BANNED` card       | Geyser 429s for ~30 min straight (quota/exhaustion, not burst)       | **Stop the bot.** Check token/quota/dashboard; wait out the cycle or upgrade tier. To keep running blind-free: clear `yellowstone_endpoint` (WS mode) and restart. Retries hourly on its own; backfill covers only the newest ~25s after recovery |
+| `INGESTION BANNED` card       | Geyser 429s for ~30 min straight (quota/exhaustion, not burst)       | **Stop the bot.** Check token/quota/dashboard; wait out the cycle or upgrade tier. To keep running blind-free: clear `yellowstone_endpoint` (WS mode) and restart. Retries hourly on its own; post-recovery backfill is capped (geyser: slot cap, shed counted; WS: 3 signature pages, capped remainder counted lost) — read the heartbeat gap lines for what was actually missed |
 | Negative execution-gap avg    | Live trails paper (congestion tips, landing latency, stale exits)     | Widen slippage, lower notional, or accept the haircut explicitly  |
 | Duplicate cards after restart | Crash between dispatch and WAL                                       | WAL replay is conservative; verify on-chain, exit dups via `sell` |
 
@@ -218,8 +239,11 @@ tips) — a persistently negative avg is the live haircut made visible.
 | `alert_giveup_burst_n` (`3`) + `alert_giveup_window_secs` (`3600`) | N GiveUps in the trailing window    | Systemic dispatch trouble (RPC/Jito/congestion): stop funding more before cause found     |
 | (always on) tip-floor fetch warn                      | Jito oracle unreachable (≤1 warn/60s TTL)         | Base tip rules unmodified: underland risk under congestion; check `tip_floor` vs landing  |
 
-The heartbeat card already carries `Diverged` and `Pending buys`
-counts every 6h, and listener `Dropped` proxies RPC 429 pressure.
+The heartbeat card every 6h carries `Diverged` and `Pending buys` plus
+the health view — RPC pool (`n/m ok · failovers`, inconsistency flag),
+data-degrade state, oldest open age, stream gaps shed (slots + capped
+backfills), and windowed GiveUps — and listener `Dropped` proxies RPC
+429 pressure. A position overdue past its own timeout warns log-only.
 A week nominal with no burst exits burn-in.
 
 ## 9. Secrets handling (read once, follow always)

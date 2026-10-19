@@ -237,6 +237,53 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
 - One shared `Arc<RpcClient>` per process (built in `main`, injected via
   `with_rpc` / `subscribe_with_rpc`). Never add a new `RpcClient`
   construction site; `new()` constructors are test/back-compat wrappers.
+  That one client now wraps `executor::rpc_pool::RpcPool` (read-path
+  failover + latency + slot-staleness/inconsistency sampler built in
+  `main` from `http_url` + `fallback_rpc_urls`): still ONE construction
+  site — the pool builds endpoint senders inside itself. Reads only.
+  Attempt budgets are per-method (`attempt_timeout`: 6s light /
+  25s block-weight) and sit UNDER the callers' 10s outers, so a hung
+  primary actually fails over instead of dying at the outer first.
+  **Dispatch never rides the pool and never fans out**: one decision →
+  one Jito bundle on one endpoint; the failover sender re-attempts the
+  NEXT endpoint only AFTER an attempt failed (failover, never an
+  all-endpoints broadcast — a broadcast would double-execute and
+  double-rate-limit). Do not add a second dispatch path "for
+  redundancy" without written executed-once semantics.
+  `RpcPool::degraded` is hysteresis-gated, never blip-gated: no probe
+  evidence yet (boot) = healthy; sampler reaches nobody = degraded;
+  all-reached-but-none-eligible counts ONLY when every endpoint is
+  stale (a lone cooldown is a read-level fail-closed, not a pause).
+  Pinned by `single_blip_is_not_degradation` /
+  `boot_grace_withholds_degradation_without_probe_evidence`.
+  Endpoint URLs are redacted in pool logs (`ids::redact_endpoint`):
+  an `?api-key=` must never reach a log line. Mainnet proof is a
+  read-only `#[ignore]` probe (`rpc_pool_acceptance`, `RPC_POOL_ACCEPTANCE=1`).
+- Data-degrade pause (`data_paused` on `Pipeline`) halts entries through
+  the SAME `open_tracked` choke point as the kill switch — do NOT add a
+  second check site. The main-loop supervisor owns it (edge-logged +
+  one card). Reasons: RPC pool degraded (sampler-confirmed, never a
+  blip), SOL/USD feed stale — but a boot that never priced gets a
+  300s grace (`has_ever_priced`; losing a HAD price pauses at once) —
+  listener ingestion banned, plus a mode-agnostic stall trip (no logs
+  for 30 min; the ban latch is geyser-only, pump.fun launches are
+  seconds apart so silence is a dead stream). WS backfill pages the
+  signature list (cheap) up to `BACKFILL_MAX_PAGES=3` seeking the seen
+  boundary (`classify_backfill_page`, oldest-of-page rule); past the cap
+  with unseen beyond it counts `backfill_pages_capped` (lost, unknown
+  count — never silently). Exits and `sell <mint>` keep running;
+  recovery clears the pause automatically. The operator's marker file
+  and this flag stay separate states (operator vs system).
+- WAL carries a per-boot `Meta` stamp (`wal::WAL_SCHEMA_VERSION`,
+  `LiveTrader::wal_write_meta`, written after compaction; fresh boots
+  stamp too): provenance only, no custody — old binaries skip it.
+  Compaction preserves every stamp (`WalReplay::meta`); the file names
+  ALL its writers, not just the last session.
+  `day-state.json` carries `schema` (`day_state::DAY_STATE_SCHEMA`); a
+  file from a NEWER schema degrades to a fresh day loudly, never
+  adopts guessed numbers. Crash-recovery rules are pinned by tests:
+  torn final line / garbage lines are `skipped`, never half-adopted;
+  unreadable WAL still refuses boot.
 - Resend guard (`prior_sell_pending`) decides through the SAME
   `resolve_dispatch` as buys (`prior_sell_state` in `src/live.rs`): hold
   while `Unknown`, release on `Landed` (warn: possibly stale ledger) or

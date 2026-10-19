@@ -1348,6 +1348,17 @@ impl LiveTrader {
         self.wal_degraded.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Write the per-boot schema stamp (provenance only; no custody).
+    /// Called once after boot replay so every WAL names its writer and
+    /// schema from the first line of the fresh session onward.
+    pub fn wal_write_meta(&self, ts: u64) {
+        self.wal_record(&wal::WalLine::Meta {
+            schema: wal::WAL_SCHEMA_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            ts,
+        });
+    }
+
     /// Append one typed line (synced). No-op without a WAL path; a
     /// serialize failure would be an engine bug: latched, not panicked.
     fn wal_record(&self, line: &wal::WalLine) {

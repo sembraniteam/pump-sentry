@@ -1482,6 +1482,7 @@ dependencies = [
 name = "executor"
 version = "0.7.2"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "bincode",
  "borsh",
@@ -1501,6 +1502,7 @@ dependencies = [
  "solana-keypair 3.1.2",
  "solana-message 4.6.0",
  "solana-pubkey 4.4.0",
+ "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-signature",
  "solana-signer 3.0.1",

@@ -78,6 +78,25 @@ pub struct HeartbeatReport<'a> {
     pub cash_usd: f64,
     /// Mark-to-market paper equity (USD).
     pub equity_usd: f64,
+    /// Data-degrade pause active (RPC pool / SOL feed / listener).
+    pub data_paused: bool,
+    /// RPC read pool: configured endpoints.
+    pub rpc_endpoints: usize,
+    /// RPC read pool: currently eligible endpoints.
+    pub rpc_healthy: usize,
+    /// RPC read pool: reads served by a failover endpoint.
+    pub rpc_failover_reads: u64,
+    /// RPC read pool: endpoints disagree on slot (views inconsistent).
+    pub rpc_inconsistent: bool,
+    /// Age (secs) of the oldest open paper position (0 = none).
+    pub oldest_open_age_secs: u64,
+    /// Backfill-capped reconnect gaps shed (slots never replayed).
+    pub stream_gaps_shed: u64,
+    /// WS reconnect backfills capped with unseen history beyond
+    /// (launches lost, count unknown).
+    pub stream_pages_capped: u64,
+    /// Dispatch GiveUps (buy/sell failures) in the trailing window.
+    pub giveups_window: u64,
 }
 
 /// Resolve the Hermes binary: override, env, then PATH.
@@ -356,6 +375,8 @@ impl Alerter {
         let strategy = Self::sanitize(r.strategy);
         let uptime_h = r.uptime_secs / 3_600;
         let uptime_m = (r.uptime_secs % 3_600) / 60;
+        let oldest_h = r.oldest_open_age_secs / 3_600;
+        let oldest_m = (r.oldest_open_age_secs % 3_600) / 60;
         format!(
             "💚 **[BOT HEARTBEAT]**\n\
              • **Mode:** `{mode} · {strategy}`\n\
@@ -366,10 +387,15 @@ impl Alerter {
              • **Dropped:** `{}`\n\
              • **Watchlist:** `{}` pending\n\
              • **Open:** `{}` position(s)\n\
+             • **Oldest open:** `{oldest_h}h {oldest_m}m`\n\
              • **Manual bags:** `{}` held\n\
              • **Diverged:** `{}` (paper without live cover)\n\
              • **Pending buys:** `{}` unconfirmed\n\
              • **Breaker:** {}\n\
+             • **Data:** {}\n\
+             • **RPC:** `{}/{} ok · failovers {}{}`\n\
+             • **Stream gaps shed:** `{}` slots (`{}` capped backfills)\n\
+             • **GiveUps:** `{}` in window\n\
              • **Cash:** `${:.2}`\n\
              • **Equity:** `${:.2}`",
             r.logs_seen,
@@ -382,6 +408,22 @@ impl Alerter {
             r.diverged,
             r.pending_buys,
             Self::breaker_line(r.breaker_halted, r.day_net),
+            if r.data_paused {
+                "`DEGRADED — entries paused`"
+            } else {
+                "`ok`"
+            },
+            r.rpc_healthy,
+            r.rpc_endpoints,
+            r.rpc_failover_reads,
+            if r.rpc_inconsistent {
+                " · INCONSISTENT"
+            } else {
+                ""
+            },
+            r.stream_gaps_shed,
+            r.stream_pages_capped,
+            r.giveups_window,
             r.cash_usd,
             r.equity_usd,
         )
@@ -431,6 +473,38 @@ mod tests {
 
     const PAPER: CardCtx = CardCtx { mode: "paper", strategy: "adaptive" };
     const LIVE: CardCtx = CardCtx { mode: "live", strategy: "scalp" };
+
+    /// Base heartbeat fixture; tests override individual fields.
+    #[cfg(test)]
+    fn construct_heartbeat_fixture() -> HeartbeatReport<'static> {
+        HeartbeatReport {
+            mode: "live",
+            strategy: "runner",
+            uptime_secs: 7_500,
+            logs_seen: 1000,
+            candidates: 50,
+            parse_ok: 48,
+            dropped: 2,
+            watchlist_pending: 3,
+            open_positions: 1,
+            manual_bags: 2,
+            diverged: 1,
+            pending_buys: 0,
+            breaker_halted: false,
+            day_net: 3.25,
+            cash_usd: 90.5,
+            equity_usd: 102.25,
+            data_paused: false,
+            rpc_endpoints: 2,
+            rpc_healthy: 2,
+            rpc_failover_reads: 3,
+            rpc_inconsistent: false,
+            oldest_open_age_secs: 4_400,
+            stream_gaps_shed: 7,
+            stream_pages_capped: 0,
+            giveups_window: 1,
+        }
+    }
 
     #[test]
     fn entry_card_marks_fields() {
@@ -483,6 +557,15 @@ mod tests {
             day_net: 3.25,
             cash_usd: 90.5,
             equity_usd: 102.25,
+            data_paused: false,
+            rpc_endpoints: 2,
+            rpc_healthy: 2,
+            rpc_failover_reads: 3,
+            rpc_inconsistent: false,
+            oldest_open_age_secs: 4_400,
+            stream_gaps_shed: 7,
+            stream_pages_capped: 1,
+            giveups_window: 1,
         });
         assert!(card.contains("[BOT HEARTBEAT]"));
         assert!(card.contains("`live · runner`"));
@@ -491,6 +574,21 @@ mod tests {
         assert!(card.contains("`2` held"));
         assert!(card.contains("$90.50"));
         assert!(card.contains("$102.25"));
+        // Observability lines: health, RPC pool, stream gaps, failures.
+        assert!(card.contains("**Data:** `ok`"));
+        assert!(card.contains("**RPC:** `2/2 ok · failovers 3`"));
+        assert!(card.contains("**Oldest open:** `1h 13m`"));
+        assert!(card.contains("**Stream gaps shed:** `7` slots (`1` capped backfills)"));
+        assert!(card.contains("**GiveUps:** `1` in window"));
+        // Degraded state reads as paused, inconsistent as a flag.
+        let degraded = Alerter::format_heartbeat(&HeartbeatReport {
+            data_paused: true,
+            rpc_healthy: 0,
+            rpc_inconsistent: true,
+            ..construct_heartbeat_fixture()
+        });
+        assert!(degraded.contains("**Data:** `DEGRADED — entries paused`"));
+        assert!(degraded.contains("`0/2 ok · failovers 3 · INCONSISTENT`"));
     }
 
     #[test]
