@@ -378,6 +378,16 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   `PoolLeg::pumpswap_sell_order` (unit-pinned), used by
   `LiveTrader::sell_pumpswap`; Raydium needs no mapping (raw ==
   normalized there). Never route around the mapper.
+- Early-live dispatch scope is SOL-paired quotes only (both curve
+  preflights refuse non-WSOL quotes fail-closed; PumpSwap/Raydium were
+  already WSOL-only by their trust gates). The USDC/pump-coin quote
+  paths exist in code but never validated live — quote math, ATA
+  funding, fee legs, recovery are proven on SOL pairs only. Mayhem
+  rides SOL pairs and is unaffected (the gate keys on the quote mint,
+  never the curve kind; pinned by `mayhem_sol_quote_passes_scope_gate`).
+  Paper is unscoped by design (research freedom); a paper-open on a
+  token pair surfaces as diverged. Lift per-quote only after
+  quote/ATA/fee/recovery validation for that quote.
 - Dispatch status semantics live in `crates/executor/src/executor.rs`
   (`ConfirmOutcome`, `DispatchVerdict`, pinned by `timeout_is_never_a_failure`
   / `chain_verdicts_open_only_on_voted_states`): receipt = submitted

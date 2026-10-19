@@ -1578,6 +1578,22 @@ impl SwapExecutor {
                 "cashback-era curve: v3 refused on-chain (6094) and v2 dispatch retired; refusing (fail-closed)".to_string(),
             ));
         }
+        // Early-live scope: SOL-paired quotes only. The USDC/pump-coin
+        // quote paths exist in code (quote tiers, ATA prefixes) but are
+        // unvalidated live (quote math, ATA funding, fee legs, recovery
+        // have only ever been proven on SOL pairs) — refusing here
+        // keeps live money on the proven path. Mayhem rides SOL pairs
+        // and is unaffected (this keys on the quote mint, not the
+        // curve kind). Paper is unscoped (research freedom); a
+        // paper-open on a token pair surfaces as diverged, by design.
+        // Lift only after quote/ATA/fee/recovery validation per quote.
+        if state.quote_mint != crate::instructions::WSOL_MINT {
+            warn!(mint = %order.mint, quote = %state.quote_mint, "non-WSOL quote mint; live scope is SOL-paired only — refusing (fail-closed)");
+            return Err(ExecutorError::BadOrder(
+                "non-WSOL quote mint: live scope is SOL-paired only; refusing (fail-closed)"
+                    .to_string(),
+            ));
+        }
         // Program-bound ATA (differs for 2022 mints). Both reads batched.
         let ata = user_ata_with_program(&payer, &order.mint, &token_program);
         let (ixs, (final_max, _)) = tokio::join!(
@@ -1764,6 +1780,16 @@ impl SwapExecutor {
             warn!(mint = %order.mint, "cashback-era curve: v2 dispatch retired; refusing (fail-closed, manual exit)");
             return Err(ExecutorError::BadOrder(
                 "cashback-era curve: v2 dispatch retired; refusing (fail-closed)".to_string(),
+            ));
+        }
+        // Early-live scope: SOL-paired quotes only (mirrors the buy
+        // gate above). Paper is unscoped; a paper-open here surfaces as
+        // diverged, by design. Lift only after per-quote validation.
+        if state.quote_mint != crate::instructions::WSOL_MINT {
+            warn!(mint = %order.mint, quote = %state.quote_mint, "non-WSOL quote mint; live scope is SOL-paired only — refusing (fail-closed)");
+            return Err(ExecutorError::BadOrder(
+                "non-WSOL quote mint: live scope is SOL-paired only; refusing (fail-closed)"
+                    .to_string(),
             ));
         }
         info!(mint = %order.mint, mayhem = state.is_mayhem,
@@ -2390,6 +2416,105 @@ mod tests {
         );
     }
 
+    /// Mock-RPC wire DTOs (serde, never ad-hoc JSON). Shared by the
+    /// preflight refusal tests below.
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MockCtx {
+        slot: u64,
+        api_version: &'static str,
+    }
+    #[derive(serde::Serialize)]
+    struct MockResp<T: serde::Serialize> {
+        context: MockCtx,
+        value: T,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MockUiAcct {
+        data: (String, String),
+        executable: bool,
+        lamports: u64,
+        owner: String,
+        rent_epoch: u64,
+        space: u64,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MockTokAmt {
+        amount: String,
+        decimals: u8,
+        ui_amount_string: String,
+    }
+    fn mock_resp<T: serde::Serialize>(value: T) -> serde_json::Value {
+        serde_json::to_value(MockResp {
+            context: MockCtx {
+                slot: 1,
+                api_version: "4.3.0",
+            },
+            value,
+        })
+        .expect("mock response serializes")
+    }
+    fn mock_ui_account(owner: &solana_pubkey::Pubkey, data: &[u8]) -> serde_json::Value {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        mock_resp(MockUiAcct {
+            data: (BASE64_STANDARD.encode(data), "base64".to_string()),
+            executable: false,
+            lamports: 1_000_000,
+            owner: owner.to_string(),
+            rent_epoch: 0,
+            space: data.len() as u64,
+        })
+    }
+    fn mock_executor(mocks: solana_rpc_client::mock_sender::MocksMap) -> SwapExecutor {
+        use solana_client::{rpc_client::RpcClientConfig, rpc_request::RpcRequest};
+        let _ = RpcRequest::GetBalance;
+        let sender = solana_rpc_client::mock_sender::MockSender::new_with_mocks_map(
+            "preflight-scope",
+            mocks,
+        );
+        let rpc = std::sync::Arc::new(
+            solana_client::nonblocking::rpc_client::RpcClient::new_sender(
+                sender,
+                RpcClientConfig::with_commitment(
+                    solana_commitment_config::CommitmentConfig::confirmed(),
+                ),
+            ),
+        );
+        let keypair = Keypair::new();
+        let wallet = WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
+            .expect("wallet");
+        SwapExecutor::with_rpc(rpc, wallet)
+    }
+    /// Synthetic curve blob (own layout, already pinned) with a chosen
+    /// quote mint, creator, and flags.
+    fn mock_curve(
+        creator: &solana_pubkey::Pubkey,
+        quote_mint: &solana_pubkey::Pubkey,
+        complete: bool,
+        mayhem: bool,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 166];
+        data[..8].copy_from_slice(&ids::BONDING_CURVE_DISCRIMINATOR);
+        data[crate::instructions::CURVE_CREATOR_OFFSET..crate::instructions::CURVE_CREATOR_END]
+            .copy_from_slice(creator.as_ref());
+        data[crate::instructions::CURVE_QUOTE_MINT_OFFSET
+            ..crate::instructions::CURVE_QUOTE_MINT_END]
+            .copy_from_slice(quote_mint.as_ref());
+        // Live reserves (vt/vq/real) so quotes price.
+        data[8..16].copy_from_slice(&1_000_000_000_000_000u64.to_le_bytes());
+        data[16..24].copy_from_slice(&30_000_000_000u64.to_le_bytes());
+        data[24..32].copy_from_slice(&800_000_000_000_000u64.to_le_bytes());
+        if complete {
+            data[crate::instructions::CURVE_COMPLETE_OFFSET] = 1;
+        }
+        if mayhem {
+            data[crate::instructions::CURVE_MAYHEM_FLAG_OFFSET] = 1;
+        }
+        data
+    }
+
     /// A complete curve refuses BEFORE dispatch (no tip can burn on a
     /// doomed sell). Proven end-to-end by a $0 mainnet sim showing the
     /// CHAIN refuses too (`BondingCurveComplete` 6005): the refusal
@@ -2397,82 +2522,29 @@ mod tests {
     /// (no network): solvency, mint owner, ATA balance, curve state.
     #[tokio::test]
     async fn complete_curve_sell_refuses_without_dispatch() {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-        use solana_client::{rpc_client::RpcClientConfig, rpc_request::RpcRequest};
-        use solana_rpc_client::mock_sender::{MockSender, MocksMap};
+        use solana_client::rpc_request::RpcRequest;
+        use solana_rpc_client::mock_sender::MocksMap;
 
-        /// Typed wire DTOs (serde, never ad-hoc JSON).
-        #[derive(serde::Serialize)]
-        struct Ctx {
-            slot: u64,
-            #[serde(rename = "apiVersion")]
-            api_version: &'static str,
-        }
-        #[derive(serde::Serialize)]
-        struct Resp<T: serde::Serialize> {
-            context: Ctx,
-            value: T,
-        }
-        #[derive(serde::Serialize)]
-        struct UiAcct {
-            data: (String, String),
-            executable: bool,
-            lamports: u64,
-            owner: String,
-            #[serde(rename = "rentEpoch")]
-            rent_epoch: u64,
-            space: u64,
-        }
-        #[derive(serde::Serialize)]
-        struct TokAmt {
-            amount: String,
-            decimals: u8,
-            #[serde(rename = "uiAmountString")]
-            ui_amount_string: String,
-        }
-        fn resp<T: serde::Serialize>(value: T) -> serde_json::Value {
-            serde_json::to_value(Resp {
-                context: Ctx {
-                    slot: 1,
-                    api_version: "4.3.0",
-                },
-                value,
-            })
-            .expect("mock response serializes")
-        }
-
+        // A complete curve refuses BEFORE dispatch (no tip can burn on
+        // a doomed sell). Proven end-to-end by a $0 mainnet sim showing
+        // the CHAIN refuses too (`BondingCurveComplete` 6005): the
+        // refusal mirrors chain policy, it is not ours to relax.
+        // Mocked reads (no network): solvency, mint owner, ATA balance,
+        // curve state.
         let creator = Pubkey::new_from_array([9; 32]);
         let mint = Pubkey::new_from_array([10; 32]);
         let curve = Pubkey::new_from_array([11; 32]);
-        // Synthetic complete curve (own layout, already pinned): the
-        // refusal keys off `state.complete`, never the chain.
-        let mut curve_data = vec![0u8; 166];
-        curve_data[..8].copy_from_slice(&ids::BONDING_CURVE_DISCRIMINATOR);
-        curve_data
-            [crate::instructions::CURVE_CREATOR_OFFSET..crate::instructions::CURVE_CREATOR_END]
-            .copy_from_slice(creator.as_ref());
-        curve_data[crate::instructions::CURVE_COMPLETE_OFFSET] = 1;
         let token_prog = crate::instructions::TOKEN_PROGRAM_ID;
-        let ui_account = |owner: &Pubkey, data: &[u8]| {
-            resp(UiAcct {
-                data: (BASE64_STANDARD.encode(data), "base64".to_string()),
-                executable: false,
-                lamports: 1_000_000,
-                owner: owner.to_string(),
-                rent_epoch: 0,
-                space: data.len() as u64,
-            })
-        };
         let mut mocks = MocksMap::default();
-        mocks.insert(RpcRequest::GetBalance, resp(1_000_000_000u64));
+        mocks.insert(RpcRequest::GetBalance, mock_resp(1_000_000_000u64));
         // Call order in preflight_sell: mint owner, then curve state.
         mocks.insert(
             RpcRequest::GetAccountInfo,
-            ui_account(&token_prog, &[0u8; 8]),
+            mock_ui_account(&token_prog, &[0u8; 8]),
         );
         mocks.insert(
             RpcRequest::GetTokenAccountBalance,
-            resp(TokAmt {
+            mock_resp(MockTokAmt {
                 amount: "1000000".to_string(),
                 decimals: 6,
                 ui_amount_string: "1.0".to_string(),
@@ -2480,19 +2552,12 @@ mod tests {
         );
         mocks.insert(
             RpcRequest::GetAccountInfo,
-            ui_account(&crate::instructions::PUMP_PROGRAM_ID, &curve_data),
-        );
-        let sender = MockSender::new_with_mocks_map("complete-refusal", mocks);
-        let rpc = Arc::new(
-            solana_client::nonblocking::rpc_client::RpcClient::new_sender(
-                sender,
-                RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+            mock_ui_account(
+                &crate::instructions::PUMP_PROGRAM_ID,
+                &mock_curve(&creator, &crate::instructions::WSOL_MINT, true, false),
             ),
         );
-        let keypair = Keypair::new();
-        let wallet = WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
-            .expect("wallet");
-        let exec = SwapExecutor::with_rpc(rpc, wallet);
+        let exec = mock_executor(mocks);
         let err = exec
             .preflight_sell(
                 &SellOrder {
@@ -2513,5 +2578,184 @@ mod tests {
             matches!(err, ExecutorError::BadOrder(ref m) if m.contains("curve complete")),
             "refusal, not dispatch: {err}"
         );
+    }
+
+    /// Early-live scope: SOL-paired quotes only (see the preflight
+    /// gates). USDC quote on both sides refuses with the scope message;
+    /// mayhem on a SOL quote sails through the gate (mayhem is a fee
+    /// variant, never a quote variant).
+    #[tokio::test]
+    async fn non_wsol_quote_buy_refuses() {
+        use solana_client::rpc_request::RpcRequest;
+        use solana_rpc_client::mock_sender::MocksMap;
+
+        let creator = Pubkey::new_from_array([9; 32]);
+        let mint = Pubkey::new_from_array([10; 32]);
+        let curve = Pubkey::new_from_array([11; 32]);
+        let token_prog = crate::instructions::TOKEN_PROGRAM_ID;
+        let mut mocks = MocksMap::default();
+        mocks.insert(RpcRequest::GetBalance, mock_resp(1_000_000_000u64));
+        // Call order in preflight_buy: mint owner, then curve state.
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &[0u8; 8]),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(
+                &crate::instructions::PUMP_PROGRAM_ID,
+                &mock_curve(&creator, &crate::instructions::USDC_MINT, false, false),
+            ),
+        );
+        let exec = mock_executor(mocks);
+        let err = exec
+            .preflight_buy(
+                &BuyOrder {
+                    mint,
+                    bonding_curve: curve,
+                    associated_bonding_curve: curve,
+                    amount_tokens: 1_000,
+                    max_sol_cost: 1_000_000,
+                    tip_lamports: 0,
+                    creator: Some(creator),
+                    slippage_bps: 200,
+                },
+                false,
+            )
+            .await
+            .expect_err("USDC quote must refuse");
+        assert!(
+            matches!(err, ExecutorError::BadOrder(ref m) if m.contains("SOL-paired")),
+            "scope refusal, not dispatch: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_wsol_quote_sell_refuses() {
+        use solana_client::rpc_request::RpcRequest;
+        use solana_rpc_client::mock_sender::MocksMap;
+
+        let creator = Pubkey::new_from_array([9; 32]);
+        let mint = Pubkey::new_from_array([10; 32]);
+        let curve = Pubkey::new_from_array([11; 32]);
+        let token_prog = crate::instructions::TOKEN_PROGRAM_ID;
+        let mut mocks = MocksMap::default();
+        mocks.insert(RpcRequest::GetBalance, mock_resp(1_000_000_000u64));
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &[0u8; 8]),
+        );
+        mocks.insert(
+            RpcRequest::GetTokenAccountBalance,
+            mock_resp(MockTokAmt {
+                amount: "1000000".to_string(),
+                decimals: 6,
+                ui_amount_string: "1.0".to_string(),
+            }),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(
+                &crate::instructions::PUMP_PROGRAM_ID,
+                &mock_curve(&creator, &crate::instructions::USDC_MINT, false, false),
+            ),
+        );
+        let exec = mock_executor(mocks);
+        let err = exec
+            .preflight_sell(
+                &SellOrder {
+                    mint,
+                    bonding_curve: curve,
+                    associated_bonding_curve: curve,
+                    amount_tokens: 1_000,
+                    min_sol_output: 1,
+                    tip_lamports: 0,
+                    slippage_bps: 200,
+                    creator: Some(creator),
+                },
+                false,
+            )
+            .await
+            .expect_err("USDC quote must refuse");
+        assert!(
+            matches!(err, ExecutorError::BadOrder(ref m) if m.contains("SOL-paired")),
+            "scope refusal, not dispatch: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mayhem_sol_quote_passes_scope_gate() {
+        use solana_client::rpc_request::RpcRequest;
+        use solana_rpc_client::mock_sender::MocksMap;
+
+        // Mayhem on a SOL quote must sail through the scope gate and
+        // price: the gate keys on the quote mint, never the curve kind.
+        // Fee inputs ride the frozen mainnet schedule (same bytes the
+        // quote tests decode); global carries only the gate byte.
+        let creator = Pubkey::new_from_array([9; 32]);
+        let mint = Pubkey::new_from_array([10; 32]);
+        let curve = Pubkey::new_from_array([11; 32]);
+        let token_prog = crate::instructions::TOKEN_PROGRAM_ID;
+        let fee_bin: &[u8] = include_bytes!("../../listener/tests/fixtures/fee_config_live.bin");
+        let mut global = vec![0u8; 1046];
+        global[1045] = 1;
+        let mut mocks = MocksMap::default();
+        mocks.insert(RpcRequest::GetBalance, mock_resp(2_000_000_000u64));
+        // preflight_buy order: mint owner, curve state.
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &[0u8; 8]),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(
+                &crate::instructions::PUMP_PROGRAM_ID,
+                &mock_curve(&creator, &crate::instructions::WSOL_MINT, false, true),
+            ),
+        );
+        // Base ATA exists (skip the create prefix).
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &[0u8; 8]),
+        );
+        // quote_buy_guard order: fee inputs (global, then fee config),
+        // then mint supply (mint account again, supply u64 at [36:44]).
+        // Quote mint program (WSOL resolves classic SPL here).
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&crate::instructions::PUMP_PROGRAM_ID, &global),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&crate::instructions::FEE_CONFIG_PROGRAM, fee_bin),
+        );
+        let mut mint_blob = vec![0u8; 64];
+        mint_blob[36..44].copy_from_slice(&1_000_000_000_000_000u64.to_le_bytes());
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &mint_blob),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &[0u8; 8]),
+        );
+        let exec = mock_executor(mocks);
+        let ixs = exec
+            .preflight_buy(
+                &BuyOrder {
+                    mint,
+                    bonding_curve: curve,
+                    associated_bonding_curve: curve,
+                    amount_tokens: 1_000,
+                    max_sol_cost: 1_000_000_000,
+                    tip_lamports: 0,
+                    creator: Some(creator),
+                    slippage_bps: 200,
+                },
+                false,
+            )
+            .await
+            .expect("mayhem SOL quote must pass the scope gate");
+        assert!(!ixs.is_empty(), "preflight builds dispatch ixs");
     }
 }
