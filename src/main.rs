@@ -5,10 +5,12 @@ mod config;
 mod day_state;
 mod follow;
 mod gate;
+mod journal;
 mod live;
 mod live_mirror;
 mod money;
 mod pipeline;
+mod replay;
 mod settings;
 mod wal;
 
@@ -47,6 +49,7 @@ async fn main() {
         cli::CliAction::Sell { mint } => cli::cmd_sell(&mint),
         cli::CliAction::Pause => cli::cmd_pause(),
         cli::CliAction::Resume => cli::cmd_resume(),
+        cli::CliAction::Replay { file } => replay::cmd_replay(file).await,
         cli::CliAction::Upgrade { allow_unverified } => cli::cmd_upgrade(allow_unverified),
         cli::CliAction::InitConfig => {
             let path = config::resolve_config_path();
@@ -798,6 +801,19 @@ async fn run_pipeline(live_arg: bool) {
         }
     };
 
+    // Decision journal (analytics-only, fail-soft): opened even in
+    // paper mode so replay and paper/live metric separation work from
+    // day one. `with_journal` before any tick runs.
+    let jrn = journal::JournalSink::maybe_open(&journal::default_journal_path());
+    if let Some(ref j) = jrn {
+        // Snapshot BEFORE the settings move into the pipeline.
+        j.boot(
+            crate::settings::now_secs(),
+            &settings,
+            if live_mode { "live" } else { "paper" },
+        );
+    }
+
     let pipeline = Pipeline::shared(
         settings,
         auditor,
@@ -811,6 +827,9 @@ async fn run_pipeline(live_arg: bool) {
         sol_feed,
         Some(day_state_path()),
     );
+    if let Some(j) = jrn {
+        pipeline.with_journal(std::sync::Arc::new(j));
+    }
 
     // Kill switch: the marker file halts entries without a restart.
     // Polled below each gate round; flip the state now so boot tells
@@ -958,6 +977,21 @@ async fn run_pipeline(live_arg: bool) {
                     cash_usd: cash,
                     equity_usd: equity,
                 });
+                // Equity-curve record (drawdown / expectation evidence).
+                if let Some(j) = pipeline.journal() {
+                    if j.is_degraded() {
+                        warn!("decision journal is degraded (stopped recording after an IO failure); decisions since then are unplayable — restart the bot to clear (trading unaffected)");
+                    } else {
+                        j.append(&journal::JournalLine::Equity {
+                            ts: crate::settings::now_secs(),
+                            cash,
+                            equity,
+                            open_count: open,
+                            day_net,
+                            breaker_halted,
+                        });
+                    }
+                }
                 info!("heartbeat: logs={} candidates={} watchlist={} open={} manual={} diverged={} pending_buys={} equity={:.2}",
                     snap.logs_seen, snap.candidates, pending, open, manual, diverged, pending_buys, equity);
                 // Stashed and synthetic PnL bypass the breaker by

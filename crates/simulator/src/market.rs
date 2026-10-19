@@ -1,6 +1,27 @@
 //! Slippage fills and exit triggers.
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::{ExitReason, Position, Side};
+
+/// JSON lens for `Mark::liquidity_usd`: NaN ⇄ null ⇄ 0.0. Fills price
+/// identically at 0.0 and NaN (both reject the fill), so the round
+/// trip never changes a decision.
+mod json_nan_null {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn ser<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        if v.is_finite() {
+            s.serialize_some(v)
+        } else {
+            s.serialize_none()
+        }
+    }
+
+    pub fn de<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Ok(Option::<f64>::deserialize(d)?.unwrap_or(0.0))
+    }
+}
 
 /// Standard venue fee per side, bps. Live-launch schedule total
 /// (95 + 30); custom-tier mints override per mint.
@@ -21,7 +42,7 @@ const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 /// the same curve. Quote math is integer (u128, like the chain); the
 /// only float legs are the USD conversions at the edges. A mint whose
 /// tick carried no reserves quotes on the proxy basis instead.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CurveReserves {
     /// Virtual SOL reserves, lamports.
     pub vq_lamports: u64,
@@ -36,11 +57,18 @@ pub struct CurveReserves {
 }
 
 /// Mark-to-market quote for one mint.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Mark {
     /// Spot USD per whole token.
     pub price: f64,
     /// SOL-side depth in USD (proxy basis when `curve` is `None`).
+    /// JSON lens: NaN (unpriced proxy basis) writes as `null` and
+    /// reads back as `0.0` — both reject fills the same way, so
+    /// recorded decisions reproduce bit-for-bit off either.
+    #[serde(
+        serialize_with = "json_nan_null::ser",
+        deserialize_with = "json_nan_null::de"
+    )]
     pub liquidity_usd: f64,
     /// Exact curve state for size-aware quotes, when the tick carried
     /// reserves. `None` = proxy basis only (mocks, synthetic prices).
@@ -551,6 +579,19 @@ pub fn move_percent(side: Side, entry_price: f64, price: f64) -> f64 {
     }
 }
 
+/// The fraction a TP close takes out when the position carries a
+/// moonbag: TP scales out `1 − moonbag` once, leaving the runner tail
+/// to the next decision; every other reason closes whole. Single
+/// owner: the tick path and the offline replay both call this, so a
+/// slice-out can never size two ways.
+pub fn exit_fraction(reason: ExitReason, moonbag_percent: f64) -> f64 {
+    if reason == ExitReason::TakeProfit && moonbag_percent > 0.0 {
+        (1.0 - moonbag_percent / 100.0).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 /// Exit check against the realizable exit price (fee-aware fill), not
 /// the gross mark: SL must fire on what the exit actually nets, and TP
 /// must not book phantom edge the fill never pays. Timeout still fires
@@ -613,6 +654,25 @@ pub fn check_exit(position: &mut Position, price: f64, now_secs: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The proxy basis is liquidity-NaN; the JSON lens must round-trip
+    /// it to 0.0 without changing any fill decision (0.0 and NaN both
+    /// reject fills).
+    #[test]
+    fn mark_nan_liquidity_json_roundtrip_prices_identically() {
+        let mark = Mark::price_only(1.5);
+        assert!(mark.liquidity_usd.is_nan());
+        let decoded: Mark =
+            serde_json::from_str(&serde_json::to_string(&mark).expect("nan mark encodes as null"))
+                .expect("null decodes to 0.0");
+        assert_eq!(decoded.price, mark.price);
+        assert_eq!(decoded.liquidity_usd, 0.0);
+        assert!(decoded.curve.is_none());
+        // Finite depth survives verbatim.
+        let filled = Mark::new(1.5, 23_000.0);
+        let back: Mark = serde_json::from_str(&serde_json::to_string(&filled).unwrap()).unwrap();
+        assert_eq!(back.liquidity_usd, filled.liquidity_usd);
+    }
 
     /// Pump.fun launch scale: 30 SOL virtual / 1.073e15 virtual tokens /
     /// 793.1e12 real tokens, 6 decimals, SOL $200.

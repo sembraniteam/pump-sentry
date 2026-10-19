@@ -208,6 +208,7 @@ use solana_pubkey::Pubkey;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::journal::{FillClaim, JournalLine};
 use crate::live::{
     DecimalsRefusal, LAMPORTS_PER_SOL, LiveBuyParams, LiveError, LivePosition, LiveSellParams,
     LiveTrader, PumpSwapSellParams, RaydiumSellParams, RecheckOutcome, SELL_MAX_ATTEMPTS,
@@ -463,25 +464,27 @@ impl<L> LiveExecution<L> {
     }
 
     /// Live settled a sale (call on every confirmed sell AND settled
-    /// manual exit). Logs the gap when a paper close was pending; silent
-    /// `None` otherwise (orphan legs record nothing).
+    /// manual exit). Returns the gap when a paper close was pending
+    /// (journal mirrors it); silent `None` otherwise (orphan legs
+    /// record nothing — never fabricated gaps).
     pub async fn note_gap_live_settle(
         &self,
         mint: &str,
         settle_price_usd: f64,
         tip_usd: f64,
-    ) {
+    ) -> Option<FillGap> {
         let gap = self
             .gaps
             .lock()
             .await
             .note_live_settle(mint, settle_price_usd, tip_usd);
-        if let Some(gap) = gap {
+        if let Some(ref gap) = gap {
             info!(mint = %gap.mint, paper = gap.paper_price_usd, settle = gap.settle_price_usd,
                 qty = gap.qty_tokens, tip = format!("{:.4}", gap.tip_usd),
                 gap_usd = format!("{:+.4}", gap.gap_usd),
                 "execution gap settled (paper model vs live reality)");
         }
+        gap
     }
 
     /// Drop a pending gap note (mint lifecycle ended with no settle:
@@ -496,25 +499,27 @@ impl<L> LiveExecution<L> {
     }
 
     /// Record a landed entry gap. Single call site per buy confirm;
-    /// logs the gap, silent `None` on degenerate input.
+    /// returns the gap for the journal mirror, silent `None` on
+    /// degenerate input (orphan legs record nothing).
     pub async fn note_entry_gap(
         &self,
         mint: &str,
         paper_price_usd: f64,
         fill_price_usd: f64,
         qty_tokens: f64,
-    ) {
+    ) -> Option<EntryGap> {
         let gap = self
             .gaps
             .lock()
             .await
             .note_entry_gap(mint, paper_price_usd, fill_price_usd, qty_tokens);
-        if let Some(gap) = gap {
+        if let Some(ref gap) = gap {
             info!(mint = %gap.mint, paper = gap.paper_price_usd, fill = gap.fill_price_usd,
                 qty = gap.qty_tokens,
                 gap_usd = format!("{:+.4}", gap.gap_usd),
                 "entry gap settled (paper model vs landed fill)");
         }
+        gap
     }
 
     /// `(filled_count, avg_gap_usd, total_gap_usd)` for the heartbeat.
@@ -640,6 +645,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let Some((sol_usd, _ts)) = sol.filter(|(_, ts)| self.sol_feed.age_ok(*ts)) else {
             warn!(%mint, "stale SOL/USD — live buy skipped (no static fallback)");
             // One-shot buy: a skip leaves paper uncovered.
+            self.journal_buy_skip(mint, "stale sol");
             self.exec
                 .mark_diverged(mint, "live buy skipped: stale SOL/USD".to_string())
                 .await;
@@ -655,6 +661,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             let already_exposed = exposure.iter().any(|m| m == mint);
             if !already_exposed && exposure.len() >= self.settings.max_open_positions {
                 warn!(%mint, cap = self.settings.max_open_positions, "live heat limit: paper opens, live mirror skipped (real exposure at cap)");
+                self.journal_buy_skip(mint, "heat limit");
                 self.exec
                     .mark_diverged(mint, "live buy skipped: heat limit".to_string())
                     .await;
@@ -665,6 +672,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Pre-dispatch dup guard (post check stays as backup).
         if self.is_live_tracked(trader, mint).await {
             warn!(%mint, "LIVE buy skipped: mint already tracked/manual/pending; no dispatch (paper stays open, no new funds)");
+            self.journal_buy_skip(mint, "already tracked");
             self.emit(format!("LIVE buy skipped on already-tracked {mint}; no dispatch"));
             return;
         }
@@ -675,6 +683,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Ok(d) => d,
             Err(DecimalsRefusal::NonSix(other)) => {
                 warn!(%mint, decimals = other, "non-6-decimal mint; live buy skipped (fail-closed)");
+                self.journal_buy_skip(mint, "non-6 decimals");
                 self.exec
                     .mark_diverged(mint, "live buy skipped: non-6 decimals".to_string())
                     .await;
@@ -683,6 +692,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
             Err(DecimalsRefusal::Unreadable(error)) => {
                 warn!(%mint, %error, "mint decimals unreadable; live buy skipped (fail-closed)");
+                self.journal_buy_skip(mint, "decimals unreadable");
                 self.exec
                     .mark_diverged(mint, "live buy skipped: decimals unreadable".to_string())
                     .await;
@@ -760,10 +770,24 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // Entry-gap calibration: paper model vs landed fill.
                 // Skipped when unobservable (late-confirm path never
                 // carries one either) — absence is documented, not hidden.
-                if let Some(fill) = entry_fill {
+                let entry_gap = if let Some(fill) = entry_fill {
                     self.exec
                         .note_entry_gap(mint, entry_quote, fill.fill_price_usd, fill.tokens)
-                        .await;
+                        .await
+                } else {
+                    None
+                };
+                if let (Some(j), Some(entry_gap)) = (self.journal(), entry_gap) {
+                    j.append(&JournalLine::Gap {
+                        ts: now_secs(),
+                        mint: entry_gap.mint,
+                        leg: "entry".to_string(),
+                        paper_price_usd: entry_gap.paper_price_usd,
+                        realized_price_usd: entry_gap.fill_price_usd,
+                        qty_tokens: entry_gap.qty_tokens,
+                        tip_usd: None,
+                        gap_usd: entry_gap.gap_usd,
+                    });
                 }
                 // First-touch cost feeds the day-loss gate.
                 self.debit_dispatch_usd(Self::dispatch_usd(
@@ -771,12 +795,35 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     sol_usd,
                 ))
                 .await;
+                // Dispatch record: what was sent, at what, costing what.
+                if let Some(j) = self.journal() {
+                    j.append(&JournalLine::BuyAttempt {
+                        ts: now_secs(),
+                        mint: mint.to_string(),
+                        bundle: bundle.clone(),
+                        tokens: amount,
+                        fill: entry_fill.map(|f| FillClaim {
+                            fill_price_usd: f.fill_price_usd,
+                            tokens: f.tokens,
+                        }),
+                        debit_usd: Some(Self::dispatch_usd(
+                            trader.first_touch_cost_lamports(),
+                            sol_usd,
+                        )),
+                    });
+                    // Terminal bookkeeping for the direct path: every
+                    // buy gets exactly one outcome line, so confirmed
+                    // counts include at-dispatch confirms (the debit is
+                    // NOT repeated — the Attempt line owns it).
+                    self.journal_buy_outcome(mint, Some(bundle.clone()), "confirmed", None, None);
+                }
                 warn!(%mint, "LIVE buy dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_buy(&self.card_ctx(), mint, &bundle, amount));
             }
             Err(LiveError::UnknownDispatch { position, reason }) => {
                 // No signature: fill unknown, park manual.
                 warn!(%mint, error = %reason, "LIVE buy dispatch unknown; parked for manual review (may hold — check mint activity on explorer, no signature exists)");
+                self.journal_buy_outcome(mint, None, "unknown", Some(reason.to_string()), None);
                 trader.record_manual(&position, "dispatch-unknown");
                 self.exec.park_manual(mint.to_string(), *position).await;
                 self.emit(format!("LIVE buy dispatch unknown on {mint}; MANUAL REVIEW REQUIRED (fill unknown)"));
@@ -786,14 +833,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // the chain charged base + priority, and the tip transfer
                 // rolled back with the failed transaction.
                 // Never-forwarded and expired dispatches paid nothing.
-                if reason == DeadReason::FailedOnChain {
-                    self.debit_dispatch_usd(Self::dispatch_usd(
-                        trader.failed_dispatch_cost_lamports(),
-                        sol_usd,
-                    ))
-                    .await;
+                let debit = (reason == DeadReason::FailedOnChain)
+                    .then(|| Self::dispatch_usd(trader.failed_dispatch_cost_lamports(), sol_usd));
+                if let Some(usd) = debit {
+                    self.debit_dispatch_usd(usd).await;
                 }
                 warn!(%mint, %reason, error = %context, "LIVE buy provably dead (no fill); paper still open but DIVERGED");
+                self.journal_buy_outcome(mint, None, "dead", Some(context.clone()), debit);
                 self.exec.mark_diverged(mint, context).await;
                 self.emit(format!(
                     "LIVE buy provably dead on {mint} ({reason}); paper open WITHOUT live cover"
@@ -802,13 +848,59 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Err(LiveError::Unconfirmed(msg)) => {
                 // Pending stays with recheck; GiveUp parks it.
                 warn!(%mint, error = %msg, "LIVE buy unconfirmed; tracked as pending, rechecking");
+                self.journal_buy_outcome(mint, None, "unknown", Some(msg), None);
             }
             Err(e) => {
                 // No fill: paper stays open but diverged.
                 warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
+                self.journal_buy_outcome(mint, None, "unknown", Some(e.to_string()), None);
                 self.exec.mark_diverged(mint, e.to_string()).await;
                 self.emit(format!("LIVE buy failed on {mint} ({e}); paper open WITHOUT live cover"));
             }
+        }
+    }
+
+    /// Decision record: live buy decided not to dispatch (reason is
+    /// the decision). Analytics-only; never gates anything.
+    fn journal_buy_skip(&self, mint: &str, reason: &str) {
+        if let Some(j) = self.journal() {
+            j.append(&JournalLine::BuySkip {
+                ts: now_secs(),
+                mint: mint.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+
+    /// Decision record: terminal/recheck state for a pending live buy.
+    fn journal_buy_outcome(
+        &self,
+        mint: &str,
+        bundle: Option<String>,
+        verdict: &str,
+        detail: Option<String>,
+        debit_usd: Option<f64>,
+    ) {
+        if let Some(j) = self.journal() {
+            j.append(&JournalLine::BuyOutcome {
+                ts: now_secs(),
+                mint: mint.to_string(),
+                bundle,
+                verdict: verdict.to_string(),
+                detail,
+                debit_usd,
+            });
+        }
+    }
+
+    /// Decision record: live sell automation given up (bag parked).
+    fn journal_mint_giveup(&self, mint: &str, cause: &str) {
+        if let Some(j) = self.journal() {
+            j.append(&JournalLine::SellGiveUp {
+                ts: now_secs(),
+                mint: mint.to_string(),
+                cause: cause.to_string(),
+            });
         }
     }
 
@@ -842,6 +934,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     // Late confirm never clobbers a newer bag.
                     if self.is_live_tracked(trader, &mint).await {
                         warn!(mint = %mint, bundle = %recheck.bundle_id, amount = recheck.position.amount_tokens, "late LIVE buy confirm for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
+                        self.journal_buy_outcome(
+                            &mint,
+                            Some(recheck.bundle_id.clone()),
+                            "confirmed",
+                            Some("late confirm parked as manual (still held)".to_string()),
+                            None,
+                        );
                         trader.record_manual(&recheck.position, &recheck.bundle_id);
                         self.exec
                             .park_manual(
@@ -858,36 +957,63 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.exec.insert_tracked(recheck.position).await;
                     self.exec.clear_diverged(&mint).await;
                     // Same first-touch cost; stale feed skips.
-                    if let Some(sol_usd) = self.sol_feed.price() {
-                        self.debit_dispatch_usd(Self::dispatch_usd(
-                            trader.first_touch_cost_lamports(),
-                            sol_usd,
-                        ))
-                        .await;
+                    let confirmed_debit = self.sol_feed.price().map(|sol_usd| {
+                        Self::dispatch_usd(trader.first_touch_cost_lamports(), sol_usd)
+                    });
+                    if let Some(usd) = confirmed_debit {
+                        self.debit_dispatch_usd(usd).await;
                     }
+                    self.journal_buy_outcome(
+                        &mint,
+                        Some(recheck.bundle_id.clone()),
+                        "confirmed",
+                        None,
+                        confirmed_debit,
+                    );
                     warn!(mint = %mint, "LIVE buy confirmed late; now tracked with exits");
                     self.emit(Alerter::format_live_buy(&self.card_ctx(), &mint, &recheck.bundle_id, amount));
                 }
                 RecheckOutcome::Dead(reason) => {
                     // Same honest burn as the direct path: only an
                     // on-chain failure paid fees (the tip rolled back).
-                    if reason == DeadReason::FailedOnChain
-                        && let Some(sol_usd) = self.sol_feed.price()
-                    {
-                        self.debit_dispatch_usd(Self::dispatch_usd(
-                            trader.failed_dispatch_cost_lamports(),
-                            sol_usd,
-                        ))
-                        .await;
+                    let dead_debit = (reason == DeadReason::FailedOnChain)
+                        .then(|| self.sol_feed.price())
+                        .flatten()
+                        .map(|sol_usd| {
+                            Self::dispatch_usd(trader.failed_dispatch_cost_lamports(), sol_usd)
+                        });
+                    if let Some(usd) = dead_debit {
+                        self.debit_dispatch_usd(usd).await;
                     }
                     warn!(mint = %mint, bundle = %recheck.bundle_id, %reason, "pending LIVE buy provably dead; no fill, dropping");
+                    self.journal_buy_outcome(
+                        &mint,
+                        Some(recheck.bundle_id.clone()),
+                        "dead",
+                        Some(reason.to_string()),
+                        dead_debit,
+                    );
                 }
                 RecheckOutcome::StillUnknown => {
                     warn!(mint = %mint, bundle = %recheck.bundle_id, "pending LIVE buy still unconfirmed; keeping for next round");
+                    self.journal_buy_outcome(
+                        &mint,
+                        Some(recheck.bundle_id.clone()),
+                        "unknown",
+                        None,
+                        None,
+                    );
                 }
                 RecheckOutcome::GiveUp => {
                     // No verdict: may hold, park manual.
                     warn!(mint = %mint, bundle = %recheck.bundle_id, sig = %recheck.signature, "pending LIVE buy unconfirmed after retries; parked for MANUAL REVIEW (may hold — look up sig on explorer)");
+                    self.journal_buy_outcome(
+                        &mint,
+                        Some(recheck.bundle_id.clone()),
+                        "giveup",
+                        Some(format!("sig {}", recheck.signature)),
+                        None,
+                    );
                     trader.record_manual(&recheck.position, &recheck.signature);
                     self.exec.park_manual(mint.clone(), recheck.position).await;
                     self.exec.note_giveup(now_secs()).await;
@@ -932,6 +1058,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             self.exec.park_manual(mint.to_string(), held).await;
         }
         self.exec.note_giveup(now).await;
+        self.journal_mint_giveup(mint, cause);
         warn!(%mint, cause, "LIVE sell gave up; parked for manual exit (still HELD)");
         self.emit(format!("LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"));
         false
@@ -1057,6 +1184,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(%mint, attempts, "prior sell bundle still inflight (Pending/Unknown); holding resend");
             return false;
         }
+        // Venue tag for the dispatch record (journal), decided by the
+        // same routing the dispatch itself uses.
+        let venue_tag = match &pool {
+            Some(leg) => match leg.venue {
+                crate::live::PoolVenue::PumpSwap => "pumpswap",
+                crate::live::PoolVenue::RaydiumV4 => "raydium",
+            },
+            None => "curve",
+        };
         let sell_result = match &pool {
             Some(leg) => match leg.venue {
                 crate::live::PoolVenue::PumpSwap => {
@@ -1111,7 +1247,39 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // Execution-gap calibration: pool legs settle at vault
                 // prices, curve legs near this tick; the tick is the
                 // shared proxy (see `FillGap` docs for what this omits).
-                self.exec.note_gap_live_settle(mint, price_usd, tip_usd).await;
+                let gap = self
+                    .exec
+                    .note_gap_live_settle(mint, price_usd, tip_usd)
+                    .await;
+                // Dispatch record: what was sent, at what, costing what.
+                if let Some(j) = self.journal() {
+                    j.append(&JournalLine::SellAttempt {
+                        ts: now_secs(),
+                        mint: mint.to_string(),
+                        bundle: bundle.clone(),
+                        venue: venue_tag.to_string(),
+                        tokens: probe.amount_tokens,
+                        price_usd,
+                        debit_usd: Some(tip_usd),
+                        // The paired Gap line (below, from the same
+                        // tracker Option) already owns this tip; only
+                        // an unpaired settle's tip is replayed as an
+                        // explicit subtraction.
+                        settle_paired: gap.is_some(),
+                    });
+                    if let Some(gap) = gap {
+                        j.append(&JournalLine::Gap {
+                            ts: now_secs(),
+                            mint: gap.mint,
+                            leg: "exit".to_string(),
+                            paper_price_usd: gap.paper_price_usd,
+                            realized_price_usd: gap.settle_price_usd,
+                            qty_tokens: gap.qty_tokens as f64,
+                            tip_usd: Some(gap.tip_usd),
+                            gap_usd: gap.gap_usd,
+                        });
+                    }
+                }
                 warn!(%mint, %bundle, "LIVE sell dispatched via Jito (real funds)");
                 self.emit(Alerter::format_live_sell(&self.card_ctx(), mint, &bundle));
                 true
@@ -1240,12 +1408,27 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // the portfolio guard; same discipline as the card emits below).
         let mut gap_notes: Vec<(f64, u64)> = Vec::new();
         let now = now_secs();
+        // Decision-input record BEFORE the closes (manual-sell path):
+        // each exit re-derives from exactly this state line, and the
+        // `manual_exits` flag marks the trigger as the operator's call.
+        if let Some(j) = self.journal() {
+            j.append(&JournalLine::Tick {
+                ts: now,
+                mint: tick.mint.clone(),
+                mark,
+                sol_feed: self.sol_feed.price(),
+                tick_observed_at: tick.observed_at,
+                complete: false,
+                manual_exits: true,
+            });
+        }
         for id in ids {
             match portfolio.close_position(id, &mark, ExitReason::Manual, tick.observed_at) {
                 Ok(trade) => {
                     let headline = breaker_headline(trade.net_pnl, trade.dispatch_usd);
                     closed_pnls.push(headline);
                     gap_notes.push((trade.exit_price, trade.quantity));
+                    self.journal_exit(&tick.mint, &trade, 1.0, &mark, tick.observed_at);
                     let mut marks: HashMap<String, simulator::Mark> = HashMap::new();
                     marks.insert(tick.mint.clone(), mark);
                     let equity = portfolio.snapshot(&marks).equity;

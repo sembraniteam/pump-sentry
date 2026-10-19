@@ -16,6 +16,7 @@ use risk_engine::{
 use simulator::Side;
 use tracing::{debug, info, warn};
 
+use crate::journal::JournalLine;
 use crate::pipeline::{AlertSink, Auditor, CurveRead, LiveSink, Pipeline, ReserveFeed, Screener};
 use crate::settings::now_secs;
 
@@ -1015,6 +1016,23 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     mark = format!("{entry_quote:.10}"),
                     tp = profile.tp_percent, sl = profile.sl_percent,
                     equity = format!("{:.2}", snap.equity), "paper position opened");
+                // Decision record: the paper open plus the risk engine
+                // provenance that shaped its profile.
+                if let Some(j) = self.journal() {
+                    let position = portfolio.position(id).cloned();
+                    if let Some(position) = position {
+                        j.append(&JournalLine::Open {
+                            ts: now,
+                            mint: mint.to_string(),
+                            risk: req.risk.to_string(),
+                            venue_fee_bps: portfolio.venue_fee_for(mint),
+                            sol_feed: self.sol_feed.price(),
+                            mark,
+                            ticket_usd: self.settings.notional_usd,
+                            position,
+                        });
+                    }
+                }
                 // Emit after unlock: never alert under lock.
                 let card = Alerter::format_entry(
                     &self.card_ctx(),

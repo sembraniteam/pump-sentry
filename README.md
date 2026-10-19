@@ -38,10 +38,35 @@ Pipeline: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum →
 | `pump-sentry run`          | foreground (debugging)                                        |
 | `pump-sentry upgrade`      | install latest release                                        |
 | `pump-sentry init-config`  | write the default `config.toml` (`CONFIG_FILE` overrides path) |
+| `pump-sentry replay [file]` | re-derive recorded decisions offline from `journal.jsonl`; exit 1 on any mismatch/unverifiable step |
 
 State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, day-state, kill-switch marker, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.
 
 Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fees + tips + 0.05 reserve. A **WSOL** float is only needed for token-paired quotes.
+
+## Decision journal & offline replay
+
+Every decision the bot makes is appended to `journal.jsonl` (next to the log):
+boot settings, each price tick that drove a check, paper opens/exits (exact
+booked numbers and trigger reasons), live dispatch attempts with verdicts and
+real costs, settled execution gaps, and equity heartbeats. It is
+**analytics-only and fail-soft**: journal write failures log a warning and
+degrade recording, but trading never stops because of it (unlike the custody
+WAL).
+
+`pump-sentry replay` re-derives the recorded decisions from recorded inputs
+only — no lookahead — and prints two strictly separated metric buckets:
+
+- **paper** (simulator: model fills, booked fees): trades, win rate, net PnL,
+  expectancy, avg cost/trade, drawdown;
+- **live** (chain outcomes): buy attempts → fill rate, sell give-ups →
+  failed-exit rate, settled execution gaps, committed costs, and a
+  live-net estimate.
+
+Paper numbers describe the simulator only; paper win rate is NOT evidence of
+live profitability — judge live by the live bucket alone. An exit whose input
+tick line is missing reports as *unverifiable* and fails the exit code (fail
+closed, never assumed).
 
 ## Uninstall
 

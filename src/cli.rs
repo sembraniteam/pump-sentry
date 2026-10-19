@@ -79,6 +79,8 @@ Commands:
   sell <mint>             Queue a manual full exit for one mint now
   pause                   Kill switch: halt new entries (open positions keep managing)
   resume                  Clear the kill switch (entries may open again)
+  replay [file]           Re-derive recorded decisions offline + paper/live metrics
+                          (default journal: journal.jsonl next to the log)
   init-config             Write ~/.pump-sentry/config.toml when missing
   upgrade                 Install the latest release (refuses when behind nothing or daemon runs; --allow-unverified to skip checksum)
   help                    Show this help
@@ -143,6 +145,8 @@ pub enum CliAction {
     Pause,
     /// Clear the kill switch.
     Resume,
+    /// Re-derive recorded decisions offline; paper vs live metrics.
+    Replay { file: Option<String> },
     /// Usage; `Some` is the cause.
     Help {
         error: Option<String>,
@@ -185,6 +189,9 @@ pub fn parse_cli(args: &[String]) -> CliAction {
         },
         "pause" => CliAction::Pause,
         "resume" => CliAction::Resume,
+        "replay" => CliAction::Replay {
+            file: args.get(2).cloned().filter(|f| !f.is_empty() && f != "-"),
+        },
         "help" | "--help" | "-h" => CliAction::Help { error: None },
         "" => CliAction::Help {
             error: Some(

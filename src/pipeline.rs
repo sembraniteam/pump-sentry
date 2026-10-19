@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use alert::{Alerter, CardCtx};
 use auditor::{RugCheckClient, RugCheckError, RugCheckReport};
@@ -29,6 +30,7 @@ use crate::day_state::DayBook;
 pub use crate::gate::LaunchRequest;
 #[cfg(test)]
 pub(crate) use crate::gate::{dev_reputation_score, fee_aware_sl_floor, resolve_entry_with_flag};
+use crate::journal::{JournalLine, JournalSink};
 #[cfg(test)]
 pub(crate) use listener::BundleVerdict;
 use crate::settings::{Settings, now_secs};
@@ -422,6 +424,10 @@ pub struct Pipeline<
     pub strategy: StrategyMode,
     /// Alerts; `None` silences.
     pub alerts: Option<T>,
+    /// Decision journal (analytics-only, fail-soft). Detached from
+    /// custody: a broken journal never gates a trade — see
+    /// `journal::JournalSink`.
+    journal: OnceLock<Arc<JournalSink>>,
 }
 
 
@@ -472,12 +478,45 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             daily: Mutex::new(DayBook::open(day_state, boot_now)),
             strategy,
             alerts,
+            journal: OnceLock::new(),
             vaults,
             sol_feed,
             last_marks: Mutex::new(HashMap::new()),
         })
     }
 
+
+    /// Attach the (analytics-only) decision journal to a built
+    /// pipeline; the first sink wins, later calls no-op.
+    pub fn with_journal(&self, sink: Arc<JournalSink>) {
+        let _ = self.journal.set(sink);
+    }
+
+    /// Journal sink; `None` until `with_journal` and never blocking.
+    pub fn journal(&self) -> Option<&JournalSink> {
+        self.journal.get().map(|a| a.as_ref())
+    }
+
+    /// Journal a market-updated paper exit (tick or manual-sell path).
+    pub(crate) fn journal_exit(
+        &self,
+        mint: &str,
+        trade: &simulator::ClosedTrade,
+        fraction: f64,
+        mark: &simulator::Mark,
+        tick_observed_at: u64,
+    ) {
+        if let Some(j) = self.journal() {
+            j.append(&JournalLine::Exit {
+                ts: now_secs(),
+                mint: mint.to_string(),
+                fraction,
+                tick_observed_at,
+                trade: trade.clone(),
+                mark: *mark,
+            });
+        }
+    }
 
     /// Paper cash plus equity.
     pub async fn paper_cash_equity(&self) -> (f64, f64) {
@@ -793,6 +832,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 );
                 portfolio.set_paper_dispatch_legs(open_leg, close_leg);
             }
+            // Decision-input record BEFORE any trigger check: each
+            // following exit re-derives from exactly this state line.
+            if let Some(j) = self.journal() {
+                j.append(&JournalLine::Tick {
+                    ts: now,
+                    mint: tick.mint.clone(),
+                    mark,
+                    sol_feed: self.sol_feed.price(),
+                    tick_observed_at: tick.observed_at,
+                    complete: tick.complete,
+                    manual_exits: false,
+                });
+            }
             for id in ids {
                 let reason = if tick.complete {
                     Some(ExitReason::Manual)
@@ -802,15 +854,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 };
                 let Some(reason) = reason else { continue };
                 // Moonbag TP scales out once.
-                let moonbag = portfolio
-                    .position(id)
-                    .map(|p| p.moonbag_percent)
-                    .unwrap_or(0.0);
-                let exit_fraction = if reason == ExitReason::TakeProfit && moonbag > 0.0 {
-                    (1.0 - moonbag / 100.0).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
+                let exit_fraction =
+                    simulator::market::exit_fraction(reason, portfolio.moonbag_of(id));
                 match portfolio.close_partial_position(
                     id,
                     exit_fraction,
@@ -857,6 +902,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             is_moonbag_exit,
                         ));
                         sold_qty += trade.quantity;
+                        // Decision record: what closed, why, on which
+                        // mark (the tick mark above is the same input).
+                        self.journal_exit(
+                            &tick.mint,
+                            &trade,
+                            exit_fraction,
+                            &mark,
+                            tick.observed_at,
+                        );
                     }
                     Err(e) => warn!(mint = %tick.mint, id, error = %e, "paper close failed"),
                 }

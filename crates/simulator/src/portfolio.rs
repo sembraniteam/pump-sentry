@@ -292,6 +292,12 @@ impl PaperPortfolio {
         self.positions.get(&id)
     }
 
+    /// Moonbag percent of a position (0 for a gone id). The tick path
+    /// and the replay both size the TP scale-out from it.
+    pub fn moonbag_of(&self, id: PositionId) -> f64 {
+        self.position(id).map(|p| p.moonbag_percent).unwrap_or(0.0)
+    }
+
     pub fn history(&self) -> &[ClosedTrade] {
         &self.history
     }

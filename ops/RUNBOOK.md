@@ -167,6 +167,15 @@ already held.
   unconfirmed buy is skipped until that recheck resolves. The check
   never writes the claim file, so it repeats identically every boot
   until the bag is exited or the file is retired.
+- `~/.pump-sentry/journal.jsonl` is the decision journal
+  (analytics-only): every recorded tick/open/exit/dispatch/gap/equity
+  the replay and paper-vs-live metrics are derived from. It is
+  fail-soft — recording degrades on write failure with a heartbeat
+  warn (`decision journal is degraded`); trading is unaffected.
+  `pump-sentry replay` re-derives the recorded decisions offline
+  (no lookahead); exit code 1 means a mismatch or an unverifiable
+  step (a missing tick line in front of an exit) — never an assumption.
+  Do not edit the file: it is the record of what happened.
 
 ## 5. Parked bags (`MINT`, `MINT#2-…`, `MINT#late-…`)
 

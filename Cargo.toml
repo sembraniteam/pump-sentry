@@ -51,6 +51,7 @@ url = "2"
 solana-commitment-config = "3.1"
 
 [dev-dependencies]
+tempfile = "3"
 solana-keypair = "3.1"
 solana-commitment-config = "3.1"
 bs58 = "0.5"

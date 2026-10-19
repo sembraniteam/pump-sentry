@@ -175,6 +175,37 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   an operator restart with a working WAL — exits, pending rechecks, and
   `sell <mint>` keep running. State files stage through
   `cli::atomic_write_private` (owner-only tmp + rename).
+- The decision journal (`src/journal.rs`, `journal.jsonl` beside the log)
+  is the REPLAY/analytics record and is fail-SOFT — the opposite policy
+  from the WAL: a write failure latches `degraded` + prompts the
+  heartbeat warn (`is_degraded`) and skips recording; trading never
+  stops for it. Hooks record inputs BEFORE decisions (tick lines carry
+  the mark each check ran on; Open carries the open mark + risk
+  provenance; Exit carries the tick mark + recorded trade), so offline
+  replay (`src/replay.rs`, `pump-sentry replay`) re-derives the paper
+  book via the same public portfolio APIs and FAILS CLOSED on missing
+  inputs: an exit without its causal tick is "unverifiable" and exit
+  code 1 — never assumed. Metrics are two strict buckets (paper
+  simulator vs live chain outcomes) with the paper≠live-evidence
+  disclaimer printed; do NOT merge them or re-derive gap math outside
+  `FillGapTracker` (journal Gap lines mirror its `Option<FillGap>` /
+  `Option<EntryGap>` returns, single owner). Live money-debits replay
+  from the recorded `debit_usd` (first-touch / FailedOnChain-only rule
+  mirrors the runtime — the journal records what was debited, it never
+  recomputes costs). Two accounting pins: Open carries the ACTUAL
+  ticket (`ticket_usd`; a delta from the Boot snapshot is a NOTE, not a
+  mismatch), and SellAttempt carries `settle_paired` so a paired
+  settle's tip counts exactly once (inside its exit Gap line, tracker
+  math) and only UNPAIRED debits are subtracted from the estimate.
+  Trigger provenance is a pin too: Tick carries `manual_exits` for
+  operator sells (`sell <mint>` books Manual with no market trigger —
+  replay re-derives them as Manual only via that flag; a Manual exit on
+  a flagged-less market tick is a mismatch, never excused), and every
+  live buy gets exactly ONE outcome line (the direct-dispatch path
+  emits Attempt + confirmed Outcome; the Attempt owns the debit, the
+  Outcome owns the verdict). The TP scale-out fraction math is single
+  owner `simulator::market::exit_fraction` (tick path + replay both
+  call it) with `PaperPortfolio::moonbag_of`.
 - Ticks with non-positive/NaN liquidity are unpriceable
   (`unpriceable_liquidity`): a delivered tick carries parsed reserves
   (the ticker clamps non-positive to 0), so this is a drained market
