@@ -75,6 +75,7 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("gate", "dev_screen_sample_txs", "DEV_SCREEN_SAMPLE_TXS"),
     ("gate", "dev_sig_limit", "DEV_SIG_LIMIT"),
     ("risk", "strategy_mode", "STRATEGY_MODE"),
+    ("risk", "force_exit_regime", "FORCE_EXIT_REGIME"),
     ("risk", "runner_moonbag_percent", "RUNNER_MOONBAG_PERCENT"),
     ("risk", "inference_endpoint", "INFERENCE_ENDPOINT"),
     ("risk", "inference_model", "INFERENCE_MODEL"),
@@ -160,6 +161,7 @@ dev_sig_limit = 100         # (history scan cap)
 
 [risk]
 strategy_mode = "adaptive"  # (adaptive|scalp|runner)
+force_exit_regime = ""  # (empty = LLM selects; fixed baseline for evaluation, or the LLM kill path: conservative|momentum|liquidity_sensitive)
 runner_moonbag_percent = 20.0  # (runner share kept, 0-100)
 inference_endpoint = "http://127.0.0.1:11434/v1/chat/completions"  # 
 inference_model = "llama3.2:1b"  # 

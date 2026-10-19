@@ -1,6 +1,6 @@
 //! Runtime knobs, all tunable via config.toml (secrets stay in env).
 
-use risk_engine::StrategyMode;
+use risk_engine::{ExitRegime, StrategyMode};
 use std::collections::HashMap;
 use zeroize::Zeroizing;
 
@@ -123,6 +123,11 @@ pub struct Settings {
     pub slippage_vol_extra_cap_bps: u64,
     /// `adaptive` | `scalp` | `runner`. Unknown falls back.
     pub strategy_mode: String,
+    /// Forced exit regime (`""` = LLM selects from the closed set):
+    /// fixed baseline for evaluation, and the LLM kill path — set it
+    /// permanently if selection never beats the baseline. Unknown
+    /// non-empty values warn at boot and select nothing (LLM decides).
+    pub force_exit_regime: String,
     /// Runner share kept after TP, 0–100.
     pub runner_moonbag_percent: f64,
     /// Priority fee price in micro-lamports.
@@ -210,6 +215,7 @@ impl std::fmt::Debug for Settings {
             .field("slippage_vol_window_secs", &self.slippage_vol_window_secs)
             .field("slippage_vol_extra_cap_bps", &self.slippage_vol_extra_cap_bps)
             .field("strategy_mode", &self.strategy_mode)
+            .field("force_exit_regime", &self.force_exit_regime)
             .field("runner_moonbag_percent", &self.runner_moonbag_percent)
             .field("priority_fee_micro_lamports", &self.priority_fee_micro_lamports)
             .field("compute_unit_limit", &self.compute_unit_limit)
@@ -307,6 +313,7 @@ impl Settings {
             slippage_vol_window_secs: get_int(vars, "SLIPPAGE_VOL_WINDOW_SECS", 0, &mut notes),
             slippage_vol_extra_cap_bps: get_int(vars, "SLIPPAGE_VOL_EXTRA_CAP_BPS", 0, &mut notes),
             strategy_mode: get_string(vars, "STRATEGY_MODE", "adaptive"),
+            force_exit_regime: get_string(vars, "FORCE_EXIT_REGIME", ""),
             runner_moonbag_percent: get_float(vars, "RUNNER_MOONBAG_PERCENT", 20.0, &mut notes),
             priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0, &mut notes),
             compute_unit_limit: get_int(vars, "COMPUTE_UNIT_LIMIT", 0, &mut notes),
@@ -345,6 +352,14 @@ impl Settings {
             out.push(format!(
                 "STRATEGY_MODE='{}' unknown; falling back to adaptive",
                 self.strategy_mode
+            ));
+        }
+        if !self.force_exit_regime.is_empty()
+            && self.force_exit_regime.parse::<ExitRegime>().is_err()
+        {
+            out.push(format!(
+                "FORCE_EXIT_REGIME='{}' unknown; LLM selects (expected conservative|momentum|liquidity_sensitive, empty = LLM selects)",
+                self.force_exit_regime
             ));
         }
         if self.inference_api_key.is_some() && is_plain_http_remote(&self.inference_endpoint) {
@@ -1085,7 +1100,26 @@ mod tests {
     }
 
     #[test]
+    fn force_exit_regime_parses_and_warns() {
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.force_exit_regime, "", "empty = LLM selects");
+        let s = Settings::from_map(&vars(&[("FORCE_EXIT_REGIME", "momentum")]));
+        assert_eq!(s.force_exit_regime, "momentum");
+        assert!(
+            !s.warnings().iter().any(|w| w.contains("FORCE_EXIT_REGIME")),
+            "{:?}",
+            s.warnings()
+        );
+        // Unknown non-empty warns loudly and selects nothing (LLM decides).
+        let w = Settings::from_map(&vars(&[("FORCE_EXIT_REGIME", "turbo")]))
+            .warnings()
+            .join("\n");
+        assert!(w.contains("FORCE_EXIT_REGIME='turbo'"), "{w}");
+    }
+
+    #[test]
     fn overrides_apply() {
+
         let s = Settings::from_map(&vars(&[
             ("START_BALANCE", "250.5"),
             ("GATE_MIN_BUYERS", "5"),

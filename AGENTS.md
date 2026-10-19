@@ -508,6 +508,15 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   Prompt rules only tighten (PASS/temper on wash, concentration,
   insider distribution, fading velocity); the heuristic keeps the
   velocity screen and ignores the newer context fields.
+- Exit regimes are a closed set (`ExitRegime`: conservative/momentum/
+  liquidity_sensitive): the model picks, deterministic `resolve_regime`
+  (`crates/risk-engine/src/strategy.rs`) snaps the numbers to the
+  regime's tested profile — free-form TP/SL never reach the book, PASS
+  and invalid pass through, and the heuristic's band profiles already
+  equal the conservative/momentum consts (snap idempotent).
+  `force_exit_regime` (`""` = LLM selects) is the fixed baseline for
+  evaluation and the LLM kill path; replay bins expectancy per recorded
+  regime in `Open.regime` so selection is judged against the baseline.
 - Measured latency per decision: gpt-oss-120b ~1.7–2.1s (mostly
   timeout→fallback at the 2s clamp), qwen3.8-27b ~0.3s (fits). Remote
   gateways need `inference_timeout_ms` raised (README `[risk]` example).

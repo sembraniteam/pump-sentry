@@ -86,6 +86,51 @@ pub struct RiskProfile {
     /// Moonbag share left riding after TP, in percent.
     #[serde(default)]
     pub moonbag_percent: f64,
+    /// Selected exit regime. The model chooses from the closed set;
+    /// deterministic `resolve_regime` snaps the numbers to the
+    /// regime's tested profile, so free-form TP/SL never reach the
+    /// book. Legacy outputs decode as `Conservative`.
+    #[serde(default)]
+    pub regime: ExitRegime,
+}
+
+/// Closed exit-regime set: the model selects, never invents.
+/// Each variant pins tested numbers (see `strategy::exit_profile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExitRegime {
+    /// Ordinary tape: moderate band numbers.
+    #[default]
+    Conservative,
+    /// High-momentum deep book: wide TP, trailed runner.
+    Momentum,
+    /// Thin/fading tape: impact-aware stop, no moonbag chase.
+    LiquiditySensitive,
+}
+
+impl ExitRegime {
+    /// Config spelling for operator surfaces (`conservative` |
+    /// `momentum` | `liquidity_sensitive`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExitRegime::Conservative => "conservative",
+            ExitRegime::Momentum => "momentum",
+            ExitRegime::LiquiditySensitive => "liquidity_sensitive",
+        }
+    }
+}
+
+impl std::str::FromStr for ExitRegime {
+    type Err = String;
+
+    /// Parses the three regime names (case-insensitive).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "conservative" => Ok(ExitRegime::Conservative),
+            "momentum" => Ok(ExitRegime::Momentum),
+            "liquidity_sensitive" => Ok(ExitRegime::LiquiditySensitive),
+            other => Err(format!("unknown exit regime '{other}'")),
+        }
+    }
 }
 
 impl RiskProfile {
@@ -98,6 +143,7 @@ impl RiskProfile {
             trailing_stop: false,
             timeout_seconds: 0,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         }
     }
 
@@ -154,7 +200,7 @@ pub const MAX_TIMEOUT_SECS: u64 = 3600;
 pub const MIN_TIMEOUT_SECS: u64 = 1;
 
 /// System instruction sent to the model.
-pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Thin trailing volume (low volume_usd) against high velocity is the same suspect wash: tape without size is quoting, not demand — prefer PASS. Concentrated round flow (high top_wallet_share_pct) or a high buy_ratio with few unique_traders is quoting concentration, not breadth — prefer PASS or the moderate band, never high-momentum TP. Insiders distributing into the round (negative creator_net_base) or a fading tape (negative velocity_delta) tempers momentum reads: prefer PASS or the moderate band. Whale-held supply (high top_holder_pct) caps upside conviction the same way: never high-momentum TP. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.\nOutput schema (exact key names and types): {\"action\":\"BUY\" or \"PASS\",\"tp_percent\":number,\"sl_percent\":number,\"trailing_stop\":boolean,\"timeout_seconds\":integer,\"moonbag_percent\":number}. For PASS use \"action\":\"PASS\" with all other fields 0 or false.";
+pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Thin trailing volume (low volume_usd) against high velocity is the same suspect wash: tape without size is quoting, not demand — prefer PASS. Concentrated round flow (high top_wallet_share_pct) or a high buy_ratio with few unique_traders is quoting concentration, not breadth — prefer PASS or the moderate band, never high-momentum TP. Insiders distributing into the round (negative creator_net_base) or a fading tape (negative velocity_delta) tempers momentum reads: prefer PASS or the moderate band. Whale-held supply (high top_holder_pct) caps upside conviction the same way: never high-momentum TP. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.\nChoose exactly one regime for every BUY (the numbers you emit steer only this pick — tested numbers below replace them): `momentum` for high-velocity deep books (the high band above); `conservative` for ordinary confirm tapes; `liquidity_sensitive` for thin books or fading tapes where impact dominates (the exit must survive spread, not chase runs).\nOutput schema (exact key names and types): {\"action\":\"BUY\" or \"PASS\",\"tp_percent\":number,\"sl_percent\":number,\"trailing_stop\":boolean,\"timeout_seconds\":integer,\"moonbag_percent\":number,\"regime\":\"conservative\" or \"momentum\" or \"liquidity_sensitive\"}. For PASS use \"action\":\"PASS\" with all other fields 0 or false.";
 
 /// Inference input payload: the skill's `INPUT PAYLOAD` keys. Unknowns
 /// ship as `null`, never omitted — the model reads absent/null as
@@ -273,6 +319,7 @@ mod tests {
             trailing_stop: true,
             timeout_seconds: 180,
             moonbag_percent: 20.0,
+            regime: ExitRegime::Conservative,
         };
         let value = serde_json::to_value(sample).expect("serialize");
         let keys: Vec<&str> = value
@@ -298,6 +345,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: 90,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(!nan.is_valid());
 
@@ -308,6 +356,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: 90,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(!inverted.is_valid());
 
@@ -318,6 +367,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: 0,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(!dirty_pass.is_valid());
 
@@ -329,6 +379,7 @@ mod tests {
                 trailing_stop: true,
                 timeout_seconds: 180,
                 moonbag_percent: bad_moonbag,
+                regime: ExitRegime::Conservative,
             };
             assert!(!bad.is_valid(), "moonbag={bad_moonbag}");
         }
@@ -341,6 +392,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: 90,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(!zero_buy.is_valid());
 
@@ -353,6 +405,7 @@ mod tests {
                 trailing_stop: false,
                 timeout_seconds: 90,
                 moonbag_percent: 0.0,
+                regime: ExitRegime::Conservative,
             };
             assert!(!dust.is_valid(), "tp={tp} sl={sl}");
         }
@@ -364,6 +417,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: 90,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(floored.is_valid());
 
@@ -375,6 +429,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: 90,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(!huge_tp.is_valid());
         let huge_sl = RiskProfile {
@@ -384,6 +439,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: 90,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(!huge_sl.is_valid());
         let huge_timeout = RiskProfile {
@@ -393,6 +449,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: u64::MAX,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(!huge_timeout.is_valid());
 
@@ -404,6 +461,7 @@ mod tests {
             trailing_stop: true,
             timeout_seconds: MAX_TIMEOUT_SECS,
             moonbag_percent: 99.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(capped.is_valid());
         assert!(!RiskProfile { moonbag_percent: 100.0, ..capped }.is_valid());
@@ -416,6 +474,7 @@ mod tests {
             trailing_stop: false,
             timeout_seconds: 0,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(dusty_pass.is_valid());
 
@@ -427,6 +486,7 @@ mod tests {
             trailing_stop: true,
             timeout_seconds: 0,
             moonbag_percent: 0.0,
+            regime: ExitRegime::Conservative,
         };
         assert!(!armed_pass.is_valid());
     }

@@ -158,6 +158,10 @@ pub enum JournalLine {
         /// expectancy analysis per signal.
         #[serde(default)]
         micro: Option<listener::MicroSignals>,
+        /// Effective exit regime (`None` on pre-regime lines): what the
+        /// exit actually ran, for offline expectancy per regime.
+        #[serde(default)]
+        regime: Option<String>,
     },
     /// Paper exit: the ledger trade as booked plus the fraction the
     /// book closed and the mark it closed on.
@@ -465,6 +469,7 @@ mod tests {
             ticket_usd: 100.0,
             position: pos(),
             micro: None,
+            regime: None,
         };
         let raw = serde_json::to_string(&open).unwrap();
         assert!(matches!(decode_line(&raw), Decoded::Line(_)));
@@ -472,10 +477,18 @@ mod tests {
         // a fabricated zero-signal.
         let mut old = serde_json::to_value(&open).unwrap();
         old.as_object_mut().unwrap().remove("micro");
+        old.as_object_mut().unwrap().remove("regime");
         match decode_line(&serde_json::to_string(&old).unwrap()) {
             Decoded::Line(line)
-                if matches!(&*line, JournalLine::Open { micro: None, .. }) => {}
-            _ => panic!("pre-signal open must decode with micro None"),
+                if matches!(
+                    &*line,
+                    JournalLine::Open {
+                        micro: None,
+                        regime: None,
+                        ..
+                    }
+                ) => {}
+            _ => panic!("pre-signal open must decode with micro/regime None"),
         }
     }
 

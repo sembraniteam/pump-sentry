@@ -1414,6 +1414,46 @@ async fn holder_concentration_cap_blocks_whale_mints() {
 }
 
 #[tokio::test]
+async fn forced_exit_regime_shapes_the_open() {
+    // Heuristic alone yields the moderate (conservative) band; the
+    // forced baseline overrides the pick with tested momentum numbers
+    // (TP 60, trailed) — the fixed baseline for evaluation, and the
+    // LLM kill path.
+    let mut settings = Settings::from_map(&HashMap::new());
+    settings.force_exit_regime = "momentum".to_string();
+    let pipe = pipeline_screened(
+        settings,
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+        None,
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    let ids = pipe.portfolio.lock().await.position_ids();
+    assert_eq!(ids.len(), 1);
+    let pos = pipe
+        .portfolio
+        .lock()
+        .await
+        .position(ids[0])
+        .expect("open")
+        .clone();
+    assert_eq!((pos.tp_percent, pos.trailing_stop), (60.0, true));
+}
+
+#[tokio::test]
 async fn confirm_flow_opens_with_measured_velocity() {
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
     let reserves = StubReserves::with_tick(tick(MINT, 2.0));

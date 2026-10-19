@@ -32,6 +32,7 @@ const fn pass_profile() -> RiskProfile {
         trailing_stop: false,
         timeout_seconds: 0,
         moonbag_percent: 0.0,
+        regime: crate::schema::ExitRegime::Conservative,
     }
 }
 /// Heuristic decision. Mirrors the model table, including the wash
@@ -70,7 +71,7 @@ pub fn evaluate_heuristic_fallback(metrics: &TokenMetrics) -> RiskProfile {
     }
 }
 
-/// High-momentum band profile.
+/// High-momentum band profile (the tested momentum regime numbers).
 const fn high_profile() -> RiskProfile {
     RiskProfile {
         action: Action::Buy,
@@ -79,10 +80,13 @@ const fn high_profile() -> RiskProfile {
         trailing_stop: true,
         timeout_seconds: 180,
         moonbag_percent: 20.0,
+        regime: crate::schema::ExitRegime::Momentum,
     }
 }
 
-/// Moderate-momentum band profile.
+/// Moderate-momentum band profile (the tested conservative numbers).
+/// Thin-book precision (`liquidity_sensitive`) is model-only: the
+/// heuristic stays coarse and safe.
 const fn moderate_profile() -> RiskProfile {
     RiskProfile {
         action: Action::Buy,
@@ -91,6 +95,7 @@ const fn moderate_profile() -> RiskProfile {
         trailing_stop: false,
         timeout_seconds: 90,
         moonbag_percent: 0.0,
+        regime: crate::schema::ExitRegime::Conservative,
     }
 }
 

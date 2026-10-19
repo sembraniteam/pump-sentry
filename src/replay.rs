@@ -106,6 +106,8 @@ struct MicroRow {
     ts: u64,
     net_pnl: f64,
     micro: MicroSignals,
+    /// Effective exit regime the trade ran (`None` on pre-regime lines).
+    regime: Option<String>,
 }
 
 /// Thin-bin floor: fewer samples than this is noise — printed with a
@@ -477,10 +479,11 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
     let mut equity_peak: Option<f64> = None;
     let mut realized_cum: f64 = 0.0;
     let mut realized_peak: f64 = 0.0;
-    // Entry microstructure by recorded position id. Cleared on every
+    // Entry context by recorded position id. Cleared on every
     // boot like the reconstructed book: ids restart with the book, so
     // a post-restart exit must never join a pre-restart entry.
     let mut open_micro: HashMap<u64, MicroSignals> = HashMap::new();
+    let mut open_regime: HashMap<u64, String> = HashMap::new();
     for line in lines {
         match line {
             JournalLine::Boot { settings: s, .. } => {
@@ -491,13 +494,18 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                 realized_cum = 0.0;
                 realized_peak = 0.0;
                 open_micro.clear();
+                open_regime.clear();
             }
             JournalLine::Open {
                 position,
                 micro: Some(micro),
+                regime,
                 ..
             } => {
                 open_micro.insert(position.id, *micro);
+                if let Some(regime) = regime {
+                    open_regime.insert(position.id, regime.clone());
+                }
             }
             JournalLine::Open { micro: None, .. } => {}
             JournalLine::Exit { ts, trade, .. } => {
@@ -514,6 +522,7 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                         ts: *ts,
                         net_pnl: trade.net_pnl,
                         micro: *micro,
+                        regime: open_regime.get(&trade.id).cloned(),
                     });
                 }
                 realized_cum += trade.net_pnl - trade.dispatch_usd;
@@ -753,11 +762,11 @@ fn concentration_bin(pct: f64) -> &'static str {
 fn print_micro_table(
     title: &str,
     rows: &[MicroRow],
-    key: impl Fn(&MicroSignals) -> Option<&'static str>,
+    key: impl Fn(&MicroRow) -> Option<&'static str>,
 ) {
     let mut keyed: Vec<(&str, u64, f64)> = rows
         .iter()
-        .filter_map(|r| key(&r.micro).map(|k| (k, r.ts, r.net_pnl)))
+        .filter_map(|r| key(r).map(|k| (k, r.ts, r.net_pnl)))
         .collect();
     if keyed.is_empty() {
         return;
@@ -797,27 +806,47 @@ fn print_micro_table(
     }
 }
 
+/// Regime labels for the expectancy table. Unknown covers pre-regime
+/// lines: the rows always sum back to the joined total.
+fn regime_label(regime: Option<&str>) -> &'static str {
+    match regime {
+        Some("momentum") => "regime momentum",
+        Some("conservative") => "regime conservative",
+        Some("liquidity_sensitive") => "regime liquidity-sensitive",
+        _ => "regime unknown",
+    }
+}
+
 fn print_micro_tables(rows: &[MicroRow], paper_trades: usize) {
     if rows.is_empty() {
         return;
     }
     println!("-- microstructure expectancy (paper exits joined to entry signals; halves = chronological stability check) --");
-    print_micro_table("buy pressure", rows, |m| m.buy_ratio.map(ratio_bin));
-    print_micro_table("round concentration", rows, |m| {
-        m.top_wallet_share_pct.map(concentration_bin)
+    print_micro_table("buy pressure", rows, |r| {
+        r.micro.buy_ratio.map(ratio_bin)
     });
-    print_micro_table("insider flow", rows, |m| {
-        Some(if m.creator_net_base < 0 {
+    print_micro_table("round concentration", rows, |r| {
+        r.micro.top_wallet_share_pct.map(concentration_bin)
+    });
+    print_micro_table("insider flow", rows, |r| {
+        Some(if r.micro.creator_net_base < 0 {
             "insiders distributing"
-        } else if m.creator_net_base > 0 {
+        } else if r.micro.creator_net_base > 0 {
             "insiders accumulating"
         } else {
             "insiders flat"
         })
     });
-    print_micro_table("tape velocity", rows, |m| {
-        m.velocity_delta
+    print_micro_table("tape velocity", rows, |r| {
+        r.micro
+            .velocity_delta
             .map(|v| if v < 0.0 { "fading" } else { "accelerating" })
+    });
+    // Regime expectancy: what actually ran (LLM pick or forced
+    // baseline) — the table the operator judges selection against the
+    // fixed baseline with. Unknown covers pre-regime lines.
+    print_micro_table("exit regime", rows, |r| {
+        Some(regime_label(r.regime.as_deref()))
     });
     let excluded = paper_trades.saturating_sub(rows.len());
     if excluded > 0 {
@@ -917,6 +946,7 @@ mod tests {
             ticket_usd: ticket,
             position: position.clone(),
             micro: None,
+            regime: None,
         });
 
         // benign tick, then the TP tick. Tick lines first (runtime
@@ -1049,6 +1079,7 @@ mod tests {
                 ticket_usd: settings.notional_usd,
                 position,
                 micro: None,
+                regime: None,
             });
             // +5% mark: under the TP/SL thresholds — no market trigger.
             let now = 1_050;
@@ -1134,6 +1165,7 @@ mod tests {
                 moonbag_percent: 0.0,
             },
             micro: None,
+            regime: None,
         })
         .unwrap();
         let old_ticket = open.as_object_mut().unwrap().remove("ticket_usd");
@@ -1323,7 +1355,12 @@ mod tests {
         }
     }
 
-    fn micro_open(id: u64, ts: u64, micro: Option<MicroSignals>) -> JournalLine {
+    fn micro_open(
+        id: u64,
+        ts: u64,
+        micro: Option<MicroSignals>,
+        regime: Option<&str>,
+    ) -> JournalLine {
         JournalLine::Open {
             ts,
             mint: "M".into(),
@@ -1350,6 +1387,7 @@ mod tests {
                 moonbag_percent: 0.0,
             },
             micro,
+            regime: regime.map(str::to_string),
         }
     }
 
@@ -1388,11 +1426,12 @@ mod tests {
                 7,
                 1_001,
                 Some(micro_sig(Some(0.9), Some(20.0), 0, Some(0.5))),
+                Some("momentum"),
             ),
             micro_exit(7, 1_100, 2.0),
             // Pre-signal open: the exit counts in the leg totals but
             // never in the signal tables.
-            micro_open(8, 1_002, None),
+            micro_open(8, 1_002, None, None),
             micro_exit(8, 1_101, 1.0),
         ];
         let m = metrics(&lines);
@@ -1400,6 +1439,7 @@ mod tests {
         assert_eq!(m.micro_rows.len(), 1);
         assert!((m.micro_rows[0].net_pnl - 2.0).abs() < 1e-12);
         assert_eq!(m.micro_rows[0].micro.buy_ratio, Some(0.9));
+        assert_eq!(m.micro_rows[0].regime.as_deref(), Some("momentum"));
     }
 
     #[test]
@@ -1412,7 +1452,7 @@ mod tests {
                 ts: 1_000,
                 settings: settings.clone(),
             },
-            micro_open(1, 1_001, Some(micro_sig(Some(0.9), None, 0, None))),
+            micro_open(1, 1_001, Some(micro_sig(Some(0.9), None, 0, None)), None),
             JournalLine::Boot { ts: 2_000, settings },
             micro_exit(1, 2_100, 5.0),
         ];

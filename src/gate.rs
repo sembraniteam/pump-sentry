@@ -11,8 +11,8 @@ use listener::{
     micro_signals, tape_volume_base_units,
 };
 use risk_engine::{
-    Action, DecisionSource, RiskDecision, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
-    evaluate_metrics_fallback, resolve_strategy,
+    Action, DecisionSource, ExitRegime, RiskDecision, SCALP_TP_MIN, StrategyConfig, StrategyMode,
+    TokenMetrics, evaluate_metrics_fallback, resolve_regime, resolve_strategy,
 };
 use simulator::Side;
 use tracing::{debug, info, warn};
@@ -190,6 +190,8 @@ struct TrackedOpen<'a> {
     complete: bool,
     /// Confirm-tape microstructure snapshot for the journal.
     micro: MicroSignals,
+    /// Effective exit regime (LLM pick or forced baseline) for the journal.
+    regime: ExitRegime,
 }
 
 /// Log-safe token text: on-chain name/symbol are attacker-controlled,
@@ -919,13 +921,20 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             info!(%mint, buyers, score, "risk PASS at confirm");
             return;
         }
+        // Regime snap BEFORE the strategy reshape: the model picks
+        // from the closed set and tested numbers replace its free-form
+        // TP/SL; the forced baseline (evaluation control / LLM kill
+        // path) overrides the pick. Operator shaping still applies
+        // after, so `scalp`/`runner` intent always wins.
+        let forced = self.settings.force_exit_regime.parse().ok();
+        let (profile, regime) = resolve_regime(&profile, forced);
         // Rewrite BUY per strategy.
         let strategy = StrategyConfig {
             mode: self.strategy,
             runner_moonbag_percent: self.settings.runner_moonbag_percent,
         };
         let profile = resolve_strategy(&profile, &strategy);
-        info!(%mint, mode = ?strategy.mode, tp = profile.tp_percent,
+        info!(%mint, mode = ?strategy.mode, regime = regime.as_str(), tp = profile.tp_percent,
             moonbag = profile.moonbag_percent, trailing = profile.trailing_stop,
             "strategy resolved");
         // Low scalp TP is honored, never widened.
@@ -969,6 +978,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             },
             complete,
             micro: req.micro,
+            regime,
         })
         .await;
     }
@@ -1255,6 +1265,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             ticket_usd: self.settings.notional_usd,
                             position,
                             micro: Some(req.micro),
+                            regime: Some(req.regime.as_str().to_string()),
                         });
                     }
                 }
