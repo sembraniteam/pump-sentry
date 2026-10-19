@@ -346,6 +346,17 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   The TTL release (`SELL_GUARD_TTL_SECS`) is the ONLY evidence-free
   release, deliberately loud; guard checks poll one-shot
   (`SELL_GUARD_RESOLVE_TIMEOUT`) so they never block an exit.
+- Pool legs are WSOL-side-first NORMALIZED (`MigratedPool` swaps
+  PumpSwap vaults; ticker, spike math, and `PoolLeg` docs all assume
+  it), but `SellPumpSwapOrder`, the preflight wiring guard, and the
+  `sell_v2` ix speak RAW pool orientation (base vault = token
+  inventory). Passing a leg straight through refused every live
+  PumpSwap dispatch at that guard (order WSOL vault vs pool token
+  vault) — found by audit, never by a green sim (probes construct raw
+  orders directly and bypass the leg). The single mapping lives in
+  `PoolLeg::pumpswap_sell_order` (unit-pinned), used by
+  `LiveTrader::sell_pumpswap`; Raydium needs no mapping (raw ==
+  normalized there). Never route around the mapper.
 - Dispatch status semantics live in `crates/executor/src/executor.rs`
   (`ConfirmOutcome`, `DispatchVerdict`, pinned by `timeout_is_never_a_failure`
   / `chain_verdicts_open_only_on_voted_states`): receipt = submitted

@@ -136,6 +136,34 @@ pub struct PoolLeg {
     pub venue: PoolVenue,
 }
 
+impl PoolLeg {
+    /// Sell order in the AMM's raw pool orientation. The leg is
+    /// WSOL-side-first normalized, but `SellPumpSwapOrder` (like the
+    /// `sell_v2` ix itself) speaks raw pool orientation — base vault =
+    /// token inventory, quote vault = WSOL inventory. Swapping here
+    /// (and ONLY here) keeps one orientation per layer: the preflight
+    /// wiring guard (`order vaults == pool vaults`) proves the rest,
+    /// and passing normalized vaults straight through refuses every
+    /// dispatch at that guard.
+    pub fn pumpswap_sell_order(
+        &self,
+        mint: Pubkey,
+        amount_tokens: u64,
+        slippage_bps: u64,
+        tip_lamports: u64,
+    ) -> executor::SellPumpSwapOrder {
+        executor::SellPumpSwapOrder {
+            mint,
+            pool: self.amm,
+            base_vault: self.quote_vault,
+            quote_vault: self.base_vault,
+            amount_tokens,
+            slippage_bps,
+            tip_lamports,
+        }
+    }
+}
+
 /// Tracked fill (base units). Validated addresses: custody code never
 /// re-parses strings to tell its own holdings apart.
 #[derive(Debug, Clone)]
@@ -1652,15 +1680,12 @@ impl LiveTrader {
         let mint_str = position.mint.to_string();
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
-            self.executor.sell_pumpswap_jito(&executor::SellPumpSwapOrder {
-                mint: position.mint,
-                pool: pool.amm,
-                base_vault: pool.base_vault,
-                quote_vault: pool.quote_vault,
-                amount_tokens: position.amount_tokens,
-                slippage_bps: self.effective_slippage_bps(&mint_str, now_secs()),
-                tip_lamports: req.tip_lamports,
-            }),
+            self.executor.sell_pumpswap_jito(&pool.pumpswap_sell_order(
+                position.mint,
+                position.amount_tokens,
+                self.effective_slippage_bps(&mint_str, now_secs()),
+                req.tip_lamports,
+            )),
         )
         .await
         {
@@ -1681,6 +1706,29 @@ impl LiveTrader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pumpswap_sell_order_unpacks_normalized_vaults() {
+        // The leg is WSOL-side-first normalized; the AMM order is raw
+        // (base vault = token inventory). Passing the leg straight
+        // through refused every dispatch at the preflight wiring guard
+        // (order WSOL vault vs pool token vault) — this mapping owns
+        // the boundary, and the guard proves the rest.
+        let leg = PoolLeg {
+            mint: test_pubkey(60),
+            amm: test_pubkey(61),
+            base_vault: test_pubkey(62),
+            quote_vault: test_pubkey(63),
+            venue: PoolVenue::PumpSwap,
+        };
+        let order = leg.pumpswap_sell_order(test_pubkey(60), 1_000, 200, 7_000);
+        assert_eq!(order.pool, test_pubkey(61));
+        assert_eq!(order.base_vault, test_pubkey(63), "token inventory");
+        assert_eq!(order.quote_vault, test_pubkey(62), "WSOL inventory");
+        assert_eq!(order.amount_tokens, 1_000);
+        assert_eq!(order.slippage_bps, 200);
+        assert_eq!(order.tip_lamports, 7_000);
+    }
 
     #[test]
     fn slippage_ceiling_covers_fee_inclusive_quotes() {

@@ -1402,6 +1402,122 @@ async fn data_degrade_pauses_entries_but_not_exits() {
 }
 
 #[tokio::test]
+async fn migrated_curve_rejects_entries() {
+    // Entries are pre-migration only: a complete tick refuses at the
+    // choke (paper must not open what live refuses at preflight), and
+    // so does a pricing tick for a mint the pipeline already knows as
+    // migrated (ticks that don't carry the flag).
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let dev = dev_wallet();
+    let launch = LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev,
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    };
+    // Case 1: the confirm tick reads complete.
+    let mut done = tick(MINT, 2.0);
+    done.complete = true;
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(done),
+        funded(),
+        screener,
+        None,
+    );
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "complete tick: nothing opens"
+    );
+
+    // Case 2: pricing tick, but the mint is known-migrated.
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        screener,
+        None,
+    );
+    pipe.migrated
+        .lock()
+        .await
+        .insert(MINT.to_string(), now_secs());
+    pipe.on_launch(&launch).await;
+    pipe.poll_gates().await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "known-migrated mint: nothing opens"
+    );
+}
+
+#[tokio::test]
+async fn migration_hunt_routes_pool_exit_end_to_end() {
+    // Venue switch without hand-inserted legs: open pre-migration,
+    // resolve the pool through the hunt (`detect_migration` stub),
+    // then exit — the live leg must ride the pool, never the curve.
+    use listener::MigrationDestination;
+    let live = StubLive::working();
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    *screener.inner.migration.lock().expect("lock") = Some(MigrationReport {
+        signature: "migsig".to_string(),
+        destination: MigrationDestination::PumpSwap,
+        amm_id: Some(fixture_wallet(20)),
+        base_mint: Some("WSOL".to_string()),
+        quote_mint: Some(MINT.to_string()),
+        base_vault: Some(fixture_wallet(21)),
+        quote_vault: Some(fixture_wallet(22)),
+    });
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        screener,
+        Some(live.clone()),
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+    // Hunt (not a hand insert): the stub report becomes the pool leg.
+    pipe.report_migration_once(MINT, CURVE).await;
+    {
+        let followed = pipe.followed.lock().await;
+        let leg = followed
+            .get(MINT)
+            .and_then(|state| state.pool.clone())
+            .expect("hunt stores the leg");
+        assert_eq!(leg.amm, pk(&fixture_wallet(20)));
+    }
+    // Exit: the live leg rides PumpSwap; the curve leg stays silent.
+    pipe.on_tick(&tick(MINT, 3.0)).await;
+    assert!(live.sells().is_empty());
+    assert!(live.raydium_sells().is_empty());
+    assert_eq!(
+        live.pumpswap_sells(),
+        vec![(MINT.to_string(), fixture_wallet(20), 1_000)]
+    );
+}
+
+#[tokio::test]
 async fn wal_degraded_halts_entries_but_not_exits() {
     // A failed WAL write means custody can no longer be recorded: no
     // new risk opens (paper or live) until a restart, while a held

@@ -180,6 +180,9 @@ struct TrackedOpen<'a> {
     /// live sizing quote the chain's own math. `None` on synthetic
     /// (override-priced) opens and mocks.
     reserves: Option<simulator::CurveReserves>,
+    /// True when the confirm tick read complete (chain truth). Entries
+    /// are pre-migration only; the choke refuses these (see below).
+    complete: bool,
 }
 
 /// Log-safe token text: on-chain name/symbol are attacker-controlled,
@@ -649,7 +652,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         // Exact reserves off the same read (copied out before the tick
         // is consumed): paper fills and live sizing both quote them.
+        // The complete flag rides along separately: the choke refuses
+        // migrated entries (see `open_tracked`).
         let exec = tick_result.as_ref().ok().and_then(|t| t.exec);
+        let complete = tick_result.as_ref().is_ok_and(|t| t.complete);
         // Fallback is paper-only; the flag is the source.
         let Some((entry_quote, liquidity_usd, priced_via_override)) = resolve_entry_with_flag(
             tick_result,
@@ -828,6 +834,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             } else {
                 exec.map(|e| crate::live::curve_reserves(&e))
             },
+            complete,
         })
         .await;
     }
@@ -858,6 +865,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // untouched and the supervisor clears it on recovery.
         if self.data_paused.load(Ordering::Relaxed) {
             warn!(%mint, "data degraded: entries paused; skipping open");
+            return;
+        }
+        // Migrated/completed curves never open: entries are
+        // pre-migration only (exits route via pool legs). Without this,
+        // paper would open what live must refuse at preflight
+        // (`state.complete`), stranding paper-without-live. Same choke
+        // point as the kill switch; the migrated set covers ticks that
+        // don't carry the flag.
+        if req.complete || self.migrated.lock().await.contains_key(req.mint) {
+            warn!(%mint, "curve complete/migrated; entries are pre-migration only — skipping open");
             return;
         }
         // WAL degraded: a custody write failed, so the claim of record

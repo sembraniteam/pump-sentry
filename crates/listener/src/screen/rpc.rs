@@ -286,7 +286,9 @@ pub struct DetectedMigration {
 }
 
 /// Plain-string migration report for cross-crate use.
-/// BASE is WSOL, QUOTE the token.
+/// Venue orientation differs: Raydium pools are WSOL-based, PumpSwap
+/// pools are WSOL-quoted (see `MigratedPool` vaults, the source of
+/// truth — never infer orientation from these mint labels).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationReport {
     /// Migration transaction signature (base58).
