@@ -1454,6 +1454,32 @@ async fn forced_exit_regime_shapes_the_open() {
 }
 
 #[tokio::test]
+async fn fallback_policy_pass_skips_entries_on_model_failure() {
+    // No engine (the deliberate-heuristic path) with policy=pass:
+    // the confirm skips instead of opening on the fallback profile.
+    // Same tape with the default heuristic policy opens — the policy
+    // is the only difference.
+    for (policy, expect_open) in [("pass", false), ("heuristic", true)] {
+        let mut settings = Settings::from_map(&HashMap::new());
+        settings.inference_fallback = policy.to_string();
+        let pipe = pipeline_screened(
+            settings,
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick(MINT, 2.0)),
+            funded(),
+            StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+            None,
+        );
+        launch_once(&pipe).await;
+        assert_eq!(
+            pipe.portfolio.lock().await.position_ids().len(),
+            usize::from(expect_open),
+            "policy={policy}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn confirm_flow_opens_with_measured_velocity() {
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
     let reserves = StubReserves::with_tick(tick(MINT, 2.0));

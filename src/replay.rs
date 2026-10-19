@@ -102,23 +102,26 @@ impl VerifyReport {
 /// One paper exit joined to the microstructure its entry priced on.
 /// Pre-signal exits (no entry snapshot) never enter this table.
 #[derive(Debug, Clone)]
-struct MicroRow {
-    ts: u64,
-    net_pnl: f64,
-    micro: MicroSignals,
+pub(crate) struct MicroRow {
+    pub(crate) ts: u64,
+    pub(crate) net_pnl: f64,
+    pub(crate) micro: MicroSignals,
     /// Effective exit regime the trade ran (`None` on pre-regime lines).
-    regime: Option<String>,
+    pub(crate) regime: Option<String>,
+    /// Risk provenance as recorded (`model` | `heuristic` | other):
+    /// fallback-decision outcomes read off this column.
+    pub(crate) source: String,
 }
 
 /// Thin-bin floor: fewer samples than this is noise — printed with a
 /// marker, never read as signal evidence.
-const MICRO_BIN_MIN: usize = 5;
+pub(crate) const MICRO_BIN_MIN: usize = 5;
 
 /// Paper vs live metric buckets (kept apart, always).
 #[derive(Debug, Default)]
 pub struct Metrics {
     // ---- paper (simulator world) ----
-    paper_trades: usize,
+    pub(crate) paper_trades: usize,
     paper_wins: usize,
     paper_net_pnl: f64,
     paper_fees: f64,
@@ -148,7 +151,7 @@ pub struct Metrics {
     /// Paper exits joined to their entry microstructure (paper-only
     /// expectancy evidence; live profitability is judged in the live
     /// bucket, never here).
-    micro_rows: Vec<MicroRow>,
+    pub(crate) micro_rows: Vec<MicroRow>,
     live_cost_usd: f64,
     /// Live estimate: paper edges (live mode) + settled exit gaps −
     /// UNPAIRED dispatch debits. Paired tips ride inside their gap.
@@ -484,6 +487,7 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
     // a post-restart exit must never join a pre-restart entry.
     let mut open_micro: HashMap<u64, MicroSignals> = HashMap::new();
     let mut open_regime: HashMap<u64, String> = HashMap::new();
+    let mut open_source: HashMap<u64, String> = HashMap::new();
     for line in lines {
         match line {
             JournalLine::Boot { settings: s, .. } => {
@@ -495,17 +499,20 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                 realized_peak = 0.0;
                 open_micro.clear();
                 open_regime.clear();
+                open_source.clear();
             }
             JournalLine::Open {
                 position,
                 micro: Some(micro),
                 regime,
+                risk,
                 ..
             } => {
                 open_micro.insert(position.id, *micro);
                 if let Some(regime) = regime {
                     open_regime.insert(position.id, regime.clone());
                 }
+                open_source.insert(position.id, risk.clone());
             }
             JournalLine::Open { micro: None, .. } => {}
             JournalLine::Exit { ts, trade, .. } => {
@@ -523,6 +530,10 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                         net_pnl: trade.net_pnl,
                         micro: *micro,
                         regime: open_regime.get(&trade.id).cloned(),
+                        source: open_source
+                            .get(&trade.id)
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string()),
                     });
                 }
                 realized_cum += trade.net_pnl - trade.dispatch_usd;
@@ -739,7 +750,7 @@ fn print_gap_venues(leg: &str, table: &HashMap<String, (usize, f64)>) {
 /// the ratio with concentration, insider flow, and velocity — and
 /// every bin shows chronological halves, so a first-half fluke cannot
 /// pose as out-of-sample stability.
-fn ratio_bin(ratio: f64) -> &'static str {
+pub(crate) fn ratio_bin(ratio: f64) -> &'static str {
     if ratio < 0.6 {
         "buy_ratio<0.6"
     } else if ratio < 0.8 {
@@ -749,7 +760,7 @@ fn ratio_bin(ratio: f64) -> &'static str {
     }
 }
 
-fn concentration_bin(pct: f64) -> &'static str {
+pub(crate) fn concentration_bin(pct: f64) -> &'static str {
     if pct < 25.0 {
         "top_wallet<25%"
     } else if pct <= 50.0 {
@@ -808,7 +819,7 @@ fn print_micro_table(
 
 /// Regime labels for the expectancy table. Unknown covers pre-regime
 /// lines: the rows always sum back to the joined total.
-fn regime_label(regime: Option<&str>) -> &'static str {
+pub(crate) fn regime_label(regime: Option<&str>) -> &'static str {
     match regime {
         Some("momentum") => "regime momentum",
         Some("conservative") => "regime conservative",
@@ -847,6 +858,16 @@ fn print_micro_tables(rows: &[MicroRow], paper_trades: usize) {
     // fixed baseline with. Unknown covers pre-regime lines.
     print_micro_table("exit regime", rows, |r| {
         Some(regime_label(r.regime.as_deref()))
+    });
+    // Decision-source expectancy: model vs fallback (heuristic) trades.
+    // Fallback outcomes read off this column — a fallback that protects
+    // volume at the cost of edge shows up here, not hidden in the rate.
+    print_micro_table("decision source", rows, |r| {
+        Some(match r.source.as_str() {
+            "model" => "source model",
+            "heuristic" => "source heuristic (fallback)",
+            _ => "source other",
+        })
     });
     let excluded = paper_trades.saturating_sub(rows.len());
     if excluded > 0 {
@@ -1360,11 +1381,12 @@ mod tests {
         ts: u64,
         micro: Option<MicroSignals>,
         regime: Option<&str>,
+        risk: &str,
     ) -> JournalLine {
         JournalLine::Open {
             ts,
             mint: "M".into(),
-            risk: "model".into(),
+            risk: risk.to_string(),
             venue_fee_bps: 125.0,
             sol_feed: Some(150.0),
             mark: outmark(1.0),
@@ -1427,19 +1449,31 @@ mod tests {
                 1_001,
                 Some(micro_sig(Some(0.9), Some(20.0), 0, Some(0.5))),
                 Some("momentum"),
+                "model",
             ),
             micro_exit(7, 1_100, 2.0),
+            // Heuristic-sourced exit joins with its provenance carried.
+            micro_open(
+                9,
+                1_003,
+                Some(micro_sig(Some(0.7), Some(20.0), 0, None)),
+                Some("conservative"),
+                "heuristic",
+            ),
+            micro_exit(9, 1_102, -1.0),
             // Pre-signal open: the exit counts in the leg totals but
             // never in the signal tables.
-            micro_open(8, 1_002, None, None),
+            micro_open(8, 1_002, None, None, "model"),
             micro_exit(8, 1_101, 1.0),
         ];
         let m = metrics(&lines);
-        assert_eq!(m.paper_trades, 2);
-        assert_eq!(m.micro_rows.len(), 1);
+        assert_eq!(m.paper_trades, 3);
+        assert_eq!(m.micro_rows.len(), 2);
         assert!((m.micro_rows[0].net_pnl - 2.0).abs() < 1e-12);
         assert_eq!(m.micro_rows[0].micro.buy_ratio, Some(0.9));
         assert_eq!(m.micro_rows[0].regime.as_deref(), Some("momentum"));
+        assert_eq!(m.micro_rows[0].source, "model");
+        assert_eq!(m.micro_rows[1].source, "heuristic");
     }
 
     #[test]
@@ -1452,7 +1486,13 @@ mod tests {
                 ts: 1_000,
                 settings: settings.clone(),
             },
-            micro_open(1, 1_001, Some(micro_sig(Some(0.9), None, 0, None)), None),
+            micro_open(
+                1,
+                1_001,
+                Some(micro_sig(Some(0.9), None, 0, None)),
+                None,
+                "model",
+            ),
             JournalLine::Boot { ts: 2_000, settings },
             micro_exit(1, 2_100, 5.0),
         ];

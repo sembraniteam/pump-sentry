@@ -11,6 +11,7 @@ mod live_mirror;
 mod money;
 mod pipeline;
 mod replay;
+mod research;
 mod settings;
 mod wal;
 
@@ -50,6 +51,7 @@ async fn main() {
         cli::CliAction::Pause => cli::cmd_pause(),
         cli::CliAction::Resume => cli::cmd_resume(),
         cli::CliAction::Replay { file } => replay::cmd_replay(file).await,
+        cli::CliAction::Research { file } => research::cmd_research(file).await,
         cli::CliAction::Upgrade { allow_unverified } => cli::cmd_upgrade(allow_unverified),
         cli::CliAction::InitConfig => {
             let path = config::resolve_config_path();
@@ -1237,6 +1239,15 @@ async fn run_pipeline(live_arg: bool) {
                         if pct >= thresholds.alert_risk_fallback_warn_pct {
                             warn!("alert: risk-engine fallback rate {pct}% ({fallbacks}/{decisions}) >= ALERT_RISK_FALLBACK_WARN_PCT={}; model may be down, entries run heuristic", thresholds.alert_risk_fallback_warn_pct);
                         }
+                    }
+                    // Confidence view per model: latency percentiles plus
+                    // what the fallback actually decided (BUY keeps
+                    // volume, PASS protects edge — the split shows which
+                    // the fallback is doing, so a volume-protecting
+                    // fallback can't hide behind the rate alone).
+                    if let Some((p50, p95, p99)) = engine.latency_ms_percentiles() {
+                        info!("inference confidence: model={} decisions={decisions} fallbacks={fallbacks} (buy={}, pass={}) latency_ms p50={p50} p95={p95} p99={p99}",
+                            engine.model(), engine.fallback_buy_count(), engine.fallback_pass_count());
                     }
                 }
                 if thresholds.alert_giveup_burst_n > 0 {

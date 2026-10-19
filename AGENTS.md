@@ -508,6 +508,14 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   Prompt rules only tighten (PASS/temper on wash, concentration,
   insider distribution, fading velocity); the heuristic keeps the
   velocity screen and ignores the newer context fields.
+- Explicit fallback policy (`inference_fallback`: `heuristic` | `pass`,
+  default heuristic): on any inference failure the operator chooses
+  validated bands or skip — never a hotter fallback to protect volume.
+  Single choke in confirm (engine-absent and engine-failed both arrive
+  as `Fallback`). Confidence telemetry per model: latency p50/p95/p99
+  over a bounded window (timeouts sit at the budget they cost) plus
+  fallback BUY vs PASS counts, on the heartbeat — a volume-protecting
+  fallback can't hide behind the rate alone.
 - Exit regimes are a closed set (`ExitRegime`: conservative/momentum/
   liquidity_sensitive): the model picks, deterministic `resolve_regime`
   (`crates/risk-engine/src/strategy.rs`) snaps the numbers to the
@@ -517,6 +525,12 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   `force_exit_regime` (`""` = LLM selects) is the fixed baseline for
   evaluation and the LLM kill path; replay bins expectancy per recorded
   regime in `Open.regime` so selection is judged against the baseline.
+- Research agent (`pump-sentry research`, `src/research.rs`): offline
+  loss-pattern analysis over the journal — loss clusters plus ranked
+  filter proposals with avoided-vs-foregone math and halves. READ-ONLY
+  by construction (no write path to config/wallet/dispatch); promoting
+  anything requires operator config edit, paper backtest, live confirm,
+  explicit approval. Paper patterns are never live evidence.
 - Measured latency per decision: gpt-oss-120b ~1.7–2.1s (mostly
   timeout→fallback at the 2s clamp), qwen3.8-27b ~0.3s (fits). Remote
   gateways need `inference_timeout_ms` raised (README `[risk]` example).

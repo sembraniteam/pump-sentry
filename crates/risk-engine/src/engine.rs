@@ -5,9 +5,11 @@ use crate::schema::{RiskProfile, TokenMetrics, build_prompt};
 use reqwest::Client;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::str::FromStr;
 use zeroize::Zeroizing;use std::sync::{
     Arc,
+    Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -203,7 +205,18 @@ pub struct RiskEngine {
     /// Non-compliant model outputs (undecodable or invalid;
     /// fail-closed to PASS, not heuristic fallback).
     invalid_count: Arc<AtomicU64>,
+    /// Fallback decisions that said BUY (heuristic band hit).
+    fallback_buys: Arc<AtomicU64>,
+    /// Fallback decisions that said PASS.
+    fallback_passes: Arc<AtomicU64>,
+    /// Recent `evaluate` latencies in ms (bounded window for p50/p95/
+    /// p99). Timeouts record the budget (the call cost the full
+    /// budget); transport failures record actual elapsed.
+    latencies_ms: Arc<Mutex<VecDeque<u128>>>,
 }
+
+/// Latency window for percentile stats (bounded diagnostics).
+const LATENCY_CAP: usize = 256;
 
 impl std::fmt::Debug for RiskEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -324,6 +337,9 @@ impl RiskEngine {
             decision_count: Arc::new(AtomicU64::new(0)),
             timeout_count: Arc::new(AtomicU64::new(0)),
             invalid_count: Arc::new(AtomicU64::new(0)),
+            fallback_buys: Arc::new(AtomicU64::new(0)),
+            fallback_passes: Arc::new(AtomicU64::new(0)),
+            latencies_ms: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -345,6 +361,62 @@ impl RiskEngine {
     /// Non-compliant model outputs since construction.
     pub fn invalid_count(&self) -> u64 {
         self.invalid_count.load(Ordering::Relaxed)
+    }
+
+    /// Model id these stats describe (per-model performance reads off
+    /// this name; one engine serves one model per process).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Fallback decisions that said BUY since construction.
+    pub fn fallback_buy_count(&self) -> u64 {
+        self.fallback_buys.load(Ordering::Relaxed)
+    }
+
+    /// Fallback decisions that said PASS since construction.
+    pub fn fallback_pass_count(&self) -> u64 {
+        self.fallback_passes.load(Ordering::Relaxed)
+    }
+
+    /// Latency percentiles over the retained window, ms
+    /// (`None` with no samples yet). Nearest-rank on the sorted
+    /// window; timeouts sit at the budget they cost.
+    pub fn latency_ms_percentiles(&self) -> Option<(u64, u64, u64)> {
+        let mut sorted: Vec<u128> = self
+            .latencies_ms
+            .lock()
+            .map(|q| q.iter().copied().collect())
+            .unwrap_or_default();
+        if sorted.is_empty() {
+            return None;
+        }
+        sorted.sort_unstable();
+        let rank = |p: usize| {
+            let idx = (p * sorted.len()).div_ceil(100);
+            sorted[idx.saturating_sub(1).min(sorted.len() - 1)] as u64
+        };
+        Some((rank(50), rank(95), rank(99)))
+    }
+
+    /// Record one `evaluate` latency sample (bounded window).
+    fn note_latency(&self, elapsed_ms: u128) {
+        if let Ok(mut q) = self.latencies_ms.lock() {
+            q.push_back(elapsed_ms);
+            while q.len() > LATENCY_CAP {
+                q.pop_front();
+            }
+        }
+    }
+
+    /// Count a fallback decision by its action (BUY vs PASS split
+    /// shows whether the fallback protects volume or edge).
+    fn note_fallback_action(&self, buys: bool) {
+        if buys {
+            self.fallback_buys.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.fallback_passes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Transport/model-trouble fallback (unreachable, over budget,
@@ -373,6 +445,7 @@ impl RiskEngine {
     /// of garbled output.
     pub async fn evaluate(&self, metrics: &TokenMetrics) -> RiskDecision {
         self.decision_count.fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
         let (system, user) = build_prompt(metrics);
         let request = ChatRequest {
             model: self.model.clone(),
@@ -395,6 +468,7 @@ impl RiskEngine {
 
         match tokio::time::timeout(self.timeout, self.infer(request)).await {
             Ok(Some(profile)) => {
+                self.note_latency(started.elapsed().as_millis());
                 // In-crate score gate (not prompt advice): high-risk
                 // mints never buy on any path, even on a model BUY.
                 // The heuristic already PASSes above the cap itself.
@@ -417,27 +491,33 @@ impl RiskEngine {
             }
             Ok(None) => {
                 self.note_fallback();
+                self.note_latency(started.elapsed().as_millis());
                 // `infer` already warned the cause; stay at debug here.
                 debug!(
                     endpoint = %log_endpoint(&self.endpoint), model = %self.model,
                     fallbacks = self.fallback_count(),
                     "inference unusable; using heuristic fallback"
                 );
+                let profile = evaluate_metrics_fallback(metrics);
+                self.note_fallback_action(profile.action == crate::schema::Action::Buy);
                 RiskDecision {
-                    profile: evaluate_metrics_fallback(metrics),
+                    profile,
                     source: DecisionSource::Fallback,
                 }
             }
             Err(_) => {
                 self.note_timeout();
+                self.note_latency(self.timeout.as_millis());
                 warn!(
                     endpoint = %log_endpoint(&self.endpoint), model = %self.model,
                     timeout = ?self.timeout,
                     fallbacks = self.fallback_count(),
                     "inference timed out; using heuristic fallback"
                 );
+                let profile = evaluate_metrics_fallback(metrics);
+                self.note_fallback_action(profile.action == crate::schema::Action::Buy);
                 RiskDecision {
-                    profile: evaluate_metrics_fallback(metrics),
+                    profile,
                     source: DecisionSource::Fallback,
                 }
             }
@@ -936,6 +1016,53 @@ mod tests {
         assert_eq!(decision.source, DecisionSource::Model);
         assert_eq!(decision.profile.tp_percent, 90.0);
         assert!(decision.profile.trailing_stop);
+    }
+
+    #[tokio::test]
+    async fn telemetry_records_latency_and_fallback_actions() {
+        // Fast valid model BUY: latency sampled, no fallback counts.
+        let inner = r#"{"action":"BUY","tp_percent":90.0,"sl_percent":-8.0,"trailing_stop":true,"timeout_seconds":180}"#;
+        let leaked: &'static str = Box::leak(chat_body(inner).into_boxed_str());
+        let base = serve_scripted(vec![(0, 200, leaked)]).await;
+        let engine = fast_engine(&base);
+        assert_eq!(engine.latency_ms_percentiles(), None);
+        let decision = engine.evaluate(&metrics()).await;
+        assert_eq!(decision.source, DecisionSource::Model);
+        assert_eq!(engine.decision_count(), 1);
+        assert_eq!(engine.fallback_count(), 0);
+        let Some((p50, p95, p99)) = engine.latency_ms_percentiles() else {
+            panic!("one sample must percentile");
+        };
+        assert!(p50 <= p95 && p95 <= p99);
+        assert_eq!(
+            (engine.fallback_buy_count(), engine.fallback_pass_count()),
+            (0, 0)
+        );
+        // Slow model on hot metrics: timeout fallback, heuristic BUY
+        // counted as a fallback buy (volume-protecting, visible).
+        let base = serve_scripted(vec![(1000, 200, leaked)]).await;
+        let slow = RiskEngine::builder()
+            .endpoint(&base)
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("engine");
+        let decision = slow.evaluate(&metrics()).await;
+        assert_eq!(decision.source, DecisionSource::Fallback);
+        assert_eq!(decision.profile.action, Action::Buy);
+        assert_eq!(slow.fallback_buy_count(), 1);
+        assert_eq!(slow.fallback_pass_count(), 0);
+        // Timeout sits at the budget it cost.
+        let Some((_, _, _)) = slow.latency_ms_percentiles() else {
+            panic!("timeout must sample");
+        };
+        // Slow model on cold metrics: fallback PASS counted as edge
+        // protection, never volume.
+        let mut cold = metrics();
+        cold.buy_velocity_5s = 0;
+        let decision = slow.evaluate(&cold).await;
+        assert_eq!(decision.profile.action, Action::Pass);
+        assert_eq!(slow.fallback_buy_count(), 1);
+        assert_eq!(slow.fallback_pass_count(), 1);
     }
 
     #[tokio::test]

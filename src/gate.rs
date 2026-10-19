@@ -889,7 +889,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 source: DecisionSource::Fallback,
             },
         };
-        let profile = decision.profile;
+        // Explicit fallback policy (`inference_fallback`): on any
+        // inference failure the operator chooses the validated
+        // heuristic bands or skip (PASS) — never a hotter fallback to
+        // protect trade count. Single choke with the engine-absent
+        // path above: both arrive here as `Fallback`.
+        let mut profile = decision.profile;
+        if decision.source == DecisionSource::Fallback && self.settings.inference_fallback == "pass"
+        {
+            info!(%mint, "inference fallback policy=pass: skipping entry on model failure");
+            profile = risk_engine::RiskProfile::pass();
+        }
         // Always log the decision (source + latency): heuristic-only
         // operation (`engine: None`) must be as visible as model calls.
         // Logs stay on when alerts are silenced (see the settings TODO

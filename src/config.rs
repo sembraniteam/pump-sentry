@@ -79,6 +79,7 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("risk", "runner_moonbag_percent", "RUNNER_MOONBAG_PERCENT"),
     ("risk", "inference_endpoint", "INFERENCE_ENDPOINT"),
     ("risk", "inference_model", "INFERENCE_MODEL"),
+    ("risk", "inference_fallback", "INFERENCE_FALLBACK"),
     ("risk", "inference_timeout_ms", "INFERENCE_TIMEOUT_MS"),
     ("risk", "inference_headers", "INFERENCE_HEADERS"),
     ("execution", "slippage_bps", "SLIPPAGE_BPS"),
@@ -164,7 +165,8 @@ strategy_mode = "adaptive"  # (adaptive|scalp|runner)
 force_exit_regime = ""  # (empty = LLM selects; fixed baseline for evaluation, or the LLM kill path: conservative|momentum|liquidity_sensitive)
 runner_moonbag_percent = 20.0  # (runner share kept, 0-100)
 inference_endpoint = "http://127.0.0.1:11434/v1/chat/completions"  # 
-inference_model = "llama3.2:1b"  # 
+inference_model = "llama3.2:1b"  #
+inference_fallback = "heuristic"  # (heuristic|pass; pass skips entries on any inference failure — never a hotter fallback)
 inference_timeout_ms = 300  # (raising past 300ms costs entry price)
 inference_headers = ""  # (optional extra headers, comma-separated when more than one: "Name: value, Other: value", e.g. "x-opencode-session: sess-123, X-Custom-Flag: fast"; empty = none; auth never here — INFERENCE_API_KEY stays in env)
 # INFERENCE_API_KEY stays in env (bearer token; secret, never written here).
