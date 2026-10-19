@@ -153,6 +153,11 @@ pub enum JournalLine {
         #[serde(default)]
         ticket_usd: f64,
         position: simulator::Position,
+        /// Confirm-tape microstructure snapshot (`None` on pre-signal
+        /// lines): the flow the entry priced on, for offline
+        /// expectancy analysis per signal.
+        #[serde(default)]
+        micro: Option<listener::MicroSignals>,
     },
     /// Paper exit: the ledger trade as booked plus the fraction the
     /// book closed and the mark it closed on.
@@ -459,9 +464,19 @@ mod tests {
             mark: simulator::Mark::new(1.0, 50_000.0),
             ticket_usd: 100.0,
             position: pos(),
+            micro: None,
         };
         let raw = serde_json::to_string(&open).unwrap();
         assert!(matches!(decode_line(&raw), Decoded::Line(_)));
+        // Pre-signal lines carry no micro: they decode with None, never
+        // a fabricated zero-signal.
+        let mut old = serde_json::to_value(&open).unwrap();
+        old.as_object_mut().unwrap().remove("micro");
+        match decode_line(&serde_json::to_string(&old).unwrap()) {
+            Decoded::Line(line)
+                if matches!(&*line, JournalLine::Open { micro: None, .. }) => {}
+            _ => panic!("pre-signal open must decode with micro None"),
+        }
     }
 
     #[test]

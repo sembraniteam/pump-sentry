@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use simulator::{ExitReason, PaperPortfolio};
 
 use crate::journal::{self, JournalLine};
+use listener::MicroSignals;
 
 /// The decision journal for offline replay; human report, then exit
 /// code 0 (fully reproduced) or 1 (any mismatch or unverifiable
@@ -98,6 +99,19 @@ impl VerifyReport {
     }
 }
 
+/// One paper exit joined to the microstructure its entry priced on.
+/// Pre-signal exits (no entry snapshot) never enter this table.
+#[derive(Debug, Clone)]
+struct MicroRow {
+    ts: u64,
+    net_pnl: f64,
+    micro: MicroSignals,
+}
+
+/// Thin-bin floor: fewer samples than this is noise — printed with a
+/// marker, never read as signal evidence.
+const MICRO_BIN_MIN: usize = 5;
+
 /// Paper vs live metric buckets (kept apart, always).
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -129,6 +143,10 @@ pub struct Metrics {
     /// always sum back to the leg totals above — never silent drops.
     entry_gap_by_venue: HashMap<String, (usize, f64)>,
     exit_gap_by_venue: HashMap<String, (usize, f64)>,
+    /// Paper exits joined to their entry microstructure (paper-only
+    /// expectancy evidence; live profitability is judged in the live
+    /// bucket, never here).
+    micro_rows: Vec<MicroRow>,
     live_cost_usd: f64,
     /// Live estimate: paper edges (live mode) + settled exit gaps −
     /// UNPAIRED dispatch debits. Paired tips ride inside their gap.
@@ -459,6 +477,10 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
     let mut equity_peak: Option<f64> = None;
     let mut realized_cum: f64 = 0.0;
     let mut realized_peak: f64 = 0.0;
+    // Entry microstructure by recorded position id. Cleared on every
+    // boot like the reconstructed book: ids restart with the book, so
+    // a post-restart exit must never join a pre-restart entry.
+    let mut open_micro: HashMap<u64, MicroSignals> = HashMap::new();
     for line in lines {
         match line {
             JournalLine::Boot { settings: s, .. } => {
@@ -468,8 +490,17 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                 // boots.
                 realized_cum = 0.0;
                 realized_peak = 0.0;
+                open_micro.clear();
             }
-            JournalLine::Exit { trade, .. } => {
+            JournalLine::Open {
+                position,
+                micro: Some(micro),
+                ..
+            } => {
+                open_micro.insert(position.id, *micro);
+            }
+            JournalLine::Open { micro: None, .. } => {}
+            JournalLine::Exit { ts, trade, .. } => {
                 m.paper_trades += 1;
                 m.paper_net_pnl += trade.net_pnl;
                 m.paper_fees += trade.fees;
@@ -477,6 +508,13 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                 m.paper_hold_secs += trade.hold_seconds;
                 if trade.net_pnl > 0.0 {
                     m.paper_wins += 1;
+                }
+                if let Some(micro) = open_micro.get(&trade.id) {
+                    m.micro_rows.push(MicroRow {
+                        ts: *ts,
+                        net_pnl: trade.net_pnl,
+                        micro: *micro,
+                    });
                 }
                 realized_cum += trade.net_pnl - trade.dispatch_usd;
                 realized_peak = realized_peak.max(realized_cum);
@@ -668,6 +706,7 @@ fn print_metrics(m: &Metrics) {
     );
     print_gap_venues("entry", &m.entry_gap_by_venue);
     print_gap_venues("exit", &m.exit_gap_by_venue);
+    print_micro_tables(&m.micro_rows, m.paper_trades);
     println!(
         "committed costs {:+.4} USD (recorded debits at actuals) | live net PnL ESTIMATE {:+.4} USD (paper edge + settled exit gaps − unpaired dispatch debits)",
         m.live_cost_usd, m.live_net_estimate,
@@ -683,6 +722,106 @@ fn print_gap_venues(leg: &str, table: &HashMap<String, (usize, f64)>) {
     rows.sort_by(|a, b| a.0.cmp(b.0));
     for (venue, (n, total)) in rows {
         println!("  {leg} gap venue {venue}: n={n} total {total:+.4} USD");
+    }
+}
+
+/// Fixed analysis bins (display cutoffs, never trading logic): a high
+/// buy ratio alone is not organic-buying proof, so every table pairs
+/// the ratio with concentration, insider flow, and velocity — and
+/// every bin shows chronological halves, so a first-half fluke cannot
+/// pose as out-of-sample stability.
+fn ratio_bin(ratio: f64) -> &'static str {
+    if ratio < 0.6 {
+        "buy_ratio<0.6"
+    } else if ratio < 0.8 {
+        "buy_ratio 0.6-0.8"
+    } else {
+        "buy_ratio>=0.8"
+    }
+}
+
+fn concentration_bin(pct: f64) -> &'static str {
+    if pct < 25.0 {
+        "top_wallet<25%"
+    } else if pct <= 50.0 {
+        "top_wallet 25-50%"
+    } else {
+        "top_wallet>50%"
+    }
+}
+
+fn print_micro_table(
+    title: &str,
+    rows: &[MicroRow],
+    key: impl Fn(&MicroSignals) -> Option<&'static str>,
+) {
+    let mut keyed: Vec<(&str, u64, f64)> = rows
+        .iter()
+        .filter_map(|r| key(&r.micro).map(|k| (k, r.ts, r.net_pnl)))
+        .collect();
+    if keyed.is_empty() {
+        return;
+    }
+    keyed.sort_by_key(|(_, ts, _)| *ts);
+    let half = keyed.len() / 2;
+    // label → (n, total, first-half n/total, second-half n/total).
+    let mut bins: HashMap<&str, (usize, f64, usize, f64, usize, f64)> = HashMap::new();
+    for (i, (label, _, net)) in keyed.iter().enumerate() {
+        let e = bins.entry(label).or_insert((0, 0.0, 0, 0.0, 0, 0.0));
+        e.0 += 1;
+        e.1 += net;
+        if i < half {
+            e.2 += 1;
+            e.3 += net;
+        } else {
+            e.4 += 1;
+            e.5 += net;
+        }
+    }
+    let mut labels: Vec<&&str> = bins.keys().collect();
+    labels.sort();
+    println!("  {title}:");
+    for label in labels {
+        let (n, total, n1, t1, n2, t2) = bins[label];
+        let thin = if n < MICRO_BIN_MIN {
+            " THIN (not evidence)"
+        } else {
+            ""
+        };
+        println!(
+            "    {label}: n={n} avg={:+.4} | 1st-half n={n1} avg={:+.4} | 2nd-half n={n2} avg={:+.4}{thin}",
+            total / n as f64,
+            t1 / n1.max(1) as f64,
+            t2 / n2.max(1) as f64,
+        );
+    }
+}
+
+fn print_micro_tables(rows: &[MicroRow], paper_trades: usize) {
+    if rows.is_empty() {
+        return;
+    }
+    println!("-- microstructure expectancy (paper exits joined to entry signals; halves = chronological stability check) --");
+    print_micro_table("buy pressure", rows, |m| m.buy_ratio.map(ratio_bin));
+    print_micro_table("round concentration", rows, |m| {
+        m.top_wallet_share_pct.map(concentration_bin)
+    });
+    print_micro_table("insider flow", rows, |m| {
+        Some(if m.creator_net_base < 0 {
+            "insiders distributing"
+        } else if m.creator_net_base > 0 {
+            "insiders accumulating"
+        } else {
+            "insiders flat"
+        })
+    });
+    print_micro_table("tape velocity", rows, |m| {
+        m.velocity_delta
+            .map(|v| if v < 0.0 { "fading" } else { "accelerating" })
+    });
+    let excluded = paper_trades.saturating_sub(rows.len());
+    if excluded > 0 {
+        println!("  ({excluded} exits without entry signals — pre-signal lines, excluded)");
     }
 }
 
@@ -777,6 +916,7 @@ mod tests {
             mark: outmark(1.0),
             ticket_usd: ticket,
             position: position.clone(),
+            micro: None,
         });
 
         // benign tick, then the TP tick. Tick lines first (runtime
@@ -908,6 +1048,7 @@ mod tests {
                 mark: outmark(1.0),
                 ticket_usd: settings.notional_usd,
                 position,
+                micro: None,
             });
             // +5% mark: under the TP/SL thresholds — no market trigger.
             let now = 1_050;
@@ -992,6 +1133,7 @@ mod tests {
                 timeout_seconds: 60,
                 moonbag_percent: 0.0,
             },
+            micro: None,
         })
         .unwrap();
         let old_ticket = open.as_object_mut().unwrap().remove("ticket_usd");
@@ -1162,9 +1304,135 @@ mod tests {
         assert_eq!(rows, m.exit_gaps);
     }
 
+    fn micro_sig(
+        ratio: Option<f64>,
+        conc: Option<f64>,
+        creator: i64,
+        vel: Option<f64>,
+    ) -> MicroSignals {
+        MicroSignals {
+            buys: 5,
+            sells: 1,
+            buy_ratio: ratio,
+            buy_volume_base: 5_000_000,
+            sell_volume_base: 1_000_000,
+            unique_traders: 4,
+            top_wallet_share_pct: conc,
+            creator_net_base: creator,
+            velocity_delta: vel,
+        }
+    }
+
+    fn micro_open(id: u64, ts: u64, micro: Option<MicroSignals>) -> JournalLine {
+        JournalLine::Open {
+            ts,
+            mint: "M".into(),
+            risk: "model".into(),
+            venue_fee_bps: 125.0,
+            sol_feed: Some(150.0),
+            mark: outmark(1.0),
+            ticket_usd: 10.0,
+            position: simulator::Position {
+                id,
+                mint: "M".into(),
+                side: Side::Long,
+                entry_price: 1.0,
+                quantity: 10,
+                entry_notional: 10.0,
+                entry_fee: 0.1,
+                tp_percent: 75.0,
+                sl_percent: -8.0,
+                trail_percent: 0.0,
+                trailing_stop: false,
+                best_price: 1.0,
+                opened_at: ts,
+                timeout_seconds: 300,
+                moonbag_percent: 0.0,
+            },
+            micro,
+        }
+    }
+
+    fn micro_exit(id: u64, ts: u64, net: f64) -> JournalLine {
+        JournalLine::Exit {
+            ts,
+            mint: "M".into(),
+            fraction: 1.0,
+            tick_observed_at: ts,
+            trade: simulator::ClosedTrade {
+                id,
+                mint: "M".into(),
+                side: Side::Long,
+                entry_price: 1.0,
+                exit_price: 1.0,
+                quantity: 10,
+                gross_pnl: net,
+                fees: 0.0,
+                net_pnl: net,
+                net_pnl_percent: 0.0,
+                reason: ExitReason::TakeProfit,
+                fraction_closed: 1.0,
+                opened_at: ts,
+                closed_at: ts,
+                hold_seconds: 10,
+                dispatch_usd: 0.0,
+            },
+            mark: outmark(1.0),
+        }
+    }
+
     #[test]
-    fn replay_fails_on_tampered_reason() {
-        let (mut lines, _) = lifecycle();
+    fn metrics_joins_exits_to_entry_micro() {
+        let lines = vec![
+            micro_open(
+                7,
+                1_001,
+                Some(micro_sig(Some(0.9), Some(20.0), 0, Some(0.5))),
+            ),
+            micro_exit(7, 1_100, 2.0),
+            // Pre-signal open: the exit counts in the leg totals but
+            // never in the signal tables.
+            micro_open(8, 1_002, None),
+            micro_exit(8, 1_101, 1.0),
+        ];
+        let m = metrics(&lines);
+        assert_eq!(m.paper_trades, 2);
+        assert_eq!(m.micro_rows.len(), 1);
+        assert!((m.micro_rows[0].net_pnl - 2.0).abs() < 1e-12);
+        assert_eq!(m.micro_rows[0].micro.buy_ratio, Some(0.9));
+    }
+
+    #[test]
+    fn metrics_boot_clears_micro_join() {
+        // Ids restart with the book: a post-restart exit must never
+        // join a pre-restart entry carrying the same id.
+        let settings = boot(1_000, "paper");
+        let lines = vec![
+            JournalLine::Boot {
+                ts: 1_000,
+                settings: settings.clone(),
+            },
+            micro_open(1, 1_001, Some(micro_sig(Some(0.9), None, 0, None))),
+            JournalLine::Boot { ts: 2_000, settings },
+            micro_exit(1, 2_100, 5.0),
+        ];
+        let m = metrics(&lines);
+        assert!(m.micro_rows.is_empty(), "{m:?}");
+        assert_eq!(m.paper_trades, 1);
+    }
+
+    #[test]
+    fn micro_bins_follow_documented_cutoffs() {
+        assert_eq!(ratio_bin(0.59), "buy_ratio<0.6");
+        assert_eq!(ratio_bin(0.6), "buy_ratio 0.6-0.8");
+        assert_eq!(ratio_bin(0.8), "buy_ratio>=0.8");
+        assert_eq!(concentration_bin(24.9), "top_wallet<25%");
+        assert_eq!(concentration_bin(50.0), "top_wallet 25-50%");
+        assert_eq!(concentration_bin(50.1), "top_wallet>50%");
+    }
+
+    #[test]
+    fn replay_fails_on_tampered_reason() {        let (mut lines, _) = lifecycle();
         if let Some(JournalLine::Exit { trade, .. }) = lines.last_mut() {
             trade.reason = ExitReason::StopLoss;
         }

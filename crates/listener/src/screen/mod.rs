@@ -40,6 +40,7 @@ use tracing::{debug, warn};
 mod bundle;
 mod cache;
 mod entry;
+mod micro;
 mod rpc;
 mod swaps;
 pub(crate) use cache::TimedCache;
@@ -49,6 +50,7 @@ pub use entry::{
     DevScreenConfig, DevVerdict, EntryGate, GATE_POLL_INTERVAL, GateOutcome, MAX_COHORT_WALLETS,
     MAX_PENDING_ENTRIES, judge_developer,
 };
+pub use micro::{MicroSignals, TapePoint, micro_signals};
 pub use rpc::{
     DecodedIx, DetectedMigration, MigrationReport, RpcScreener, INITIALIZE2_AMM_INDEX,
     MAX_TRACED_BUYERS, find_funding_source, initialize2_amm_id, migrate_pool_id, read_curve_swaps,

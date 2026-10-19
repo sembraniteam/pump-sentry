@@ -7,7 +7,8 @@ use alert::Alerter;
 use auditor::RugCheckError;
 use curve::{CurveError, PriceTick};
 use listener::{
-    BundleVerdict, EntryGate, GateOutcome, PUMP_PROGRAM_ID, ScreenError, tape_volume_base_units,
+    BundleVerdict, EntryGate, GateOutcome, MicroSignals, PUMP_PROGRAM_ID, ScreenError, TapePoint,
+    micro_signals, tape_volume_base_units,
 };
 use risk_engine::{
     Action, DecisionSource, RiskDecision, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
@@ -156,6 +157,8 @@ struct OpenRequest<'a> {
     /// Confirming round's tape volume in base units (6-decimal basis;
     /// spot-priced to USD at the confirm quote).
     tape_base_units: u64,
+    /// Confirm-tape microstructure snapshot for the journal.
+    micro: MicroSignals,
     allow_live: bool,
     creation_slot_buys: Option<u32>,
     cluster_pct: Option<f64>,
@@ -177,8 +180,7 @@ struct TrackedOpen<'a> {
     /// Venue tier with the tick. `None` is standard; synthetic forces `None`.
     venue_fee_bps: Option<f64>,
     /// SOL/USD stamped at confirm. Rechecked at use; stale fails closed.
-    sol: Option<(f64, u64)>,
-    trail_percent: f64,
+    sol: Option<(f64, u64)>,    trail_percent: f64,
     /// Exact curve reserves off the confirm tick: the paper fill and the
     /// live sizing quote the chain's own math. `None` on synthetic
     /// (override-priced) opens and mocks.
@@ -186,6 +188,8 @@ struct TrackedOpen<'a> {
     /// True when the confirm tick read complete (chain truth). Entries
     /// are pre-migration only; the choke refuses these (see below).
     complete: bool,
+    /// Confirm-tape microstructure snapshot for the journal.
+    micro: MicroSignals,
 }
 
 /// Log-safe token text: on-chain name/symbol are attacker-controlled,
@@ -215,6 +219,10 @@ pub struct PendingSignal {
     /// Watch-entry intake time. The hard cap sheds the oldest intake
     /// first; audit retries never re-stamp it.
     pub intake_secs: u64,
+    /// Previous round's tape point (observe time + buy records) for
+    /// microstructure velocity. Updated every observed round; the
+    /// confirm reads it, never a re-stamped audit time.
+    pub prev_tape: Option<TapePoint>,
 }
 
 /// Gate plus signal context under one lock.
@@ -405,6 +413,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 creator: req.creator.map(|c| c.to_string()),
                 dev: dev.to_string(),
                 intake_secs: now,
+                prev_tape: None,
             },
         );
         match audit_score {
@@ -468,12 +477,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .await;
         // Phase 2: gate machine.
         enum GateStep {
-            Confirmed(u32, u64, PendingSignal),
+            // Boxed: the signal owns five strings; an inline variant
+            // would bloat every step of this transient enum.
+            Confirmed {
+                buyers: u32,
+                tape: u64,
+                signal: Box<PendingSignal>,
+                micro: MicroSignals,
+            },
             Aborted(String),
             Waiting,
             Stale,
         }
-        let mut confirmed: Vec<(String, PendingSignal, u32, u64)> = Vec::new();
+        let mut confirmed: Vec<(String, Box<PendingSignal>, u32, u64, MicroSignals)> = Vec::new();
         for (mint, mut signal, observed) in observations {
             let (swaps, newest) = match observed {
                 Ok(CurveRead::Full { swaps, watermark }) => (swaps, watermark),
@@ -551,14 +567,39 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     if signal.audit_score.is_none() {
                         GateStep::Waiting
                     } else {
-                        match state.gate.observe(&mint, &swaps, now_secs()) {
+                        // Microstructure tape: this round's activity
+                        // against the stored previous point (velocity
+                        // needs history of one). The stored point is
+                        // read before this round overwrites it below.
+                        let now = now_secs();
+                        let stored_prev = state.meta.get(&mint).and_then(|m| m.prev_tape);
+                        let round_buys = swaps
+                            .iter()
+                            .filter(|s| s.side == listener::SwapSide::Buy)
+                            .count() as u32;
+                        let micro = micro_signals(
+                            &swaps,
+                            &signal.dev,
+                            signal.creator.as_deref(),
+                            stored_prev,
+                            now,
+                        );
+                        signal.prev_tape = Some(TapePoint {
+                            ts: now,
+                            buys: round_buys,
+                        });
+                        match state.gate.observe(&mint, &swaps, now) {
                             GateOutcome::Confirm { buyers } => {
                                 state.meta.remove(&mint);
                                 // Tape volume rides the confirm: the same
                                 // swaps that made quorum, in base units.
                                 let tape = tape_volume_base_units(&swaps);
-                                GateStep::Confirmed(buyers, tape, signal.clone())
-                            }
+                                GateStep::Confirmed {
+                                    buyers,
+                                    tape,
+                                    signal: Box::new(signal.clone()),
+                                    micro,
+                                }                            }
                             GateOutcome::Abort { reason } => {
                                 state.meta.remove(&mint);
                                 GateStep::Aborted(reason)
@@ -569,7 +610,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 }
             };
             match step {
-                GateStep::Confirmed(buyers, tape, sig) => confirmed.push((mint, sig, buyers, tape)),
+                GateStep::Confirmed {
+                    buyers,
+                    tape,
+                    signal: sig,
+                    micro,
+                } => confirmed.push((mint, sig, buyers, tape, micro)),
                 GateStep::Aborted(reason) => {
                     info!(%mint, %reason, "gate abort");
                 }
@@ -579,7 +625,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Phase 3: forensics plus opens.
         if !confirmed.is_empty() {
             use futures_util::stream::{self, StreamExt};
-            stream::iter(confirmed.into_iter().map(|(mint, signal, buyers, tape)| async move {
+            stream::iter(confirmed.into_iter().map(|(mint, signal, buyers, tape, micro)| async move {
                 // Reject drops; suspect is paper-only.
                 match self
                     .screener
@@ -593,10 +639,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                     Ok(analysis) if analysis.verdict == BundleVerdict::SuspectLowVolume => {
                         info!(%mint, "bundle suspect: paper-only, live dispatch skipped");
-                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, tape_base_units: tape, allow_live: false, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
+                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, tape_base_units: tape, micro, allow_live: false, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
                     }
                     Ok(analysis) => {
-                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, tape_base_units: tape, allow_live: true, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
+                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, tape_base_units: tape, micro, allow_live: true, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
                     }
                     Err(e) => {
                         warn!(%mint, error = %ids::redact_urls_in_text(&e.to_string()), "bundle screen error; dropping (fail-closed)");
@@ -818,6 +864,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     "risk heuristic fallback (no engine)");
             }
         }
+        // Confirm-tape microstructure: what the round's flow looked
+        // like (logged for BUY and PASS alike — a passed tape is still
+        // evidence about the signal).
+        {
+            let m = req.micro;
+            info!(%mint, buys = m.buys, sells = m.sells, buy_ratio = ?m.buy_ratio,
+                unique_traders = m.unique_traders, top_wallet_share_pct = ?m.top_wallet_share_pct,
+                creator_net_base = m.creator_net_base, velocity_delta = ?m.velocity_delta,
+                "confirm tape microstructure");
+        }
         if profile.action != Action::Buy {
             info!(%mint, buyers, score, "risk PASS at confirm");
             return;
@@ -871,6 +927,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 exec.map(|e| crate::live::curve_reserves(&e))
             },
             complete,
+            micro: req.micro,
         })
         .await;
     }
@@ -1156,6 +1213,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             mark,
                             ticket_usd: self.settings.notional_usd,
                             position,
+                            micro: Some(req.micro),
                         });
                     }
                 }
@@ -1224,6 +1282,7 @@ mod tests {
             last_sig: None,
             dev: "D".to_string(),
             intake_secs,
+            prev_tape: None,
         };
         let mut meta = HashMap::new();
         meta.insert("newest".to_string(), signal(300));

@@ -210,6 +210,18 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   Outcome owns the verdict). The TP scale-out fraction math is single
   owner `simulator::market::exit_fraction` (tick path + replay both
   call it) with `PaperPortfolio::moonbag_of`.
+- Confirm-tape microstructure (`listener::screen::micro`, `MicroSignals`):
+  buys/sells, buy ratio, base-unit volumes, unique traders, top-wallet
+  share, insider net flow, round-over-round velocity — pure computation
+  over already-observed swaps, no new RPC. Threaded through the confirm
+  path (`PendingSignal::prev_tape` supplies the velocity history of one)
+  into `JournalLine::Open.micro` (optional; pre-signal lines decode as
+  `None`, and replay joins exits to entries per boot, never across
+  restarts). Replay bins paper expectancy per signal with chronological
+  halves and a thin-bin floor (`MICRO_BIN_MIN`); bins are analysis
+  display, never trading logic. Deliberately excluded: per-round
+  funder graphs (creation-slot bundle screen owns related-wallet
+  forensics) and liquidity change (rounds observe swaps, not reserves).
 - Ticks with non-positive/NaN liquidity are unpriceable
   (`unpriceable_liquidity`): a delivered tick carries parsed reserves
   (the ticker clamps non-positive to 0), so this is a drained market
