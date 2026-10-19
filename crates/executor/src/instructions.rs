@@ -3,8 +3,9 @@
 //! Layouts and account order are byte-exact vs frozen mainnet samples.
 //! SPL IDs cross-check the SPL crates, so drift fails in tests.
 //!
-//! Shapes: 17-account `buy_v3`/`sell_v3` plus 17-account
-//! `buy_exact_quote_in_v3`. Legacy/18/v2 shapes are deleted;
+//! Shapes: 17-account `buy_v3`/`sell_v3` (plus chain-side recognition
+//! of `buy_exact_quote_in_v3` in screening — no dispatch builder; the
+//! bot buys by base amount only). Legacy/18/v2 shapes are deleted;
 //! non-v3 curves fail closed in preflight.
 //!
 //! Routing is runtime: v3 needs only the buyback pick (any of the 8);
@@ -23,7 +24,7 @@ pub use ids::{
     DEFAULT_BUYBACK_FEE_RECIPIENT, EVENT_AUTHORITY, FEE_CONFIG_ACCOUNT, FEE_CONFIG_PROGRAM,
     FEE_RECIPIENT, GLOBAL_ACCOUNT, PUMP_AMM_EVENT_AUTHORITY_SEED, PUMP_AMM_FEE_CONFIG,
     PUMP_AMM_GLOBAL_CONFIG, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SELL_V2_DISCRIMINATOR,
-    PUMP_BUY_V3_DISCRIMINATOR, PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_PROGRAM_ID,
+    PUMP_BUY_V3_DISCRIMINATOR, PUMP_PROGRAM_ID,
     PUMP_SELL_V3_DISCRIMINATOR, RENT_SYSVAR_ID, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
     TOKEN_2022_PROGRAM_ID, USDC_MINT, USER_VOLUME_ACCUMULATOR_SEED, WSOL_MINT,
 };
@@ -44,15 +45,6 @@ pub struct PumpSellV3Args {
     pub amount: u64,
     /// Min quote to receive.
     pub min_sol_output: u64,
-}
-
-/// v3 exact-quote buy args: same 17 accounts, 24-byte payload.
-#[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
-pub struct PumpBuyExactQuoteInV3Args {
-    /// Exact quote to spend, fees in.
-    pub spendable_quote_in: u64,
-    /// Fewest base tokens accepted.
-    pub min_tokens_out: u64,
 }
 
 /// Stateless v3 builder.
@@ -166,21 +158,6 @@ impl PumpSwapBuilder {
         Instruction { program_id: PUMP_PROGRAM_ID, accounts, data }
     }
 
-    /// v3 exact-quote buy: spend `spendable_quote_in` for `min_tokens_out`.
-    pub fn build_buy_exact_quote_in_v3_ix(
-        spendable_quote_in: u64,
-        min_tokens_out: u64,
-        accts: &BuyV3Accounts<'_>,
-    ) -> Instruction {
-        let mut data = Vec::with_capacity(24);
-        data.extend_from_slice(&PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR);
-        PumpBuyExactQuoteInV3Args { spendable_quote_in, min_tokens_out }
-            .serialize(&mut data)
-            .expect("in-memory Borsh encode cannot fail");
-        Self::build_v3_ix(data, accts.payer, accts.mint, accts.quote_mint, accts.bonding_curve,
-            accts.associated_bonding_curve, accts.base_token_program, accts.quote_token_program,
-            accts.buyback_recipient)
-    }
 }
 
 /// PumpSwap `sell_v2` args: 24-byte payload.
@@ -623,76 +600,6 @@ mod tests {
                 AccountMeta::new_readonly(key(i), false)
             };
             assert_eq!(*meta, expect, "flags {i}");
-        }
-        assert_eq!(built.data, data);
-    }
-
-    #[test]
-    fn buy_exact_quote_in_v3_matches_frozen_sample() {
-        // Byte-equality vs mainnet `buy_exact_quote_in_v3` fill (17 accounts).
-        use std::collections::HashSet;
-        let fetched = crate::test_fixture::confirmed_tx(include_str!(
-            "../../listener/tests/fixtures/buy_exact_quote_in_v3_mainnet.json"
-        ));
-        // Landed transaction only: a failed fill proves nothing.
-        assert!(
-            crate::test_fixture::landed(&fetched),
-            "success fixture must carry a landed transaction"
-        );
-        let crate::test_fixture::FrozenFill { keys, idx, data } = crate::test_fixture::frozen_fill(
-            &fetched,
-            &PUMP_PROGRAM_ID,
-            &PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR,
-            24,
-        );
-        assert_eq!(idx.len(), 17);
-        let key = |i: usize| Pubkey::from_str(&keys[idx[i]]).expect("pubkey");
-        assert_eq!(user_volume_accumulator_pda(&key(8)), key(11));
-        assert!(
-            BUYBACK_FEE_RECIPIENTS.contains(&key(13)),
-            "buyback recipient must come from the published 8-list"
-        );
-        let spend = u64::from_le_bytes(data[8..16].try_into().expect("u64"));
-        let min_out = u64::from_le_bytes(data[16..24].try_into().expect("u64"));
-        assert_eq!(spend, 1_000_000_000);
-        assert_eq!(min_out, 12_211_736_678_104);
-        let built = PumpSwapBuilder::build_buy_exact_quote_in_v3_ix(
-            spend,
-            min_out,
-            &BuyV3Accounts {
-                payer: &key(8),
-                mint: &key(1),
-                quote_mint: &key(2),
-                bonding_curve: &key(5),
-                associated_bonding_curve: &key(6),
-                base_token_program: &key(3),
-                quote_token_program: &key(4),
-                buyback_recipient: &key(13),
-            },
-        );
-        assert_eq!(built.accounts.len(), 17);
-        // Same inferred set as the other v3 sides (8 is the signer).
-        let writable: HashSet<usize> = [5, 6, 7, 8, 9, 10, 11, 13].into_iter().collect();
-        for (i, meta) in built.accounts.iter().enumerate() {
-            // Position 9 excepted: this fill spent from an AUX base account,
-            // not the canonical ATA. Our builds always use the canonical ATA.
-            if i != 9 {
-                assert_eq!(meta.pubkey, key(i), "position {i}");
-            }
-            let expect = if i == 8 {
-                AccountMeta::new(key(i), true)
-            } else if writable.contains(&i) {
-                AccountMeta::new(key(i), false)
-            } else {
-                AccountMeta::new_readonly(key(i), false)
-            };
-            if i != 9 {
-                assert_eq!(*meta, expect, "flags {i}");
-            } else {
-                // Aux position: flags still asserted, pubkey excluded.
-                assert_eq!(meta.is_signer, expect.is_signer, "flags {i}");
-                assert_eq!(meta.is_writable, expect.is_writable, "flags {i}");
-            }
         }
         assert_eq!(built.data, data);
     }

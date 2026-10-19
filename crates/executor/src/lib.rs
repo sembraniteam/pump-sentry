@@ -19,7 +19,7 @@ pub use executor::{
     JitoReceipt, LiveFundingReport, ObservedBuyFill, SellOrder, SellPumpSwapOrder,
     SellRaydiumOrder, SwapExecutor,
 };
-pub use instructions::{BuyV3Accounts, PumpAmmSellV2Accounts, PumpBuyV3Args, PumpSellV3Args, PumpBuyExactQuoteInV3Args, PumpSwapBuilder, SellV3Accounts, parse_pubkey, user_ata_with_program};
+pub use instructions::{BuyV3Accounts, PumpAmmSellV2Accounts, PumpBuyV3Args, PumpSellV3Args, PumpSwapBuilder, SellV3Accounts, parse_pubkey, user_ata_with_program};
 pub use quote::{CurveView, FeeSchedule, FeesBps, QuoteError, QuoteKind};
 pub use jito::{BundleStatus, JITO_TIP_ACCOUNTS, JitoClient, JitoError, apply_tip_floor, bundle_payload, tip_floor_parse_failures};
 pub use raydium::{
