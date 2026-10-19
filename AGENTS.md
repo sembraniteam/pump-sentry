@@ -279,6 +279,59 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   stamp too): provenance only, no custody — old binaries skip it.
   Compaction preserves every stamp (`WalReplay::meta`); the file names
   ALL its writers, not just the last session.
+- Curve completion events are decoded, not assumed
+  (`listener::events`, frozen proofs `complete_mayhem_buy_mainnet.json`
+  + `complete_std_buy_mainnet.json`): `TradeEvent` = curve part
+  (tokens == buyer credit, balance-reconciled), `CompleteEvent` =
+  transition. Both exhausting buys filled ENTIRELY from the curve (no
+  pool part, no migrate in-tx) and both landed the remainder on
+  EXACTLY 206,900,000,000,000 base units — completion is a token floor
+  shared by mayhem and standard curves, not a SOL threshold. So no
+  curve→pool split-fill math exists: over-remainder tickets stay
+  fail-closed in paper (`Exhausted`) and dispatch (`DepletedCurve`),
+  and the chain clamp (`tokens.min`) is the documented divergence, not
+  a pool leg. Recent buys (both completing and ordinary) carry a
+  trailing 25th data byte (`0x00` and `0x01` both observed live, normal
+  fills historically 24) — an evolving wire field of unverified
+  meaning, NOT an exhaust flag (165 non-completing 25-byte buys killed
+  that theory); our 24-byte builder keeps landing alongside 25-byte
+  flow and sims stay green, so nothing is stale — do NOT add the byte
+  without a proven semantic, and treat a future 24-byte sim failure
+  wave as the revisit signal.
+  `PostCompleteBuyEvent` is observed exactly once (Jupiter-routed
+  buy crossing below the floor; user/mint/curve/timestamp pinned, tail
+  opaque): even there every bought token came from the curve, so it
+  marks a floor-crossing fill, not a pool leg — still no curve→pool
+  split-fill math exists anywhere observed.
+- The legacy `buy` discriminator also rides fee-routed 18-account
+  fills (creator/mayhem flow: fee program + buyback wallet +
+  mayhem-linked accounts; trader still at index 6, amount still first
+  u64 — proven across 3 samples with the `TradeEvent` user cross-checked
+  on each, and the amount equals the buyer balance delta to the unit).
+  No new classifier arm was needed: the legacy arm already covers the
+  wider layout, pinned by `replay_legacy_buy_18_mainnet` (+
+  balance-delta twin) against future arm-tightening. (An earlier
+  same-bytes "new discriminator" constant was reverted — the pairwise
+  distinctness test caught the alias.)
+- Exact-quote fills count DELIVERED, not the floor: `min_out` understates
+  whale fills by orders of magnitude (frozen PostComplete sample:
+  min_out 1 vs 6.98T delivered), and undercounting attacker supply
+  biases monopoly screens toward PASS. `extract_pump_swaps` lifts
+  unambiguous exact-quote buys to the buyer+mint balance delta via
+  `max()` — never below today's figure; shared/ambiguous deltas and
+  balance-less txs keep `min_out` (pinned by
+  `replay_exact_quote_lifts_to_delivered_delta`).
+- Mayhem curves complete at the same token floor (proven: mayhem flag
+  set, remainder exactly 206.9T like the standard sample — the earlier
+  "~0.05 SOL" framing confused a coincidence for a threshold) and no
+  pool migration was observed for the sample — no synthetic pool leg
+  exists for them. Paper closes at the stale spot on the complete tick
+  uniformly; live bags park after the retry budget and `sell <mint>`
+  stays refused while complete. There is no better venue: the chain
+  itself refuses post-complete curve sells (`BondingCurveComplete`
+  6005, $0-sim proven), so the refusal (`state.complete → BadOrder`,
+  pinned by `complete_curve_sell_refuses_without_dispatch`) mirrors
+  chain policy and burns no tip.
   `day-state.json` carries `schema` (`day_state::DAY_STATE_SCHEMA`); a
   file from a NEWER schema degrades to a fresh day loudly, never
   adopts guessed numbers. Crash-recovery rules are pinned by tests:

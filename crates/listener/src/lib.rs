@@ -3,6 +3,7 @@
 //! `logsSubscribe` → `getTransaction` → parse → bounded channel.
 //! Hot paths never panic and never block the socket loop.
 
+pub mod events;
 pub mod geyser;
 pub mod parser;
 pub mod screen;

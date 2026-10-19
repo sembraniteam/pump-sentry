@@ -61,6 +61,9 @@ pub fn extract_pump_swaps(
     sig: &str,
 ) -> Vec<SwapRecord> {
     let mut out = Vec::new();
+    // Exact-quote records needing balance-delta correction, with the
+    // mint they spent (shared 17-account layout, mint at index 1).
+    let mut exact_quotes: Vec<(usize, Pubkey, Pubkey)> = Vec::new();
     let tx_with_meta = &fetched.transaction;
     let EncodedTransaction::Json(ui_tx) = &tx_with_meta.transaction else {
         return out;
@@ -136,6 +139,7 @@ pub fn extract_pump_swaps(
             .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0);
+        let idx = out.len();
         out.push(SwapRecord {
             signature: sig.to_string(),
             slot: fetched.slot,
@@ -143,10 +147,72 @@ pub fn extract_pump_swaps(
             side,
             amount_base_units,
         });
+        // Exact-quote correction anchors the mint for the post-pass
+        // (shared 17-account layout, mint at index 1).
+        if side == SwapSide::Buy
+            && raw.starts_with(&PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR)
+            && let Some(mint_idx) = accounts.get(1)
+            && let Some(mint) = keys.get(usize::from(*mint_idx)).copied()
+        {
+            exact_quotes.push((idx, wallet, mint));
+        }
     };
 
     for_each_compiled_ix(raw, &tx_with_meta.meta, &mut classify);
+    correct_exact_quote_amounts(fetched, &mut out, &exact_quotes);
     out
+}
+
+/// Lift exact-quote buys from `min_out` to the delivered balance delta
+/// when unambiguous. `min_out` understates whale fills by orders of
+/// magnitude (frozen PostComplete sample: min_out 1 vs 6.98T delivered),
+/// and undercounting attacker supply biases monopoly screens toward
+/// PASS — the unsafe direction. `max()` never goes below today's
+/// figure; ambiguous (shared wallet+mint across several exact-quote
+/// ixs in one tx) or balance-less txs keep `min_out`.
+fn correct_exact_quote_amounts(
+    fetched: &EncodedConfirmedTransactionWithStatusMeta,
+    out: &mut [SwapRecord],
+    exact_quotes: &[(usize, Pubkey, Pubkey)],
+) {
+    let Some(meta) = fetched.transaction.meta.as_ref() else {
+        return;
+    };
+    let delta = |balances: &OptionSerializer<Vec<UiTransactionTokenBalance>>,
+                 wallet: &Pubkey,
+                 mint: &Pubkey|
+     -> i128 {
+        match balances {
+            OptionSerializer::Some(list) => list
+                .iter()
+                .filter(|b| {
+                    matches!(&b.owner, OptionSerializer::Some(o) if o == &wallet.to_string())
+                        && b.mint == mint.to_string()
+                })
+                .map(|b| b.ui_token_amount.amount.parse::<i128>().unwrap_or(0))
+                .sum(),
+            _ => 0,
+        }
+    };
+    for (idx, wallet, mint) in exact_quotes {
+        // Shared delta unattributable: keep min_out.
+        if exact_quotes
+            .iter()
+            .filter(|(_, w, m)| *w == *wallet && *m == *mint)
+            .count()
+            != 1
+        {
+            continue;
+        }
+        let net = delta(&meta.post_token_balances, wallet, mint)
+            - delta(&meta.pre_token_balances, wallet, mint);
+        if net > 0 {
+            let delivered = net.min(u64::MAX as i128) as u64;
+            if let Some(record) = out.get_mut(*idx) {
+                record.amount_base_units = record.amount_base_units.max(delivered);
+            }
+        }
+    }
 }
 
 /// Count `create` ixs by `dev`. Powers the prior-launch check.

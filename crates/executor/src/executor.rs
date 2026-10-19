@@ -2389,4 +2389,129 @@ mod tests {
             "token-paired: the recipient quote ATA"
         );
     }
+
+    /// A complete curve refuses BEFORE dispatch (no tip can burn on a
+    /// doomed sell). Proven end-to-end by a $0 mainnet sim showing the
+    /// CHAIN refuses too (`BondingCurveComplete` 6005): the refusal
+    /// mirrors chain policy, it is not ours to relax. Mocked reads
+    /// (no network): solvency, mint owner, ATA balance, curve state.
+    #[tokio::test]
+    async fn complete_curve_sell_refuses_without_dispatch() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use solana_client::{rpc_client::RpcClientConfig, rpc_request::RpcRequest};
+        use solana_rpc_client::mock_sender::{MockSender, MocksMap};
+
+        /// Typed wire DTOs (serde, never ad-hoc JSON).
+        #[derive(serde::Serialize)]
+        struct Ctx {
+            slot: u64,
+            #[serde(rename = "apiVersion")]
+            api_version: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct Resp<T: serde::Serialize> {
+            context: Ctx,
+            value: T,
+        }
+        #[derive(serde::Serialize)]
+        struct UiAcct {
+            data: (String, String),
+            executable: bool,
+            lamports: u64,
+            owner: String,
+            #[serde(rename = "rentEpoch")]
+            rent_epoch: u64,
+            space: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct TokAmt {
+            amount: String,
+            decimals: u8,
+            #[serde(rename = "uiAmountString")]
+            ui_amount_string: String,
+        }
+        fn resp<T: serde::Serialize>(value: T) -> serde_json::Value {
+            serde_json::to_value(Resp {
+                context: Ctx {
+                    slot: 1,
+                    api_version: "4.3.0",
+                },
+                value,
+            })
+            .expect("mock response serializes")
+        }
+
+        let creator = Pubkey::new_from_array([9; 32]);
+        let mint = Pubkey::new_from_array([10; 32]);
+        let curve = Pubkey::new_from_array([11; 32]);
+        // Synthetic complete curve (own layout, already pinned): the
+        // refusal keys off `state.complete`, never the chain.
+        let mut curve_data = vec![0u8; 166];
+        curve_data[..8].copy_from_slice(&ids::BONDING_CURVE_DISCRIMINATOR);
+        curve_data
+            [crate::instructions::CURVE_CREATOR_OFFSET..crate::instructions::CURVE_CREATOR_END]
+            .copy_from_slice(creator.as_ref());
+        curve_data[crate::instructions::CURVE_COMPLETE_OFFSET] = 1;
+        let token_prog = crate::instructions::TOKEN_PROGRAM_ID;
+        let ui_account = |owner: &Pubkey, data: &[u8]| {
+            resp(UiAcct {
+                data: (BASE64_STANDARD.encode(data), "base64".to_string()),
+                executable: false,
+                lamports: 1_000_000,
+                owner: owner.to_string(),
+                rent_epoch: 0,
+                space: data.len() as u64,
+            })
+        };
+        let mut mocks = MocksMap::default();
+        mocks.insert(RpcRequest::GetBalance, resp(1_000_000_000u64));
+        // Call order in preflight_sell: mint owner, then curve state.
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            ui_account(&token_prog, &[0u8; 8]),
+        );
+        mocks.insert(
+            RpcRequest::GetTokenAccountBalance,
+            resp(TokAmt {
+                amount: "1000000".to_string(),
+                decimals: 6,
+                ui_amount_string: "1.0".to_string(),
+            }),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            ui_account(&crate::instructions::PUMP_PROGRAM_ID, &curve_data),
+        );
+        let sender = MockSender::new_with_mocks_map("complete-refusal", mocks);
+        let rpc = Arc::new(
+            solana_client::nonblocking::rpc_client::RpcClient::new_sender(
+                sender,
+                RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+            ),
+        );
+        let keypair = Keypair::new();
+        let wallet = WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
+            .expect("wallet");
+        let exec = SwapExecutor::with_rpc(rpc, wallet);
+        let err = exec
+            .preflight_sell(
+                &SellOrder {
+                    mint,
+                    bonding_curve: curve,
+                    associated_bonding_curve: curve,
+                    amount_tokens: 1_000,
+                    min_sol_output: 1,
+                    tip_lamports: 0,
+                    slippage_bps: 200,
+                    creator: Some(creator),
+                },
+                false,
+            )
+            .await
+            .expect_err("complete curve must refuse");
+        assert!(
+            matches!(err, ExecutorError::BadOrder(ref m) if m.contains("curve complete")),
+            "refusal, not dispatch: {err}"
+        );
+    }
 }

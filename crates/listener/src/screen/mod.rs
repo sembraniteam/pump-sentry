@@ -23,7 +23,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiInstruction, UiMessage,
-    UiRawMessage, UiTransactionEncoding, UiTransactionStatusMeta,
+    UiRawMessage, UiTransactionEncoding, UiTransactionStatusMeta, UiTransactionTokenBalance,
     option_serializer::OptionSerializer,
 };
 use std::{
@@ -1260,6 +1260,56 @@ mod tests {
     }
 
     #[test]
+    fn replay_legacy_buy_18_mainnet() {
+        // Fee-routed 18-account buy carrying the LEGACY buy
+        // discriminator (creator/mayhem flow, not canonical v3): the
+        // legacy arm already covers it (Buy, trader at 6, first u64) —
+        // this pins that tolerance against future arm-tightening.
+        // Proven across 3 mainnet samples with the `TradeEvent` user
+        // cross-checked on each.
+        let records = v3_records(include_str!(
+            "../../tests/fixtures/legacy_buy_18_mainnet.json"
+        ));
+        let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
+        assert_eq!(buys.len(), 1, "exactly one fee-routed buy");
+        let r = buys[0];
+        assert_eq!(
+            r.wallet,
+            Pubkey::from_str("ssssswdk4RR8HqkE3uwUWzDbd6mXFTTPjcXBKNzQ57E").expect("wallet")
+        );
+        assert_eq!(r.amount_base_units, 3_731_003_023_340);
+    }
+
+    #[test]
+    fn replay_legacy_buy_18_amount_matches_balance_delta() {
+        // Independent proof: the buyer token-balance delta equals the
+        // classified amount to the unit (same bar as the v2 pin).
+        let raw = include_str!("../../tests/fixtures/legacy_buy_18_mainnet.json");
+        let fetched: solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_str(raw).expect("fixture");
+        let records = extract_pump_swaps(&fetched, "frozen-18");
+        let buy = records
+            .iter()
+            .find(|r| r.side == SwapSide::Buy)
+            .expect("one buy");
+        let meta = fetched.transaction.meta.as_ref().expect("fixture meta");
+        let buyer = buy.wallet.to_string();
+        let delta = |balances: &OptionSerializer<Vec<UiTransactionTokenBalance>>| -> i128 {
+            match balances {
+                OptionSerializer::Some(list) => list
+                    .iter()
+                    .filter(|b| matches!(&b.owner, OptionSerializer::Some(o) if o == &buyer))
+                    .map(|b| b.ui_token_amount.amount.parse::<i128>().unwrap_or(0))
+                    .sum(),
+                _ => 0,
+            }
+        };
+        let net = delta(&meta.post_token_balances) - delta(&meta.pre_token_balances);
+        assert_eq!(net, buy.amount_base_units as i128);
+        assert_eq!(net, 3_731_003_023_340);
+    }
+
+    #[test]
     fn replay_buy_exact_quote_in_v3_mainnet() {
         let records =
             v3_records(include_str!("../../tests/fixtures/buy_exact_quote_in_v3_mainnet.json"));
@@ -1275,5 +1325,19 @@ mod tests {
         // Exact-quote carries (spend, min_out): we attribute the
         // conservative `min_tokens_out` (second u64), never the spend.
         assert!(r.amount_base_units > 0, "min_tokens_out must decode");
+    }
+
+    #[test]
+    fn replay_exact_quote_lifts_to_delivered_delta() {
+        // The PostComplete capture is an exact-quote buy with min_out 1
+        // that delivered 6,979,344,739,455 base units: forensics must
+        // count delivered, not the floor (undercounting biases monopoly
+        // screens toward PASS — the unsafe direction).
+        let records = v3_records(include_str!(
+            "../../tests/fixtures/post_complete_buy_mainnet.json"
+        ));
+        let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
+        assert_eq!(buys.len(), 1, "exactly one exact-quote buy");
+        assert_eq!(buys[0].amount_base_units, 6_979_344_739_455);
     }
 }

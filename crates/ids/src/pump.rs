@@ -54,6 +54,19 @@ pub const PUMP_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64,
 pub const PUMP_MIGRATE_DISCRIMINATOR: [u8; 8] = [155, 234, 231, 146, 236, 158, 162, 30];
 /// `migrate_v2` discriminator (pump-coin quotes, per-IDL account order).
 pub const PUMP_MIGRATE_V2_DISCRIMINATOR: [u8; 8] = [187, 203, 18, 31, 206, 237, 254, 41];
+/// Anchor CPI event discriminators (`sha256("event:<Name>")[..8]`).
+/// Observed on mainnet in program logs AND `emit_cpi` self-CPI ixs
+/// (both carry the same bytes): `TradeEvent` dozens per block,
+/// `CompleteEvent` on the exhausting buy (frozen proof:
+/// `complete_mayhem_buy_mainnet.json`, balance-reconciled).
+/// `PostCompleteBuyEvent` is COMPUTED but UNOBSERVED (no pool-part
+/// transaction found to date): the constant exists so a future
+/// capture has a name to pin, but nothing parses it — decoding an
+/// unseen layout would be fabrication.
+pub const TRADE_EVENT_DISCRIMINATOR: [u8; 8] = [0xbd, 0xdb, 0x7f, 0xd3, 0x4e, 0xe6, 0x61, 0xee];
+pub const COMPLETE_EVENT_DISCRIMINATOR: [u8; 8] = [0x5f, 0x72, 0x61, 0x9c, 0xd4, 0x2e, 0x98, 0x08];
+pub const POST_COMPLETE_BUY_EVENT_DISCRIMINATOR: [u8; 8] =
+    [0x6f, 0xb0, 0x6d, 0x8b, 0x31, 0x6c, 0xd5, 0xfb];
 /// Pool account index in `migrate` (per pump IDL).
 pub const MIGRATE_POOL_ACCOUNT_INDEX: usize = 9;
 /// Pool account index in `migrate_v2` (per pump IDL).
@@ -127,6 +140,27 @@ mod tests {
     }
 
     #[test]
+    fn event_discriminators_follow_anchor_convention() {
+        // Anchor event discs are `sha256("event:<Name>")[..8]` — the
+        // same bytes the chain emits in logs and `emit_cpi` ixs. This
+        // pins the constants to the convention, not to each other;
+        // OBSERVATION (not this test) is what admits an event:
+        // Trade/Complete matched live logs, PostComplete has no
+        // capture yet (see the const docs).
+        use sha2::{Digest, Sha256};
+        let disc = |name: &str| -> [u8; 8] {
+            let hash = Sha256::digest(format!("event:{name}").as_bytes());
+            hash[..8].try_into().expect("8 bytes")
+        };
+        assert_eq!(disc("TradeEvent"), TRADE_EVENT_DISCRIMINATOR);
+        assert_eq!(disc("CompleteEvent"), COMPLETE_EVENT_DISCRIMINATOR);
+        assert_eq!(
+            disc("PostCompleteBuyEvent"),
+            POST_COMPLETE_BUY_EVENT_DISCRIMINATOR
+        );
+    }
+
+    #[test]
     fn discriminators_are_pairwise_distinct() {
         // A copy would alias two kinds in one parser arm.
         let discs = [
@@ -141,6 +175,9 @@ mod tests {
             PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR,
             PUMP_MIGRATE_DISCRIMINATOR,
             PUMP_MIGRATE_V2_DISCRIMINATOR,
+            TRADE_EVENT_DISCRIMINATOR,
+            COMPLETE_EVENT_DISCRIMINATOR,
+            POST_COMPLETE_BUY_EVENT_DISCRIMINATOR,
         ];
         for (i, a) in discs.iter().enumerate() {
             for b in &discs[i + 1..] {
