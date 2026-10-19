@@ -32,7 +32,6 @@ operator with RPC access can close them.
   to resolve per-tx versions; freeze the first v1 past the old slot.
 
 ## Gap 2: PumpSwap WSOL-quoted executable pool — CLOSED 2026-10-16
-
 - Have (fail-closed pin, keep): `pumpswap_pool_mainnet.json` (`GeWJCT...`) is a depth-2
   pump-coin quote — deliberately non-executable, the trust gate refuses
   it (`is_wsol_quoted() == false` is asserted in
@@ -46,6 +45,28 @@ operator with RPC access can close them.
   `via == "getAccountInfo"` provenance).
 - Do not mutate the existing depth-2 fixture: it pins the fail-closed
   path.
+
+## Finding (2026-10-19): live-state fixtures decay three ways — re-freeze is a treadmill
+
+- The v3 layout probe starved on public RPC (`largest-accounts`
+  throttled + fixture traders flipped/closed ATAs), so a re-freeze was
+  attempted — and REVERTED the same day, with evidence:
+  1. **Holder churn**: old fixtures' traders sell/close ATAs within
+     weeks (`funded_base=0`, `fixture fallback ATA missing on-chain`).
+  2. **Graduation**: a fill frozen minutes earlier replayed against a
+     graduated curve (`BondingCurveComplete`) — any fixture can die
+     between freeze and replay.
+  3. **Thin bench + fail-fast**: a young-curve fixture (live, 20
+     holders) panicked the probe on its first WSOL-less candidate
+     (`insufficient funds`) — `sim_skeleton_green` panics on layout
+     verdicts instead of skipping poor candidates, so one poor holder
+     aborts the run. A re-freeze that greens needs a MID-curve
+     (deep bench, far from graduation): narrow window, same decay.
+- Conclusion: do NOT re-freeze on a schedule. Run the layout probes
+  against a keyed RPC (indexed methods work → the live
+  largest-holders path needs no fresh fixture at all; proven green
+  2026-10-19). Re-freeze only if the throttled path must pass on
+  public RPC, and expect to redo it within weeks.
 
 ## How to freeze (no fabrication)
 

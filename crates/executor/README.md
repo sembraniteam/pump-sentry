@@ -38,8 +38,14 @@ MAINNET_LAYOUT=1 PUMP_ACCEPTANCE_POOL=<pool> [PUMP_ACCEPTANCE_HOLDER=<token acct
 All four probes are simulation-only ($0 by construction: unfunded
 payers, nothing sent); rerun on throttled/stale samples. Probes dial
 `MAINNET_RPC_URL` when set (dedicated RPC recommended: the public node
-429s after bulk scans). The creatorless probe needs any WSOL-quoted
-PumpSwap pool whose `coin_creator` is the default key;
+429s after bulk scans). The creatorless probe needs `PUMP_ACCEPTANCE_POOL`
+(a WSOL-quoted PumpSwap pool with default `coin_creator`; known-good
+2026-10-19: `7h4HzxjKWzKYddmsEjLfoqWYqGqC5cHats6W7D9ZF6t6`
+(net 175292, gap 531 ≈ the 30 bps tier) — early-era pools carry default
+creators while active ones set them; resample
+(`BqSFJWicNwh7PfppBqsmzxinDuJyqmunwfEv6fD4zhvK` also green with teeth;
+`XVJ99qcNErahwPWqN6j2u1za27Pq1pTzDjYmznXtcwW` greens vacuously, net 18
+lamports collapses both floors — avoid);
 `PUMP_ACCEPTANCE_HOLDER` names a funded base-side token account only for
 legacy pools whose trades predate public signature windows (otherwise a
 holder is found automatically). None of these variables is read by the
