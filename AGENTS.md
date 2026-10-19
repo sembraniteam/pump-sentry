@@ -294,10 +294,16 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   trailing 25th data byte (`0x00` and `0x01` both observed live, normal
   fills historically 24) — an evolving wire field of unverified
   meaning, NOT an exhaust flag (165 non-completing 25-byte buys killed
-  that theory); our 24-byte builder keeps landing alongside 25-byte
-  flow and sims stay green, so nothing is stale — do NOT add the byte
-  without a proven semantic, and treat a future 24-byte sim failure
-  wave as the revisit signal.
+  that theory); a later 400-block census also found 26-byte variants
+  coexisting, with 24-byte fills still landing — our 24-byte builder
+  keeps working and sims stay green, so nothing is stale. Do NOT add
+  trailing bytes without a proven semantic, and treat a future 24-byte
+  sim failure wave as the revisit signal. Over-remainder behavior is
+  settled by the same census: 389 arg==delivered against ZERO partial
+  fills, plus 42 `BondingCurveComplete` failures — oversize attempts
+  FAIL on chain instead of clamping or splitting, so fail-closed
+  (`Exhausted`/`DepletedCurve`) mirrors chain reality and the quote
+  `tokens.min` is estimation convenience, not a fill path.
   `PostCompleteBuyEvent` is observed exactly once (Jupiter-routed
   buy crossing below the floor; user/mint/curve/timestamp pinned, tail
   opaque): even there every bought token came from the curve, so it
@@ -313,6 +319,21 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   balance-delta twin) against future arm-tightening. (An earlier
   same-bytes "new discriminator" constant was reverted — the pairwise
   distinctness test caught the alias.)
+- Three-way fee accounting (charged vs direct vs held), conservation-proven
+  on a frozen mainnet buy (modeled cost+proto+creator == curve_delta +
+  buyback_delta to the lamport): the TRADER is charged cost + protocol +
+  creator (the full venue basis in every fill price, paper and live);
+  the buyback recipient transfer ([13], SOL, in-tx) is carved from the
+  protocol leg by the program — never an added charge, so no buyback
+  bps exists anywhere in the math (rate holds universal 47.5 bps of
+  event SOL, n=333 min==median==max; exactly half the 95 bps protocol
+  leg on the proven sample); the held remainder (protocol rest +
+  creator) sits in curve reserves, likewise inside the price. Nothing in
+  the codebase debits recipient flows (no recipient-balance
+  reconciliation exists by design); debits are only chain-paid overhead
+  (tip/priority/base/rent) while venue costs ride fill prices. The
+  mayhem sample paid zero buyback (all-held legs) with the model still
+  exact — carved-when-present, never added. Do NOT add a buyback bps.
 - Exact-quote fills count DELIVERED, not the floor: `min_out` understates
   whale fills by orders of magnitude (frozen PostComplete sample:
   min_out 1 vs 6.98T delivered), and undercounting attacker supply

@@ -156,6 +156,10 @@ impl CurveReserves {
     /// ceil). `None` when the curve cannot absorb the ticket: drained
     /// reserves, or a fill that would consume every remaining real
     /// token — the chain refuses that buy, so paper must too.
+    /// The `fee_bps_per_side` total (protocol + creator) is the
+    /// trader's FULL venue cost: the in-tx buyback transfer is carved
+    /// from the protocol leg by the program (conservation-proven on a
+    /// frozen mainnet fill), never an added charge — do not add it here.
     pub fn buy_tokens_base(&self, sol_lamports: u64, fee_bps_per_side: f64) -> Option<u64> {
         if sol_lamports == 0 || self.vt_base == 0 {
             return Some(0);

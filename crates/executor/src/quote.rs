@@ -183,6 +183,15 @@ pub fn curve_fee_bps(
 }
 
 /// Fee-inclusive cost to buy `amount`. Over-remainder fails closed.
+///
+/// Fee basis is protocol + creator ONLY — and that is the trader's FULL
+/// venue cost, not a partial one. The buyback recipient transfer seen
+/// in-tx ([13], SOL, direct) is carved from the protocol leg by the
+/// program, never charged on top: on a frozen mainnet buy the modeled
+/// total (cost + proto + creator) equaled curve_delta + buyback_delta
+/// to the lamport, and sims at modeled floors stay green. Do NOT add
+/// a buyback bps: it would double-count a leg the trader already pays
+/// inside `proto`.
 pub fn buy_cost_incl_fees(
     schedule: &FeeSchedule,
     gate_on: bool,
