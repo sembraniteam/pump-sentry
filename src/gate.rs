@@ -7,7 +7,7 @@ use alert::Alerter;
 use auditor::RugCheckError;
 use curve::{CurveError, PriceTick};
 use listener::{
-    BundleVerdict, EntryGate, GateOutcome, PUMP_PROGRAM_ID, ScreenError,
+    BundleVerdict, EntryGate, GateOutcome, PUMP_PROGRAM_ID, ScreenError, tape_volume_base_units,
 };
 use risk_engine::{
     Action, DecisionSource, RiskDecision, SCALP_TP_MIN, StrategyConfig, StrategyMode, TokenMetrics,
@@ -153,6 +153,9 @@ struct OpenRequest<'a> {
     mint: &'a str,
     signal: &'a PendingSignal,
     buyers: u32,
+    /// Confirming round's tape volume in base units (6-decimal basis;
+    /// spot-priced to USD at the confirm quote).
+    tape_base_units: u64,
     allow_live: bool,
     creation_slot_buys: Option<u32>,
     cluster_pct: Option<f64>,
@@ -465,12 +468,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .await;
         // Phase 2: gate machine.
         enum GateStep {
-            Confirmed(u32, PendingSignal),
+            Confirmed(u32, u64, PendingSignal),
             Aborted(String),
             Waiting,
             Stale,
         }
-        let mut confirmed: Vec<(String, PendingSignal, u32)> = Vec::new();
+        let mut confirmed: Vec<(String, PendingSignal, u32, u64)> = Vec::new();
         for (mint, mut signal, observed) in observations {
             let (swaps, newest) = match observed {
                 Ok(CurveRead::Full { swaps, watermark }) => (swaps, watermark),
@@ -551,7 +554,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         match state.gate.observe(&mint, &swaps, now_secs()) {
                             GateOutcome::Confirm { buyers } => {
                                 state.meta.remove(&mint);
-                                GateStep::Confirmed(buyers, signal.clone())
+                                // Tape volume rides the confirm: the same
+                                // swaps that made quorum, in base units.
+                                let tape = tape_volume_base_units(&swaps);
+                                GateStep::Confirmed(buyers, tape, signal.clone())
                             }
                             GateOutcome::Abort { reason } => {
                                 state.meta.remove(&mint);
@@ -563,7 +569,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 }
             };
             match step {
-                GateStep::Confirmed(buyers, sig) => confirmed.push((mint, sig, buyers)),
+                GateStep::Confirmed(buyers, tape, sig) => confirmed.push((mint, sig, buyers, tape)),
                 GateStep::Aborted(reason) => {
                     info!(%mint, %reason, "gate abort");
                 }
@@ -573,7 +579,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Phase 3: forensics plus opens.
         if !confirmed.is_empty() {
             use futures_util::stream::{self, StreamExt};
-            stream::iter(confirmed.into_iter().map(|(mint, signal, buyers)| async move {
+            stream::iter(confirmed.into_iter().map(|(mint, signal, buyers, tape)| async move {
                 // Reject drops; suspect is paper-only.
                 match self
                     .screener
@@ -587,10 +593,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                     Ok(analysis) if analysis.verdict == BundleVerdict::SuspectLowVolume => {
                         info!(%mint, "bundle suspect: paper-only, live dispatch skipped");
-                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, allow_live: false, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
+                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, tape_base_units: tape, allow_live: false, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
                     }
                     Ok(analysis) => {
-                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, allow_live: true, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
+                        self.confirm_open(&OpenRequest { mint: &mint, signal: &signal, buyers, tape_base_units: tape, allow_live: true, creation_slot_buys: Some(analysis.creation_slot_buys as u32), cluster_pct: Some(analysis.total_cluster_supply_pct) }).await;
                     }
                     Err(e) => {
                         warn!(%mint, error = %ids::redact_urls_in_text(&e.to_string()), "bundle screen error; dropping (fail-closed)");
@@ -695,6 +701,26 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return;
             }
         }
+        // Holder concentration, only when armed (`0` = off, costing no
+        // reads): the ten largest holders own this % of supply. Over
+        // the cap — or unreadable while armed — drops the signal
+        // (fail-closed); exits and held bags are untouched.
+        let holder_cap = self.settings.max_top_holder_pct;
+        if holder_cap > 0.0 && holder_cap.is_finite() {
+            match self.screener.top_holder_pct(mint).await {
+                Ok(pct) if pct <= holder_cap => {
+                    info!(%mint, top10_pct = format!("{pct:.1}"), "holder concentration within cap");
+                }
+                Ok(pct) => {
+                    warn!(%mint, top10_pct = format!("{pct:.1}"), cap = holder_cap, "holder concentration over cap; dropping signal");
+                    return;
+                }
+                Err(e) => {
+                    warn!(%mint, error = %ids::redact_urls_in_text(&e.to_string()), "holder concentration unreadable while cap armed; dropping signal (fail-closed)");
+                    return;
+                }
+            }
+        }
 
         // Confirm-time insider re-screen: dev history goes stale
         // between watchlist intake and quorum (serial launchers, fresh
@@ -754,6 +780,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Unmeasured: no reserve field carries curve progress; the
             // prompt assumes its spread prior when absent.
             curve_progress: None,
+            // Confirming tape spot-priced at the confirm quote (the
+            // 6-decimal sizing basis is proven above): `None` on an
+            // empty tape, never a zero that reads as "no demand".
+            volume_usd: if req.tape_base_units > 0 {
+                let v = req.tape_base_units as f64 / 1_000_000.0 * entry_quote;
+                v.is_finite().then_some(v)
+            } else {
+                None
+            },
         };
         // Model call timed: entry latency is sniper budget (raise
         // INFERENCE_TIMEOUT_MS only knowing it costs entry price).
@@ -774,11 +809,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Some(engine) => {
                 info!(%mint, source = ?decision.source, latency_ms = started.elapsed().as_millis(),
                     fallbacks = engine.fallback_count(), timeouts = engine.timeout_count(),
-                    invalid = engine.invalid_count(),
+                    invalid = engine.invalid_count(), volume_usd = ?metrics.volume_usd,
                     "risk decided at confirm");
             }
             None => {
                 warn!(%mint, source = ?decision.source, latency_ms = started.elapsed().as_millis(),
+                    volume_usd = ?metrics.volume_usd,
                     "risk heuristic fallback (no engine)");
             }
         }
@@ -1076,6 +1112,36 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     mark = format!("{entry_quote:.10}"),
                     tp = profile.tp_percent, sl = profile.sl_percent,
                     equity = format!("{:.2}", snap.equity), "paper position opened");
+                // Liquidity-aware exit preview for the size just booked:
+                // what a full exit nets now (SOL and USD) and under
+                // drained books. Log-only sizing context — no cap
+                // exists, so nothing refuses here; measurement first.
+                if let Some(qty) = portfolio.position(id).map(|p| p.quantity)
+                    && let Some(proceeds) =
+                        portfolio
+                            .fill_for_mint(mint)
+                            .exit_proceeds(Side::Long, &mark, qty)
+                {
+                    let usd = |v: f64| {
+                        if v.is_finite() {
+                            format!("{v:.2}")
+                        } else {
+                            "n/a".to_string()
+                        }
+                    };
+                    let in_sol = match sol {
+                        Some((sol_usd, _)) if sol_usd.is_finite() && sol_usd > 0.0 => {
+                            format!("{:.4}", proceeds.realizable_usd / sol_usd)
+                        }
+                        _ => "n/a".to_string(),
+                    };
+                    info!(%mint, realizable_usd = usd(proceeds.realizable_usd),
+                        realizable_sol = in_sol,
+                        discount_bps = format!("{:.0}", proceeds.discount_bps),
+                        half_liq_usd = usd(proceeds.stressed[0].1),
+                        quarter_liq_usd = usd(proceeds.stressed[1].1),
+                        "exit proceeds at current and drained depth");
+                }
                 // Decision record: the paper open plus the risk engine
                 // provenance that shaped its profile.
                 if let Some(j) = self.journal() {

@@ -518,6 +518,41 @@ impl RpcScreener {
         }
     }
 
+    /// Top-10 holder share of supply, percent. Two bounded reads behind
+    /// the screening deadline; any unreadable leg fails closed (`Err`).
+    /// Base-unit string math (the ratio needs no decimals): unparseable
+    /// amounts or a zero supply refuse rather than price a fiction.
+    pub async fn top_holder_pct(&self, mint: &Pubkey) -> Result<f64, ScreenError> {
+        let bad = |what: &str| ScreenError::BadAddress(format!("{what} for {mint}"));
+        let (largest, supply) = match with_screen_timeout(async {
+            let largest = self.rpc.get_token_largest_accounts(mint).await?;
+            let supply = self.rpc.get_token_supply(mint).await?;
+            Ok::<_, ScreenError>((largest, supply))
+        })
+        .await
+        {
+            None => return Err(ScreenError::Timeout("top_holder_pct")),
+            Some(result) => result?,
+        };
+        let supply_units: u128 = supply
+            .amount
+            .parse()
+            .map_err(|_| bad("unparseable supply"))?;
+        if supply_units == 0 {
+            return Err(bad("zero supply"));
+        }
+        let mut top: u128 = 0;
+        for (i, acc) in largest.iter().take(10).enumerate() {
+            let units: u128 = acc
+                .amount
+                .amount
+                .parse()
+                .map_err(|_| bad(&format!("unparseable top-{} balance", i + 1)))?;
+            top = top.saturating_add(units);
+        }
+        Ok(top as f64 / supply_units as f64 * 100.0)
+    }
+
     /// Hunt the migration tx for a graduated curve.
     /// Raydium hits need the trust gate (owner, WSOL base, quote).
     /// `None` when nothing found. Bounded by timeout.

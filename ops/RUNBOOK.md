@@ -107,7 +107,7 @@ What `pause` does (and does not do):
   confirm while paused are skipped at the open (not queued).
 - All other limits stay in force: `notional_usd`, `max_open_positions`,
   `max_exposure_usd`, `max_daily_loss_usd`, `max_expected_entry_gap_usd`,
-  `hot_wallet_max_sol`.
+  `max_top_holder_pct`, `hot_wallet_max_sol`.
 - The marker survives `stop`/`start`/`restart` and crashes: the bot
   comes back paused until `resume`. If the state dir is lost (fresh VM,
   `--purge`), it comes back **unpaused** — check `status` after a

@@ -636,6 +636,7 @@ mod tests {
             creation_slot_buys: None,
             cluster_pct: None,
             curve_progress: None,
+            volume_usd: None,
         }
     }
 

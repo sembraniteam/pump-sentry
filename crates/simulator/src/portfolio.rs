@@ -233,7 +233,10 @@ impl PaperPortfolio {
             .unwrap_or_else(|| self.fill.venue_fee_bps())
     }
 
-    fn fill_for_mint(&self, mint: &str) -> FillModel {
+    /// Fill model for one mint (per-mint tier when registered):
+    /// the same model the book settles with, so entry previews quote
+    /// what the exit will actually net.
+    pub fn fill_for_mint(&self, mint: &str) -> FillModel {
         match self.venue_fees.get(mint) {
             Some(fee) => self.fill.with_venue_fee_bps(*fee),
             None => self.fill,

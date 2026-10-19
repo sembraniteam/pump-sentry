@@ -54,6 +54,11 @@ pub struct Settings {
     /// worse than this (live paid more than paper by more than the
     /// cap). Thin cells (unknown) always allow; exits never block.
     pub max_expected_entry_gap_usd: f64,
+    /// Top-10 holder concentration cap in percent of supply (`0` = off):
+    /// refuses an open when the ten largest holders own more than this.
+    /// Unreadable holdings refuse while armed (fail-closed); exits never
+    /// block.
+    pub max_top_holder_pct: f64,
     /// Hot-wallet ceiling in SOL (`0` = off): entries refuse while the
     /// wallet holds more than this. Exits always work.
     pub hot_wallet_max_sol: f64,
@@ -164,6 +169,7 @@ impl std::fmt::Debug for Settings {
                 "max_expected_entry_gap_usd",
                 &self.max_expected_entry_gap_usd,
             )
+            .field("max_top_holder_pct", &self.max_top_holder_pct)
             .field("hot_wallet_max_sol", &self.hot_wallet_max_sol)
             .field("mint_cooldown_secs", &self.mint_cooldown_secs)
             .field("dev_min_age_secs", &self.dev_min_age_secs)
@@ -260,6 +266,7 @@ impl Settings {
                 0.0,
                 &mut notes,
             ),
+            max_top_holder_pct: get_float(vars, "MAX_TOP_HOLDER_PCT", 0.0, &mut notes),
             hot_wallet_max_sol: get_float(vars, "HOT_WALLET_MAX_SOL", 0.0, &mut notes),
             mint_cooldown_secs: get_int(vars, "MINT_COOLDOWN_SECS", 3600, &mut notes),
             dev_min_age_secs: get_int(vars, "DEV_MIN_AGE_SECS", 3600, &mut notes),
@@ -376,6 +383,17 @@ impl Settings {
             out.push(format!(
                 "MAX_EXPECTED_ENTRY_GAP_USD={} is invalid; entry bleed cap disabled",
                 self.max_expected_entry_gap_usd
+            ));
+        }
+        if self.max_top_holder_pct < 0.0 || !self.max_top_holder_pct.is_finite() {
+            out.push(format!(
+                "MAX_TOP_HOLDER_PCT={} is invalid; holder concentration cap disabled",
+                self.max_top_holder_pct
+            ));
+        } else if self.max_top_holder_pct > 100.0 {
+            out.push(format!(
+                "MAX_TOP_HOLDER_PCT={} exceeds 100%: no holding can refuse, the cap never fires",
+                self.max_top_holder_pct
             ));
         }
         if self.hot_wallet_max_sol < 0.0 || !self.hot_wallet_max_sol.is_finite() {
@@ -940,6 +958,7 @@ mod tests {
 
     #[test]
     fn entry_bleed_cap_parses_and_warns() {
+
         let s = Settings::from_map(&HashMap::new());
         assert_eq!(s.max_expected_entry_gap_usd, 0.0, "off by default");
         let s = Settings::from_map(&vars(&[("MAX_EXPECTED_ENTRY_GAP_USD", "0.75")]));
@@ -960,6 +979,35 @@ mod tests {
             "{:?}",
             s.warnings()
         );
+    }
+
+    #[test]
+    fn holder_concentration_cap_parses_and_warns() {
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.max_top_holder_pct, 0.0, "off by default");
+        let s = Settings::from_map(&vars(&[("MAX_TOP_HOLDER_PCT", "40")]));
+        assert_eq!(s.max_top_holder_pct, 40.0);
+        assert!(
+            !s.warnings()
+                .iter()
+                .any(|w| w.contains("MAX_TOP_HOLDER_PCT")),
+            "{:?}",
+            s.warnings()
+        );
+        // Garbage reads as disabled, loudly — never silently armed.
+        let s = Settings::from_map(&vars(&[("MAX_TOP_HOLDER_PCT", "-1")]));
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("MAX_TOP_HOLDER_PCT=-1")),
+            "{:?}",
+            s.warnings()
+        );
+        // A cap above 100% never fires: say so.
+        let w = Settings::from_map(&vars(&[("MAX_TOP_HOLDER_PCT", "120")]))
+            .warnings()
+            .join("\n");
+        assert!(w.contains("never fires"), "{w}");
     }
 
     #[test]

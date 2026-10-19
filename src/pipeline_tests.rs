@@ -531,6 +531,8 @@ struct StubScreenerInner {
     bundle: StdMutex<BundleOutcome>,
     migration: StdMutex<Option<MigrationReport>>,
     truncated: std::sync::atomic::AtomicBool,
+    /// Canned top-10 holder share (`None` = RPC failure).
+    top_holders: StdMutex<Option<f64>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -551,6 +553,7 @@ impl StubScreener {
                 bundle: StdMutex::new(BundleOutcome::Safe),
                 migration: StdMutex::new(None),
                 truncated: std::sync::atomic::AtomicBool::new(false),
+                top_holders: StdMutex::new(None),
             }),
         }
     }
@@ -575,6 +578,13 @@ impl StubScreener {
             .lock()
             .expect("lock")
             .insert(mint.to_string(), swaps);
+        stub
+    }
+
+    /// Canned top-10 holder share (`None` = RPC failure).
+    fn with_swaps_and_top_holders(mint: &str, swaps: Vec<SwapRecord>, pct: Option<f64>) -> Self {
+        let stub = Self::with_swaps(mint, swaps);
+        *stub.inner.top_holders.lock().expect("lock") = pct;
         stub
     }
 }
@@ -672,6 +682,14 @@ impl Screener for StubScreener {
     ) -> Result<Option<MigrationReport>, ScreenError> {
         let found = self.inner.migration.lock().expect("lock").clone();
         Ok(found)
+    }
+
+    async fn top_holder_pct(&self, _mint: &str) -> Result<f64, ScreenError> {
+        self.inner
+            .top_holders
+            .lock()
+            .expect("lock")
+            .ok_or_else(|| ScreenError::BadAddress("stub".to_string()))
     }
 }
 
@@ -1338,6 +1356,60 @@ async fn entry_bleed_cap_blocks_only_proven_bleeders() {
         pipe.portfolio.lock().await.position_ids().len(),
         1,
         "cap off disables the gate"
+    );
+}
+
+fn holder_pipe(cap_pct: f64, holders: Option<f64>) -> BleedPipe {
+    let mut settings = Settings::from_map(&HashMap::new());
+    settings.max_top_holder_pct = cap_pct;
+    pipeline_screened(
+        settings,
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        StubScreener::with_swaps_and_top_holders(
+            MINT,
+            buyer_swaps(MINT, &[11, 12, 13, 14, 15]),
+            holders,
+        ),
+        None,
+    )
+}
+
+#[tokio::test]
+async fn holder_concentration_cap_blocks_whale_mints() {
+    // Top-10 own 60% against a 50% cap: nothing opens.
+    let pipe = holder_pipe(50.0, Some(60.0));
+    launch_once(&pipe).await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "concentrated supply must refuse the open"
+    );
+
+    // Within cap: opens.
+    let pipe = holder_pipe(50.0, Some(30.0));
+    launch_once(&pipe).await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "distributed supply opens"
+    );
+
+    // Cap off: the read never runs (concentrated supply still opens).
+    let pipe = holder_pipe(0.0, Some(60.0));
+    launch_once(&pipe).await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "cap off disables the read"
+    );
+
+    // Unreadable holdings while armed: fail closed.
+    let pipe = holder_pipe(50.0, None);
+    launch_once(&pipe).await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "unknown concentration must refuse while armed"
     );
 }
 

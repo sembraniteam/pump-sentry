@@ -40,6 +40,12 @@ pub struct TokenMetrics {
     /// prompt assumes the static 2–4% spread prior when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curve_progress: Option<f64>,
+    /// Trailing-tape token volume in USD (`None` = unknown): the
+    /// confirming round's observed swaps spot-priced at the confirm
+    /// quote (6-decimal sizing basis). A proxy, not an audit — fills
+    /// inside the window printed at their own prices, not today's spot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_usd: Option<f64>,
 }
 
 /// Model output: TP/SL plus exit policy.
@@ -126,7 +132,7 @@ pub const MAX_TIMEOUT_SECS: u64 = 3600;
 pub const MIN_TIMEOUT_SECS: u64 = 1;
 
 /// System instruction sent to the model.
-pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.\nOutput schema (exact key names and types): {\"action\":\"BUY\" or \"PASS\",\"tp_percent\":number,\"sl_percent\":number,\"trailing_stop\":boolean,\"timeout_seconds\":integer,\"moonbag_percent\":number}. For PASS use \"action\":\"PASS\" with all other fields 0 or false.";
+pub const SYSTEM_PROMPT: &str = "You are an ultra-fast quantitative risk engine for volatile Solana memecoins.\nEvaluate token metrics and return optimal Take-Profit (TP) and Stop-Loss (SL) percentages.\nOutput strictly valid JSON with no markdown formatting, preamble, or comments.\nRules: dev_reputation below 0.40 or rugcheck_score above 350 or buy_velocity_5s below 5 means PASS. High momentum (velocity above 25 with liquidity above $20000): TP 45 to 100, SL -10, trailing true, timeout 180, moonbag 20. Moderate momentum (velocity 5 to 25 with liquidity at least $10000): TP 30 to 50, SL -8, trailing false, timeout 90, moonbag 0. Otherwise (low liquidity or stagnant volume): PASS, never buy dead tokens. Curve progress is currently unmeasured (curve_progress null): assume bonding-curve spread and impact run 2 to 4 percent, so never set SL tighter than -8. The payload carries venue_fee_bps when the fee tier is known (bps per side; absent means the standard 125bps tier). Round-trip venue cost is about 2*venue_fee_bps/100 percent: never set SL tighter than that cost plus margin, so on wide tiers (venue_fee_bps above 125) widen SL past it instead. High velocity with high creation_slot_buys or cluster_pct is suspect wash momentum: prefer PASS or the moderate band, never high-momentum TP. Thin trailing volume (low volume_usd) against high velocity is the same suspect wash: tape without size is quoting, not demand — prefer PASS. Hard bounds: BUY requires TP 10 to 1000, SL -100 to -8, timeout 1 to 3600, moonbag 0 to under 100; PASS must be all-zero with trailing false.\nOutput schema (exact key names and types): {\"action\":\"BUY\" or \"PASS\",\"tp_percent\":number,\"sl_percent\":number,\"trailing_stop\":boolean,\"timeout_seconds\":integer,\"moonbag_percent\":number}. For PASS use \"action\":\"PASS\" with all other fields 0 or false.";
 
 /// Inference input payload: the skill's `INPUT PAYLOAD` keys. Unknowns
 /// ship as `null`, never omitted — the model reads absent/null as
@@ -141,6 +147,7 @@ struct InputPayload {
     creation_slot_buys: Option<u32>,
     cluster_pct: Option<f64>,
     curve_progress: Option<f64>,
+    volume_usd: Option<f64>,
 }
 
 impl TokenMetrics {
@@ -155,6 +162,7 @@ impl TokenMetrics {
             creation_slot_buys: self.creation_slot_buys,
             cluster_pct: self.cluster_pct,
             curve_progress: self.curve_progress,
+            volume_usd: self.volume_usd,
         };
         // Plain scalars only: serialization cannot fail.
         serde_json::to_string(&payload).expect("input payload serializes")
@@ -181,6 +189,7 @@ mod tests {
             creation_slot_buys: None,
             cluster_pct: None,
             curve_progress: None,
+            volume_usd: Some(1_250.0),
         };
         let value: serde_json::Value =
             serde_json::from_str(&metrics.to_input_payload()).expect("valid JSON");
@@ -189,6 +198,7 @@ mod tests {
         assert_eq!(value["dev_reputation"], 0.8);
         assert_eq!(value["rugcheck_score"], 120);
         assert_eq!(value["venue_fee_bps"], 125.0);
+        assert_eq!(value["volume_usd"], 1_250.0);
     }
 
     #[test]

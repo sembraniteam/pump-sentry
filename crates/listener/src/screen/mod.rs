@@ -57,6 +57,7 @@ pub use rpc::{
 pub use swaps::{
     IDX_CREATE_USER, IDX_SWAP_USER, IDX_SWAP_V2_USER, IDX_SWAP_V3_USER, SwapRecord,
     SwapSide, count_dev_creates, extract_pump_swaps, fixture_wallet, json_tx_config, parse_address,
+    tape_volume_base_units,
 };
 /// Screening failures: config, keys, transport.
 #[derive(Error, Debug)]
@@ -491,8 +492,33 @@ mod tests {
     }
 
     #[test]
-    fn gate_confirms_on_quorum() {
-        let mut gate = EntryGate::new(60, 3);
+    fn tape_volume_sums_both_sides_saturating() {
+        let rec = |side: SwapSide, amount: u64| SwapRecord {
+            signature: "s".to_string(),
+            slot: 1001,
+            wallet: Pubkey::new_from_array([11; 32]),
+            side,
+            amount_base_units: amount,
+        };
+        // Both sides count; undecodable (0-amount) records add nothing.
+        assert_eq!(
+            tape_volume_base_units(&[
+                rec(SwapSide::Buy, 1_000_000),
+                rec(SwapSide::Sell, 500_000),
+                rec(SwapSide::Unknown, 0),
+            ]),
+            1_500_000
+        );
+        assert_eq!(tape_volume_base_units(&[]), 0);
+        // Adversarial tape never wraps: saturation caps the proxy.
+        assert_eq!(
+            tape_volume_base_units(&[rec(SwapSide::Buy, u64::MAX), rec(SwapSide::Buy, 1)]),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn gate_confirms_on_quorum() {        let mut gate = EntryGate::new(60, 3);
         let dev = Pubkey::new_from_array([7; 32]);
         assert!(gate.submit("MINT", &dev.to_string(), 1000));
         let buyers = [11u8, 12, 13].map(|b| SwapRecord {

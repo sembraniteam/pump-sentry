@@ -108,7 +108,9 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   that estimate is deliberate and mirrors heat), `max_daily_loss_usd`
   (realized day loss), `max_expected_entry_gap_usd` (proven per-ticket
   entry bleed from `FillGapTracker::expected_entry_gap_usd`; unknown
-  cells always allow, never refuse), `hot_wallet_max_sol` (buy preflight refuses
+  cells always allow, never refuse), `max_top_holder_pct` (top-10 supply
+  share from `Screener::top_holder_pct`; unreadable refuses while armed),
+  `hot_wallet_max_sol` (buy preflight refuses
   above it, off the same balance read as solvency; never on sells).
   The day tally persists in `day-state.json` (`src/day_state.rs`: atomic
   tmp+rename via `cli::atomic_write_private`, `#[serde(default)]` fields,

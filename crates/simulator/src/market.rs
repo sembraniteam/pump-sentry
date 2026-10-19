@@ -570,6 +570,71 @@ impl FillModel {
             Side::Short => mark.price * (1.0 + slip),
         })
     }
+
+    /// Full-exit proceeds at current depth plus half/quarter-depth
+    /// stress legs: how much SOL-value a position really exits, and
+    /// what it nets if liquidity drains before the sell. `None`
+    /// exactly when [`Self::exit_price`] is (unpriceable size, drained
+    /// curve, unknown liquidity) — the caller holds rather than
+    /// printing a fictitious number.
+    pub fn exit_proceeds(&self, side: Side, mark: &Mark, quantity: u64) -> Option<ExitProceeds> {
+        let exit = self.exit_price(side, mark, quantity)?;
+        let mark_value = quantity as f64 * mark.price;
+        let realizable = quantity as f64 * exit;
+        if !realizable.is_finite() {
+            return None;
+        }
+        let discount_bps = (mark_value - realizable) / mark_value * 10_000.0;
+        if !discount_bps.is_finite() {
+            return None;
+        }
+        let mut stressed = [(0.0, f64::NAN); 2];
+        for (slot, frac) in stressed.iter_mut().zip(PROCEEDS_STRESS_FRACS) {
+            // Depth stress, not curve state: the thin book reprices on
+            // the proxy basis (exact reserves don't scale).
+            let thin = Mark {
+                price: mark.price,
+                liquidity_usd: mark.liquidity_usd * frac,
+                curve: None,
+            };
+            let leg = self
+                .exit_price(side, &thin, quantity)
+                .map(|p| quantity as f64 * p)
+                .filter(|v| v.is_finite())
+                .unwrap_or(f64::NAN);
+            *slot = (frac, leg);
+        }
+        Some(ExitProceeds {
+            qty_tokens: quantity,
+            mark_value_usd: mark_value,
+            realizable_usd: realizable,
+            discount_bps,
+            stressed,
+        })
+    }
+}
+
+/// Liquidity fractions stressed by [`FillModel::exit_proceeds`]:
+/// half and quarter depth.
+pub const PROCEEDS_STRESS_FRACS: [f64; 2] = [0.5, 0.25];
+
+/// What a full exit nets now and under thinner books, USD.
+/// Single owner for the "what does the position actually exit"
+/// math: entry previews quote through here; the book snapshot keeps
+/// its own loop over the same [`FillModel::exit_price`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExitProceeds {
+    /// Whole tokens the exit sells.
+    pub qty_tokens: u64,
+    /// Gross mark value (`qty × spot`, no impact/fee).
+    pub mark_value_usd: f64,
+    /// Net at current depth (size impact + venue fee inside).
+    pub realizable_usd: f64,
+    /// `(mark − realizable)/mark` in bps: the liquidation discount.
+    pub discount_bps: f64,
+    /// `(liq_frac, realizable_usd)` at half and quarter depth, proxy
+    /// basis — `NaN` where that depth is itself unpriceable.
+    pub stressed: [(f64, f64); 2],
 }
 
 /// Signed return since entry, percent.
@@ -725,6 +790,84 @@ mod tests {
         // A bigger size nets a deeper discount (impact is size-aware).
         let deeper = curve.sell_fill_price(176_335_200, 125.0).expect("priced");
         assert!(deeper < price, "deeper={deeper} price={price}");
+    }
+
+    #[test]
+    fn exit_proceeds_prices_discount_and_drained_depth() {
+        let fill = FillModel::default();
+        let mark = Mark::new(2.0, 30_000.0);
+        let p = fill.exit_proceeds(Side::Long, &mark, 5).expect("priced");
+        assert_eq!(p.qty_tokens, 5);
+        assert!((p.mark_value_usd - 10.0).abs() < 1e-9);
+        assert!(
+            p.realizable_usd < p.mark_value_usd,
+            "realizable={} mark={}",
+            p.realizable_usd,
+            p.mark_value_usd
+        );
+        assert!(p.discount_bps > 0.0, "discount={}", p.discount_bps);
+        // Stress legs table half and quarter depth, monotonically
+        // thinner books netting less.
+        assert_eq!([p.stressed[0].0, p.stressed[1].0], PROCEEDS_STRESS_FRACS);
+        assert!(
+            p.stressed[0].1 < p.realizable_usd,
+            "half={} base={}",
+            p.stressed[0].1,
+            p.realizable_usd
+        );
+        assert!(
+            p.stressed[1].1 < p.stressed[0].1,
+            "quarter={} half={}",
+            p.stressed[1].1,
+            p.stressed[0].1
+        );
+    }
+
+    #[test]
+    fn exit_proceeds_quotes_exact_curve_state() {
+        let spot = 5.591_798_695_246_971e-6;
+        let net = 5.512_841_338_541_596e-6; // pinned by curve_sell_nets_size_impact_and_fee
+        let mark = Mark::new(spot, 30_000.0).with_curve(launch_curve());
+        let p = FillModel::default()
+            .exit_proceeds(Side::Long, &mark, 1_763_352)
+            .expect("priced");
+        assert!(
+            (p.mark_value_usd - 1_763_352.0 * spot).abs() < 1e-9,
+            "{p:?}"
+        );
+        assert!(
+            (p.realizable_usd - 1_763_352.0 * net).abs() < 1e-9,
+            "{p:?}"
+        );
+        assert!(p.discount_bps > 100.0, "{p:?}");
+    }
+
+    #[test]
+    fn exit_proceeds_exact_model_has_no_discount() {
+        let p = FillModel::Exact
+            .exit_proceeds(Side::Long, &Mark::new(2.0, 30_000.0), 5)
+            .expect("priced");
+        assert!((p.realizable_usd - 10.0).abs() < 1e-9);
+        assert_eq!(p.discount_bps, 0.0);
+        assert_eq!(p.stressed[0].1, 10.0);
+        assert_eq!(p.stressed[1].1, 10.0);
+    }
+
+    #[test]
+    fn exit_proceeds_fails_closed() {
+        let fill = FillModel::default();
+        assert!(
+            fill.exit_proceeds(Side::Long, &Mark::new(2.0, 30_000.0), 0)
+                .is_none()
+        );
+        assert!(
+            fill.exit_proceeds(Side::Long, &Mark::new(f64::NAN, 30_000.0), 5)
+                .is_none()
+        );
+        assert!(
+            fill.exit_proceeds(Side::Long, &Mark::new(2.0, f64::NAN), 5)
+                .is_none()
+        );
     }
 
     #[test]

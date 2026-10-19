@@ -1205,6 +1205,10 @@ impl SwapExecutor {
                 .ok_or_else(|| {
                     ExecutorError::BadOrder("raydium quote unroutable at this size".to_string())
                 })?;
+        // Venue evaluation, surfaced: this route's own math (25bps
+        // fee, constant-product) says the exit nets this many WSOL
+        // lamports before the slippage floor.
+        info!(mint = %order.mint, amount_in = order.amount_tokens, quoted_lamports = quoted, "raydium sell quote (venue math)");
         let floor = crate::raydium::raydium_sell_floor(quoted, order.slippage_bps).ok_or_else(|| {
             ExecutorError::BadOrder("raydium floor unguardable (dust); refusing".to_string())
         })?;
@@ -1472,6 +1476,10 @@ impl SwapExecutor {
         .map_err(|_| {
             ExecutorError::BadOrder("pumpswap quote unroutable at this size".to_string())
         })?;
+        // Venue evaluation, surfaced: this route's own math
+        // (PoolView + live fee schedule) says the exit nets this many
+        // WSOL lamports before the slippage floor.
+        info!(mint = %order.mint, amount_in = order.amount_tokens, net_lamports = net, "pumpswap sell quote (venue math)");
         let floor = pumpswap_sell_floor(net, order.slippage_bps).ok_or_else(|| {
             ExecutorError::BadOrder("pumpswap floor unguardable (dust); refusing".to_string())
         })?;

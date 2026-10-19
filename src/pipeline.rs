@@ -319,6 +319,10 @@ pub trait Screener {
         curve: &str,
         creation_slot: u64,
     ) -> Result<BundleAnalysis, ScreenError>;
+    /// Top-10 holder share of supply, percent; `Err` drops fail-closed.
+    /// Called only when the concentration cap is armed, so the extra
+    /// reads cost nothing by default.
+    async fn top_holder_pct(&self, mint: &str) -> Result<f64, ScreenError>;
     /// Migration hunt; `None` when not found.
     async fn detect_migration(
         &self,
@@ -368,6 +372,11 @@ impl Screener for RpcScreener {
             .hunt_migration(&curve, &mint)
             .await?
             .map(|detected| detected.report()))
+    }
+
+    async fn top_holder_pct(&self, mint: &str) -> Result<f64, ScreenError> {
+        let mint = listener::parse_address(mint)?;
+        RpcScreener::top_holder_pct(self, &mint).await
     }
 }
 

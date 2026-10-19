@@ -55,6 +55,18 @@ impl SwapRecord {
     }
 }
 
+/// Trailing-tape token volume in base units: saturating sum over the
+/// observed swaps (both sides; undecodable records carry 0 and add
+/// nothing). The gate spot-prices this at the confirm quote for the
+/// risk model's `volume_usd` — a proxy, not an audit: fills inside
+/// the window printed at their own prices, not today's spot.
+pub fn tape_volume_base_units(swaps: &[SwapRecord]) -> u64 {
+    swaps
+        .iter()
+        .map(|s| s.amount_base_units)
+        .fold(0u64, |acc, a| acc.saturating_add(a))
+}
+
 /// Classify every buy/sell ix into records. Covers v1, v2, v3.
 pub fn extract_pump_swaps(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
