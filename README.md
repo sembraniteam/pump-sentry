@@ -11,7 +11,7 @@ Pipeline: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum →
 
 ## Quickstart (paper mode, no money involved)
 
-1. **Install.** You need a mainnet RPC (dedicated recommended); Rust 1.99+ only matters for source builds.
+1. **Install.** You need a mainnet RPC (dedicated recommended); Rust 1.99 matters for source builds — it is pinned by `rust-toolchain.toml`, and rustup installs the 1.99 channel automatically on the first `cargo` invocation.
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/sembraniteam/pump-sentry/main/install.sh | bash
@@ -153,7 +153,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 | Section     | Keys                                                                                                                                                                                                 | Defaults                                                           |
 |-------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
 | `network`   | `mainnet_rpc_url`, `mainnet_rpc_urls_fallback`, `mainnet_wss_rpc_url`, `yellowstone_endpoint`*, `commitment`, `tick_interval_ms`, `vault_tick_interval_ms`, `fetch_concurrency`, `backfill_sig_limit`, `reconnect_backoff_max_ms` | public RPC / `[]` (primary-only) / `confirmed` / `1000` / `5000` / `32` / `100` / `5000` |
-| `trading`   | `start_balance`, `fee_bps`, `notional_usd`, `max_open_positions`, `max_exposure_usd`, `mint_cooldown_secs`, `max_daily_loss_usd`, `hot_wallet_max_sol`, `quote_usd`*, `liquidity_usd`                  | `100` / `0` / `10` / `3` / `0` (off) / `3600` / `0` (off) / `0` (off) / unset / `0`        |
+| `trading`   | `start_balance`, `fee_bps`, `notional_usd`, `max_open_positions`, `max_exposure_usd`, `mint_cooldown_secs`, `max_daily_loss_usd`, `hot_wallet_max_sol`, `quote_usd`*, `liquidity_usd`, `max_expected_entry_gap_usd`, `max_top_holder_pct`, `max_entry_flip_loss_pct`, `min_fill_rate_pct`, `max_avg_exit_gap_usd`, `max_avg_entry_gap_usd` | `100` / `0` / `10` / `3` / `0` (off) / `3600` / `0` (off) / `0` (off) / unset / `0` / `0` (off) / `0` (off) / `0` (off) / `50` / `0` (off) / `0` (off)        |
 | `exits`     | `trail_percent`, `runner_trail_percent`                                                                                                                                                              | `5` / `20`                                                         |
 | `gate`      | `gate_window_secs`, `gate_min_buyers`, `gate_poll_ms`, `dev_min_age_secs`, `dev_max_prior_launches`, `dev_screen_sample_txs`, `dev_sig_limit`                                                        | `10` / `5` / `2000` / `3600` / `1` / `20` / `100`                  |
 | `risk`      | `strategy_mode`, `runner_moonbag_percent`, `inference_endpoint`, `inference_model`, `inference_timeout_ms`, `inference_fallback`, `inference_defer_max_n`, `inference_headers`, `force_exit_regime`     | `adaptive` / `20` / local / `llama3.2:1b` / `300` / `heuristic` / `1` / unset / `""` |
@@ -161,6 +161,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 | `alerts`    | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs`                                                     | `true` / host default / `3` / `50` / `3` / `3600`                  |
 
 - `quote_usd` is test-only.
+- `fee_bps` (extra commission per side, on top of the venue fee already inside fills), `trail_percent` and `runner_trail_percent` are validated through typed units: negative/non-finite values warn, `fee_bps >= 100%` fails closed in settlement, and trail values must be in `(0, 100]`. These are advisory warnings, never a boot refusal.
 - `yellowstone_endpoint`: non-empty selects Yellowstone gRPC ingestion instead of WS (x-token via `YELLOWSTONE_TOKEN` env, never the file).
 
 - `fetch_concurrency` bounds parallel `getTransaction` fetches (lower on metered RPC; `0` refuses at boot); `backfill_sig_limit` caps signatures per backfill page (`0` disables backfill) — the WS reconnect backfill pages the signature list up to 3 pages seeking the last seen signature, past the cap with unseen history beyond it the remainder counts as lost (`backfill_pages_capped`, warn) instead of paging forever; `reconnect_backoff_max_ms` caps reconnect backoff (raise on flaky sockets).
