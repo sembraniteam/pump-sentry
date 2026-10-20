@@ -20,10 +20,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install Clippy component
+        run: rustup component add clippy
+
       - name: Show Rust toolchain
         run: |
           rustc --version
           cargo --version
+          cargo clippy --version
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v6
@@ -90,6 +94,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Ensure Rust target installed
+        run: rustup target add ${{ matrix.target }}
 
       - name: Show Rust toolchain
         run: |
