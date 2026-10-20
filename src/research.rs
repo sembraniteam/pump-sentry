@@ -122,11 +122,8 @@ fn candidate_rules() -> Vec<CandidateRule> {
 
 /// Losing trades grouped by one binning: `(label, n, total_loss)`,
 /// worst total first.
-fn loss_clusters(
-    rows: &[MicroRow],
-    key: impl Fn(&MicroRow) -> Option<&'static str>,
-) -> Vec<LossCluster> {
-    let mut acc: HashMap<&str, (usize, f64)> = HashMap::new();
+fn loss_clusters(rows: &[MicroRow], key: impl Fn(&MicroRow) -> Option<String>) -> Vec<LossCluster> {
+    let mut acc: HashMap<String, (usize, f64)> = HashMap::new();
     for row in rows.iter().filter(|r| r.net_pnl < 0.0) {
         if let Some(label) = key(row) {
             let e = acc.entry(label).or_insert((0, 0.0));
@@ -137,7 +134,7 @@ fn loss_clusters(
     let mut out: Vec<LossCluster> = acc
         .into_iter()
         .map(|(label, (n, total_loss))| LossCluster {
-            label: label.to_string(),
+            label,
             n,
             total_loss,
         })
@@ -236,16 +233,34 @@ pub async fn cmd_research(file: Option<String>) -> ! {
     println!("-- loss clusters (where the bleed concentrates) --");
     print_loss_clusters(
         "by regime",
-        &loss_clusters(rows, |r| Some(regime_label(r.regime.as_deref()))),
+        &loss_clusters(rows, |r| {
+            Some(regime_label(r.regime.as_deref()).to_string())
+        }),
+    );
+    // Per-model loss view: the journal spans boots, so this is the
+    // cross-run performance read. "Not recorded" covers engine-absent
+    // mode and pre-upgrade lines without a name.
+    print_loss_clusters(
+        "by risk model",
+        &loss_clusters(rows, |r| {
+            Some(
+                r.model
+                    .as_deref()
+                    .unwrap_or("not recorded")
+                    .to_string(),
+            )
+        }),
     );
     print_loss_clusters(
         "by buy pressure",
-        &loss_clusters(rows, |r| r.micro.buy_ratio.map(ratio_bin)),
+        &loss_clusters(rows, |r| {
+            r.micro.buy_ratio.map(|b| ratio_bin(b).to_string())
+        }),
     );
     print_loss_clusters(
         "by round concentration",
         &loss_clusters(rows, |r| {
-            r.micro.top_wallet_share_pct.map(concentration_bin)
+            r.micro.top_wallet_share_pct.map(|p| concentration_bin(p).to_string())
         }),
     );
     print_proposals(rows);
@@ -282,6 +297,7 @@ mod tests {
             net_pnl: net,
             micro,
             regime: regime.map(str::to_string),
+            model: Some("test-model".to_string()),
             source: "model".to_string(),
         }
     }
@@ -302,7 +318,8 @@ mod tests {
 
     #[test]
     fn loss_clusters_rank_by_total_loss() {
-        let clusters = loss_clusters(&fixture_rows(), |r| Some(regime_label(r.regime.as_deref())));
+        let clusters =
+            loss_clusters(&fixture_rows(), |r| Some(regime_label(r.regime.as_deref()).to_string()));
         assert_eq!(clusters.len(), 2);
         assert_eq!(clusters[0].label, "regime momentum");
         assert!((clusters[0].total_loss - 6.0).abs() < 1e-9);

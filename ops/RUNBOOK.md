@@ -256,7 +256,7 @@ tips) — a persistently negative avg is the live haircut made visible.
 | `[alerts]` key (default)                              | Fires when                                        | Meaning / action                                                                          |
 |-------------------------------------------------------|---------------------------------------------------|-------------------------------------------------------------------------------------------|
 | `alert_diverged_warn_n` (`3`)                         | Heartbeat diverged count ≥ N                      | Paper without live cover piles up: fund, fix dispatch, or accept paper-only               |
-| `alert_risk_fallback_warn_pct` (`50`)                  | LLM fallback share since boot ≥ pct               | Model down/degraded: entries run heuristic; check endpoint                                |
+| `alert_risk_fallback_warn_pct` (`50`)                  | LLM fallback share since boot ≥ pct               | Model down/degraded: entries run heuristic (or `pass`/`defer` per `inference_fallback`); check endpoint. Heartbeat prints per-model latency p50/p95/p99 plus fallback BUY vs PASS split; `pump-sentry replay` tabs per-model expectancy across boots (journal records the engine name per open) |
 | `alert_giveup_burst_n` (`3`) + `alert_giveup_window_secs` (`3600`) | N GiveUps in the trailing window    | Systemic dispatch trouble (RPC/Jito/congestion): stop funding more before cause found     |
 | (always on) tip-floor fetch warn                      | Jito oracle unreachable (≤1 warn/60s TTL)         | Base tip rules unmodified: underland risk under congestion; check `tip_floor` vs landing  |
 

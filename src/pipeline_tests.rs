@@ -1454,6 +1454,73 @@ async fn forced_exit_regime_shapes_the_open() {
 }
 
 #[tokio::test]
+async fn fallback_policy_defer_rewatches_then_opens_on_exhaustion() {
+    // Engine present but down with policy=defer: the first confirm
+    // postpones (signal re-watched, nothing opens); the second confirm
+    // exhausts the default one-defer budget and opens on the validated
+    // heuristic bands — never held open-ended, never skipped silently.
+    let mut settings = Settings::from_map(&HashMap::new());
+    settings.inference_fallback = "defer".to_string();
+    assert_eq!(settings.inference_defer_max_n, 1);
+    let pipe = pipeline_engined(
+        settings,
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+        None,
+        None,
+        dead_engine(),
+    );
+    launch_once(&pipe).await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        0,
+        "first confirm defers, never opens on broken inference"
+    );
+    // The signal is back on the watchlist, carrying its defer count.
+    let watch = pipe.gate_state.lock().await.meta.clone();
+    assert_eq!(
+        watch.get(MINT).map(|s| s.defers),
+        Some(1),
+        "defer counted on the signal"
+    );
+    pipe.poll_gates().await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "exhausted defer lands on the heuristic, never dropped"
+    );
+}
+
+#[tokio::test]
+async fn fallback_policy_defer_zero_off_and_engine_absent_never_defers() {
+    // DEFER_MAX_N=0 turns defer off at once: the confirm opens on the
+    // heuristic in a single round. Engine-absent (deliberate mode)
+    // also never defers — nothing would recover — so policy=defer
+    // behaves as heuristic there in one round too.
+    for defer_n in [0u32, 1] {
+        let mut settings = Settings::from_map(&HashMap::new());
+        settings.inference_fallback = "defer".to_string();
+        settings.inference_defer_max_n = defer_n;
+        let pipe = pipeline_screened(
+            settings,
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick(MINT, 2.0)),
+            funded(),
+            StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+            None,
+        );
+        launch_once(&pipe).await;
+        assert_eq!(
+            pipe.portfolio.lock().await.position_ids().len(),
+            1,
+            "defer_n={defer_n}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn fallback_policy_pass_skips_entries_on_model_failure() {
     // No engine (the deliberate-heuristic path) with policy=pass:
     // the confirm skips instead of opening on the fallback profile.

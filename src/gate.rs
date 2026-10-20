@@ -165,7 +165,7 @@ struct OpenRequest<'a> {
 }
 
 /// Priced confirm ready for paper plus live.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TrackedOpen<'a> {
     mint: &'a str,
     curve: &'a str,
@@ -175,6 +175,12 @@ struct TrackedOpen<'a> {
     profile: &'a risk_engine::RiskProfile,
     /// Profile provenance for the entry card (`model` | `heuristic`).
     risk: &'static str,
+    /// Risk-engine model the decision rode (Some whenever an engine is
+    /// configured, model or fallback alike — a fallback open is
+    /// attributed to the model whose failure produced it; `None` =
+    /// no engine). Journal-only: per-model performance is aggregated
+    /// offline, never a gate input.
+    model: Option<String>,
     allow_live: bool,
     creator: Option<&'a str>,
     /// Venue tier with the tick. `None` is standard; synthetic forces `None`.
@@ -225,6 +231,10 @@ pub struct PendingSignal {
     /// microstructure velocity. Updated every observed round; the
     /// confirm reads it, never a re-stamped audit time.
     pub prev_tape: Option<TapePoint>,
+    /// Confirm-level risk defers taken under the `defer` policy
+    /// (inference failed and the decision was postponed). Counts on
+    /// the signal; exhaustion lands the entry on the heuristic.
+    pub defers: u32,
 }
 
 /// Gate plus signal context under one lock.
@@ -455,6 +465,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 dev: dev.to_string(),
                 intake_secs: now,
                 prev_tape: None,
+                defers: 0,
             },
         );
         match audit_score {
@@ -889,16 +900,58 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 source: DecisionSource::Fallback,
             },
         };
-        // Explicit fallback policy (`inference_fallback`): on any
-        // inference failure the operator chooses the validated
-        // heuristic bands or skip (PASS) — never a hotter fallback to
-        // protect trade count. Single choke with the engine-absent
-        // path above: both arrive here as `Fallback`.
+        // Explicit fallback policy (`inference_fallback`): on an engine
+        // failure the operator chooses validated heuristic bands
+        // (`heuristic`), skips the entry (`pass`), or defers (`defer`):
+        // rewatch the signal and retry the model on a later confirm,
+        // bounded by `INFERENCE_DEFER_MAX_N` and the signal's own
+        // deadline; exhausted defers land on the heuristic. Engine-
+        // absent operation is a deliberate mode, not a failure: it
+        // never defers (nothing would recover) and the `pass` policy
+        // still skips it. Single choke: both arrivals are `Fallback`.
         let mut profile = decision.profile;
         if decision.source == DecisionSource::Fallback && self.settings.inference_fallback == "pass"
         {
             info!(%mint, "inference fallback policy=pass: skipping entry on model failure");
             profile = risk_engine::RiskProfile::pass();
+        }
+        if decision.source == DecisionSource::Fallback
+            && self.settings.inference_fallback == "defer"
+            && self.engine.is_some()
+            && signal.defers < self.settings.inference_defer_max_n
+        {
+            // Postpone, don't decide on broken inference: rewatch the
+            // signal (fresh window, buyers re-gather; the entry gate
+            // self-evicts at its deadline and its submit cap bounds
+            // total lifetime) and let a later confirm decide on a
+            // model.
+            let mut rewatch = (*signal).clone();
+            rewatch.defers += 1;
+            let now = now_secs();
+            {
+                let mut state = self.gate_state.lock().await;
+                let _ = state.gate.submit(mint, &rewatch.dev, now);
+                if let Some(creator) = rewatch.creator.as_deref() {
+                    let _ = state.gate.add_cohort(mint, creator);
+                }
+                state.meta.insert(mint.to_string(), rewatch);
+            }
+            info!(
+                %mint, defers = signal.defers,
+                max = self.settings.inference_defer_max_n,
+                "inference fallback policy=defer: rewatched; the model decides on a later confirm"
+            );
+            return;
+        }
+        if decision.source == DecisionSource::Fallback
+            && self.settings.inference_fallback == "defer"
+            && self.engine.is_some()
+        {
+            info!(
+                %mint, defers = signal.defers,
+                max = self.settings.inference_defer_max_n,
+                "defer budget exhausted: validated heuristic bands decide (the default)"
+            );
         }
         // Always log the decision (source + latency): heuristic-only
         // operation (`engine: None`) must be as visible as model calls.
@@ -974,6 +1027,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 DecisionSource::Model => "model",
                 DecisionSource::Fallback => "heuristic",
             },
+            model: self.engine.as_ref().map(|e| e.model().to_string()),
             allow_live: req.allow_live && !priced_via_override,
             creator: signal.creator.as_deref(),
             // Synthetic registers no tier.
@@ -1269,6 +1323,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             ts: now,
                             mint: mint.to_string(),
                             risk: req.risk.to_string(),
+                            model: req.model.clone(),
                             venue_fee_bps: portfolio.venue_fee_for(mint),
                             sol_feed: self.sol_feed.price(),
                             mark,
@@ -1396,6 +1451,7 @@ mod tests {
             dev: "D".to_string(),
             intake_secs,
             prev_tape: None,
+            defers: 0,
         };
         let mut meta = HashMap::new();
         meta.insert("newest".to_string(), signal(300));

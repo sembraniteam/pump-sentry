@@ -142,6 +142,13 @@ pub enum JournalLine {
         mint: String,
         /// Risk profile provenance: "model" | "heuristic".
         risk: String,
+        /// Risk-engine model the decision rode (`Some` whenever an
+        /// engine is configured — model or fallback alike, since a
+        /// fallback open is attributed to the model whose failure
+        /// produced it; `None` = no engine). Aggregated offline as
+        /// per-model performance; never a gate input.
+        #[serde(default)]
+        model: Option<String>,
         venue_fee_bps: f64,
         sol_feed: Option<f64>,
         /// Open mark (spot + depth + exact curve when carried).
@@ -463,6 +470,7 @@ mod tests {
             ts: 1,
             mint: "M".into(),
             risk: "model".into(),
+            model: Some("test-model".into()),
             venue_fee_bps: 125.0,
             sol_feed: None,
             mark: simulator::Mark::new(1.0, 50_000.0),
@@ -478,6 +486,7 @@ mod tests {
         let mut old = serde_json::to_value(&open).unwrap();
         old.as_object_mut().unwrap().remove("micro");
         old.as_object_mut().unwrap().remove("regime");
+        old.as_object_mut().unwrap().remove("model");
         match decode_line(&serde_json::to_string(&old).unwrap()) {
             Decoded::Line(line)
                 if matches!(
@@ -485,10 +494,11 @@ mod tests {
                     JournalLine::Open {
                         micro: None,
                         regime: None,
+                        model: None,
                         ..
                     }
                 ) => {}
-            _ => panic!("pre-signal open must decode with micro/regime None"),
+            _ => panic!("pre-signal open must decode with micro/regime/model None"),
         }
     }
 

@@ -123,10 +123,17 @@ pub struct Settings {
     pub slippage_vol_extra_cap_bps: u64,
     /// `adaptive` | `scalp` | `runner`. Unknown falls back.
     pub strategy_mode: String,
-    /// Inference-failure policy: `heuristic` (validated bands) or
-    /// `pass` (skip the entry). Never a hotter fallback to protect
-    /// trade count; unknown values warn and stay heuristic.
+    /// Inference-failure policy: `heuristic` (validated bands), `pass`
+    /// (skip the entry), or `defer` (rewatch, retry the model on a
+    /// later confirm — engine-present failures only; exhausted defers
+    /// land on heuristic). Never a hotter fallback to protect trade
+    /// count; unknown values warn and stay heuristic.
     pub inference_fallback: String,
+    /// Confirm-level defers allowed per signal before landing on the
+    /// heuristic (policy `defer` only). `0` = off (heuristic at once);
+    /// each defer burns one full confirm round of RPC budget, so the
+    /// signal's own deadline stays the hard stop.
+    pub inference_defer_max_n: u32,
     /// Forced exit regime (`""` = LLM selects from the closed set):
     /// fixed baseline for evaluation, and the LLM kill path — set it
     /// permanently if selection never beats the baseline. Unknown
@@ -220,6 +227,7 @@ impl std::fmt::Debug for Settings {
             .field("slippage_vol_extra_cap_bps", &self.slippage_vol_extra_cap_bps)
             .field("strategy_mode", &self.strategy_mode)
             .field("inference_fallback", &self.inference_fallback)
+            .field("inference_defer_max_n", &self.inference_defer_max_n)
             .field("force_exit_regime", &self.force_exit_regime)
             .field("runner_moonbag_percent", &self.runner_moonbag_percent)
             .field("priority_fee_micro_lamports", &self.priority_fee_micro_lamports)
@@ -319,6 +327,7 @@ impl Settings {
             slippage_vol_extra_cap_bps: get_int(vars, "SLIPPAGE_VOL_EXTRA_CAP_BPS", 0, &mut notes),
             strategy_mode: get_string(vars, "STRATEGY_MODE", "adaptive"),
             inference_fallback: get_string(vars, "INFERENCE_FALLBACK", "heuristic"),
+            inference_defer_max_n: get_int(vars, "INFERENCE_DEFER_MAX_N", 1, &mut notes),
             force_exit_regime: get_string(vars, "FORCE_EXIT_REGIME", ""),
             runner_moonbag_percent: get_float(vars, "RUNNER_MOONBAG_PERCENT", 20.0, &mut notes),
             priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0, &mut notes),
@@ -360,9 +369,12 @@ impl Settings {
                 self.strategy_mode
             ));
         }
-        if self.inference_fallback != "heuristic" && self.inference_fallback != "pass" {
+        if self.inference_fallback != "heuristic"
+            && self.inference_fallback != "pass"
+            && self.inference_fallback != "defer"
+        {
             out.push(format!(
-                "INFERENCE_FALLBACK='{}' unknown; staying heuristic (expected heuristic|pass)",
+                "INFERENCE_FALLBACK='{}' unknown; staying heuristic (expected heuristic|pass|defer)",
                 self.inference_fallback
             ));
         }
@@ -1125,6 +1137,14 @@ mod tests {
             "{:?}",
             s.warnings()
         );
+        let s = Settings::from_map(&vars(&[("INFERENCE_FALLBACK", "defer")]));
+        assert_eq!(s.inference_fallback, "defer");
+        assert!(s.inference_defer_max_n > 0, "bare defer defaults to one retry");
+        assert!(
+            !s.warnings().iter().any(|w| w.contains("INFERENCE_FALLBACK")),
+            "{:?}",
+            s.warnings()
+        );
         // Unknown stays heuristic, loudly — never a hotter fallback.
         let s = Settings::from_map(&vars(&[("INFERENCE_FALLBACK", "yolo")]));
         assert_eq!(s.inference_fallback, "yolo");
@@ -1135,6 +1155,17 @@ mod tests {
             "{:?}",
             s.warnings()
         );
+    }
+
+    #[test]
+    fn inference_defer_max_n_parses() {
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.inference_defer_max_n, 1, "one defer by default");
+        let s = Settings::from_map(&vars(&[("INFERENCE_DEFER_MAX_N", "3")]));
+        assert_eq!(s.inference_defer_max_n, 3);
+        // 0 = off: the defer policy behaves as heuristic at once.
+        let s = Settings::from_map(&vars(&[("INFERENCE_DEFER_MAX_N", "0")]));
+        assert_eq!(s.inference_defer_max_n, 0);
     }
 
     #[test]

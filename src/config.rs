@@ -80,6 +80,7 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("risk", "inference_endpoint", "INFERENCE_ENDPOINT"),
     ("risk", "inference_model", "INFERENCE_MODEL"),
     ("risk", "inference_fallback", "INFERENCE_FALLBACK"),
+    ("risk", "inference_defer_max_n", "INFERENCE_DEFER_MAX_N"),
     ("risk", "inference_timeout_ms", "INFERENCE_TIMEOUT_MS"),
     ("risk", "inference_headers", "INFERENCE_HEADERS"),
     ("execution", "slippage_bps", "SLIPPAGE_BPS"),
@@ -166,7 +167,8 @@ force_exit_regime = ""  # (empty = LLM selects; fixed baseline for evaluation, o
 runner_moonbag_percent = 20.0  # (runner share kept, 0-100)
 inference_endpoint = "http://127.0.0.1:11434/v1/chat/completions"  # 
 inference_model = "llama3.2:1b"  #
-inference_fallback = "heuristic"  # (heuristic|pass; pass skips entries on any inference failure — never a hotter fallback)
+inference_fallback = "heuristic"  # (heuristic|pass|defer; pass skips entries on any inference failure, defer re-watches and retries the model on a later confirm — never a hotter fallback)
+inference_defer_max_n = 1  # confirm-level defers per signal with policy=defer; 0 = off, exhausted defers land on heuristic
 inference_timeout_ms = 300  # (raising past 300ms costs entry price)
 inference_headers = ""  # (optional extra headers, comma-separated when more than one: "Name: value, Other: value", e.g. "x-opencode-session: sess-123, X-Custom-Flag: fast"; empty = none; auth never here — INFERENCE_API_KEY stays in env)
 # INFERENCE_API_KEY stays in env (bearer token; secret, never written here).

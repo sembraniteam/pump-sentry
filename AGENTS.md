@@ -508,14 +508,26 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   Prompt rules only tighten (PASS/temper on wash, concentration,
   insider distribution, fading velocity); the heuristic keeps the
   velocity screen and ignores the newer context fields.
-- Explicit fallback policy (`inference_fallback`: `heuristic` | `pass`,
-  default heuristic): on any inference failure the operator chooses
-  validated bands or skip — never a hotter fallback to protect volume.
-  Single choke in confirm (engine-absent and engine-failed both arrive
-  as `Fallback`). Confidence telemetry per model: latency p50/p95/p99
-  over a bounded window (timeouts sit at the budget they cost) plus
-  fallback BUY vs PASS counts, on the heartbeat — a volume-protecting
-  fallback can't hide behind the rate alone.
+- Explicit fallback policy (`inference_fallback`: `heuristic` | `pass` |
+  `defer`, default heuristic): on any inference failure the operator
+  chooses validated bands, skip, or defer — never a hotter fallback to
+  protect volume. Defer re-watches the signal and retries the model on
+  a later confirm (`PendingSignal.defers` counts on the signal;
+  `INFERENCE_DEFER_MAX_N` caps it, default 1, `0` = off; exhausted
+  defers land on heuristic; the entry deadline stays the hard stop).
+  Engine-absent operation is deliberate mode, never a failure — it
+  NEVER defers (nothing would recover), the engine-present choke is
+  the one defer site. Single choke in confirm (engine-absent and
+  engine-failed both arrive as `Fallback`). Confidence telemetry per
+  model: latency p50/p95/p99 over a bounded window (timeouts sit at
+  the budget they cost) plus fallback BUY vs PASS counts, on the
+  heartbeat — a volume-protecting fallback can't hide behind the rate
+  alone. The journal `Open.model` field (default `None`) records the
+  engine name on every open — model or fallback alike, a fallback open
+  is attributed to the model whose failure produced it — so replay's
+  `risk model` expectancy table and research's per-model loss cluster
+  are the cross-boot performance read; there is no cross-process
+  memory by design.
 - Exit regimes are a closed set (`ExitRegime`: conservative/momentum/
   liquidity_sensitive): the model picks, deterministic `resolve_regime`
   (`crates/risk-engine/src/strategy.rs`) snaps the numbers to the

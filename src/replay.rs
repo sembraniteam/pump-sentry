@@ -108,6 +108,10 @@ pub(crate) struct MicroRow {
     pub(crate) micro: MicroSignals,
     /// Effective exit regime the trade ran (`None` on pre-regime lines).
     pub(crate) regime: Option<String>,
+    /// Risk-engine model the open rode (`None` = engine absent or a
+    /// pre-upgrade line without the name). Per-model expectancy and
+    /// cross-boot performance read off this column.
+    pub(crate) model: Option<String>,
     /// Risk provenance as recorded (`model` | `heuristic` | other):
     /// fallback-decision outcomes read off this column.
     pub(crate) source: String,
@@ -488,6 +492,7 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
     let mut open_micro: HashMap<u64, MicroSignals> = HashMap::new();
     let mut open_regime: HashMap<u64, String> = HashMap::new();
     let mut open_source: HashMap<u64, String> = HashMap::new();
+    let mut open_model: HashMap<u64, Option<String>> = HashMap::new();
     for line in lines {
         match line {
             JournalLine::Boot { settings: s, .. } => {
@@ -500,12 +505,14 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                 open_micro.clear();
                 open_regime.clear();
                 open_source.clear();
+                open_model.clear();
             }
             JournalLine::Open {
                 position,
                 micro: Some(micro),
                 regime,
                 risk,
+                model,
                 ..
             } => {
                 open_micro.insert(position.id, *micro);
@@ -513,6 +520,7 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                     open_regime.insert(position.id, regime.clone());
                 }
                 open_source.insert(position.id, risk.clone());
+                open_model.insert(position.id, model.clone());
             }
             JournalLine::Open { micro: None, .. } => {}
             JournalLine::Exit { ts, trade, .. } => {
@@ -530,6 +538,7 @@ pub fn metrics(lines: &[JournalLine]) -> Metrics {
                         net_pnl: trade.net_pnl,
                         micro: *micro,
                         regime: open_regime.get(&trade.id).cloned(),
+                        model: open_model.get(&trade.id).cloned().flatten(),
                         source: open_source
                             .get(&trade.id)
                             .cloned()
@@ -773,9 +782,9 @@ pub(crate) fn concentration_bin(pct: f64) -> &'static str {
 fn print_micro_table(
     title: &str,
     rows: &[MicroRow],
-    key: impl Fn(&MicroRow) -> Option<&'static str>,
+    key: impl Fn(&MicroRow) -> Option<String>,
 ) {
-    let mut keyed: Vec<(&str, u64, f64)> = rows
+    let mut keyed: Vec<(String, u64, f64)> = rows
         .iter()
         .filter_map(|r| key(r).map(|k| (k, r.ts, r.net_pnl)))
         .collect();
@@ -785,9 +794,9 @@ fn print_micro_table(
     keyed.sort_by_key(|(_, ts, _)| *ts);
     let half = keyed.len() / 2;
     // label → (n, total, first-half n/total, second-half n/total).
-    let mut bins: HashMap<&str, (usize, f64, usize, f64, usize, f64)> = HashMap::new();
+    let mut bins: HashMap<String, (usize, f64, usize, f64, usize, f64)> = HashMap::new();
     for (i, (label, _, net)) in keyed.iter().enumerate() {
-        let e = bins.entry(label).or_insert((0, 0.0, 0, 0.0, 0, 0.0));
+        let e = bins.entry(label.clone()).or_insert((0, 0.0, 0, 0.0, 0, 0.0));
         e.0 += 1;
         e.1 += net;
         if i < half {
@@ -798,7 +807,7 @@ fn print_micro_table(
             e.5 += net;
         }
     }
-    let mut labels: Vec<&&str> = bins.keys().collect();
+    let mut labels: Vec<&String> = bins.keys().collect();
     labels.sort();
     println!("  {title}:");
     for label in labels {
@@ -834,40 +843,66 @@ fn print_micro_tables(rows: &[MicroRow], paper_trades: usize) {
     }
     println!("-- microstructure expectancy (paper exits joined to entry signals; halves = chronological stability check) --");
     print_micro_table("buy pressure", rows, |r| {
-        r.micro.buy_ratio.map(ratio_bin)
+        r.micro.buy_ratio.map(|b| ratio_bin(b).to_string())
     });
     print_micro_table("round concentration", rows, |r| {
-        r.micro.top_wallet_share_pct.map(concentration_bin)
+        r.micro
+            .top_wallet_share_pct
+            .map(|p| concentration_bin(p).to_string())
     });
     print_micro_table("insider flow", rows, |r| {
-        Some(if r.micro.creator_net_base < 0 {
-            "insiders distributing"
-        } else if r.micro.creator_net_base > 0 {
-            "insiders accumulating"
-        } else {
-            "insiders flat"
-        })
+        Some(
+            if r.micro.creator_net_base < 0 {
+                "insiders distributing"
+            } else if r.micro.creator_net_base > 0 {
+                "insiders accumulating"
+            } else {
+                "insiders flat"
+            }
+            .to_string(),
+        )
     });
     print_micro_table("tape velocity", rows, |r| {
         r.micro
             .velocity_delta
-            .map(|v| if v < 0.0 { "fading" } else { "accelerating" })
+            .map(|v| {
+                if v < 0.0 {
+                    "fading".to_string()
+                } else {
+                    "accelerating".to_string()
+                }
+            })
     });
     // Regime expectancy: what actually ran (LLM pick or forced
     // baseline) — the table the operator judges selection against the
     // fixed baseline with. Unknown covers pre-regime lines.
     print_micro_table("exit regime", rows, |r| {
-        Some(regime_label(r.regime.as_deref()))
+        Some(regime_label(r.regime.as_deref()).to_string())
     });
     // Decision-source expectancy: model vs fallback (heuristic) trades.
     // Fallback outcomes read off this column — a fallback that protects
     // volume at the cost of edge shows up here, not hidden in the rate.
     print_micro_table("decision source", rows, |r| {
-        Some(match r.source.as_str() {
-            "model" => "source model",
-            "heuristic" => "source heuristic (fallback)",
-            _ => "source other",
-        })
+        Some(
+            match r.source.as_str() {
+                "model" => "source model",
+                "heuristic" => "source heuristic (fallback)",
+                _ => "source other",
+            }
+            .to_string(),
+        )
+    });
+    // Per-model expectancy: named model rows plus "no engine" (a
+    // deliberate heuristic-only mode is its own regime). The journal
+    // spans boots, so this is the cross-run performance read;
+    // pre-upgrade lines without a recorded name land "not recorded".
+    print_micro_table("risk model", rows, |r| {
+        Some(
+            r.model
+                .as_deref()
+                .unwrap_or("not recorded")
+                .to_string(),
+        )
     });
     let excluded = paper_trades.saturating_sub(rows.len());
     if excluded > 0 {
@@ -961,6 +996,7 @@ mod tests {
             ts: 1_001,
             mint: position.mint.clone(),
             risk: "model".into(),
+            model: Some("test-model".into()),
             venue_fee_bps: venue_bps,
             sol_feed: Some(sol_feed),
             mark: outmark(1.0),
@@ -1094,6 +1130,7 @@ mod tests {
                 ts: 1_001,
                 mint: "M".into(),
                 risk: "heuristic".into(),
+                model: None,
                 venue_fee_bps: venue_bps,
                 sol_feed: Some(sol_feed),
                 mark: outmark(1.0),
@@ -1164,6 +1201,7 @@ mod tests {
             ts: 1,
             mint: "M".into(),
             risk: "model".into(),
+            model: Some("test-model".into()),
             venue_fee_bps: 125.0,
             sol_feed: None,
             mark: Mark::price_only(1.0),
@@ -1382,11 +1420,13 @@ mod tests {
         micro: Option<MicroSignals>,
         regime: Option<&str>,
         risk: &str,
+        model: Option<&str>,
     ) -> JournalLine {
         JournalLine::Open {
             ts,
             mint: "M".into(),
             risk: risk.to_string(),
+            model: model.map(str::to_string),
             venue_fee_bps: 125.0,
             sol_feed: Some(150.0),
             mark: outmark(1.0),
@@ -1450,6 +1490,7 @@ mod tests {
                 Some(micro_sig(Some(0.9), Some(20.0), 0, Some(0.5))),
                 Some("momentum"),
                 "model",
+                Some("gpt-oss-120b"),
             ),
             micro_exit(7, 1_100, 2.0),
             // Heuristic-sourced exit joins with its provenance carried.
@@ -1459,11 +1500,12 @@ mod tests {
                 Some(micro_sig(Some(0.7), Some(20.0), 0, None)),
                 Some("conservative"),
                 "heuristic",
+                Some("gpt-oss-120b"),
             ),
             micro_exit(9, 1_102, -1.0),
             // Pre-signal open: the exit counts in the leg totals but
             // never in the signal tables.
-            micro_open(8, 1_002, None, None, "model"),
+            micro_open(8, 1_002, None, None, "model", None),
             micro_exit(8, 1_101, 1.0),
         ];
         let m = metrics(&lines);
@@ -1474,6 +1516,40 @@ mod tests {
         assert_eq!(m.micro_rows[0].regime.as_deref(), Some("momentum"));
         assert_eq!(m.micro_rows[0].source, "model");
         assert_eq!(m.micro_rows[1].source, "heuristic");
+        // The model name rides the open line; a None name (engine
+        // absent or pre-upgrade) lands "not recorded" in the table.
+        assert_eq!(m.micro_rows[0].model.as_deref(), Some("gpt-oss-120b"));
+        assert_eq!(m.micro_rows[1].model.as_deref(), Some("gpt-oss-120b"));
+    }
+
+    #[test]
+    fn micro_model_table_separates_engines() {
+        // Same boot: model opens record their engine name; engine-
+        // absent opens read "not recorded" rather than blending in.
+        let lines = vec![
+            micro_open(
+                1,
+                1_001,
+                Some(micro_sig(Some(0.9), None, 0, None)),
+                None,
+                "model",
+                Some("gpt-oss-120b"),
+            ),
+            micro_exit(1, 1_100, 2.0),
+            micro_open(
+                2,
+                1_002,
+                Some(micro_sig(Some(0.9), None, 0, None)),
+                None,
+                "heuristic",
+                None,
+            ),
+            micro_exit(2, 1_200, -1.0),
+        ];
+        let m = metrics(&lines);
+        assert_eq!(m.micro_rows.len(), 2);
+        assert_eq!(m.micro_rows[0].model.as_deref(), Some("gpt-oss-120b"));
+        assert_eq!(m.micro_rows[1].model, None);
     }
 
     #[test]
@@ -1492,6 +1568,7 @@ mod tests {
                 Some(micro_sig(Some(0.9), None, 0, None)),
                 None,
                 "model",
+                None,
             ),
             JournalLine::Boot { ts: 2_000, settings },
             micro_exit(1, 2_100, 5.0),
