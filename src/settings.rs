@@ -59,6 +59,12 @@ pub struct Settings {
     /// Unreadable holdings refuse while armed (fail-closed); exits never
     /// block.
     pub max_top_holder_pct: f64,
+    /// Instant-flip cost cap in percent (`0` = off): refuses an open
+    /// when the measured preview — buying the normal ticket and selling
+    /// it straight back at the confirm book — loses more than this
+    /// share of the ticket (entry impact + exit impact + venue fees).
+    /// Unpriceable always allows; exits never block.
+    pub max_entry_flip_loss_pct: f64,
     /// Buy fill-rate floor in percent (`0` = off): the supervisor pauses
     /// entries while the trailing settled-outcome window fills below
     /// this. Thin windows read as unknown, never as trips; recovery is
@@ -200,6 +206,7 @@ impl std::fmt::Debug for Settings {
                 &self.max_expected_entry_gap_usd,
             )
             .field("max_top_holder_pct", &self.max_top_holder_pct)
+            .field("max_entry_flip_loss_pct", &self.max_entry_flip_loss_pct)
             .field("min_fill_rate_pct", &self.min_fill_rate_pct)
             .field("max_avg_exit_gap_usd", &self.max_avg_exit_gap_usd)
             .field("max_avg_entry_gap_usd", &self.max_avg_entry_gap_usd)
@@ -303,6 +310,7 @@ impl Settings {
                 &mut notes,
             ),
             max_top_holder_pct: get_float(vars, "MAX_TOP_HOLDER_PCT", 0.0, &mut notes),
+            max_entry_flip_loss_pct: get_float(vars, "MAX_ENTRY_FLIP_LOSS_PCT", 0.0, &mut notes),
             min_fill_rate_pct: get_float(vars, "MIN_FILL_RATE_PCT", 50.0, &mut notes),
             max_avg_exit_gap_usd: get_float(vars, "MAX_AVG_EXIT_GAP_USD", 0.0, &mut notes),
             max_avg_entry_gap_usd: get_float(vars, "MAX_AVG_ENTRY_GAP_USD", 0.0, &mut notes),
@@ -464,6 +472,17 @@ impl Settings {
             out.push(format!(
                 "MAX_TOP_HOLDER_PCT={} exceeds 100%: no holding can refuse, the cap never fires",
                 self.max_top_holder_pct
+            ));
+        }
+        if self.max_entry_flip_loss_pct < 0.0 || !self.max_entry_flip_loss_pct.is_finite() {
+            out.push(format!(
+                "MAX_ENTRY_FLIP_LOSS_PCT={} is invalid; entry flip cost cap disabled",
+                self.max_entry_flip_loss_pct
+            ));
+        } else if self.max_entry_flip_loss_pct > 100.0 {
+            out.push(format!(
+                "MAX_ENTRY_FLIP_LOSS_PCT={} exceeds 100%: a flip can never lose more than its whole ticket, the cap never fires",
+                self.max_entry_flip_loss_pct
             ));
         }
         if self.min_fill_rate_pct < 0.0
@@ -1095,6 +1114,38 @@ mod tests {
         );
         // A cap above 100% never fires: say so.
         let w = Settings::from_map(&vars(&[("MAX_TOP_HOLDER_PCT", "120")]))
+            .warnings()
+            .join("\n");
+        assert!(w.contains("never fires"), "{w}");
+    }
+
+    #[test]
+    fn entry_flip_cost_cap_parses_and_warns() {
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.max_entry_flip_loss_pct, 0.0, "off by default");
+        let s = Settings::from_map(&vars(&[("MAX_ENTRY_FLIP_LOSS_PCT", "6")]));
+        assert_eq!(s.max_entry_flip_loss_pct, 6.0);
+        assert!(
+            !s.warnings()
+                .iter()
+                .any(|w| w.contains("MAX_ENTRY_FLIP_LOSS_PCT")),
+            "{:?}",
+            s.warnings()
+        );
+        // Garbage reads as disabled, loudly — never silently armed.
+        for bad in ["-1", "abc"] {
+            let s = Settings::from_map(&vars(&[("MAX_ENTRY_FLIP_LOSS_PCT", bad)]));
+            assert!(
+                s.warnings()
+                    .iter()
+                    .any(|w| w.contains("MAX_ENTRY_FLIP_LOSS_PCT")),
+                "{:?}",
+                s.warnings()
+            );
+        }
+        // A cap above 100% never fires: a flip can never lose more
+        // than its whole ticket.
+        let w = Settings::from_map(&vars(&[("MAX_ENTRY_FLIP_LOSS_PCT", "150")]))
             .warnings()
             .join("\n");
         assert!(w.contains("never fires"), "{w}");

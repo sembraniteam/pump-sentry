@@ -110,7 +110,14 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   entry bleed from `FillGapTracker::expected_entry_gap_usd`; unknown
   cells always allow, never refuse), `max_top_holder_pct` (top-10 supply
   share from `Screener::top_holder_pct`; unreadable refuses while armed),
-  `min_fill_rate_pct` (trailing buy-fill trip, thin windows unknown),
+  `max_entry_flip_loss_pct` (measured open + instant-sell-back cost at
+  the confirm book; one compose of the book's own `entry_fill` +
+  `exit_proceeds` in `FillModel::flip_preview`, computed pre-model in
+  `confirm_open` so the risk engine reads the same number as
+  `TokenMetrics.entry_flip_loss_pct` and the journal stores it as
+  `Open.flip_loss_pct`; unpriceable allows everywhere — unknown is never
+  a cost verdict), `min_fill_rate_pct` (trailing buy-fill trip, thin
+  windows unknown),
   `max_avg_exit_gap_usd` / `max_avg_entry_gap_usd` (windowed paper-vs-live
   gap trips; the tracker totals now follow the retained window so the
   average stays windowed), `hot_wallet_max_sol` (buy preflight refuses
@@ -502,12 +509,15 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   timeout → heuristic fallback (`FALLBACK_TIMEOUT` 300ms default,
   `MAX_TIMEOUT` 2s clamp). The model is a second screener, never a gate
   override: `confirm_metrics` (`src/gate.rs`, pure, unit-pinned) feeds it
-  the structured tape (`MicroSignals` + `top_holder_pct` + volume) and
+  the structured tape (`MicroSignals` + `top_holder_pct` + volume +
+  `entry_flip_loss_pct` — the measured open + sell-back cost, same
+  preview the flip cap enforces) and
   the profile flows through the same `open_tracked` choke as every
   refusal — a model BUY cannot pass a tripped breaker, cap, or pause.
   Prompt rules only tighten (PASS/temper on wash, concentration,
-  insider distribution, fading velocity); the heuristic keeps the
-  velocity screen and ignores the newer context fields.
+  insider distribution, fading velocity, cost-floor breaches); the
+  heuristic keeps the velocity screen and ignores the newer context
+  fields.
 - Explicit fallback policy (`inference_fallback`: `heuristic` | `pass` |
   `defer`, default heuristic): on any inference failure the operator
   chooses validated bands, skip, or defer — never a hotter fallback to

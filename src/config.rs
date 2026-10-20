@@ -59,6 +59,11 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
         "MAX_EXPECTED_ENTRY_GAP_USD",
     ),
     ("trading", "max_top_holder_pct", "MAX_TOP_HOLDER_PCT"),
+    (
+        "trading",
+        "max_entry_flip_loss_pct",
+        "MAX_ENTRY_FLIP_LOSS_PCT",
+    ),
     ("trading", "min_fill_rate_pct", "MIN_FILL_RATE_PCT"),
     ("trading", "max_avg_exit_gap_usd", "MAX_AVG_EXIT_GAP_USD"),
     ("trading", "max_avg_entry_gap_usd", "MAX_AVG_ENTRY_GAP_USD"),
@@ -139,6 +144,7 @@ max_open_positions = 3      # (max concurrent positions: paper + live-held mints
 max_exposure_usd = 0.0      # (0 = off; total open exposure cap: paper basis + one ticket per unpaired live bag)
 max_expected_entry_gap_usd = 0.0  # (0 = off; refuse opens whose ticket shape bled worse than this USD in settled live fills)
 max_top_holder_pct = 0.0  # (0 = off; refuse opens when the top-10 holders own more than this % of supply)
+max_entry_flip_loss_pct = 0.0  # (0 = off; refuse opens whose measured open+sell-back cost at the confirm book exceeds this % of the ticket)
 min_fill_rate_pct = 50.0  # (0 = off; pause entries while trailing buy fills run below this %)
 max_avg_exit_gap_usd = 0.0  # (0 = off; pause entries while the avg exit gap runs worse than this USD)
 max_avg_entry_gap_usd = 0.0  # (0 = off; same for the entry leg)

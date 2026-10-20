@@ -712,6 +712,7 @@ mod tests {
             creator_net_base: 0,
             velocity_delta: None,
             top_holder_pct: None,
+            entry_flip_loss_pct: None,
         }
     }
 

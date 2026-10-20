@@ -169,6 +169,13 @@ pub enum JournalLine {
         /// exit actually ran, for offline expectancy per regime.
         #[serde(default)]
         regime: Option<String>,
+        /// Ex-ante instant-flip cost at the confirm mark, percent
+        /// (`None` = unpriceable/pre-flip lines): opening and selling
+        /// straight back at current depth — entry impact, exit impact,
+        /// and venue fees all inside. Burn-in analytics read the cost
+        /// edge per decision; nothing recomputes it.
+        #[serde(default)]
+        flip_loss_pct: Option<f64>,
     },
     /// Paper exit: the ledger trade as booked plus the fraction the
     /// book closed and the mark it closed on.
@@ -503,15 +510,18 @@ mod tests {
             position: pos(),
             micro: None,
             regime: None,
+            flip_loss_pct: Some(6.5),
         };
         let raw = serde_json::to_string(&open).unwrap();
         assert!(matches!(decode_line(&raw), Decoded::Line(_)));
         // Pre-signal lines carry no micro: they decode with None, never
-        // a fabricated zero-signal.
+        // a fabricated zero-signal. The flip preview is newer still:
+        // pre-flip open lines decode with None (absent, not zero).
         let mut old = serde_json::to_value(&open).unwrap();
         old.as_object_mut().unwrap().remove("micro");
         old.as_object_mut().unwrap().remove("regime");
         old.as_object_mut().unwrap().remove("model");
+        old.as_object_mut().unwrap().remove("flip_loss_pct");
         match decode_line(&serde_json::to_string(&old).unwrap()) {
             Decoded::Line(line)
                 if matches!(
@@ -520,6 +530,7 @@ mod tests {
                         micro: None,
                         regime: None,
                         model: None,
+                        flip_loss_pct: None,
                         ..
                     }
                 ) => {}

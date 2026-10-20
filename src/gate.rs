@@ -198,6 +198,10 @@ struct TrackedOpen<'a> {
     micro: MicroSignals,
     /// Effective exit regime (LLM pick or forced baseline) for the journal.
     regime: ExitRegime,
+    /// Ex-ante round-trip cost preview at the confirm mark (see
+    /// `FlipPreview`). `None` = unpriceable — the cap and the journal
+    /// treat unknown as absent, never as a cost.
+    flip: Option<simulator::FlipPreview>,
 }
 
 /// Log-safe token text: on-chain name/symbol are attacker-controlled,
@@ -337,6 +341,7 @@ fn confirm_metrics(
     volume_usd: Option<f64>,
     micro: MicroSignals,
     top_holder_pct: Option<f64>,
+    flip_loss_pct: Option<f64>,
 ) -> TokenMetrics {
     TokenMetrics {
         liquidity_usd,
@@ -347,7 +352,8 @@ fn confirm_metrics(
         creation_slot_buys,
         cluster_pct,
         // Unmeasured: no reserve field carries curve progress; the
-        // prompt assumes its spread prior when absent.
+        // prompt assumes its spread prior when absent — the measured
+        // neighbor `entry_flip_loss_pct` supersedes it when priced.
         curve_progress: None,
         volume_usd,
         buy_ratio: micro.buy_ratio,
@@ -356,6 +362,7 @@ fn confirm_metrics(
         creator_net_base: micro.creator_net_base,
         velocity_delta: micro.velocity_delta,
         top_holder_pct,
+        entry_flip_loss_pct: flip_loss_pct,
     }
 }
 
@@ -873,6 +880,36 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             };
             score
         };
+        // Ex-ante round-trip cost at the CURRENT book: what one
+        // normal ticket costs to open and immediately sell back
+        // (entry impact, exit impact, venue fees inside). Computed
+        // once here, before the model — the decision gets the
+        // measured number as context (`entry_flip_loss_pct`) and the
+        // entry choke enforces `MAX_ENTRY_FLIP_LOSS_PCT` on it;
+        // unknown (unpriceable) stays `None` and every consumer
+        // allows. The fill mirrors the book's tiering: prior
+        // registrations ride through, the tick's own tier overrides.
+        let flip = {
+            let portfolio = self.portfolio.lock().await;
+            let fill = match venue_fee {
+                Some(bps) => portfolio.fill_for_mint(mint).with_venue_fee_bps(bps),
+                None => portfolio.fill_for_mint(mint),
+            };
+            drop(portfolio);
+            let mark = simulator::Mark {
+                price: entry_quote,
+                liquidity_usd,
+                curve: exec.map(|e| crate::live::curve_reserves(&e)),
+            };
+            fill.flip_preview(&mark, self.settings.notional_usd)
+        };
+        if let Some(preview) = flip {
+            info!(%mint, flip_loss_pct = format!("{:.2}", preview.flip_loss_pct),
+                booked_usd = format!("{:.4}", preview.booked_usd),
+                realizable_usd = format!("{:.4}", preview.realizable_usd),
+                qty_tokens = preview.qty_tokens,
+                "entry flip cost preview at confirm (open + immediate sell-back)");
+        }
         let metrics = confirm_metrics(
             liquidity_usd,
             buyers,
@@ -889,6 +926,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             },
             req.micro,
             top_holder_pct,
+            flip.map(|p| p.flip_loss_pct),
         );
         // Model call timed: entry latency is sniper budget (raise
         // INFERENCE_TIMEOUT_MS only knowing it costs entry price).
@@ -1047,6 +1085,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             complete,
             micro: req.micro,
             regime,
+            flip,
         })
         .await;
     }
@@ -1259,6 +1298,36 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             liquidity_usd,
             curve: reserves,
         };
+        // Instant-flip cost cap (`0` = off): refuse the open when the
+        // SAME preview that informed the decision, at the tier the
+        // book will charge, says opening and selling straight back
+        // loses more than this share of the ticket — costs would eat
+        // any edge before the trade exists. Computed at the confirm
+        // mark, before the model (see `confirm_open`) and enforced
+        // HERE, at the entry choke: the model proposes, this number
+        // cannot be argued past. Unknown (`None` / unpriceable / a
+        // size the book booked differently) always allows: absence of
+        // evidence is not evidence of cost. Exits never block.
+        let flip_cap = self.settings.max_entry_flip_loss_pct;
+        if flip_cap.is_finite() && flip_cap > 0.0 {
+            match req.flip {
+                Some(preview) if preview.flip_loss_pct > flip_cap => {
+                    info!(%mint, flip_loss_pct = format!("{:.2}", preview.flip_loss_pct),
+                        cap_pct = flip_cap, booked_usd = format!("{:.4}", preview.booked_usd),
+                        realizable_usd = format!("{:.4}", preview.realizable_usd),
+                        "entry flip cap: opening and selling back at current depth loses more than the cap; skipping open");
+                    return;
+                }
+                Some(preview) => {
+                    info!(%mint, flip_loss_pct = format!("{:.2}", preview.flip_loss_pct),
+                        cap_pct = flip_cap, "entry flip cost inside cap");
+                }
+                None => {
+                    debug!(%mint, cap_pct = flip_cap,
+                        "entry flip cost unpriceable; cap allows (unknown is not a verdict)");
+                }
+            }
+        }
         match portfolio.open_position_params(&simulator::OpenPositionParams {
             mint,
             side: Side::Long,
@@ -1335,6 +1404,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             position,
                             micro: Some(req.micro),
                             regime: Some(req.regime.as_str().to_string()),
+                            flip_loss_pct: req.flip.map(|p| p.flip_loss_pct),
                         });
                     }
                 }
@@ -1415,6 +1485,7 @@ mod tests {
             Some(1_250.0),
             micro,
             Some(22.0),
+            Some(6.5),
         );
         assert_eq!(m.liquidity_usd, 30_000.0);
         assert_eq!(m.buy_velocity_5s, 6);
@@ -1425,6 +1496,7 @@ mod tests {
         assert_eq!(m.creator_net_base, -500_000);
         assert_eq!(m.velocity_delta, Some(0.3));
         assert_eq!(m.top_holder_pct, Some(22.0));
+        assert_eq!(m.entry_flip_loss_pct, Some(6.5));
         // Unknowns stay unknown (null), never zero-as-data.
         let empty = MicroSignals {
             buys: 0,
@@ -1437,10 +1509,13 @@ mod tests {
             creator_net_base: 0,
             velocity_delta: None,
         };
-        let m = confirm_metrics(30_000.0, 5, 0.9, 120, None, None, None, None, empty, None);
+        let m = confirm_metrics(
+            30_000.0, 5, 0.9, 120, None, None, None, None, empty, None, None,
+        );
         assert_eq!(m.buy_ratio, None);
         assert_eq!(m.top_holder_pct, None);
         assert_eq!(m.velocity_delta, None);
+        assert_eq!(m.entry_flip_loss_pct, None);
     }
 
     #[test]

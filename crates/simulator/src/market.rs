@@ -612,6 +612,31 @@ impl FillModel {
             stressed,
         })
     }
+
+    /// [`FlipPreview`] for one notional ticket at `mark`: entry fill
+    /// then sell-back, both off the same static state. Composed value
+    /// goes into decisions (model context, cost caps) — settlement
+    /// keeps using `entry_fill`/`exit_price`; the preview must never
+    /// become a fill.
+    pub fn flip_preview(&self, mark: &Mark, notional_usd: f64) -> Option<FlipPreview> {
+        let fill = self.entry_fill(Side::Long, mark, notional_usd).ok()?;
+        let proceeds = self.exit_proceeds(Side::Long, mark, fill.quantity)?;
+        let booked = fill.quantity as f64 * fill.price;
+        if !booked.is_finite() || booked <= 0.0 {
+            return None;
+        }
+        let flip_loss_pct = ((booked - proceeds.realizable_usd) / booked * 100.0).max(0.0);
+        if !flip_loss_pct.is_finite() {
+            return None;
+        }
+        Some(FlipPreview {
+            qty_tokens: fill.quantity,
+            entry_price: fill.price,
+            booked_usd: booked,
+            realizable_usd: proceeds.realizable_usd,
+            flip_loss_pct,
+        })
+    }
 }
 
 /// Liquidity fractions stressed by [`FillModel::exit_proceeds`]:
@@ -635,6 +660,37 @@ pub struct ExitProceeds {
     /// `(liq_frac, realizable_usd)` at half and quarter depth, proxy
     /// basis — `NaN` where that depth is itself unpriceable.
     pub stressed: [(f64, f64); 2],
+}
+
+/// Ex-ante round-trip cost preview at a static mark: what one ticket
+/// costs to open AND immediately sell back, before any order is
+/// placed. Composed from the same proven functions the book settles
+/// with (`entry_fill` for the booked cost, `exit_proceeds` for the
+/// net exit) — a decision input, never a fill. `None` exactly when
+/// either leg is unpriceable: unknown costs never feed a cap (absence
+/// of evidence is not evidence of cost).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlipPreview {
+    /// Whole tokens the ticket buys (the booked floored size).
+    pub qty_tokens: u64,
+    /// Fee-inclusive entry price for that size at the curve (impact
+    /// from this buy inside).
+    pub entry_price: f64,
+    /// `qty × entry_price`: what the entry leg books, USD.
+    pub booked_usd: f64,
+    /// `qty × exit_price`: what selling it back nets, USD (exit
+    /// impact + venue fee inside).
+    pub realizable_usd: f64,
+    /// `(booked − realizable) / booked`, percent: the instant-flip
+    /// loss. Entry impact, exit impact, and venue fees all sit
+    /// inside; the book's own commission layer does not (see the
+    /// `FillModel` fee-layer doc). The sold-back leg quotes the
+    /// PRE-buy curve state, so this slightly overstates the true
+    /// cost — the safe direction for a refusal cap: marginal entries
+    /// refuse a touch early, never a touch late. Also never fires
+    /// negative: exact models net a tiny dust loss at worst, and a
+    /// "profitable flip" is not a cost.
+    pub flip_loss_pct: f64,
 }
 
 /// Signed return since entry, percent.
@@ -1123,5 +1179,68 @@ mod tests {
         p.side = Side::Short;
         assert_eq!(check_exit(&mut p, 0.25, 1001), Some(ExitReason::TakeProfit));
         assert_eq!(check_exit(&mut p, 1.08, 1001), Some(ExitReason::StopLoss));
+    }
+
+    #[test]
+    fn flip_preview_is_the_exact_static_round_trip() {
+        let fill = FillModel::BondingCurve {
+            fee_bps_per_side: 125.0,
+            max_slip_frac: 0.5,
+        };
+        let mark = Mark::new(0.000_004_2, 30_000.0).with_curve(launch_curve());
+        let preview = fill.flip_preview(&mark, 10.0).expect("priced");
+
+        // Byte-for-byte the same composition a caller would hand-roll:
+        // the book's own entry fill, then the book's own exit quote.
+        let entry = fill
+            .entry_fill(Side::Long, &mark, 10.0)
+            .expect("entry prices");
+        let exit = fill
+            .exit_price(Side::Long, &mark, entry.quantity)
+            .expect("exit prices");
+        assert_eq!(preview.qty_tokens, entry.quantity);
+        assert_eq!(preview.entry_price, entry.price);
+        assert_eq!(preview.booked_usd, entry.quantity as f64 * entry.price);
+        assert_eq!(preview.realizable_usd, entry.quantity as f64 * exit);
+        let expected_loss =
+            (preview.booked_usd - preview.realizable_usd) / preview.booked_usd * 100.0;
+        assert_eq!(preview.flip_loss_pct, expected_loss.max(0.0));
+        // Both legs cost money (venue fee + impact on each side).
+        assert!(preview.flip_loss_pct > 0.0, "{}", preview.flip_loss_pct);
+    }
+
+    #[test]
+    fn flip_preview_thin_books_cost_more() {
+        let fill = FillModel::BondingCurve {
+            fee_bps_per_side: 125.0,
+            max_slip_frac: 0.5,
+        };
+        // Proxy basis (no curve state): depth alone drives the impact.
+        let fat = fill
+            .flip_preview(&Mark::new(0.000_004_2, 500_000.0), 10.0)
+            .expect("priced");
+        let thin = fill
+            .flip_preview(&Mark::new(0.000_004_2, 600.0), 10.0)
+            .expect("priced");
+        assert!(thin.flip_loss_pct > fat.flip_loss_pct);
+        // Size matters against the same depth.
+        let bigger = fill
+            .flip_preview(&Mark::new(0.000_004_2, 600.0), 100.0)
+            .expect("priced");
+        assert!(bigger.flip_loss_pct >= thin.flip_loss_pct);
+        // A ticket bigger than the book is unpriceable (fail-closed):
+        // unknown costs must never feed a cap.
+        assert_eq!(fill.flip_preview(&Mark::new(0.000_004_2, 5.0), 10.0), None);
+        // A drained curve state is equally unknown.
+        let mut drained = launch_curve();
+        drained.real_tokens = 0;
+        let mark = Mark::new(0.000_004_2, 30_000.0).with_curve(drained);
+        assert_eq!(fill.flip_preview(&mark, 10.0), None);
+        // Degenerate notionals never fabricate a cost.
+        assert_eq!(fill.flip_preview(&Mark::new(0.000_004_2, 30_000.0), 0.0), None);
+        let mut bad = launch_curve();
+        bad.sol_usd = f64::NAN;
+        let mark = Mark::new(0.000_004_2, 30_000.0).with_curve(bad);
+        assert_eq!(fill.flip_preview(&mark, 10.0), None);
     }
 }

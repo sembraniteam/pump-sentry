@@ -1011,6 +1011,7 @@ mod tests {
             position: position.clone(),
             micro: None,
             regime: None,
+            flip_loss_pct: None,
         });
 
         // benign tick, then the TP tick. Tick lines first (runtime
@@ -1145,6 +1146,7 @@ mod tests {
                 position,
                 micro: None,
                 regime: None,
+                flip_loss_pct: None,
             });
             // +5% mark: under the TP/SL thresholds — no market trigger.
             let now = 1_050;
@@ -1232,10 +1234,12 @@ mod tests {
             },
             micro: None,
             regime: None,
+            flip_loss_pct: None,
         })
         .unwrap();
         let old_ticket = open.as_object_mut().unwrap().remove("ticket_usd");
         assert_eq!(old_ticket, Some(serde_json::Value::from(80.0)));
+        open.as_object_mut().unwrap().remove("flip_loss_pct");
         let mut sell = serde_json::to_value(&JournalLine::SellAttempt {
             ts: 1,
             mint: "M".into(),
@@ -1457,6 +1461,7 @@ mod tests {
             },
             micro,
             regime: regime.map(str::to_string),
+            flip_loss_pct: None,
         }
     }
 

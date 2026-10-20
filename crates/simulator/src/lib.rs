@@ -5,7 +5,7 @@ pub mod portfolio;
 pub mod types;
 
 pub use market::{
-    CurveReserves, EntryFill, EntryFillError, ExitProceeds, FillModel, Mark,
+    CurveReserves, EntryFill, EntryFillError, ExitProceeds, FillModel, FlipPreview, Mark,
     STANDARD_VENUE_FEE_BPS, check_exit, check_exit_realizable,
 };
 pub use portfolio::{

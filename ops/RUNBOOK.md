@@ -107,7 +107,9 @@ What `pause` does (and does not do):
   confirm while paused are skipped at the open (not queued).
 - All other limits stay in force: `notional_usd`, `max_open_positions`,
   `max_exposure_usd`, `max_daily_loss_usd`, `max_expected_entry_gap_usd`,
-  `max_top_holder_pct`, `hot_wallet_max_sol`, plus the execution trips
+  `max_top_holder_pct`, `max_entry_flip_loss_pct` (measured open+sell-back
+  cost at the confirm book; unknown never refuses), `hot_wallet_max_sol`,
+  plus the execution trips
   below (`min_fill_rate_pct`, `max_avg_exit_gap_usd`,
   `max_avg_entry_gap_usd`, ledger-short latch).
 - The marker survives `stop`/`start`/`restart` and crashes: the bot

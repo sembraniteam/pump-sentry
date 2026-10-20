@@ -1414,6 +1414,56 @@ async fn holder_concentration_cap_blocks_whale_mints() {
 }
 
 #[tokio::test]
+async fn entry_flip_cost_cap_blocks_cost_strapped_entries() {
+    // The default tick (spot $2, $30k liquidity) prices a ~2.5% round
+    // trip through the proxy fill: entry impact + exit impact + two
+    // venue legs, all inside the preview that also feeds the model.
+    // The stock test book fills at Exact (zero cost, deterministic
+    // books) — the cap test needs the production curve model, which
+    // is what the boot path builds.
+    fn flip_pipe(cap_pct: f64) -> BleedPipe {
+        let mut settings = Settings::from_map(&HashMap::new());
+        settings.max_entry_flip_loss_pct = cap_pct;
+        pipeline_screened(
+            settings,
+            AuditOutcome::Allow(100),
+            StubReserves::with_tick(tick(MINT, 2.0)),
+            PaperPortfolio::new(100.0, 0.0),
+            StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+            None,
+        )
+    }
+
+    // Cap under the measured cost: nothing opens; the ticket can never
+    // clear its own round-trip cost, so no edge exists yet.
+    let pipe = flip_pipe(2.0);
+    launch_once(&pipe).await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "a ticket whose flip cost exceeds the cap must refuse the open"
+    );
+
+    // Cap over the measured cost: opens.
+    let pipe = flip_pipe(5.0);
+    launch_once(&pipe).await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "tolerable flip cost opens"
+    );
+
+    // Cap off (0): the preview still prices for the model and the
+    // journal, but nothing refuses.
+    let pipe = flip_pipe(0.0);
+    launch_once(&pipe).await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "cap off disables the refusal"
+    );
+}
+
+#[tokio::test]
 async fn forced_exit_regime_shapes_the_open() {
     // Heuristic alone yields the moderate (conservative) band; the
     // forced baseline overrides the pick with tested momentum numbers
