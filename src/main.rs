@@ -1237,7 +1237,10 @@ async fn run_pipeline(live_arg: bool) {
                     if thresholds.alert_risk_fallback_warn_pct > 0 && decisions > 0 {
                         let pct = fallbacks.saturating_mul(100).saturating_div(decisions);
                         if pct >= thresholds.alert_risk_fallback_warn_pct {
-                            warn!("alert: risk-engine fallback rate {pct}% ({fallbacks}/{decisions}) >= ALERT_RISK_FALLBACK_WARN_PCT={}; model may be down, entries run heuristic", thresholds.alert_risk_fallback_warn_pct);
+                            // Policy-aware: what entries do on failure is
+                            // the operator's call, not a constant.
+                            let policy = thresholds.inference_fallback.as_str();
+                            warn!("alert: risk-engine fallback rate {pct}% ({fallbacks}/{decisions}) >= ALERT_RISK_FALLBACK_WARN_PCT={}; model may be down, entries run policy '{policy}' on fallback", thresholds.alert_risk_fallback_warn_pct);
                         }
                     }
                     // Confidence view per model: latency percentiles plus

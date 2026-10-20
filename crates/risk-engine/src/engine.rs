@@ -523,8 +523,6 @@ impl RiskEngine {
         }
     }
 
-    /// Heuristic-only evaluation (no I/O). Does not touch the
-    /// model-trouble counters: this path is deliberate, not a failure.
     /// One inference attempt. `None` means fall back.
     async fn infer(&self, request: ChatRequest) -> Option<RiskProfile> {
         // Own user agent (never the generic SDK default): providers

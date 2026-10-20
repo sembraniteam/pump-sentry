@@ -368,14 +368,12 @@ pub fn decode_line(raw: &str) -> Decoded {
     }
 }
 /// Read the whole journal back; never half-adopt a bad line (counted,
-/// skipped). A read error mid-file counts the loss as bad rather than
-/// pretending the missing lines exist; an unreadable file is empty.
-/// Read the journal: decoded lines plus damage counts. Missing file
-/// (`NotFound`) is an empty journal — legitimate for a first run.
-/// Any OTHER open/read error is returned as `read_error`: the file is
-/// the record of record, so callers must fail closed on it rather
-/// than print "nothing recorded" (an unreadable journal proves
-/// nothing, never assumes nothing happened).
+/// skipped). Missing file (`NotFound`) is an empty journal —
+/// legitimate for a first run; any OTHER open error and a mid-file
+/// read failure surface as `read_error` for fail-closed callers: the
+/// file is the record of record, so "unreadable" must never print as
+/// "nothing recorded". Read failure stops the loop after one damage
+/// count, keeping the lines decoded before it.
 pub fn load_lines(path: &std::path::Path) -> (
     Vec<JournalLine>,
     usize,

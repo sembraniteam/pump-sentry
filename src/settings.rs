@@ -379,6 +379,17 @@ impl Settings {
                 self.inference_fallback
             ));
         }
+        // A huge defer budget is a runaway: every defer starts a FRESH
+        // watch window, so this count — not the deadline — is the only
+        // stop. Past a few defers the RPC burn per signal keeps going
+        // rounds. Warn-only: operator probably meant something else,
+        // but the count and its cost stay theirs.
+        if self.inference_fallback == "defer" && self.inference_defer_max_n > 20 {
+            out.push(format!(
+                "INFERENCE_DEFER_MAX_N={} looks larger than sane (each defer burns one full confirm round and re-arms the window); verify this is intended",
+                self.inference_defer_max_n
+            ));
+        }
         if !self.force_exit_regime.is_empty()
             && self.force_exit_regime.parse::<ExitRegime>().is_err()
         {
@@ -1167,6 +1178,25 @@ mod tests {
         // 0 = off: the defer policy behaves as heuristic at once.
         let s = Settings::from_map(&vars(&[("INFERENCE_DEFER_MAX_N", "0")]));
         assert_eq!(s.inference_defer_max_n, 0);
+        // An unparseable value warns and stays the default (never a
+        // silent sugar misread as a huge budget).
+        let s = Settings::from_map(&vars(&[("INFERENCE_DEFER_MAX_N", "soon")]));
+        assert_eq!(s.inference_defer_max_n, 1);
+        assert!(s.warnings().iter().any(|w| w.contains("INFERENCE_DEFER_MAX_N='soon' is not an integer")));
+        // An extreme (runaway) budget warns only with defer armed —
+        // the fresh-window re-arm makes this count the only stop.
+        let s = Settings::from_map(&vars(&[
+            ("INFERENCE_FALLBACK", "defer"),
+            ("INFERENCE_DEFER_MAX_N", "1000"),
+        ]));
+        assert!(s
+            .warnings()
+            .iter()
+            .any(|w| w.contains("INFERENCE_DEFER_MAX_N=1000 looks larger than sane")));
+        // Same number with disarm'd policy: no warning (the count is
+        // dead configuration then, its cost none).
+        let s = Settings::from_map(&vars(&[("INFERENCE_DEFER_MAX_N", "1000")]));
+        assert!(!s.warnings().iter().any(|w| w.contains("larger than sane")));
     }
 
     #[test]
