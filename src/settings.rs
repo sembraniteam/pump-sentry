@@ -131,8 +131,9 @@ pub struct Settings {
     pub inference_fallback: String,
     /// Confirm-level defers allowed per signal before landing on the
     /// heuristic (policy `defer` only). `0` = off (heuristic at once);
-    /// each defer burns one full confirm round of RPC budget, so the
-    /// signal's own deadline stays the hard stop.
+    /// each defer burns one full confirm round of RPC budget and
+    /// starts a fresh watch window, so this count is the hard stop —
+    /// never elapsed time alone.
     pub inference_defer_max_n: u32,
     /// Forced exit regime (`""` = LLM selects from the closed set):
     /// fixed baseline for evaluation, and the LLM kill path — set it

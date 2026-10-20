@@ -31,7 +31,7 @@ pub async fn cmd_replay(file: Option<String>) -> ! {
     let path: PathBuf = file
         .map(PathBuf::from)
         .unwrap_or_else(journal::default_journal_path);
-    let (lines, blank, bad) = journal::load_lines(&path);
+    let (lines, blank, bad, read_error) = journal::load_lines(&path);
     println!(
         "journal: {} ({} recorded, {} blank, {} skipped-bad lines)",
         path.display(),
@@ -39,6 +39,13 @@ pub async fn cmd_replay(file: Option<String>) -> ! {
         blank,
         bad
     );
+    if let Some(error) = read_error {
+        // The journal is the record of record for analytics: unreadable
+        // means the replay can prove nothing — fail closed, never
+        // "nothing recorded" (which would be a fabricated PASS).
+        println!("journal unreadable: {error} — replay cannot verify anything; fixing the file is an operator action");
+        std::process::exit(1);
+    }
     if lines.is_empty() {
         println!("nothing to replay: the bot has not recorded any decisions yet");
         std::process::exit(0);

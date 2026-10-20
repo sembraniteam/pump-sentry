@@ -904,54 +904,58 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // failure the operator chooses validated heuristic bands
         // (`heuristic`), skips the entry (`pass`), or defers (`defer`):
         // rewatch the signal and retry the model on a later confirm,
-        // bounded by `INFERENCE_DEFER_MAX_N` and the signal's own
-        // deadline; exhausted defers land on the heuristic. Engine-
+        // bounded by `INFERENCE_DEFER_MAX_N` (each defer starts a fresh
+        // watch window, so the defer count is the hard stop; the
+        // deadline aborts still-idle defers); exhausted defers land on
+        // the heuristic. Engine-
         // absent operation is a deliberate mode, not a failure: it
         // never defers (nothing would recover) and the `pass` policy
         // still skips it. Single choke: both arrivals are `Fallback`.
         let mut profile = decision.profile;
-        if decision.source == DecisionSource::Fallback && self.settings.inference_fallback == "pass"
-        {
-            info!(%mint, "inference fallback policy=pass: skipping entry on model failure");
-            profile = risk_engine::RiskProfile::pass();
-        }
-        if decision.source == DecisionSource::Fallback
-            && self.settings.inference_fallback == "defer"
-            && self.engine.is_some()
-            && signal.defers < self.settings.inference_defer_max_n
-        {
-            // Postpone, don't decide on broken inference: rewatch the
-            // signal (fresh window, buyers re-gather; the entry gate
-            // self-evicts at its deadline and its submit cap bounds
-            // total lifetime) and let a later confirm decide on a
-            // model.
-            let mut rewatch = (*signal).clone();
-            rewatch.defers += 1;
-            let now = now_secs();
-            {
-                let mut state = self.gate_state.lock().await;
-                let _ = state.gate.submit(mint, &rewatch.dev, now);
-                if let Some(creator) = rewatch.creator.as_deref() {
-                    let _ = state.gate.add_cohort(mint, creator);
+        if decision.source == DecisionSource::Fallback {
+            // Single choke: engine-absent and engine-failed both arrive
+            // here as `Fallback`. Engine-absent is deliberate mode, not
+            // a failure: `pass` still skips it (operator choice), but
+            // it NEVER defers — nothing would recover.
+            let model_failed = self.engine.is_some();
+            match self.settings.inference_fallback.as_str() {
+                "pass" => {
+                    info!(%mint, "inference fallback policy=pass: skipping entry on model failure");
+                    profile = risk_engine::RiskProfile::pass();
                 }
-                state.meta.insert(mint.to_string(), rewatch);
+                "defer" if model_failed && signal.defers < self.settings.inference_defer_max_n => {
+                    // Postpone, don't decide on broken inference: rewatch
+                    // the signal (fresh window, buyers re-gather; the
+                    // entry gate self-evicts at its deadline and its
+                    // submit cap bounds total lifetime) and let a later
+                    // confirm decide on a model.
+                    let mut rewatch = (*signal).clone();
+                    rewatch.defers += 1;
+                    let now = now_secs();
+                    {
+                        let mut state = self.gate_state.lock().await;
+                        let _ = state.gate.submit(mint, &rewatch.dev, now);
+                        if let Some(creator) = rewatch.creator.as_deref() {
+                            let _ = state.gate.add_cohort(mint, creator);
+                        }
+                        state.meta.insert(mint.to_string(), rewatch);
+                    }
+                    info!(
+                        %mint, defers = signal.defers,
+                        max = self.settings.inference_defer_max_n,
+                        "inference fallback policy=defer: rewatched; the model decides on a later confirm"
+                    );
+                    return;
+                }
+                "defer" if model_failed => {
+                    info!(
+                        %mint, defers = signal.defers,
+                        max = self.settings.inference_defer_max_n,
+                        "defer budget exhausted: validated heuristic bands decide (the default)"
+                    );
+                }
+                _ => {}
             }
-            info!(
-                %mint, defers = signal.defers,
-                max = self.settings.inference_defer_max_n,
-                "inference fallback policy=defer: rewatched; the model decides on a later confirm"
-            );
-            return;
-        }
-        if decision.source == DecisionSource::Fallback
-            && self.settings.inference_fallback == "defer"
-            && self.engine.is_some()
-        {
-            info!(
-                %mint, defers = signal.defers,
-                max = self.settings.inference_defer_max_n,
-                "defer budget exhausted: validated heuristic bands decide (the default)"
-            );
         }
         // Always log the decision (source + latency): heuristic-only
         // operation (`engine: None`) must be as visible as model calls.

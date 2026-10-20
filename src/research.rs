@@ -200,7 +200,7 @@ pub async fn cmd_research(file: Option<String>) -> ! {
     let path: PathBuf = file
         .map(PathBuf::from)
         .unwrap_or_else(journal::default_journal_path);
-    let (lines, blank, bad) = journal::load_lines(&path);
+    let (lines, blank, bad, read_error) = journal::load_lines(&path);
     println!(
         "journal: {} ({} recorded, {} blank, {} skipped-bad lines)",
         path.display(),
@@ -212,6 +212,12 @@ pub async fn cmd_research(file: Option<String>) -> ! {
     println!("Applying anything below means: operator edits config, paper");
     println!("backtest, live confirm, explicit approval. This command");
     println!("cannot apply anything by construction (no write path).");
+    if let Some(error) = read_error {
+        // An unreadable journal is not evidence of zero decisions;
+        // "nothing recorded" would be a fabricated clean slate.
+        println!("journal unreadable: {error} — no patterns report (fail closed)");
+        std::process::exit(1);
+    }
     if lines.is_empty() {
         println!("nothing to analyze: the bot has not recorded any decisions yet");
         std::process::exit(0);

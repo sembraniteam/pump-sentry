@@ -196,8 +196,7 @@ pub struct RiskEngine {
     /// Heuristic-fallback count.
     fallback_count: Arc<AtomicU64>,
     /// Total `evaluate` calls (denominator for the fallback rate;
-    /// deliberate heuristic-only calls via `evaluate_fallback` are
-    /// excluded — this measures model trouble, not mode).
+    /// measures model trouble, not deliberate heuristic-only mode).
     decision_count: Arc<AtomicU64>,
     /// Timeouts only (subset of fallbacks; operator can tell
     /// whether the model is slow vs non-compliant).
@@ -526,14 +525,6 @@ impl RiskEngine {
 
     /// Heuristic-only evaluation (no I/O). Does not touch the
     /// model-trouble counters: this path is deliberate, not a failure.
-    pub fn evaluate_fallback(&self, metrics: &TokenMetrics) -> RiskDecision {
-        tracing::debug!(?metrics, "explicit heuristic fallback (no model call)");
-        RiskDecision {
-            profile: evaluate_metrics_fallback(metrics),
-            source: DecisionSource::Fallback,
-        }
-    }
-
     /// One inference attempt. `None` means fall back.
     async fn infer(&self, request: ChatRequest) -> Option<RiskProfile> {
         // Own user agent (never the generic SDK default): providers

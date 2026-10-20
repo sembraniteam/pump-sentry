@@ -370,24 +370,51 @@ pub fn decode_line(raw: &str) -> Decoded {
 /// Read the whole journal back; never half-adopt a bad line (counted,
 /// skipped). A read error mid-file counts the loss as bad rather than
 /// pretending the missing lines exist; an unreadable file is empty.
-pub fn load_lines(path: &std::path::Path) -> (Vec<JournalLine>, usize, usize) {
+/// Read the journal: decoded lines plus damage counts. Missing file
+/// (`NotFound`) is an empty journal — legitimate for a first run.
+/// Any OTHER open/read error is returned as `read_error`: the file is
+/// the record of record, so callers must fail closed on it rather
+/// than print "nothing recorded" (an unreadable journal proves
+/// nothing, never assumes nothing happened).
+pub fn load_lines(path: &std::path::Path) -> (
+    Vec<JournalLine>,
+    usize,
+    usize,
+    Option<String>,
+) {
     let mut lines = Vec::new();
     let mut blank = 0usize;
     let mut bad = 0usize;
-    if let Ok(file) = std::fs::File::open(path) {
-        for raw in std::io::BufReader::new(file).lines() {
-            match raw {
-                // Read error counts as damage, never as a blank line.
-                Err(_) => bad += 1,
-                Ok(line) => match decode_line(&line) {
-                    Decoded::Line(line) => lines.push(*line),
-                    Decoded::Blank => blank += 1,
-                    Decoded::Bad => bad += 1,
-                },
+    match std::fs::File::open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return (lines, blank, bad, Some(e.to_string())),
+        Ok(file) => {
+            for raw in std::io::BufReader::new(file).lines() {
+                match raw {
+                    Ok(line) => match decode_line(&line) {
+                        Decoded::Line(line) => lines.push(*line),
+                        Decoded::Blank => blank += 1,
+                        Decoded::Bad => bad += 1,
+                    },
+                    // Read error counts as damage, never as a blank
+                    // line. One count, then stop: a reader that keeps
+                    // erroring (a directory fd, dying disk) must not
+                    // spin "bad" counts forever, and the lines decoded
+                    // before the failure stay usable.
+                    Err(_) => {
+                        bad += 1;
+                        return (
+                            lines,
+                            blank,
+                            bad,
+                            Some("read failed mid-file; lines before it kept, the rest unproven".to_string()),
+                        );
+                    }
+                }
             }
         }
     }
-    (lines, blank, bad)
+    (lines, blank, bad, None)
 }
 
 #[cfg(test)]
@@ -516,6 +543,20 @@ mod tests {
         assert_eq!(text.lines().count(), 1);
         // Unwritable destination: None + warn (fail-soft open).
         assert!(JournalSink::maybe_open(&dir.path().join("no-dir/journal.jsonl")).is_none());
+        // Read side distinguishes: the staged journal decodes, a missing
+        // file is an empty journal (NotFound, first run), and another
+        // open failure surfaces as `read_error` — never as a silent
+        // empty journal.
+        let (lines, blank, bad, err) = load_lines(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!((blank, bad), (0, 0));
+        assert!(err.is_none());
+        let (lines, _, _, err) = load_lines(&dir.path().join("never-written.jsonl"));
+        assert!(lines.is_empty());
+        assert!(err.is_none(), "NotFound is an empty journal, not damage");
+        let (lines, _, _, err) = load_lines(dir.path());
+        assert!(lines.is_empty());
+        assert!(err.is_some(), "open error on a directory must surface");
     }
 
     #[test]

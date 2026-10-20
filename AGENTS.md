@@ -513,11 +513,13 @@ cargo fmt --all -- --check        # repo has PRE-EXISTING diffs: fix only
   chooses validated bands, skip, or defer — never a hotter fallback to
   protect volume. Defer re-watches the signal and retries the model on
   a later confirm (`PendingSignal.defers` counts on the signal;
-  `INFERENCE_DEFER_MAX_N` caps it, default 1, `0` = off; exhausted
-  defers land on heuristic; the entry deadline stays the hard stop).
-  Engine-absent operation is deliberate mode, never a failure — it
-  NEVER defers (nothing would recover), the engine-present choke is
-  the one defer site. Single choke in confirm (engine-absent and
+  `INFERENCE_DEFER_MAX_N` caps it, default 1, `0` = off — the count is
+  the hard stop because each defer starts a fresh watch window;
+  exhausted defers land on heuristic, and the deadline aborts
+  still-idle defers). Engine-absent operation is deliberate mode,
+  never a failure — it NEVER defers (nothing would recover), the
+  engine-present choke is the one defer site. Single choke in confirm
+  (engine-absent and
   engine-failed both arrive as `Fallback`). Confidence telemetry per
   model: latency p50/p95/p99 over a bounded window (timeouts sit at
   the budget they cost) plus fallback BUY vs PASS counts, on the
