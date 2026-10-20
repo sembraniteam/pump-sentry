@@ -7,6 +7,8 @@ Real-time detector for new Pump.fun tokens: `logsSubscribe` → `getTransaction`
 - Geyser 429s trip a circuit breaker (30 consecutive): retries drop to hourly with a card, the heartbeat re-logs while banned; recovery is automatic on a working subscribe.
 - Retries: 250ms transient + ~1s jittered tier for 429 (HTTP + JSON-RPC surfaces); permits never held across sleeps.
 - `screen`: dev/creator history (reject fresh/serial, fail-closed), buyer-quorum watchlist (dev dump aborts), bundle forensics at confirm (reject drops, suspect paper-only).
+- `screen::micro` (`MicroSignals`): per-round confirm-tape microstructure — buys/sells, buy ratio, base-unit volumes, unique traders, top-wallet share, insider net flow, round-over-round velocity. Pure computation over already-observed swaps: no new RPC. Round-over-round velocity joins one round's record to the stored previous point (`PendingSignal.prev_tape`).
+- `Screener::top_holder_pct`: top-10 supply share read once per confirm for the armed cap and the risk model alike (unreadable refuses while armed; unarmed it is `None`, never zero).
 - Funders resolve by walking to genesis (page-capped, deadline-bound); RPC caches: dev 1h, funder 24h (transient misses never cached).
 - Zero panics; `create`/`create_v2` layouts frozen-sample proven.
 

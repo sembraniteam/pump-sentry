@@ -39,6 +39,7 @@ Pipeline: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum →
 | `pump-sentry upgrade`      | install latest release                                        |
 | `pump-sentry init-config`  | write the default `config.toml` (`CONFIG_FILE` overrides path) |
 | `pump-sentry replay [file]` | re-derive recorded decisions offline from `journal.jsonl`; exit 1 on any mismatch/unverifiable step |
+| `pump-sentry research [file]` | offline loss-pattern analysis over the journal: loss clusters plus ranked filter proposals with avoided-vs-foregone math and halves; read-only by construction |
 
 State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, day-state, kill-switch marker, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.
 
@@ -67,6 +68,26 @@ Paper numbers describe the simulator only; paper win rate is NOT evidence of
 live profitability — judge live by the live bucket alone. An exit whose input
 tick line is missing reports as *unverifiable* and fails the exit code (fail
 closed, never assumed).
+
+Replay also bins expectancy per entry attribute, each with chronological
+halves and a thin-bin floor (`n < 5` is marked, never read as evidence):
+
+- **decision source** — model vs heuristic-fallback trades (a fallback that
+  protects volume at the cost of edge shows here, not hidden by the rate);
+- **risk model** — expectancy per named engine plus `not recorded` (no
+  engine or pre-upgrade lines): the journal spans boots, so this is the
+  cross-run per-model performance read;
+- **exit regime** — what each trade actually ran (LLM pick or the
+  `force_exit_regime` baseline);
+- plus microstructure joins — buy pressure, round concentration, insider
+  flow, tape velocity.
+
+`pump-sentry research` extends this offline (read-only): it clusters losses
+by regime / pressure / concentration / risk model and ranks candidate
+exclusion rules with the loss they would have avoided against the wins they
+would have foregone. A proposal "wins" only when the halves agree — and
+promoting one always remains operator work: config edit, paper backtest,
+live confirm, explicit approval. The command cannot apply anything.
 
 ## Resilience
 
@@ -145,7 +166,8 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 - `fetch_concurrency` bounds parallel `getTransaction` fetches (lower on metered RPC; `0` refuses at boot); `backfill_sig_limit` caps signatures per backfill page (`0` disables backfill) — the WS reconnect backfill pages the signature list up to 3 pages seeking the last seen signature, past the cap with unseen history beyond it the remainder counts as lost (`backfill_pages_capped`, warn) instead of paging forever; `reconnect_backoff_max_ms` caps reconnect backoff (raise on flaky sockets).
 - `mainnet_rpc_urls_fallback` (or `MAINNET_RPC_URLS_FALLBACK`, comma-separated): read-path failover endpoints behind the one shared RPC client — primary first, next only after an attempt fails (failover, never broadcast). Reads only: order dispatch stays single-path Jito and never fans out. Empty (default) keeps today's primary-only shape.
 - `strategy_mode`: `adaptive` runs the profile verbatim; `scalp` clamps TP to +25…+35%; `runner` sells 80%, trails the 20% moonbag toward 5x–10x.
-- Risk limits (all optional, `0` = off; exits are never blocked by any of them): `notional_usd` caps one ticket, `max_open_positions` caps concurrent positions (paper + live-held mints), `max_exposure_usd` caps total open exposure in USD (paper cost basis + one ticket per unpaired live bag — a bag carries no stored USD basis), `max_daily_loss_usd` halts entries past the day's realized loss. The day-loss tally persists in `~/.pump-sentry/day-state.json`, so a restart cannot reset either the tally or the cap it enforces; live-held custody is restored from the WAL and counts against heat/exposure after a restart too.
+- `force_exit_regime` (`""` = the model selects): pins the exit profile to a closed regime (`momentum` / `conservative` / `liquidity_sensitive`) for evaluation and as the LLM kill path. With selection on, the model only picks from that closed set and a deterministic snap replaces free-form numbers; operator shaping (`scalp`/`runner`) still applies after.
+- Risk limits (all optional, `0` = off; exits are never blocked by any of them): `notional_usd` caps one ticket, `max_open_positions` caps concurrent positions (paper + live-held mints), `max_exposure_usd` caps total open exposure in USD (paper cost basis + one ticket per unpaired live bag — a bag carries no stored USD basis), `max_daily_loss_usd` halts entries past the day's realized loss, and `max_expected_entry_gap_usd` / `max_top_holder_pct` refuse tickets with proven entry bleed / over-concentrated supply (thin evidence always allows). The day-loss tally persists in `~/.pump-sentry/day-state.json`, so a restart cannot reset either the tally or the cap it enforces; live-held custody is restored from the WAL and counts against heat/exposure after a restart too.
 - `hot_wallet_max_sol`: entries refuse (buy preflight) while the wallet holds more SOL than this. The operator bounds what an un-swept wallet or a leaked key can lose; `sell`/exits never consult it. Sweeping is the fix, not raising the cap.
 - `inference_headers`: optional extra headers, one or more comma-separated as `"Name: value, Other: value"` (e.g. OpenCode Go requires `x-opencode-session` for routing/cache); empty (default) sends none. Values may contain `:` (first-colon split) but not `,` (entry separator); repeats resolve last-wins. Malformed and transport-owned entries are skipped with a warning naming the header only (never the value). `authorization`/`user-agent`/framing headers are refused — auth stays in `INFERENCE_API_KEY` env, the user agent is owned.
 - `inference_fallback`: what happens on a model failure at confirm — `heuristic` (default: validated bands open), `pass` (skip the entry), `defer` (re-watch the signal and retry the model on a later confirm; buyers re-gather, the entry deadline still aborts). Engine-absent mode is deliberate, not a failure: it never defers. `inference_defer_max_n` caps defers per signal (`0` = off; exhausted defers land on the heuristic). Per-model performance is read offline — the journal records the engine name on every open (`pump-sentry replay` bins a `risk model` expectancy table across boots; `pump-sentry research` clusters losses by model) — and the heartbeat carries live latency/fallback telemetry per booted model.
