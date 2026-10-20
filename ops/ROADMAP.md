@@ -1,4 +1,4 @@
-# Roadmap — next release (post-0.8.1)
+# Roadmap — next release (post-0.8.2)
 
 ## Shared RPC pool — DONE
 
