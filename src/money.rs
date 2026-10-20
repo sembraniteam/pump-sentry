@@ -4,11 +4,13 @@
 //! owns validated config units so `settings.rs` can adopt them later
 //! without crossing that boundary.
 //!
-//! TODO(settings): migrate `Settings::{fee_bps, slippage_bps,
-//! trail_percent, runner_trail_percent, runner_moonbag_percent}` to
-//! [`Bps`]/[`Percent`] once the owning agents agree on the boundary.
-//! For now these types are provided + tested; `Settings` keeps its
-//! primitive fields so behavior is unchanged.
+//! Settled boundary: `live.rs` owns dispatch DTOs (other owner — do
+//! not touch), and the simulator crate plus the journal `BootSettings`
+//! wire take raw f64/u64 at their boundaries, so `Settings` keeps its
+//! primitive fields. Typed validation lives on the accessors instead —
+//! `Settings::{slippage, fee}` (`Bps`) and `Settings::{trail,
+//! runner_trail, runner_moonbag}` (`Percent`). Use the accessors in
+//! new validation; never add a parallel float check.
 
 /// Basis points, validated `0..=10_000` (100% = 10_000).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -59,7 +61,6 @@ impl Percent {
     }
 
     /// Raw value in percent.
-    #[allow(dead_code)]
     #[must_use]
     pub const fn get(self) -> f64 {
         self.0

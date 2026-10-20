@@ -26,7 +26,7 @@ pub struct Settings {
     /// Virtual balance in USD.
     pub start_balance: f64,
     /// Extra commission per side in bps (stacks on the venue fee).
-    /// Future: migrate to `crate::money::Bps` (see money.rs TODO).
+    /// Validated via typed [`Settings::fee`] (`crate::money::Bps`).
     pub fee_bps: f64,
     /// Paper notional per trade in USD.
     pub notional_usd: f64,
@@ -417,9 +417,9 @@ impl Settings {
                 self.runner_moonbag_percent
             ));
         }
-        if !self.runner_trail_percent.is_finite() || self.runner_trail_percent <= 0.0 {
+        if self.runner_trail().is_none() {
             out.push(format!(
-                "RUNNER_TRAIL_PERCENT={} must be positive; runners would never trail-exit",
+                "RUNNER_TRAIL_PERCENT={} must be in (0, 100]: runners would never trail-exit (≤0%) or the giveback exceeds the trade (>100%)",
                 self.runner_trail_percent
             ));
         }
@@ -429,8 +429,11 @@ impl Settings {
                 self.notional_usd
             ));
         }
-        if self.fee_bps < 0.0 || !self.fee_bps.is_finite() {
-            out.push(format!("FEE_BPS={} is invalid", self.fee_bps));
+        if self.fee().is_none() {
+            out.push(format!(
+                "FEE_BPS={} is invalid (want 0 to below 10000: non-negative whole bps; 100% fails closed in settlement)",
+                self.fee_bps
+            ));
         } else if self.fee_bps > 0.0 {
             out.push(format!(
                 "FEE_BPS={} is commission-only on top of the 125bps venue fee already in FillModel fills (keep 0 unless charging extra)",
@@ -532,9 +535,9 @@ impl Settings {
                 self.start_balance
             ));
         }
-        if !self.trail_percent.is_finite() || self.trail_percent <= 0.0 {
+        if self.trail().is_none() {
             out.push(format!(
-                "TRAIL_PERCENT={} must be positive finite; trailing exits would never fire",
+                "TRAIL_PERCENT={} must be in (0, 100]: trailing exits would never fire (≤0%) or the giveback exceeds the trade (>100%)",
                 self.trail_percent
             ));
         }
@@ -580,6 +583,38 @@ impl Settings {
     /// Typed runner moonbag share (`None` when outside 0–100).
     pub fn runner_moonbag(&self) -> Option<crate::money::Percent> {
         crate::money::Percent::new(self.runner_moonbag_percent)
+    }
+
+    /// Typed extra-commission guard (`None` when negative, not finite,
+    /// at/above 100%, or unrepresentable). Per-side extra bps stacked on
+    /// the venue fee. Mirrors the settlement rule exactly
+    /// (`simulator::market` rounds to whole bps and fails closed
+    /// at/above 100%): a typed `Some` always settles, `None` never
+    /// does. Prefer this over raw `fee_bps` math in validation.
+    pub fn fee(&self) -> Option<crate::money::Bps> {
+        if !self.fee_bps.is_finite() || self.fee_bps < 0.0 {
+            return None;
+        }
+        let rounded = self.fee_bps.round();
+        if rounded >= crate::money::Bps::DENOMINATOR as f64 {
+            return None;
+        }
+        u32::try_from(rounded as u64)
+            .ok()
+            .and_then(crate::money::Bps::new)
+    }
+
+    /// Typed trailing giveback guard (`None` when not finite, at or
+    /// below 0%, or above 100%): trailing exits never fire at zero and
+    /// cannot give back more than the position. Same guard for the
+    /// runner profile via [`Settings::runner_trail`].
+    pub fn trail(&self) -> Option<crate::money::Percent> {
+        crate::money::Percent::new(self.trail_percent).filter(|p| p.get() > 0.0)
+    }
+
+    /// Same trailing guard for [`Settings::runner_trail_percent`].
+    pub fn runner_trail(&self) -> Option<crate::money::Percent> {
+        crate::money::Percent::new(self.runner_trail_percent).filter(|p| p.get() > 0.0)
     }
 
     /// Hot-wallet ceiling in lamports (`0` = off). Negative, NaN, and
@@ -1324,6 +1359,54 @@ mod tests {
         assert!(w.contains("GATE_POLL_MS='zero'"), "{w}");
         assert!(w.contains("QUOTE_USD=-5"), "{w}");
         assert!(w.contains("DISCORD_ALERTS='perhaps'"), "{w}");
+    }
+
+    #[test]
+    fn typed_money_accessors_guard_fee_and_trails() {
+        use crate::money::{Bps, Percent};
+        // Defaults validate through the typed units.
+        let s = Settings::from_map(&HashMap::new());
+        assert_eq!(s.fee().map(Bps::get), Some(0));
+        assert_eq!(s.trail().map(Percent::get), Some(5.0));
+        assert_eq!(s.runner_trail().map(Percent::get), Some(20.0));
+        // Fee: whole-bps floor, 100% edge admitted, garbage refused.
+        let mut s = Settings::from_map(&HashMap::new());
+        s.fee_bps = 125.0;
+        assert_eq!(s.fee().map(Bps::get), Some(125));
+        s.fee_bps = 0.5;
+        assert_eq!(s.fee().map(Bps::get), Some(1), "rounds like settlement");
+        s.fee_bps = 0.4;
+        assert_eq!(s.fee().map(Bps::get), Some(0));
+        s.fee_bps = 10_000.0;
+        assert!(s.fee().is_none(), "100% fails closed in settlement");
+        s.fee_bps = -0.5;
+        assert!(s.fee().is_none(), "negative fee");
+        s.fee_bps = f64::NAN;
+        assert!(s.fee().is_none(), "NaN fee");
+        s.fee_bps = 12_000.0;
+        assert!(s.fee().is_none(), "fee above 100%");
+        // Trails: (0, 100].
+        s.trail_percent = 0.0;
+        assert!(s.trail().is_none(), "zero trail");
+        s.trail_percent = 100.0;
+        assert_eq!(s.trail().map(Percent::get), Some(100.0));
+        s.trail_percent = 150.0;
+        assert!(s.trail().is_none(), "trail above 100%");
+        s.trail_percent = f64::NAN;
+        assert!(s.trail().is_none(), "NaN trail");
+        s.runner_trail_percent = -1.0;
+        assert!(s.runner_trail().is_none(), "negative runner trail");
+        // Warnings route through the accessors: over-100% warns now
+        // (warn-only; nothing gates on these advisories).
+        let s = Settings::from_map(&vars(&[
+            ("TRAIL_PERCENT", "200"),
+            ("RUNNER_TRAIL_PERCENT", "200"),
+            ("FEE_BPS", "20000"),
+        ]));
+        let w = s.warnings().join("\n");
+        assert!(w.contains("TRAIL_PERCENT=200"), "{w}");
+        assert!(w.contains("RUNNER_TRAIL_PERCENT=200"), "{w}");
+        assert!(w.contains("FEE_BPS=20000"), "{w}");
     }
 
     #[test]
