@@ -1,6 +1,6 @@
 ---
 description: Commit staged changes with a Conventional Commits message
-model: opencode/deepseek-v4.1-flash-free
+model: opencode-go/deepseek-v4.1-flash
 ---
 
 Create a commit from staged changes only. Review the changes, detect anomalies, validate the commit message, obtain
