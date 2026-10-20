@@ -44,12 +44,12 @@ struct Proposal {
 /// Evaluate one exclusion rule: `exclude` names the trades the rule
 /// would have skipped. Losses avoided and wins foregone both count —
 /// a rule that dodges losses by also dodging larger wins is a cut,
-/// not an improvement.
+/// not an improvement. Chronological halves mirror the replay
+/// stability check: a rule that worked only in the first half is a
+/// fluke, not a filter.
 fn evaluate_rule(name: &str, rows: &[MicroRow], exclude: impl Fn(&MicroRow) -> bool) -> Proposal {
     let mut excluded = 0usize;
-    let (mut avoided, mut foregone) = (0.0f64, 0.0f64);
-    // Chronological halves mirror the replay stability check: a rule
-    // that worked only in the first half is a fluke, not a filter.
+    // Per half: (losses avoided, wins foregone) in positive USD.
     let mut halves = [(0.0f64, 0.0f64); 2];
     let mut sorted: Vec<&MicroRow> = rows.iter().collect();
     sorted.sort_by_key(|r| r.ts);
@@ -59,26 +59,28 @@ fn evaluate_rule(name: &str, rows: &[MicroRow], exclude: impl Fn(&MicroRow) -> b
             continue;
         }
         excluded += 1;
-        if row.net_pnl < 0.0 {
-            avoided += -row.net_pnl;
+        // A rule that dodges losses by also dodging larger wins is a
+        // cut, not an improvement: both directions are counted and the
+        // net tells which.
+        let (avoided, foregone) = if row.net_pnl < 0.0 {
+            (-row.net_pnl, 0.0)
         } else {
-            foregone += row.net_pnl;
-        }
+            (0.0, row.net_pnl)
+        };
         let slot = &mut halves[usize::from(i >= half)];
-        if row.net_pnl < 0.0 {
-            slot.0 += -row.net_pnl;
-        } else {
-            slot.1 += row.net_pnl;
-        }
+        slot.0 += avoided;
+        slot.1 += foregone;
     }
+    let net_delta = halves.iter().map(|(a, f)| a - f).sum::<f64>();
+    let (first_delta, second_delta) = (halves[0].0 - halves[0].1, halves[1].0 - halves[1].1);
     Proposal {
         name: name.to_string(),
         excluded,
-        avoided,
-        foregone,
-        net_delta: avoided - foregone,
-        first_delta: halves[0].0 - halves[0].1,
-        second_delta: halves[1].0 - halves[1].1,
+        avoided: halves[0].0 + halves[1].0,
+        foregone: halves[0].1 + halves[1].1,
+        net_delta,
+        first_delta,
+        second_delta,
     }
 }
 
@@ -111,7 +113,7 @@ fn candidate_rules() -> Vec<CandidateRule> {
         "fading tape excluded".to_string(),
         Box::new(|r: &MicroRow| r.micro.velocity_delta.is_some_and(|v| v < 0.0)),
     ));
-    for regime in ["momentum", "conservative", "liquidity_sensitive"] {
+    for regime in risk_engine::EXIT_REGIME_NAMES {
         rules.push((
             format!("regime {regime} excluded"),
             Box::new(move |r: &MicroRow| r.regime.as_deref() == Some(regime)),

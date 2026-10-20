@@ -119,6 +119,15 @@ impl ExitRegime {
     }
 }
 
+/// The closed regime set, spelled the way operators write it. The
+/// single source for every surface that needs to enumerate regimes
+/// (`force_exit_regime` parsing, replay tables, research rule grids) —
+/// a fourth regime extends here and nowhere else except the two
+/// functions that must stay in mechanical sync (`as_str`,
+/// `FromStr`), both pinned by pairwise-distinct tests.
+pub const EXIT_REGIME_NAMES: [&str; 3] =
+    ["conservative", "momentum", "liquidity_sensitive"];
+
 impl std::str::FromStr for ExitRegime {
     type Err = String;
 
@@ -257,6 +266,26 @@ pub fn build_prompt(metrics: &TokenMetrics) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published name set stays in mechanical sync with the parse:
+    /// every published name parses, every parse spelling is published.
+    #[test]
+    fn regime_name_set_matches_fromstr() {
+        assert_eq!(EXIT_REGIME_NAMES.len(), 3);
+        for name in EXIT_REGIME_NAMES {
+            let parsed: ExitRegime = name.parse().expect("published name must parse");
+            assert_eq!(parsed.as_str(), name);
+        }
+        // Every domain spelling parses too, so publication cannot lag
+        // behind a new variant.
+        for regime in [
+            ExitRegime::Conservative,
+            ExitRegime::Momentum,
+            ExitRegime::LiquiditySensitive,
+        ] {
+            assert!(EXIT_REGIME_NAMES.contains(&regime.as_str()));
+        }
+    }
 
     #[test]
     fn input_payload_matches_skill_shape() {
