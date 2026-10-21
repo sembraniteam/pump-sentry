@@ -1,7 +1,8 @@
 //! Jito bundles for frontrunning protection.
 //!
-//! Signed tx -> bincode -> base64 -> `sendBundle`. The tip is a plain
-//! system transfer in the same tx, so a landed bundle pays.
+//! Signed tx -> wincode (bincode-1 wire format) -> base64 -> `sendBundle`
+//! . The tip is a plain system transfer in the same tx, so a landed
+//! bundle pays.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::Client;
@@ -572,7 +573,7 @@ pub fn tip_instruction(payer: &Pubkey, tip_account: &Pubkey, lamports: u64) -> I
     }
 }
 
-/// Encode signed txs for `sendBundle`: bincode -> base64.
+/// Encode signed txs for `sendBundle`: wincode -> base64.
 /// Rejects empty and over-limit bundles (engine takes at most 5).
 pub fn encode_bundle(txs: &[Transaction]) -> Result<Vec<String>, JitoError> {
     if txs.is_empty() || txs.len() > MAX_BUNDLE_TXS {
@@ -583,7 +584,7 @@ pub fn encode_bundle(txs: &[Transaction]) -> Result<Vec<String>, JitoError> {
     }
     txs.iter()
         .map(|tx| {
-            bincode::serialize(tx)
+            wincode::serialize(tx)
                 .map(|bytes| BASE64_STANDARD.encode(bytes))
                 .map_err(|e| JitoError::Encode(e.to_string()))
         })
