@@ -87,10 +87,7 @@ mod tests {
 
     #[test]
     fn addresses_match_canonical_strings() {
-        assert_eq!(
-            PUMP_AMM_PROGRAM_ID.to_string(),
-            PUMP_AMM_PROGRAM_ID_STR
-        );
+        assert_eq!(PUMP_AMM_PROGRAM_ID.to_string(), PUMP_AMM_PROGRAM_ID_STR);
         assert_eq!(
             PUMP_AMM_PROGRAM_ID.to_string(),
             "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -117,9 +114,18 @@ mod tests {
         assert_eq!(POOL_MAYHEM_FLAG_OFFSET + 1, POOL_CASHBACK_FLAG_OFFSET);
         assert_eq!(POOL_CASHBACK_FLAG_OFFSET + 1, POOL_VIRT_Q_OFFSET);
         assert_eq!(POOL_VIRT_Q_OFFSET + 16, POOL_CREATOR_FEE_BPS_OFFSET);
-        assert_eq!(POOL_CREATOR_FEE_BPS_OFFSET + 8, POOL_CAN_EDIT_CREATOR_FEE_OFFSET);
-        assert_eq!(POOL_CAN_EDIT_CREATOR_FEE_OFFSET + 1, POOL_HOLDER_REWARD_FLAG_OFFSET);
-        assert_eq!(POOL_HOLDER_REWARD_FLAG_OFFSET + 1, POOL_PROTOCOL_FEES_OFFSET);
+        assert_eq!(
+            POOL_CREATOR_FEE_BPS_OFFSET + 8,
+            POOL_CAN_EDIT_CREATOR_FEE_OFFSET
+        );
+        assert_eq!(
+            POOL_CAN_EDIT_CREATOR_FEE_OFFSET + 1,
+            POOL_HOLDER_REWARD_FLAG_OFFSET
+        );
+        assert_eq!(
+            POOL_HOLDER_REWARD_FLAG_OFFSET + 1,
+            POOL_PROTOCOL_FEES_OFFSET
+        );
         assert_eq!(POOL_CREATOR_FEES_OFFSET + 8, POOL_FULL_LEN);
     }
 }

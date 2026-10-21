@@ -14,7 +14,7 @@ pub use ids::WSOL_MINT;
 use crate::detector::{MigrationError, PUMP_AMM_PROGRAM_ID};
 use ids::{
     POOL_BASE_MINT_OFFSET, POOL_BASE_VAULT_OFFSET, POOL_CASHBACK_FLAG_OFFSET,
-    POOL_COIN_CREATOR_OFFSET, POOL_CREATOR_FEES_OFFSET, POOL_CREATOR_FEE_BPS_OFFSET,
+    POOL_COIN_CREATOR_OFFSET, POOL_CREATOR_FEE_BPS_OFFSET, POOL_CREATOR_FEES_OFFSET,
     POOL_HOLDER_REWARD_FLAG_OFFSET, POOL_MAYHEM_FLAG_OFFSET, POOL_MIN_LEN,
     POOL_PROTOCOL_FEES_OFFSET, POOL_QUOTE_MINT_OFFSET, POOL_QUOTE_VAULT_OFFSET, POOL_VIRT_Q_OFFSET,
     PUMP_AMM_POOL_DISCRIMINATOR,
@@ -270,10 +270,7 @@ mod tests {
         use crate::detector::PUMP_AMM_PROGRAM_ID;
         let (_, owner, data) = frozen_pool();
         assert_eq!(owner, PUMP_AMM_PROGRAM_ID);
-        assert_eq!(
-            virtual_reserves(&data, &owner),
-            Some(987_731_733_625)
-        );
+        assert_eq!(virtual_reserves(&data, &owner), Some(987_731_733_625));
         // Wrong owner, short data, foreign discriminator: no reserves.
         let stranger = Pubkey::new_from_array([9; 32]);
         assert_eq!(virtual_reserves(&data, &stranger), None);
@@ -282,7 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn short_layouts_default_trailing_fees() {        // Older pools end at virtual reserves: counters read 0.
+    fn short_layouts_default_trailing_fees() {
+        // Older pools end at virtual reserves: counters read 0.
         let (pool, _, data) = frozen_pool();
         let short = &data[..POOL_MIN_LEN];
         let parsed = PumpSwapPool::parse(&pool, short).expect("parse");

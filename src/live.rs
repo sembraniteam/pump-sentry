@@ -309,20 +309,15 @@ pub fn paper_dispatch_legs_usd(
     if !sol_usd.is_finite() || sol_usd <= 0.0 {
         return (0.0, 0.0);
     }
-    let leg =
-        |lamports: u64| lamports as f64 / LAMPORTS_PER_SOL * sol_usd;
+    let leg = |lamports: u64| lamports as f64 / LAMPORTS_PER_SOL * sol_usd;
     (
-        leg(
-            tip_lamports
-                .saturating_add(priority_lamports)
-                .saturating_add(BASE_TX_FEE_LAMPORTS)
-                .saturating_add(ATA_RENT_LAMPORTS),
-        ),
-        leg(
-            tip_lamports
-                .saturating_add(priority_lamports)
-                .saturating_add(BASE_TX_FEE_LAMPORTS),
-        ),
+        leg(tip_lamports
+            .saturating_add(priority_lamports)
+            .saturating_add(BASE_TX_FEE_LAMPORTS)
+            .saturating_add(ATA_RENT_LAMPORTS)),
+        leg(tip_lamports
+            .saturating_add(priority_lamports)
+            .saturating_add(BASE_TX_FEE_LAMPORTS)),
     )
 }
 
@@ -597,6 +592,11 @@ pub struct LiveTrader {
     compute_unit_limit: u32,
     /// WAL path (`None` disables IO).
     wal_path: Option<PathBuf>,
+    /// Serializes WAL appends across concurrent dispatches sharing this
+    /// trader (clones share the `Arc`): without it two in-flight
+    /// dispatches can interleave `writeln!` syscalls and tear lines,
+    /// which replay counts as `skipped` (silent custody loss).
+    wal_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// WAL write failures latch entries off: the claim of record is
     /// broken until an operator restart. Shared (clones agree).
     wal_degraded: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -687,7 +687,6 @@ pub enum RecheckOutcome {
     GiveUp,
 }
 
-
 impl LiveTrader {
     /// Wrap an executor with sizing policy.
     pub fn new(executor: SwapExecutor, slippage_bps: u64, tip_lamports: u64) -> Self {
@@ -698,13 +697,12 @@ impl LiveTrader {
             priority_fee_micro_lamports: 0,
             compute_unit_limit: 0,
             wal_path: None,
+            wal_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wal_degraded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             marks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             vol_window_secs: 0,
             vol_extra_cap_bps: 0,
-            pending: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            pending: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             last_sell_bundle: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -812,10 +810,7 @@ impl LiveTrader {
     /// Overhead at an explicit tip (escalated retries debit actuals, not
     /// the base rate).
     pub fn dispatch_cost_for_tip(&self, tip_lamports: u64) -> u64 {
-        let prio = priority_fee_lamports(
-            self.compute_unit_limit,
-            self.priority_fee_micro_lamports,
-        );
+        let prio = priority_fee_lamports(self.compute_unit_limit, self.priority_fee_micro_lamports);
         tip_lamports
             .saturating_add(prio)
             .saturating_add(BASE_TX_FEE_LAMPORTS)
@@ -835,7 +830,8 @@ impl LiveTrader {
     }
 
     /// Run `f` under the pending lock (one poison policy).
-    fn with_pending<R>(        &self,
+    fn with_pending<R>(
+        &self,
         op: &'static str,
         fallback: R,
         f: impl FnOnce(&mut std::collections::HashMap<String, PendingBuy>) -> R,
@@ -973,11 +969,18 @@ impl LiveTrader {
         match self.prior_sell_state(&entry).await {
             PriorSell::Hold => true,
             PriorSell::Landed => {
+                // Terminal: forget the guard now (retiring its WAL
+                // trace) instead of status-probing it until TTL.
+                self.clear_sell_bundle(mint);
                 tracing::warn!(%mint, bundle = %entry.bundle_id, signature = ?entry.signature,
                     "prior sell LANDED on-chain; releasing resend — ledger may be stale, MANUAL REVIEW if the bag no longer exists");
                 false
             }
-            PriorSell::Dead => false,
+            PriorSell::Dead => {
+                // Terminal: provably no-fill — forget the guard now.
+                self.clear_sell_bundle(mint);
+                false
+            }
         }
     }
 
@@ -1099,6 +1102,54 @@ impl LiveTrader {
         out
     }
 
+    /// Classify a resolved buy dispatch error: a POST that failed after
+    /// signing is unknown custody (park for review), never a no-fill.
+    /// Everything else passes through unchanged.
+    fn buy_dispatch_error(
+        mint: Pubkey,
+        curve: Pubkey,
+        assoc_curve: Pubkey,
+        amount_tokens: u64,
+        creator: Option<Pubkey>,
+        e: ExecutorError,
+    ) -> LiveError {
+        match e {
+            ExecutorError::SendUnknown {
+                signature,
+                blockhash,
+                ..
+            } => LiveError::UnknownDispatch {
+                position: Box::new(Self::pending_position(
+                    mint,
+                    curve,
+                    assoc_curve,
+                    amount_tokens,
+                    creator,
+                )),
+                reason: format!(
+                    "buy bundle POST of {mint} failed after signing (sig {signature}, blockhash {blockhash}); may still land, MANUAL REVIEW REQUIRED"
+                ),
+            },
+            other => LiveError::from(other),
+        }
+    }
+
+    /// Classify a sell dispatch timeout: the timed-out POST may have
+    /// been signed and sent, and without a receipt there is no guard
+    /// entry to hold resends — so the bag parks for manual review
+    /// (unknown custody) instead of blind-retrying into a double-spend.
+    /// Pure constructor so the timeout arms cannot drift back to a
+    /// retryable `Unconfirmed`.
+    fn sell_dispatch_timeout(position: &LivePosition, label: &str) -> LiveError {
+        LiveError::UnknownDispatch {
+            position: Box::new(position.clone()),
+            reason: format!(
+                "{label} sell dispatch of {} timed out after {:?}; may still land, MANUAL REVIEW REQUIRED (no resend)",
+                position.mint, LIVE_DISPATCH_TIMEOUT
+            ),
+        }
+    }
+
     /// Build a tracked position (one constructor).
     fn pending_position(
         mint: Pubkey,
@@ -1202,16 +1253,13 @@ impl LiveTrader {
         )
         .await
         {
-            Ok(dispatch) => dispatch?,
+            Ok(dispatch) => dispatch.map_err(|e| {
+                Self::buy_dispatch_error(mint, curve, assoc_curve, plan.amount_tokens, creator, e)
+            })?,
             Err(_) => {
                 // No signature: fill unknown, park for review.
-                let position = Self::pending_position(
-                    mint,
-                    curve,
-                    assoc_curve,
-                    plan.amount_tokens,
-                    creator,
-                );
+                let position =
+                    Self::pending_position(mint, curve, assoc_curve, plan.amount_tokens, creator);
                 return Err(LiveError::UnknownDispatch {
                     position: Box::new(position),
                     reason: format!(
@@ -1223,13 +1271,8 @@ impl LiveTrader {
         };
         tracing::info!(%mint, bundle = %receipt.bundle_id, amount = plan.amount_tokens, "LIVE buy dispatched");
         // Receipt exists from here; confirm removes it.
-        let intended = Self::pending_position(
-            mint,
-            curve,
-            assoc_curve,
-            plan.amount_tokens,
-            creator,
-        );
+        let intended =
+            Self::pending_position(mint, curve, assoc_curve, plan.amount_tokens, creator);
         Self::track_pending(&self.pending, &mint_str, intended.clone(), &receipt);
         self.write_wal_pending(&intended, &receipt);
         let dispatch_blockhash = receipt.blockhash.to_string();
@@ -1255,13 +1298,7 @@ impl LiveTrader {
                     )
                     .await;
                 Ok((
-                    Self::pending_position(
-                        mint,
-                        curve,
-                        assoc_curve,
-                        plan.amount_tokens,
-                        creator,
-                    ),
+                    Self::pending_position(mint, curve, assoc_curve, plan.amount_tokens, creator),
                     receipt.bundle_id,
                     entry_fill,
                 ))
@@ -1326,12 +1363,23 @@ impl LiveTrader {
         }
     }
 
-    /// Append one line (synced). A failure cannot undo the dispatch
-    /// that already happened, but it latches entries off: no further
-    /// live risk may open while custody cannot be recorded.
+    /// Append one line (synced). Serialized across threads sharing
+    /// this trader: one formatted line must be one contiguous write.
+    /// A failure cannot undo the dispatch that already happened, but
+    /// it latches entries off: no further live risk may open while
+    /// custody cannot be recorded.
     fn wal_append(&self, line: String) {
         let Some(path) = self.wal_path.as_ref() else {
             return;
+        };
+        // Serialize before touching the filesystem so concurrent
+        // dispatches cannot interleave bytes on the same file.
+        let _guard = match self.wal_lock.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                self.mark_wal_degraded("wal lock poisoned");
+                return;
+            }
         };
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -1513,8 +1561,12 @@ impl LiveTrader {
         esc.max(floor.min(base.saturating_mul(TIP_ESCALATION_MAX_MULT)))
     }
 
-    /// Import boot-replayed pendings into recheck.
-    pub fn import_pending(&self, items: Vec<wal::WalPending>) -> usize {
+    /// Import boot-replayed pendings into recheck. Returns
+    /// `(imported, skipped)`: a skipped pending is a second buy for a
+    /// mint the rechecker cannot own — surfaced to the caller so it can
+    /// be parked as a visible manual claim instead of being silently
+    /// dropped (AUD-009: either bundle may still have landed).
+    pub fn import_pending(&self, items: Vec<wal::WalPending>) -> (usize, Vec<wal::WalPending>) {
         use std::collections::hash_map::Entry;
         // Pre-upgrade lines carry no blockhash: their expiry can never
         // be proven, so an unresolved one parks to manual instead of
@@ -1527,7 +1579,8 @@ impl LiveTrader {
                 "WAL replay: pending line(s) without blockhash (pre-upgrade); unresolved ones park to manual, never auto-drop"
             );
         }
-        self.with_pending("wal-import", 0, |guard| {
+        let mut skipped = Vec::new();
+        let n = self.with_pending("wal-import", 0, |guard| {
             let mut n = 0usize;
             for item in items {
                 let mint = item.position.mint.to_string();
@@ -1547,12 +1600,14 @@ impl LiveTrader {
                     // dup-guard makes this rare, never impossible).
                     Entry::Occupied(_) => {
                         tracing::warn!(mint = %item.position.mint, bundle = %item.bundle_id,
-                            "WAL replay: second pending for same mint skipped (first wins; inspect the file)");
+                            "WAL replay: second pending for same mint held out for a manual claim (either may have landed)");
+                        skipped.push(item);
                     }
                 }
             }
             n
-        })
+        });
+        (n, skipped)
     }
 
     /// Sell the full tracked amount via Jito.
@@ -1588,10 +1643,7 @@ impl LiveTrader {
         {
             Ok(dispatch) => dispatch?,
             Err(_) => {
-                return Err(LiveError::Unconfirmed(format!(
-                    "sell dispatch of {} timed out after {:?}; still holding",
-                    position.mint, LIVE_DISPATCH_TIMEOUT
-                )));
+                return Err(Self::sell_dispatch_timeout(position, "curve"));
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE sell dispatched");
@@ -1647,29 +1699,28 @@ impl LiveTrader {
         let mint_str = position.mint.to_string();
         let receipt = match tokio::time::timeout(
             LIVE_DISPATCH_TIMEOUT,
-            self.executor.sell_raydium_jito(&executor::SellRaydiumOrder {
-                mint: position.mint,
-                amm: pool.amm,
-                base_vault: pool.base_vault,
-                quote_vault: pool.quote_vault,
-                amount_tokens: position.amount_tokens,
-                slippage_bps: self.effective_slippage_bps(&mint_str, now_secs()),
-                tip_lamports: req.tip_lamports,
-            }),
+            self.executor
+                .sell_raydium_jito(&executor::SellRaydiumOrder {
+                    mint: position.mint,
+                    amm: pool.amm,
+                    base_vault: pool.base_vault,
+                    quote_vault: pool.quote_vault,
+                    amount_tokens: position.amount_tokens,
+                    slippage_bps: self.effective_slippage_bps(&mint_str, now_secs()),
+                    tip_lamports: req.tip_lamports,
+                }),
         )
         .await
         {
             Ok(dispatch) => dispatch?,
             Err(_) => {
-                return Err(LiveError::Unconfirmed(format!(
-                    "raydium sell dispatch of {} timed out after {:?}; still holding",
-                    position.mint, LIVE_DISPATCH_TIMEOUT
-                )));
+                return Err(Self::sell_dispatch_timeout(position, "raydium"));
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE raydium sell dispatched");
         self.note_sell_bundle(&mint_str, &receipt);
-        self.confirm_pool_sell(&mint_str, &receipt, "raydium sell").await
+        self.confirm_pool_sell(&mint_str, &receipt, "raydium sell")
+            .await
     }
 
     /// PumpSwap sell at `pool` via Jito. Floor quotes from live
@@ -1691,15 +1742,13 @@ impl LiveTrader {
         {
             Ok(dispatch) => dispatch?,
             Err(_) => {
-                return Err(LiveError::Unconfirmed(format!(
-                    "pumpswap sell dispatch of {} timed out after {:?}; still holding",
-                    position.mint, LIVE_DISPATCH_TIMEOUT
-                )));
+                return Err(Self::sell_dispatch_timeout(position, "pumpswap"));
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE pumpswap sell dispatched");
         self.note_sell_bundle(&mint_str, &receipt);
-        self.confirm_pool_sell(&mint_str, &receipt, "pumpswap sell").await
+        self.confirm_pool_sell(&mint_str, &receipt, "pumpswap sell")
+            .await
     }
 }
 
@@ -1755,8 +1804,19 @@ mod tests {
             u128::from(base).saturating_mul(u128::from(bps)).div_ceil(D)
         };
         for base in [
-            0u64, 1, 2, 99, 100, 101, 999, 1024, 1_000_000, 123_456_789, 6_750_000_001,
-            4_294_967_295, u64::MAX / 20_000,
+            0u64,
+            1,
+            2,
+            99,
+            100,
+            101,
+            999,
+            1024,
+            1_000_000,
+            123_456_789,
+            6_750_000_001,
+            4_294_967_295,
+            u64::MAX / 20_000,
         ] {
             for tier in [0u64, 1, 125, 250, 300, 1000, 5000] {
                 for t1 in [0u64, 1, tier / 3, tier / 2, tier] {
@@ -1767,8 +1827,7 @@ mod tests {
                     let Some(covered) = fee_inclusive_cost(base, tier as f64) else {
                         continue;
                     };
-                    let onchain =
-                        u128::from(base) + ceil_fee(base, t1) + ceil_fee(base, t2);
+                    let onchain = u128::from(base) + ceil_fee(base, t1) + ceil_fee(base, t2);
                     assert!(
                         u128::from(covered) >= onchain,
                         "underfunded: base={base} tier={tier} split={t1}+{t2}"
@@ -1783,20 +1842,137 @@ mod tests {
     }
 
     #[test]
+    fn buy_transport_unknown_parks_instead_of_no_fill() {
+        // A bundle POST that fails after signing may still land: the
+        // dispatch error must park for manual review (unknown custody),
+        // never resolve to a definitive no-fill without chain proof.
+        let err = LiveTrader::buy_dispatch_error(
+            test_pubkey(1),
+            test_pubkey(2),
+            test_pubkey(3),
+            1_000,
+            None,
+            ExecutorError::SendUnknown {
+                signature: "sig123".to_string(),
+                blockhash: "bh456".to_string(),
+                source: executor::JitoError::Rpc("timeout".to_string()),
+            },
+        );
+        match err {
+            LiveError::UnknownDispatch { position, reason } => {
+                assert_eq!(position.mint, test_pubkey(1));
+                assert_eq!(position.amount_tokens, 1_000);
+                assert!(reason.contains("sig123"), "{reason}");
+            }
+            other => panic!("transport failure must park, got {other:?}"),
+        }
+        // Pre-signing failures pass through untouched: nothing was
+        // sent, so the existing no-fill handling still applies.
+        let err = LiveTrader::buy_dispatch_error(
+            test_pubkey(1),
+            test_pubkey(2),
+            test_pubkey(3),
+            1_000,
+            None,
+            ExecutorError::Timeout("get_latest_blockhash"),
+        );
+        assert!(
+            matches!(err, LiveError::Dispatch(ExecutorError::Timeout(_))),
+            "pre-signing errors keep their verdict"
+        );
+    }
+
+    #[test]
+    fn sell_dispatch_timeout_parks_instead_of_retrying() {
+        // A sell dispatch that times out with no receipt may have been
+        // signed and sent, and there is no guard entry to hold resends
+        // — so the error must park for manual review (unknown custody),
+        // never come back as a retryable `Unconfirmed` that a blind
+        // resend could double-spend against.
+        let position = LivePosition {
+            mint: test_pubkey(1),
+            curve: test_pubkey(2),
+            assoc_curve: test_pubkey(3),
+            amount_tokens: 500,
+            creator: None,
+        };
+        for label in ["curve", "raydium", "pumpswap"] {
+            match LiveTrader::sell_dispatch_timeout(&position, label) {
+                LiveError::UnknownDispatch {
+                    position: boxed,
+                    reason,
+                } => {
+                    assert_eq!(boxed.amount_tokens, 500);
+                    assert!(reason.contains(label), "{reason}");
+                    assert!(reason.contains("no resend"), "{reason}");
+                }
+                other => panic!("sell timeout must park, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn sell_guard_expires_on_ttl() {
         // A guard entry older than the TTL releases (loudly at the
         // call site): Jito bundles resolve in minutes, so an hour-old
         // hold is outage, not custody.
         assert!(!LiveTrader::sell_guard_expired(1_000, 1_000));
-        assert!(!LiveTrader::sell_guard_expired(1_000, 1_000 + SELL_GUARD_TTL_SECS - 1));
-        assert!(LiveTrader::sell_guard_expired(1_000, 1_000 + SELL_GUARD_TTL_SECS));
-        assert!(LiveTrader::sell_guard_expired(1_000, 1_000 + SELL_GUARD_TTL_SECS + 3_600));
+        assert!(!LiveTrader::sell_guard_expired(
+            1_000,
+            1_000 + SELL_GUARD_TTL_SECS - 1
+        ));
+        assert!(LiveTrader::sell_guard_expired(
+            1_000,
+            1_000 + SELL_GUARD_TTL_SECS
+        ));
+        assert!(LiveTrader::sell_guard_expired(
+            1_000,
+            1_000 + SELL_GUARD_TTL_SECS + 3_600
+        ));
         // Clock skew never panics, never holds.
         assert!(!LiveTrader::sell_guard_expired(2_000, 1_000));
     }
 
     #[test]
-    fn tip_escalates_bounded_by_attempts() {        assert_eq!(escalated_tip(100_000, 0), 100_000);
+    fn terminal_sell_forgets_guard_immediately() {
+        // Terminal states (landed/dead) drop the resend guard at once
+        // instead of status-probing it until TTL: fewer RPC calls, no
+        // stale-hold noise. `clear_sell_bundle` is what the release
+        // path calls.
+        let trader = cost_trader(10_000, 0, 0);
+        trader.last_sell_bundle.lock().expect("lock").insert(
+            "MINT".to_string(),
+            SellGuard {
+                bundle_id: "B1".to_string(),
+                signature: Some("sig".to_string()),
+                blockhash: Some("bh".to_string()),
+                noted_at: 1_000,
+            },
+        );
+        assert!(
+            trader
+                .last_sell_bundle
+                .lock()
+                .expect("lock")
+                .contains_key("MINT")
+        );
+        trader.clear_sell_bundle("MINT");
+        assert!(
+            trader
+                .last_sell_bundle
+                .lock()
+                .expect("lock")
+                .get("MINT")
+                .is_none(),
+            "terminal sell must not linger to TTL"
+        );
+        // Unknown mint: no panic, no WAL side effects (no WAL path).
+        trader.clear_sell_bundle("NOPE");
+    }
+
+    #[test]
+    fn tip_escalates_bounded_by_attempts() {
+        assert_eq!(escalated_tip(100_000, 0), 100_000);
         assert_eq!(escalated_tip(100_000, 1), 200_000);
         assert_eq!(escalated_tip(100_000, 2), 300_000);
         assert_eq!(escalated_tip(100_000, 3), 400_000);
@@ -1851,15 +2027,20 @@ mod tests {
     fn buy_fill_price_math() {
         // 7_855_520 lamports for 2000 tokens (6dp) at SOL $150:
         // 0.00785552 * 150 / 2000 = 0.000589164 $/token.
-        let price =
-            buy_fill_price_usd(7_855_520, 2_000_000_000, 6, 150.0).expect("price");
+        let price = buy_fill_price_usd(7_855_520, 2_000_000_000, 6, 150.0).expect("price");
         assert!((price - 0.000_589_164).abs() < 1e-12, "price={price}");
         // Degenerate inputs never divide by zero.
         assert_eq!(buy_fill_price_usd(0, 2_000_000_000, 6, 150.0), None);
         assert_eq!(buy_fill_price_usd(7_855_520, 0, 6, 150.0), None);
         assert_eq!(buy_fill_price_usd(7_855_520, 2_000_000_000, 6, 0.0), None);
-        assert_eq!(buy_fill_price_usd(7_855_520, 2_000_000_000, 6, f64::NAN), None);
-        assert_eq!(buy_fill_price_usd(7_855_520, 2_000_000_000, 19, 150.0), None);
+        assert_eq!(
+            buy_fill_price_usd(7_855_520, 2_000_000_000, 6, f64::NAN),
+            None
+        );
+        assert_eq!(
+            buy_fill_price_usd(7_855_520, 2_000_000_000, 19, 150.0),
+            None
+        );
     }
 
     #[test]
@@ -2122,7 +2303,10 @@ mod tests {
             plan_sell_floor(1_000_000, 150.0, 200, 125.0, 6, &mark(3.0, 30_000.0)).expect("floor");
         let gross = 1_000_000_f64 / 1e6 * 3.0 / 150.0 * LAMPORTS_PER_SOL;
         assert!((floor as f64) < gross, "floor {floor} vs gross {gross}");
-        assert!((floor as f64) > gross * 0.9, "floor {floor} vs gross {gross}");
+        assert!(
+            (floor as f64) > gross * 0.9,
+            "floor {floor} vs gross {gross}"
+        );
     }
 
     #[test]
@@ -2130,12 +2314,20 @@ mod tests {
         // `DEAD` retires via its settled tombstone; `BROKEN` (missing
         // fields) and the non-JSON line are the two skips.
         let lines = [
-            format!(r#"{{"t":"pending","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}}"#),
-            format!(r#"{{"t":"pending","mint":"{TEST_MINT_A}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":500,"creator":null,"sig":"SIG2","bundle":"B2","ts":2}}"#),
+            format!(
+                r#"{{"t":"pending","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}}"#
+            ),
+            format!(
+                r#"{{"t":"pending","mint":"{TEST_MINT_A}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":500,"creator":null,"sig":"SIG2","bundle":"B2","ts":2}}"#
+            ),
             r#"{"t":"settled","bundle":"B2","ts":3}"#.to_string(),
-            format!(r#"{{"t":"position","mint":"{TEST_MINT_B}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":700,"creator":null,"bundle":"B3","ts":4}}"#),
+            format!(
+                r#"{{"t":"position","mint":"{TEST_MINT_B}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":700,"creator":null,"bundle":"B3","ts":4}}"#
+            ),
             format!(r#"{{"t":"sell","mint":"{TEST_MINT_B}","amount":200,"bundle":"B4","ts":5}}"#),
-            format!(r#"{{"t":"manual","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":300,"creator":null,"ts":6}}"#),
+            format!(
+                r#"{{"t":"manual","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":300,"creator":null,"ts":6}}"#
+            ),
             "not json at all".to_string(),
             r#"{"t":"pending","mint":"BROKEN","ts":7}"#.to_string(),
         ];
@@ -2155,8 +2347,12 @@ mod tests {
     #[test]
     fn wal_replay_settled_retires_pending_beside_manual() {
         let retired = [
-            format!(r#"{{"t":"pending","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}}"#),
-            format!(r#"{{"t":"manual","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"note":"dispatch-unknown","ts":2}}"#),
+            format!(
+                r#"{{"t":"pending","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}}"#
+            ),
+            format!(
+                r#"{{"t":"manual","mint":"{TEST_MINT}","curve":"{TEST_CURVE}","assoc":"{TEST_ASSOC}","amount":1000,"creator":null,"note":"dispatch-unknown","ts":2}}"#
+            ),
             r#"{"t":"settled","bundle":"B1","ts":3}"#.to_string(),
         ];
         let replay = wal::replay_lines(retired.iter().map(String::as_str));
@@ -2170,9 +2366,8 @@ mod tests {
         use solana_commitment_config::CommitmentConfig;
         use solana_keypair::Keypair;
         let keypair = Keypair::new();
-        let wallet =
-            WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
-                .expect("wallet");
+        let wallet = WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
+            .expect("wallet");
         let exec = SwapExecutor::new(
             listener::types::DEFAULT_HTTP_RPC_URL,
             CommitmentConfig::confirmed(),
@@ -2180,6 +2375,68 @@ mod tests {
         )
         .expect("executor");
         LiveTrader::new(exec, 200, tip_lamports).with_dispatch_fees(unit_limit, unit_price)
+    }
+
+    #[test]
+    fn import_pending_holds_out_a_second_same_mint_pending() {
+        // AUD-009: two pendings for one mint (both bundles may have
+        // landed) must never silently drop one. The first enters the
+        // recheck map; the second is returned for a visible parked
+        // claim.
+        let trader = cost_trader(10_000, 0, 0);
+        let pending = |mint: &str, bundle: &str, amount: u64| wal::WalPending {
+            position: LivePosition {
+                mint: executor::parse_pubkey(mint).expect("mint"),
+                curve: executor::parse_pubkey(TEST_CURVE).expect("curve"),
+                assoc_curve: executor::parse_pubkey(TEST_ASSOC).expect("assoc"),
+                amount_tokens: amount,
+                creator: None,
+            },
+            signature: format!("sig-{bundle}"),
+            bundle_id: bundle.to_string(),
+            blockhash: Some("bh".to_string()),
+        };
+        let (imported, held_out) = trader.import_pending(vec![
+            pending(TEST_MINT, "B1", 1_000),
+            pending(TEST_MINT, "B2", 500),
+        ]);
+        assert_eq!(imported, 1, "first wins the recheck map");
+        assert_eq!(held_out.len(), 1, "the second is surfaced, never dropped");
+        assert_eq!(held_out[0].bundle_id, "B2");
+        // A distinct mint imports normally.
+        let (imported, held_out) = trader.import_pending(vec![pending(TEST_MINT_B, "B3", 1)]);
+        assert_eq!((imported, held_out.len()), (1, 0));
+    }
+
+    #[test]
+    fn concurrent_wal_appends_recover_all_lines() {
+        // Concurrent dispatches share one trader: appends must be
+        // serialized so replay recovers every line with zero skips.
+        // Without the lock, interleaved `writeln!` syscalls tear lines.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let trader = cost_trader(10_000, 0, 0).with_wal(dir.path().join("wal.jsonl"));
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let trader = trader.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        trader.wal_append(format!(
+                            "{{\"t\":\"settled\",\"bundle\":\"B{t}-{i}\",\"ts\":{i}}}"
+                        ));
+                    }
+                })
+            })
+            .collect();
+        for h in threads {
+            h.join().expect("thread");
+        }
+        let replay = wal::replay_file(&dir.path().join("wal.jsonl")).expect("replay");
+        assert_eq!(replay.skipped, 0, "no torn lines");
+        // 8 threads x 25 lines; settled lines carry no custody but must
+        // parse (torn bytes would count as skipped above) — count raw
+        // lines too: a tear reads as extra/missing lines.
+        let raw = std::fs::read_to_string(dir.path().join("wal.jsonl")).expect("read");
+        assert_eq!(raw.lines().count(), 200, "every append landed");
     }
 
     #[test]
@@ -2248,7 +2505,11 @@ mod tests {
         // are a floor, never a ceiling).
         let (open, close) = paper_dispatch_legs_usd(100_000, 200, 150.0);
         let unit = 150.0 / LAMPORTS_PER_SOL;
-        assert!(((open - (100_000 + 200 + BASE_TX_FEE_LAMPORTS + ATA_RENT_LAMPORTS) as f64 * unit).abs()) < 1e-9);
+        assert!(
+            ((open - (100_000 + 200 + BASE_TX_FEE_LAMPORTS + ATA_RENT_LAMPORTS) as f64 * unit)
+                .abs())
+                < 1e-9
+        );
         assert!(((close - (100_000 + 200 + BASE_TX_FEE_LAMPORTS) as f64 * unit).abs()) < 1e-9);
         // Priority matches the live cost path exactly (one formula).
         assert_eq!(

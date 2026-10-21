@@ -8,10 +8,10 @@ use thiserror::Error;
 
 /// Canonical addresses live in [`ids`]. Re-exported here.
 pub use ids::{
-    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR,
-    PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_CREATE_DISCRIMINATOR,
-    PUMP_CREATE_V2_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR,
-    PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR, PUMP_SELL_V3_DISCRIMINATOR,
+    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR,
+    PUMP_BUY_V3_DISCRIMINATOR, PUMP_CREATE_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR,
+    PUMP_MIGRATE_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR, PUMP_SELL_DISCRIMINATOR,
+    PUMP_SELL_V2_DISCRIMINATOR, PUMP_SELL_V3_DISCRIMINATOR,
 };
 
 /// Min accounts on a `create` ix.
@@ -121,9 +121,7 @@ pub fn is_pump_create_v2_ix(data: &[u8]) -> bool {
 
 /// Decode the shared `(name, symbol, uri)` triple.
 /// One path for both versions. Caller reads the tail.
-fn decode_name_symbol_uri(
-    cursor: &mut &[u8],
-) -> Result<PumpCreateInstructionArgs, PumpParseError> {
+fn decode_name_symbol_uri(cursor: &mut &[u8]) -> Result<PumpCreateInstructionArgs, PumpParseError> {
     PumpCreateInstructionArgs::deserialize(cursor).map_err(PumpParseError::Borsh)
 }
 
@@ -233,7 +231,9 @@ pub fn parse_pump_create_v2(
         required: PUMP_CREATE_V2_MIN_ACCOUNTS,
         found,
     };
-    let mint = *accounts.get(IDX_V2_MINT).ok_or(insufficient(accounts.len()))?;
+    let mint = *accounts
+        .get(IDX_V2_MINT)
+        .ok_or(insufficient(accounts.len()))?;
     let bonding_curve = *accounts
         .get(IDX_V2_BONDING_CURVE)
         .ok_or(insufficient(accounts.len()))?;
@@ -427,8 +427,8 @@ mod tests {
         assert!(is_pump_create_v2_ix(&data));
         assert!(!is_pump_create_ix(&data));
         let accounts: Vec<Pubkey> = (10u8..24).map(test_pubkey).collect();
-        let ev = parse_pump_create_v2(&data, &accounts, "sig123".to_string(), 42)
-            .expect("v2 parse ok");
+        let ev =
+            parse_pump_create_v2(&data, &accounts, "sig123".to_string(), 42).expect("v2 parse ok");
         assert_eq!(ev.mint, test_pubkey(10));
         assert_eq!(ev.bonding_curve, test_pubkey(12));
         assert_eq!(ev.associated_bonding_curve, test_pubkey(13));
@@ -466,8 +466,7 @@ mod tests {
                 .iter()
                 .map(|i| Pubkey::from_str(&keys[*i]).expect("key"))
                 .collect();
-            let ev =
-                parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77).expect("parse");
+            let ev = parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77).expect("parse");
             assert_eq!(ev.name, "makemerich");
             assert_eq!(ev.symbol, "mmrich");
             assert_eq!(
@@ -481,8 +480,8 @@ mod tests {
             assert_eq!(
                 ev.creator,
                 Some(Pubkey::new_from_array([
-                    181, 33, 156, 169, 71, 74, 115, 4, 142, 47, 129, 175, 116, 186, 124, 26,
-                    181, 141, 124, 30, 200, 103, 36, 11, 1, 87, 83, 217, 77, 172, 67, 38,
+                    181, 33, 156, 169, 71, 74, 115, 4, 142, 47, 129, 175, 116, 186, 124, 26, 181,
+                    141, 124, 30, 200, 103, 36, 11, 1, 87, 83, 217, 77, 172, 67, 38,
                 ]))
             );
             assert_eq!(ev.slot, 77);
@@ -528,8 +527,7 @@ mod tests {
                 .iter()
                 .map(|i| Pubkey::from_str(&keys[*i]).expect("key"))
                 .collect();
-            let ev = parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77)
-                .expect("parse");
+            let ev = parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77).expect("parse");
             assert_eq!(ev.name, "BYD AUTO");
             assert_eq!(ev.symbol, "$BYD");
             assert_eq!(
@@ -579,8 +577,7 @@ mod tests {
                 .iter()
                 .map(|i| Pubkey::from_str(&keys[*i]).expect("key"))
                 .collect();
-            let ev = parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77)
-                .expect("parse");
+            let ev = parse_pump_create_v2(&data, &accounts, "sig".to_string(), 77).expect("parse");
             // Trailing space is on-chain data (attacker-controlled
             // name), not a typo — assert exact.
             assert_eq!(ev.name, "TRUMP STREAM ");

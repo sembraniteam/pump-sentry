@@ -422,7 +422,11 @@ mod tests {
         let empty = FeeSchedule {
             tiers: vec![],
             stable: vec![],
-            flat: FeesBps { lp: 0, protocol: 95, creator: 30 },
+            flat: FeesBps {
+                lp: 0,
+                protocol: 95,
+                creator: 30,
+            },
             exotic: FeesBps::default(),
         };
         assert_eq!(select_tier(&empty, QuoteKind::SolLike, 0), None);

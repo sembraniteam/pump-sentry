@@ -6,8 +6,8 @@
 //! trade — it latches a degraded flag and warns once. State files in
 //! this repo stage through `cli::atomic_write_private` for custody; a
 //! journal open is append-only reuse of an existing file, not a
-//! rewrite, so `create` mode re-seals to the owner-like umask and no
-//! operator override of perms happens here.
+//! rewrite, but it is sealed owner-only (0600) on unix, matching the
+//! log and WAL.
 //!
 //! Replay reads the same lines back and re-derives the paper ledger's
 //! decisions from recorded inputs only: no future information exists
@@ -17,12 +17,18 @@
 //! Dropped lines (encode/write failure) COUNT and mark degradation —
 //! a replay over a degraded journal still runs, but its `skipped`
 //! accounting is loud about the gap.
+//!
+//! Secret hygiene (AUD-005): journal lines carry transport error text
+//! (redacted at the call sites), and the file itself is owner-only
+//! (0600 on unix) like the log and the WAL — an analytics-only record
+//! must never be group/world-readable, and redaction here is defense
+//! in depth, not a license for weaker file modes.
 
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -278,12 +284,27 @@ pub struct FillClaim {
     pub tokens: f64,
 }
 
-/// Append-only JSONL sink. Never latches custody: a write failure
-/// flips `degraded` and warns once, then all writes no-op.
+/// Append-only JSONL sink. Never latches custody and never blocks
+/// trading: `append` only serializes (fast, in-memory) and queues the
+/// line on a bounded channel to a dedicated writer thread. A full or
+/// dead channel flips `degraded` and warns once, then writes no-op —
+/// decisions keep flowing while the journal records the gap by its
+/// absence (replay `skipped` accounting stays loud about it).
 pub struct JournalSink {
-    writer: Mutex<BufWriter<std::fs::File>>,
-    degraded: AtomicBool,
+    tx: Mutex<Option<std::sync::mpsc::SyncSender<WriterMsg>>>,
+    degraded: Arc<AtomicBool>,
 }
+
+/// Writer-thread work item. The barrier lets `flush` (tests,
+/// shutdown) wait until every line queued before it hit the disk.
+enum WriterMsg {
+    Line(String),
+    Barrier(std::sync::mpsc::SyncSender<()>),
+}
+
+/// Bounded queue depth: burst headroom for tick storms; beyond it the
+/// sink degrades (drops + warns) rather than back-pressuring trading.
+const JOURNAL_QUEUE_DEPTH: usize = 1024;
 
 impl JournalSink {
     /// Fail-soft open: errors return None with a warning, never panic.
@@ -298,10 +319,35 @@ impl JournalSink {
     }
 
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(path)?;
+        // Re-seal an existing file to owner-only (AUD-005): a journal
+        // created by an older release (procedural umask, often 0644)
+        // must not stay group/world-readable now that it carries
+        // redacted-but-sensitive transport details.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        let degraded = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(JOURNAL_QUEUE_DEPTH);
+        std::thread::Builder::new()
+            .name("journal-writer".to_string())
+            .spawn({
+                let degraded = degraded.clone();
+                move || writer_loop(rx, file, &degraded)
+            })
+            .map_err(std::io::Error::other)?;
         Ok(Self {
-            writer: Mutex::new(BufWriter::new(file)),
-            degraded: AtomicBool::new(false),
+            tx: Mutex::new(Some(tx)),
+            degraded,
         })
     }
 
@@ -313,42 +359,128 @@ impl JournalSink {
         });
     }
 
-    /// Append one encoded line. Fail-soft: encode or IO failure warns
-    /// once and flips `degraded` (trading is never affected).
+    /// Append one encoded line. Fail-soft and non-blocking: encode
+    /// or queue failure warns once and flips `degraded` (trading is
+    /// never affected, the writer thread owns all disk waits).
     pub fn append(&self, line: &JournalLine) {
         if self.degraded.load(Ordering::Relaxed) {
             return;
         }
-        let mut writer = match self.writer.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                // A poisoned mutex means a write panicked mid-line —
-                // same fail-soft policy as IO: latch loud, never block
-                // trading, and never fake the missing lines.
-                if !self.degraded.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "decision journal degraded (writer lock poisoned; analysis only, trading unaffected)"
-                    );
-                }
+        let line_text = match serde_json::to_string(line) {
+            Ok(mut s) => {
+                s.push('\n');
+                s
+            }
+            Err(e) => {
+                self.degrade(format!("encode failed: {e}"));
                 return;
             }
         };
-        let encode = serde_json::to_string(line).map(|mut s| {
-            s.push('\n');
-            s
-        });
-        let out = match encode {
-            Ok(s) => writer.write_all(s.as_bytes()).and_then(|()| writer.flush()),
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        let tx = match self.tx.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => {
+                self.degrade("sender lock poisoned".to_string());
+                return;
+            }
         };
-        if let Err(e) = out {
-            self.degraded.store(true, Ordering::Relaxed);
-            warn!(error = %e, "decision journal degraded (analysis only; trading unaffected)");
+        let Some(tx) = tx else {
+            self.degrade("writer gone".to_string());
+            return;
+        };
+        match tx.try_send(WriterMsg::Line(line_text)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.degrade("queue full (burst beyond 1024); dropping".to_string());
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.degrade("writer thread gone".to_string());
+            }
+        }
+    }
+
+    /// Block (bounded) until every line queued before the call hits the
+    /// disk. For tests and shutdown — never on the trading hot path.
+    pub fn flush(&self) -> bool {
+        if self.degraded.load(Ordering::Relaxed) {
+            return false;
+        }
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let tx = match self.tx.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return false,
+        };
+        let Some(tx) = tx else { return false };
+        // Bounded, never blocking: a full queue degrades instead of
+        // hanging the caller.
+        if tx.try_send(WriterMsg::Barrier(ack_tx)).is_err() {
+            self.degrade("flush barrier not accepted".to_string());
+            return false;
+        }
+        if ack_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err()
+        {
+            self.degrade("writer unresponsive".to_string());
+            return false;
+        }
+        true
+    }
+
+    fn degrade(&self, reason: String) {
+        if !self.degraded.swap(true, Ordering::Relaxed) {
+            warn!("decision journal degraded ({reason}; analysis only, trading unaffected)");
         }
     }
 
     pub fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for JournalSink {
+    fn drop(&mut self) {
+        // Shutdown path only (the sink lives in an `Arc` for the run):
+        // give queued lines a bounded chance to land, never hang exit.
+        self.flush();
+    }
+}
+
+/// Dedicated writer: the only thread that ever touches the journal
+/// file. Slow disks stall here, never the trading hot path. An IO
+/// error degrades once and stops the loop — queued lines behind the
+/// failure are dropped (fail-soft: counted by their absence, replay
+/// `skipped` stays loud), trading continues.
+fn writer_loop(
+    rx: std::sync::mpsc::Receiver<WriterMsg>,
+    file: std::fs::File,
+    degraded: &AtomicBool,
+) {
+    let mut writer = BufWriter::new(file);
+    let fail = |reason: String, degraded: &AtomicBool| {
+        if !degraded.swap(true, Ordering::Relaxed) {
+            warn!("decision journal degraded ({reason}; analysis only, trading unaffected)");
+        }
+    };
+    for msg in rx {
+        match msg {
+            WriterMsg::Line(text) => {
+                if writer
+                    .write_all(text.as_bytes())
+                    .and_then(|()| writer.flush())
+                    .is_err()
+                {
+                    fail("write failed".to_string(), degraded);
+                    break;
+                }
+            }
+            WriterMsg::Barrier(ack) => {
+                if writer.flush().is_err() {
+                    fail("flush failed".to_string(), degraded);
+                    break;
+                }
+                let _ = ack.send(());
+            }
+        }
     }
 }
 
@@ -381,12 +513,7 @@ pub fn decode_line(raw: &str) -> Decoded {
 /// file is the record of record, so "unreadable" must never print as
 /// "nothing recorded". Read failure stops the loop after one damage
 /// count, keeping the lines decoded before it.
-pub fn load_lines(path: &std::path::Path) -> (
-    Vec<JournalLine>,
-    usize,
-    usize,
-    Option<String>,
-) {
+pub fn load_lines(path: &Path) -> (Vec<JournalLine>, usize, usize, Option<String>) {
     let mut lines = Vec::new();
     let mut blank = 0usize;
     let mut bad = 0usize;
@@ -412,7 +539,10 @@ pub fn load_lines(path: &std::path::Path) -> (
                             lines,
                             blank,
                             bad,
-                            Some("read failed mid-file; lines before it kept, the rest unproven".to_string()),
+                            Some(
+                                "read failed mid-file; lines before it kept, the rest unproven"
+                                    .to_string(),
+                            ),
                         );
                     }
                 }
@@ -443,6 +573,38 @@ mod tests {
             opened_at: 100,
             timeout_seconds: 300,
             moonbag_percent: 10.0,
+        }
+    }
+
+    #[test]
+    fn journal_is_owner_only_and_reseals_looser_files() {
+        // AUD-005: the decision journal may carry redacted transport
+        // detail; owner-only (0600) is required on a fresh file, and a
+        // pre-existing looser file (older release, umask) is re-sealed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("journal.jsonl");
+            let sink = JournalSink::open(&path).unwrap();
+            sink.append(&JournalLine::Boot {
+                ts: 1,
+                settings: BootSettings::pre_boot(),
+            });
+            assert!(sink.flush());
+            drop(sink);
+            let mode = std::fs::metadata(&path).expect("file").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "fresh journal must be owner-only");
+            // A group/world-readable old file is re-sealed on open.
+            let old = dir.path().join("old.jsonl");
+            std::fs::write(&old, "stale\n").expect("write");
+            std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod 644");
+            let sink = JournalSink::open(&old).expect("open");
+            assert!(sink.flush());
+            drop(sink);
+            let mode = std::fs::metadata(&old).expect("file").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "pre-existing journal is re-sealed");
         }
     }
 
@@ -548,6 +710,7 @@ mod tests {
             settings: BootSettings::pre_boot(),
         });
         assert!(!sink.is_degraded());
+        assert!(sink.flush(), "queued line lands before the read");
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1);
         // Unwritable destination: None + warn (fail-soft open).
@@ -590,7 +753,45 @@ mod tests {
             ts: 2,
             settings: BootSettings::pre_boot(),
         });
+        assert!(sink.flush());
         let text = std::fs::read_to_string(dir.path().join("journal.jsonl")).unwrap();
         assert_eq!(text.lines().count(), 1);
+    }
+
+    #[test]
+    fn burst_appends_never_block_and_never_lose_quietly() {
+        // The hot-path contract: a tick storm must not stall the
+        // caller, and whatever lands must be complete lines. Either
+        // every line lands, or the sink degrades loudly — never a
+        // block, never silent loss.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let sink = JournalSink::open(&path).unwrap();
+        let started = std::time::Instant::now();
+        for i in 0..5000u64 {
+            sink.append(&JournalLine::Tick {
+                ts: i,
+                mint: "M".into(),
+                mark: simulator::Mark::price_only(1.0),
+                sol_feed: Some(100.0),
+                tick_observed_at: i,
+                complete: false,
+                manual_exits: false,
+            });
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "5000 queued appends must not block trading"
+        );
+        if sink.flush() {
+            assert!(!sink.is_degraded());
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.lines().count(), 5000, "no silent loss");
+            let (lines, _, bad, _) = load_lines(&path);
+            assert_eq!(lines.len(), 5000);
+            assert_eq!(bad, 0);
+        } else {
+            assert!(sink.is_degraded(), "flush failure means loud degradation");
+        }
     }
 }

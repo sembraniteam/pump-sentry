@@ -34,15 +34,22 @@ pub enum ExecutorError {
     Rpc(#[from] ClientError),
     #[error("jito error: {0}")]
     Jito(#[from] JitoError),
+    /// Bundle POST failed after signing: the engine may still have
+    /// received it, so the signed identity rides along for
+    /// reconcile-or-park. Callers must never resend blindly from this
+    /// nor verdict it a no-fill without chain proof.
+    #[error("bundle send failed after signing (sig {signature}; may still land): {source}")]
+    SendUnknown {
+        signature: String,
+        blockhash: String,
+        source: JitoError,
+    },
     /// Jito route with no bundle client.
     #[error("jito client not configured; call with_jito first")]
     NoJito,
     /// Not valid base58.
     #[error("bad signature '{value}': {msg}")]
-    BadSignature {
-        value: String,
-        msg: String,
-    },
+    BadSignature { value: String, msg: String },
     /// No signatures after signing.
     #[error("unsigned transaction: refusing to dispatch")]
     UnsignedTransaction,
@@ -171,13 +178,20 @@ pub fn parse_curve_state(owner: &Pubkey, data: &[u8]) -> Option<CurveState> {
         return None;
     }
     let creator = Pubkey::new_from_array(
-        data.get(CURVE_CREATOR_OFFSET..CURVE_CREATOR_END)?.try_into().ok()?,
+        data.get(CURVE_CREATOR_OFFSET..CURVE_CREATOR_END)?
+            .try_into()
+            .ok()?,
     );
     let quote_raw = Pubkey::new_from_array(
-        data.get(CURVE_QUOTE_MINT_OFFSET..CURVE_QUOTE_MINT_END)?.try_into().ok()?,
+        data.get(CURVE_QUOTE_MINT_OFFSET..CURVE_QUOTE_MINT_END)?
+            .try_into()
+            .ok()?,
     );
     let u64at = |off: usize| -> Option<u64> {
-        data.get(off..off + 8)?.try_into().ok().map(u64::from_le_bytes)
+        data.get(off..off + 8)?
+            .try_into()
+            .ok()
+            .map(u64::from_le_bytes)
     };
     Some(CurveState {
         creator,
@@ -253,8 +267,7 @@ async fn fetch_fee_inputs(rpc: &RpcClient) -> Option<(bool, crate::quote::FeeSch
     use crate::instructions::{FEE_CONFIG_ACCOUNT, FEE_CONFIG_PROGRAM, GLOBAL_ACCOUNT};
     let (global, schedule) = tokio::join!(
         async {
-            let account =
-                rpc_timeout(RPC_READ_TIMEOUT, rpc.get_account(&GLOBAL_ACCOUNT)).await?;
+            let account = rpc_timeout(RPC_READ_TIMEOUT, rpc.get_account(&GLOBAL_ACCOUNT)).await?;
             if account.owner != crate::instructions::PUMP_PROGRAM_ID {
                 return None;
             }
@@ -401,7 +414,8 @@ pub struct SwapExecutor {
     /// paper paths opt out explicitly via [`Self::with_strict_sim`](false).
     strict_sim: bool,
     /// Curve fee-input cache: (gate_on, schedule, fetched_at).
-    fee_cache: Arc<tokio::sync::Mutex<Option<(bool, crate::quote::FeeSchedule, std::time::Instant)>>>,
+    fee_cache:
+        Arc<tokio::sync::Mutex<Option<(bool, crate::quote::FeeSchedule, std::time::Instant)>>>,
     /// Mint supply cache: (supply, fetched_at).
     supply_cache: Arc<tokio::sync::Mutex<HashMap<Pubkey, (u64, std::time::Instant)>>>,
 }
@@ -627,9 +641,7 @@ impl SwapExecutor {
         // a classic-ATA address so funding stays visible. Never use this
         // fallback to build a swap ix.
         let wsol_ata = match self.token_program(&WSOL_MINT).await {
-            Some(program) => {
-                user_ata_with_program(&self.wallet.pubkey(), &WSOL_MINT, &program)
-            }
+            Some(program) => user_ata_with_program(&self.wallet.pubkey(), &WSOL_MINT, &program),
             None => user_ata_with_program(
                 &self.wallet.pubkey(),
                 &WSOL_MINT,
@@ -700,10 +712,7 @@ impl SwapExecutor {
             warn!(mint = %mint, "sell re-quote failed ({why}); refusing loose floor (fail-closed)");
             ExecutorError::BadOrder(format!("sell re-quote failed ({why}); refusing"))
         };
-        let (fees, supply) = tokio::join!(
-            self.fee_inputs(),
-            self.supply_cached(mint),
-        );
+        let (fees, supply) = tokio::join!(self.fee_inputs(), self.supply_cached(mint),);
         let (Some((gate_on, schedule)), Some(supply)) = (fees, supply) else {
             return Err(refuse("fee inputs unreadable"));
         };
@@ -731,8 +740,7 @@ impl SwapExecutor {
             return Some((gate, schedule));
         }
         let fresh = fetch_fee_inputs(&self.rpc).await?;
-        *self.fee_cache.lock().await =
-            Some((fresh.0, fresh.1.clone(), std::time::Instant::now()));
+        *self.fee_cache.lock().await = Some((fresh.0, fresh.1.clone(), std::time::Instant::now()));
         Some((fresh.0, fresh.1))
     }
 
@@ -753,21 +761,21 @@ impl SwapExecutor {
 
     /// Fee-inclusive spend guard. Falls back to the order guard when
     /// unreadable. Never exceeds the order ceiling.
-    async fn quote_buy_guard(        &self,
+    async fn quote_buy_guard(
+        &self,
         mint: &Pubkey,
         state: Option<&CurveState>,
         amount: u64,
         fallback_max: u64,
         slippage_bps: u64,
     ) -> (u64, Option<u64>) {
-        let Some(state) = state else { return (fallback_max, None) };
+        let Some(state) = state else {
+            return (fallback_max, None);
+        };
         if state.complete || state.is_cashback {
             return (fallback_max, None);
         }
-        let (fees, supply) = tokio::join!(
-            self.fee_inputs(),
-            self.supply_cached(mint),
-        );
+        let (fees, supply) = tokio::join!(self.fee_inputs(), self.supply_cached(mint),);
         let (Some((gate_on, schedule)), Some(supply)) = (fees, supply) else {
             warn!(mint = %mint, "fee inputs unreadable; keeping sized guard (sim decides)");
             return (fallback_max, None);
@@ -857,7 +865,11 @@ impl SwapExecutor {
                     (b.mint == mint_str
                         && matches!(&b.owner, OptionSerializer::Some(o) if o == &buyer))
                     .then(|| {
-                        b.ui_token_amount.amount.parse::<u64>().ok().map(|a| (b.account_index, a))
+                        b.ui_token_amount
+                            .amount
+                            .parse::<u64>()
+                            .ok()
+                            .map(|a| (b.account_index, a))
                     })?
                 })
                 .collect(),
@@ -1021,10 +1033,12 @@ impl SwapExecutor {
     }
 
     /// Resolve a dispatched bundle+signature into one verdict. Chain
-    /// beats engine: a landed signature decides; a timeout asks the
-    /// engine — whose terminal verdicts (Landed, Failed) are taken as
-    /// given — then reconciles by signature over full history before
-    /// any terminal release. Only an unseen signature with a provably
+    /// beats engine: a chain-confirmed signature decides; otherwise the
+    /// engine is only a hint. In particular an engine `Landed` without
+    /// a chain-confirmed signature stays `Unknown` and re-reconciles by
+    /// signature over full history before any terminal release — a
+    /// bundle that "landed" while its transaction errored must never
+    /// open a tracked position. Only an unseen signature with a provably
     /// dead blockhash may close as expired; unverifiable reconciles and
     /// unprovable expiry stay `Unknown`, which never authorizes a
     /// resend (the caller's own bound releases those, loudly).
@@ -1041,15 +1055,14 @@ impl SwapExecutor {
         }
         let engine = self.bundle_status(bundle_id).await;
         let (reconciled, expiry) = match engine {
-            // Engine terminal states need no chain second-opinion: the
-            // poll above already checked the chain for this signature.
-            BundleStatus::Landed | BundleStatus::Failed | BundleStatus::Pending => {
-                (None, UnseenExpiry::Unknown)
-            }
-            // Forgot (5-minute lookback) or unreadable: no testimony at
-            // all. The signature is the reconciliation key, and only
-            // "unseen" opens the expiry question.
-            BundleStatus::Invalid | BundleStatus::Unknown => {
+            // Never forwarded: no funds moved, no chain second-opinion
+            // needed (the poll above already checked this signature).
+            BundleStatus::Failed | BundleStatus::Pending => (None, UnseenExpiry::Unknown),
+            // Landed, forgot (5-minute lookback), or unreadable: the
+            // signature is the reconciliation key. Engine `Landed` alone
+            // never authorizes a fill — reconcile by signature first.
+            // Only "unseen" opens the expiry question.
+            BundleStatus::Landed | BundleStatus::Invalid | BundleStatus::Unknown => {
                 match self.reconcile_signature(signature).await {
                     Ok(seen) => {
                         let expiry = if seen.is_none() {
@@ -1119,7 +1132,12 @@ impl SwapExecutor {
         }
         let balance = self
             .wallet
-            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
+            .assert_solvency(
+                &self.rpc,
+                0,
+                self.effective_tip(order.tip_lamports, bundled),
+                self.priority_fee_lamports(),
+            )
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "raydium sell pre-flight ok");
         let payer = self.wallet.pubkey();
@@ -1127,7 +1145,9 @@ impl SwapExecutor {
         // only: upstream requires `[0] == spl_token::id()`, so a
         // Token-2022 mint fails here (not after burning sim budget).
         let Some(token_program) = self.token_program(&order.mint).await else {
-            return Err(ExecutorError::BadOrder("mint account unreadable; token program unknown".to_string()));
+            return Err(ExecutorError::BadOrder(
+                "mint account unreadable; token program unknown".to_string(),
+            ));
         };
         if token_program != crate::instructions::TOKEN_PROGRAM_ID {
             warn!(mint = %order.mint, "Token-2022 mint on a Raydium V4 pool: unroutable by program construction; refusing (fail-closed, manual exit)");
@@ -1135,7 +1155,8 @@ impl SwapExecutor {
                 "Token-2022 mint unroutable via Raydium V4; refusing (fail-closed)".to_string(),
             ));
         }
-        let source_ata = crate::instructions::user_ata_with_program(&payer, &order.mint, &token_program);
+        let source_ata =
+            crate::instructions::user_ata_with_program(&payer, &order.mint, &token_program);
         match tokio::time::timeout(
             Duration::from_secs(10),
             self.rpc.get_token_account_balance(&source_ata),
@@ -1168,10 +1189,12 @@ impl SwapExecutor {
         // subtracted (accepted ~0.03% tolerance; the sim gate decides).
         let (base_vault, quote_vault) = tokio::join!(
             async {
-                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.base_vault)).await
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.base_vault))
+                    .await
             },
             async {
-                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.quote_vault)).await
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.quote_vault))
+                    .await
             }
         );
         let (base_vault, quote_vault) = match (base_vault, quote_vault) {
@@ -1209,9 +1232,10 @@ impl SwapExecutor {
         // fee, constant-product) says the exit nets this many WSOL
         // lamports before the slippage floor.
         info!(mint = %order.mint, amount_in = order.amount_tokens, quoted_lamports = quoted, "raydium sell quote (venue math)");
-        let floor = crate::raydium::raydium_sell_floor(quoted, order.slippage_bps).ok_or_else(|| {
-            ExecutorError::BadOrder("raydium floor unguardable (dust); refusing".to_string())
-        })?;
+        let floor =
+            crate::raydium::raydium_sell_floor(quoted, order.slippage_bps).ok_or_else(|| {
+                ExecutorError::BadOrder("raydium floor unguardable (dust); refusing".to_string())
+            })?;
         // WSOL dest [6] must exist; prefix is idempotent.
         let user_destination = crate::instructions::user_ata_with_program(
             &payer,
@@ -1269,8 +1293,8 @@ impl SwapExecutor {
         bundled: bool,
     ) -> Result<Vec<solana_instruction::Instruction>, ExecutorError> {
         use crate::instructions::{
-            DEFAULT_BUYBACK_FEE_RECIPIENT, PUMP_AMM_FEE_CONFIG, PUMP_AMM_PROGRAM_ID, TOKEN_PROGRAM_ID,
-            WSOL_MINT, user_ata_with_program,
+            DEFAULT_BUYBACK_FEE_RECIPIENT, PUMP_AMM_FEE_CONFIG, PUMP_AMM_PROGRAM_ID,
+            TOKEN_PROGRAM_ID, WSOL_MINT, user_ata_with_program,
         };
         use crate::quote::{
             market_cap, parse_amm_creator_gate, pumpswap_fee_bps, pumpswap_sell_floor,
@@ -1289,13 +1313,20 @@ impl SwapExecutor {
         }
         let balance = self
             .wallet
-            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
+            .assert_solvency(
+                &self.rpc,
+                0,
+                self.effective_tip(order.tip_lamports, bundled),
+                self.priority_fee_lamports(),
+            )
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "pumpswap sell pre-flight ok");
         let payer = self.wallet.pubkey();
         // PumpSwap supports both token programs: the vault owners decide.
         let Some(token_program) = self.token_program(&order.mint).await else {
-            return Err(ExecutorError::BadOrder("mint account unreadable; token program unknown".to_string()));
+            return Err(ExecutorError::BadOrder(
+                "mint account unreadable; token program unknown".to_string(),
+            ));
         };
         let source_ata = user_ata_with_program(&payer, &order.mint, &token_program);
         match tokio::time::timeout(
@@ -1331,20 +1362,28 @@ impl SwapExecutor {
                 tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.pool)).await
             },
             async {
-                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.base_vault)).await
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.base_vault))
+                    .await
             },
             async {
-                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.quote_vault)).await
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&order.quote_vault))
+                    .await
             },
             async {
-                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&ids::PUMP_AMM_GLOBAL_CONFIG)).await
+                tokio::time::timeout(
+                    RPC_READ_TIMEOUT,
+                    self.rpc.get_account(&ids::PUMP_AMM_GLOBAL_CONFIG),
+                )
+                .await
             },
             async {
-                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&PUMP_AMM_FEE_CONFIG)).await
+                tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&PUMP_AMM_FEE_CONFIG))
+                    .await
             },
             async { self.supply_cached(&order.mint).await }
         );
-        let (Ok(Ok(pool)), Ok(Ok(base_vault)), Ok(Ok(quote_vault))) = (pool, base_vault, quote_vault)
+        let (Ok(Ok(pool)), Ok(Ok(base_vault)), Ok(Ok(quote_vault))) =
+            (pool, base_vault, quote_vault)
         else {
             return Err(ExecutorError::BadOrder(
                 "pumpswap pool or vaults unreadable; refusing unroutable dispatch (fail-closed)"
@@ -1352,12 +1391,9 @@ impl SwapExecutor {
             ));
         };
         // Trust gate: AMM owner, our mint at base, WSOL quote.
-        let Some(parsed) = PumpSwapPool::parse_validated(
-            &order.pool,
-            &pool.data,
-            &pool.owner,
-            &order.mint,
-        ) else {
+        let Some(parsed) =
+            PumpSwapPool::parse_validated(&order.pool, &pool.data, &pool.owner, &order.mint)
+        else {
             return Err(ExecutorError::BadOrder(
                 "pumpswap pool failed trust gate (owner/mint/quote); refusing (fail-closed)"
                     .to_string(),
@@ -1409,10 +1445,9 @@ impl SwapExecutor {
                 "pumpswap fee config owner mismatch; refusing".to_string(),
             ));
         }
-        let gate_on =
-            parse_amm_creator_gate(&global.data).map_err(|_| {
-                ExecutorError::BadOrder("pumpswap global gate unparsable; refusing".to_string())
-            })?;
+        let gate_on = parse_amm_creator_gate(&global.data).map_err(|_| {
+            ExecutorError::BadOrder("pumpswap global gate unparsable; refusing".to_string())
+        })?;
         if global
             .data
             .get(ids::PUMP_AMM_GLOBAL_DISABLE_FLAGS_OFFSET)
@@ -1434,7 +1469,9 @@ impl SwapExecutor {
             .and_then(|v| u64::try_from(v).ok())
             .filter(|v| *v > 0)
             .ok_or_else(|| {
-                ExecutorError::BadOrder("pumpswap effective reserves non-positive; refusing".to_string())
+                ExecutorError::BadOrder(
+                    "pumpswap effective reserves non-positive; refusing".to_string(),
+                )
             })?;
         let real_cap = u64::try_from(parsed.fee_buckets)
             .ok()
@@ -1446,7 +1483,9 @@ impl SwapExecutor {
             ids::PUMP_AMM_MAYHEM_SUPPLY
         } else {
             supply.ok_or_else(|| {
-                ExecutorError::BadOrder("pumpswap mint supply unreadable; refusing unpriced dispatch".to_string())
+                ExecutorError::BadOrder(
+                    "pumpswap mint supply unreadable; refusing unpriced dispatch".to_string(),
+                )
             })?
         };
         let mcap = market_cap(eff_quote, base_reserve, circulating).map_err(|_| {
@@ -1492,11 +1531,8 @@ impl SwapExecutor {
                 .await,
         );
         // Buyback recipient ATA must exist; never funded by the trade.
-        let buyback = user_ata_with_program(
-            &DEFAULT_BUYBACK_FEE_RECIPIENT,
-            &WSOL_MINT,
-            quote_program,
-        );
+        let buyback =
+            user_ata_with_program(&DEFAULT_BUYBACK_FEE_RECIPIENT, &WSOL_MINT, quote_program);
         match tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&buyback)).await {
             Ok(Ok(_)) => {}
             _ => {
@@ -1506,23 +1542,25 @@ impl SwapExecutor {
                 ));
             }
         }
-        ixs.push(crate::instructions::PumpSwapBuilder::build_sell_pumpswap_v2_ix(
-            order.amount_tokens,
-            floor,
-            &crate::instructions::PumpAmmSellV2Accounts {
-                pool: &order.pool,
-                user: &payer,
-                base_mint: &order.mint,
-                quote_mint: &WSOL_MINT,
-                user_base_token_account: &source_ata,
-                user_quote_token_account: &user_quote,
-                pool_base_token_account: &order.base_vault,
-                pool_quote_token_account: &order.quote_vault,
-                base_token_program: &token_program,
-                quote_token_program: quote_program,
-                buyback_fee_recipient: &buyback,
-            },
-        ));
+        ixs.push(
+            crate::instructions::PumpSwapBuilder::build_sell_pumpswap_v2_ix(
+                order.amount_tokens,
+                floor,
+                &crate::instructions::PumpAmmSellV2Accounts {
+                    pool: &order.pool,
+                    user: &payer,
+                    base_mint: &order.mint,
+                    quote_mint: &WSOL_MINT,
+                    user_base_token_account: &source_ata,
+                    user_quote_token_account: &user_quote,
+                    pool_base_token_account: &order.base_vault,
+                    pool_quote_token_account: &order.quote_vault,
+                    base_token_program: &token_program,
+                    quote_token_program: quote_program,
+                    buyback_fee_recipient: &buyback,
+                },
+            ),
+        );
         Ok(ixs)
     }
 
@@ -1534,7 +1572,9 @@ impl SwapExecutor {
     ) -> Result<Vec<solana_instruction::Instruction>, ExecutorError> {
         // Reject before spending fees.
         if order.amount_tokens == 0 {
-            return Err(ExecutorError::BadOrder("buy amount_tokens is 0".to_string()));
+            return Err(ExecutorError::BadOrder(
+                "buy amount_tokens is 0".to_string(),
+            ));
         }
         if order.max_sol_cost == 0 {
             return Err(ExecutorError::BadOrder("buy max_sol_cost is 0".to_string()));
@@ -1552,7 +1592,9 @@ impl SwapExecutor {
             self.read_curve_state(&order.bonding_curve)
         );
         let Some(token_program) = base_program else {
-            return Err(ExecutorError::BadOrder("mint account unreadable; token program unknown".to_string()));
+            return Err(ExecutorError::BadOrder(
+                "mint account unreadable; token program unknown".to_string(),
+            ));
         };
         // v3-only: creatorless, mismatched, complete, cashback fail closed.
         let Some(creator) = order.creator.as_ref() else {
@@ -1621,7 +1663,12 @@ impl SwapExecutor {
         let trade_lamports = if is_sol_quote { final_max } else { 0 };
         let balance = self
             .wallet
-            .assert_solvency(&self.rpc, trade_lamports, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
+            .assert_solvency(
+                &self.rpc,
+                trade_lamports,
+                self.effective_tip(order.tip_lamports, bundled),
+                self.priority_fee_lamports(),
+            )
             .await?;
         // Hot-wallet ceiling (`HOT_WALLET_MAX_SOL`): buys refuse while
         // the wallet sits above it. Same balance read, no extra RPC,
@@ -1661,8 +1708,7 @@ impl SwapExecutor {
         let buyback_wallet = crate::instructions::DEFAULT_BUYBACK_FEE_RECIPIENT;
         let buyback = buyback_account(&buyback_wallet, &quote_mint, &quote_program);
         // SOL-paired pays native ([10] unused). Token-paired debits the quote ATA.
-        let user_quote =
-            user_ata_with_program(payer, &quote_mint, &quote_program);
+        let user_quote = user_ata_with_program(payer, &quote_mint, &quote_program);
         if quote_mint == crate::instructions::WSOL_MINT {
             info!(mint = %order.mint, cost = max_sol_cost, "sol-pair buy pays native SOL; no quote ATA needed");
         } else {
@@ -1714,21 +1760,32 @@ impl SwapExecutor {
         bundled: bool,
     ) -> Result<Vec<solana_instruction::Instruction>, ExecutorError> {
         if order.amount_tokens == 0 {
-            return Err(ExecutorError::BadOrder("sell amount_tokens is 0".to_string()));
+            return Err(ExecutorError::BadOrder(
+                "sell amount_tokens is 0".to_string(),
+            ));
         }
         // Zero floor authorizes any fill price (sandwich drain): fail closed,
         // mirroring the buy-side max_sol_cost == 0 refusal above.
         if order.min_sol_output == 0 {
-            return Err(ExecutorError::BadOrder("sell min_sol_output is 0".to_string()));
+            return Err(ExecutorError::BadOrder(
+                "sell min_sol_output is 0".to_string(),
+            ));
         }
         let balance = self
             .wallet
-            .assert_solvency(&self.rpc, 0, self.effective_tip(order.tip_lamports, bundled), self.priority_fee_lamports())
+            .assert_solvency(
+                &self.rpc,
+                0,
+                self.effective_tip(order.tip_lamports, bundled),
+                self.priority_fee_lamports(),
+            )
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "sell pre-flight ok");
         let payer = self.wallet.pubkey();
         let Some(token_program) = self.token_program(&order.mint).await else {
-            return Err(ExecutorError::BadOrder("mint account unreadable; token program unknown".to_string()));
+            return Err(ExecutorError::BadOrder(
+                "mint account unreadable; token program unknown".to_string(),
+            ));
         };
         // Read the account the swap spends from.
         let ata = user_ata_with_program(&payer, &order.mint, &token_program);
@@ -1838,8 +1895,7 @@ impl SwapExecutor {
         // Quote ATA [10] must exist; prefix is idempotent. SOL pairs
         // skip it: the account is unused and needs neither read nor rent.
         if quote_mint != crate::instructions::WSOL_MINT {
-            let user_quote =
-                user_ata_with_program(payer, &quote_mint, &quote_program);
+            let user_quote = user_ata_with_program(payer, &quote_mint, &quote_program);
             ixs.extend(
                 self.maybe_create_ata_ix(payer, payer, &quote_mint, &user_quote, &quote_program)
                     .await,
@@ -1952,10 +2008,26 @@ impl SwapExecutor {
                 )))
             }
             Err(e) => {
-                // Transport failure is not a refusal: a timed-out POST
-                // may still land, so callers park instead of resending.
-                warn!(%label, error = %e, "bundle send failed (no resend: a timeout may still land)");
-                Err(ExecutorError::Jito(e))
+                // Classify before wrapping (AUD-002): only an ambiguous
+                // transport failure may claim "may still land". A 429
+                // rate limit or a JSON-RPC error is the engine answering
+                // WITHOUT accepting — deterministic, retryable, and it
+                // must never create a custody claim. Endpoint text stays
+                // redacted (the error can embed the request URL).
+                match crate::jito::classify_send_failure(&e) {
+                    crate::jito::BundleRejection::AmbiguousTransport => {
+                        warn!(%label, %signature, error = %ids::strip_error_url(&e.to_string()), "bundle send failed (no resend: a timeout may still land)");
+                        Err(ExecutorError::SendUnknown {
+                            signature,
+                            blockhash: blockhash.to_string(),
+                            source: e,
+                        })
+                    }
+                    crate::jito::BundleRejection::Deterministic => {
+                        warn!(%label, error = %ids::strip_error_url(&e.to_string()), "bundle send rejected deterministically (no custody claim; retry policy applies)");
+                        Err(ExecutorError::Jito(e))
+                    }
+                }
             }
         }
     }
@@ -1965,12 +2037,10 @@ impl SwapExecutor {
         &self,
         ixs: &[solana_instruction::Instruction],
     ) -> Result<(Transaction, Hash), ExecutorError> {
-        let blockhash = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.rpc.get_latest_blockhash(),
-        )
-        .await
-        .map_err(|_| ExecutorError::Timeout("get_latest_blockhash"))??;
+        let blockhash =
+            tokio::time::timeout(Duration::from_secs(15), self.rpc.get_latest_blockhash())
+                .await
+                .map_err(|_| ExecutorError::Timeout("get_latest_blockhash"))??;
         // Budget prefix first; empty by default.
         let mut all = self.budget_prefix();
         all.extend_from_slice(ixs);
@@ -2086,8 +2156,10 @@ fn timeout_verdict(
         return verdict_from_chain(outcome);
     }
     match engine {
-        // The engine saw it land: chain truth, even if the poll lagged.
-        BundleStatus::Landed => DispatchVerdict::Landed,
+        // Engine `Landed` without a chain-confirmed signature: the
+        // bundle may have landed while its transaction errored. Never
+        // a fill verdict — reconcile (above) or park as unknown.
+        BundleStatus::Landed => DispatchVerdict::Unknown("engine landed; chain unconfirmed"),
         // Never forwarded: no funds moved, a rebuild is safe.
         BundleStatus::Failed => DispatchVerdict::Dead(DeadReason::NeverForwarded),
         BundleStatus::Pending => DispatchVerdict::Unknown("engine still pending"),
@@ -2123,6 +2195,25 @@ mod tests {
         .expect("executor")
     }
 
+    #[test]
+    fn send_unknown_carries_signed_identity_for_park() {
+        // A POST that fails after signing may still land: the error
+        // must carry the signed identity so callers park instead of
+        // verdicting no-fill (or resending blind).
+        let err = ExecutorError::SendUnknown {
+            signature: "sig123".to_string(),
+            blockhash: "bh456".to_string(),
+            source: JitoError::Rpc("timeout".to_string()),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("sig123"), "{rendered}");
+        assert!(rendered.contains("may still land"), "{rendered}");
+        assert!(
+            matches!(err, ExecutorError::SendUnknown { .. }),
+            "distinct from plain Jito transport errors"
+        );
+    }
+
     #[tokio::test]
     async fn confirm_rejects_garbage_signature_without_network() {
         let err = executor()
@@ -2143,22 +2234,27 @@ mod tests {
 
     #[test]
     fn status_classification_distinguishes_chain_states() {
-        let make =
-            |confirmations: Option<usize>, level: Option<TransactionConfirmationStatus>| {
-                TransactionStatus {
-                    slot: 1,
-                    confirmations,
-                    status: Ok(()),
-                    err: None,
-                    confirmation_status: level,
-                }
-            };
+        let make = |confirmations: Option<usize>, level: Option<TransactionConfirmationStatus>| {
+            TransactionStatus {
+                slot: 1,
+                confirmations,
+                status: Ok(()),
+                err: None,
+                confirmation_status: level,
+            }
+        };
         assert_eq!(
-            classify_status(&make(Some(0), Some(TransactionConfirmationStatus::Processed))),
+            classify_status(&make(
+                Some(0),
+                Some(TransactionConfirmationStatus::Processed)
+            )),
             ConfirmOutcome::Processed
         );
         assert_eq!(
-            classify_status(&make(Some(5), Some(TransactionConfirmationStatus::Confirmed))),
+            classify_status(&make(
+                Some(5),
+                Some(TransactionConfirmationStatus::Confirmed)
+            )),
             ConfirmOutcome::Confirmed
         );
         assert_eq!(
@@ -2170,8 +2266,14 @@ mod tests {
             classify_status(&make(Some(0), None)),
             ConfirmOutcome::Processed
         );
-        assert_eq!(classify_status(&make(Some(1), None)), ConfirmOutcome::Confirmed);
-        assert_eq!(classify_status(&make(None, None)), ConfirmOutcome::Finalized);
+        assert_eq!(
+            classify_status(&make(Some(1), None)),
+            ConfirmOutcome::Confirmed
+        );
+        assert_eq!(
+            classify_status(&make(None, None)),
+            ConfirmOutcome::Finalized
+        );
         // An on-chain error outranks any vote state.
         let mut failed = make(None, Some(TransactionConfirmationStatus::Finalized));
         failed.err = Some(solana_transaction_error::TransactionError::AccountNotFound);
@@ -2258,13 +2360,24 @@ mod tests {
             ),
             DispatchVerdict::Landed
         );
-        // Engine pending holds; engine landed wins.
+        // Engine pending holds; engine landed alone never fills —
+        // chain confirmation decides.
         assert_eq!(
             timeout_verdict(BundleStatus::Pending, None, UnseenExpiry::Unknown),
             DispatchVerdict::Unknown("engine still pending")
         );
         assert_eq!(
             timeout_verdict(BundleStatus::Landed, None, UnseenExpiry::Unknown),
+            DispatchVerdict::Unknown("engine landed; chain unconfirmed")
+        );
+        // ...but a reconciled landing is the deciding word, even when
+        // the engine claims it landed on its own.
+        assert_eq!(
+            timeout_verdict(
+                BundleStatus::Landed,
+                Some(ConfirmOutcome::Confirmed),
+                UnseenExpiry::Unknown
+            ),
             DispatchVerdict::Landed
         );
     }
@@ -2295,7 +2408,10 @@ mod tests {
         // Zero tokens: nothing to price.
         assert_eq!(buy_fill_from_deltas(10_000_000, 0, 1, 100_000, 200), None);
         // Exact overhead: zero swap leg (would divide by zero downstream).
-        assert_eq!(buy_fill_from_deltas(2_144_480, 1_000, 1, 100_000, 200), None);
+        assert_eq!(
+            buy_fill_from_deltas(2_144_480, 1_000, 1, 100_000, 200),
+            None
+        );
         // Underfunded: spent below overhead.
         assert_eq!(buy_fill_from_deltas(100_000, 1_000, 1, 100_000, 200), None);
         // Overflow: absurd created count.
@@ -2318,10 +2434,18 @@ mod tests {
         };
         assert_eq!(funded.native_ok(), Some(true));
         assert_eq!(funded.wsol_funded(), Some(true));
-        let broke = LiveFundingReport { native_balance: Some(10_000), wsol_balance: Some(0), ..funded };
+        let broke = LiveFundingReport {
+            native_balance: Some(10_000),
+            wsol_balance: Some(0),
+            ..funded
+        };
         assert_eq!(broke.native_ok(), Some(false));
         assert_eq!(broke.wsol_funded(), Some(false));
-        let unknown = LiveFundingReport { native_balance: None, wsol_balance: None, ..funded };
+        let unknown = LiveFundingReport {
+            native_balance: None,
+            wsol_balance: None,
+            ..funded
+        };
         assert_eq!(unknown.native_ok(), None);
         assert_eq!(unknown.wsol_funded(), None);
     }
@@ -2351,7 +2475,9 @@ mod tests {
         assert!(!is_blockhash_expired(&ExecutorError::SimFailed(
             "InstructionError(4, Custom(6002))".to_string()
         )));
-        assert!(!is_blockhash_expired(&ExecutorError::Timeout("send_and_confirm")));
+        assert!(!is_blockhash_expired(&ExecutorError::Timeout(
+            "send_and_confirm"
+        )));
     }
 
     #[test]
@@ -2362,8 +2488,8 @@ mod tests {
             CURVE_MAYHEM_FLAG_OFFSET, CURVE_QUOTE_MINT_OFFSET, WSOL_MINT,
         };
         let pump = crate::instructions::PUMP_PROGRAM_ID;
-        let creator = Pubkey::from_str("DC4X9szDJk2wVm2NAGsshGFydKAahBg6sAAjmxvSJZGh")
-            .expect("creator");
+        let creator =
+            Pubkey::from_str("DC4X9szDJk2wVm2NAGsshGFydKAahBg6sAAjmxvSJZGh").expect("creator");
         let mut data = vec![0u8; 166];
         data[..8].copy_from_slice(&ids::BONDING_CURVE_DISCRIMINATOR);
         data[8..16].copy_from_slice(&1_073_000_000_000_000u64.to_le_bytes());
@@ -2372,8 +2498,7 @@ mod tests {
         data[40..48].copy_from_slice(&1_000_000_000_000_000u64.to_le_bytes());
         data[115..123].copy_from_slice(&0u64.to_le_bytes());
         data[CURVE_COMPLETE_OFFSET] = 0;
-        data[CURVE_CREATOR_OFFSET..CURVE_CREATOR_OFFSET + 32]
-            .copy_from_slice(&creator.to_bytes());
+        data[CURVE_CREATOR_OFFSET..CURVE_CREATOR_OFFSET + 32].copy_from_slice(&creator.to_bytes());
         data[CURVE_MAYHEM_FLAG_OFFSET] = 1;
         data[CURVE_CASHBACK_FLAG_OFFSET] = 0;
         // Zero quote → WSOL.
@@ -2391,8 +2516,8 @@ mod tests {
         let state = parse_curve_state(&pump, &data).expect("state");
         assert!(state.is_cashback && state.complete);
         // Non-zero quote passes through.
-        let quote = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-            .expect("quote");
+        let quote =
+            Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").expect("quote");
         data[CURVE_QUOTE_MINT_OFFSET..CURVE_QUOTE_MINT_OFFSET + 32]
             .copy_from_slice(&quote.to_bytes());
         let state = parse_curve_state(&pump, &data).expect("state");
@@ -2409,8 +2534,8 @@ mod tests {
         // Quote rule + buyback rule.
         assert_eq!(resolve_quote_mint(&Pubkey::default()), WSOL_MINT);
         assert_eq!(resolve_quote_mint(&quote), quote);
-        let wallet = Pubkey::from_str("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7")
-            .expect("wallet");
+        let wallet =
+            Pubkey::from_str("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7").expect("wallet");
         assert_eq!(
             buyback_account(&wallet, &WSOL_MINT, &WSOL_MINT),
             wallet,

@@ -398,7 +398,9 @@ impl FillModel {
         }
         let fee = match *self {
             FillModel::Exact => 0.0,
-            FillModel::BondingCurve { fee_bps_per_side, .. } => fee_bps_per_side.max(0.0) / 10_000.0,
+            FillModel::BondingCurve {
+                fee_bps_per_side, ..
+            } => fee_bps_per_side.max(0.0) / 10_000.0,
         };
         if liquidity_usd == 0.0 {
             return Some(fee);
@@ -440,7 +442,9 @@ impl FillModel {
         }
         let fee = match *self {
             FillModel::Exact => 0.0,
-            FillModel::BondingCurve { fee_bps_per_side, .. } => fee_bps_per_side.max(0.0) / 10_000.0,
+            FillModel::BondingCurve {
+                fee_bps_per_side, ..
+            } => fee_bps_per_side.max(0.0) / 10_000.0,
         };
         let cap = match *self {
             FillModel::Exact => 0.0,
@@ -891,10 +895,7 @@ mod tests {
             (p.mark_value_usd - 1_763_352.0 * spot).abs() < 1e-9,
             "{p:?}"
         );
-        assert!(
-            (p.realizable_usd - 1_763_352.0 * net).abs() < 1e-9,
-            "{p:?}"
-        );
+        assert!((p.realizable_usd - 1_763_352.0 * net).abs() < 1e-9, "{p:?}");
         assert!(p.discount_bps > 100.0, "{p:?}");
     }
 
@@ -1089,14 +1090,20 @@ mod tests {
         let buy_slip = model
             .try_slip_fraction(Side::Long, 5_000.0, 10_000.0)
             .expect("s < 1 prices");
-        assert!((buy_slip - (1.0 + 0.0125)).abs() < 1e-12, "buy_slip={buy_slip}");
+        assert!(
+            (buy_slip - (1.0 + 0.0125)).abs() < 1e-12,
+            "buy_slip={buy_slip}"
+        );
         // Whale Long exit (s = 1000): impact ~= 1.0, fill floors at 0.
         let whale = model
             .try_fill_price(Side::Short, 1.0, 10_000_000.0, 10_000.0)
             .expect("bounded impact prices");
         assert_eq!(whale, 0.0, "whale exit must print ~0, not 0.75");
         // Buy-side exhaustion still rejects (unbounded impact).
-        assert_eq!(model.try_fill_price(Side::Long, 1.0, 10_000_000.0, 10_000.0), None);
+        assert_eq!(
+            model.try_fill_price(Side::Long, 1.0, 10_000_000.0, 10_000.0),
+            None
+        );
         // Zero liquidity stays fee-only (synthetic-grade, caller-gated).
         assert_eq!(
             model.try_slip_fraction(Side::Short, 100.0, 0.0),
@@ -1170,7 +1177,10 @@ mod tests {
         assert_eq!(check_exit(&mut p, 0.0, 1060), Some(ExitReason::Timeout));
         let mut p = long(75.0, -8.0);
         p.timeout_seconds = 60;
-        assert_eq!(check_exit(&mut p, f64::NAN, 1060), Some(ExitReason::Timeout));
+        assert_eq!(
+            check_exit(&mut p, f64::NAN, 1060),
+            Some(ExitReason::Timeout)
+        );
     }
 
     #[test]
@@ -1237,7 +1247,10 @@ mod tests {
         let mark = Mark::new(0.000_004_2, 30_000.0).with_curve(drained);
         assert_eq!(fill.flip_preview(&mark, 10.0), None);
         // Degenerate notionals never fabricate a cost.
-        assert_eq!(fill.flip_preview(&Mark::new(0.000_004_2, 30_000.0), 0.0), None);
+        assert_eq!(
+            fill.flip_preview(&Mark::new(0.000_004_2, 30_000.0), 0.0),
+            None
+        );
         let mut bad = launch_curve();
         bad.sol_usd = f64::NAN;
         let mark = Mark::new(0.000_004_2, 30_000.0).with_curve(bad);

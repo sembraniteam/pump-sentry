@@ -20,7 +20,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, info, warn};
@@ -62,7 +62,7 @@ pub struct GeyserSubscriber {
     rpc: Option<Arc<RpcClient>>,
 }
 
-    /// Rate-limit cooldown: hammering a 429 every 5s sustains the ban
+/// Rate-limit cooldown: hammering a 429 every 5s sustains the ban
 /// (each reconnect is a fresh subscribe the limiter must refuse).
 /// A minute of silence lets token-bucket limiters recover; anything
 /// still failing after that is quota/exhaustion, not burst.
@@ -132,7 +132,10 @@ fn is_rate_limited(e: &GeyserError) -> bool {
     };
     msg.match_indices("429").any(|(i, _)| {
         let before = msg[..i].chars().last().is_none_or(|c| !c.is_ascii_digit());
-        let after = msg[i + 3..].chars().next().is_none_or(|c| !c.is_ascii_digit());
+        let after = msg[i + 3..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit());
         before && after
     })
 }
@@ -179,8 +182,14 @@ impl GeyserSubscriber {
     pub async fn subscribe(
         config: ListenerConfig,
         token: Option<String>,
-    ) -> Result<(mpsc::Receiver<ListenerEvent>, Arc<ListenerStats>, JoinHandle<()>), GeyserError>
-    {
+    ) -> Result<
+        (
+            mpsc::Receiver<ListenerEvent>,
+            Arc<ListenerStats>,
+            JoinHandle<()>,
+        ),
+        GeyserError,
+    > {
         Self::subscribe_with_rpc(config, token, None).await
     }
 
@@ -190,8 +199,14 @@ impl GeyserSubscriber {
         config: ListenerConfig,
         token: Option<String>,
         rpc: Option<Arc<RpcClient>>,
-    ) -> Result<(mpsc::Receiver<ListenerEvent>, Arc<ListenerStats>, JoinHandle<()>), GeyserError>
-    {
+    ) -> Result<
+        (
+            mpsc::Receiver<ListenerEvent>,
+            Arc<ListenerStats>,
+            JoinHandle<()>,
+        ),
+        GeyserError,
+    > {
         let sub = match rpc {
             Some(shared) => GeyserSubscriber::new(config, token)?.with_rpc(shared),
             None => GeyserSubscriber::new(config, token)?,
@@ -227,6 +242,27 @@ pub const MAX_BACKFILL_SLOTS: u64 = 64;
 /// Per-block fetch deadline inside backfill. A wedged block must not
 /// stall the resubscribe behind it.
 const BACKFILL_BLOCK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Overall backfill deadline (AUD-017): one reconnect backfill may not
+/// extend the blind window past this — the live session must resume.
+/// A 64-slot gap at the per-slot cap could previously run ~21 minutes.
+pub const BACKFILL_TOTAL_BUDGET: Duration = Duration::from_secs(30);
+
+/// Effective per-block deadline (AUD-017): the per-slot cap, or what
+/// is left of the total budget — never more than the budget allows.
+/// Pure for unit pinning.
+fn block_timeout(remaining: Duration) -> Duration {
+    BACKFILL_BLOCK_TIMEOUT.min(remaining)
+}
+
+/// Slots still unread when the budget expires: `slot..=to` (0 when the
+/// expired slot is past the range end). Pure.
+fn shed_on_budget_expiry(slot: u64, to: u64) -> u64 {
+    if slot > to {
+        return 0;
+    }
+    to.saturating_sub(slot).saturating_add(1)
+}
 
 /// Backfill window over a missed range: `(scan_from, scan_to, skipped)`.
 /// `scan_from..=scan_to` is scanned; the `skipped` older slots are left
@@ -304,7 +340,9 @@ impl GeyserSubscriber {
                     // the line on long outages.
                     from_slot = last_slot;
                     if ban.note_healthy() {
-                        self.stats.ingestion_banned.store(false, std::sync::atomic::Ordering::Relaxed);
+                        self.stats
+                            .ingestion_banned
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                         warn!("geyser ban lifted: subscription accepted again");
                     }
                 }
@@ -312,8 +350,13 @@ impl GeyserSubscriber {
                     rate_limited = is_rate_limited(&e);
                     if rate_limited {
                         if ban.note_429() {
-                            self.stats.ingestion_banned.store(true, std::sync::atomic::Ordering::Relaxed);
-                            warn!(attempt, "geyser BANNED: {BANNED_AFTER_CONSECUTIVE_429} consecutive 429s — quota/exhaustion, not burst; retrying hourly, check token/quota or fall back to WS mode");
+                            self.stats
+                                .ingestion_banned
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            warn!(
+                                attempt,
+                                "geyser BANNED: {BANNED_AFTER_CONSECUTIVE_429} consecutive 429s — quota/exhaustion, not burst; retrying hourly, check token/quota or fall back to WS mode"
+                            );
                         } else {
                             warn!(error = %e, attempt, "geyser rate limited (429); yielding a full minute");
                         }
@@ -332,7 +375,11 @@ impl GeyserSubscriber {
             }
             let healthy = self.stats.logs_seen().saturating_sub(seen_before) > 1000
                 || session_start.elapsed() > Duration::from_secs(30);
-            attempt = if healthy { 0 } else { attempt.saturating_add(1) };
+            attempt = if healthy {
+                0
+            } else {
+                attempt.saturating_add(1)
+            };
             let wait = if ban.banned() {
                 BANNED_RETRY_INTERVAL
             } else {
@@ -367,32 +414,29 @@ impl GeyserSubscriber {
         } else {
             builder
         };
-        let mut client = builder
-            .connect()
-            .await
-            .map_err(|e| {
-                // Flatten the tonic source chain: bare `transport error`
-                // hides TLS/DNS/refused/auth-reset underneath, and the
-                // operator cannot tell those apart from the log line.
-                // Token presence (never the value) separates "no auth
-                // offered" from "auth rejected or unreachable".
-                let mut chain = e.to_string();
-                let mut src = std::error::Error::source(&e);
-                while let Some(s) = src {
-                    chain.push_str("; caused by: ");
-                    chain.push_str(&s.to_string());
-                    src = s.source();
-                }
-                let token = if self.token.as_deref().is_some_and(|t| !t.is_empty()) {
-                    "set"
-                } else {
-                    "unset"
-                };
-                GeyserError::Connect(format!(
-                    "{chain} (endpoint={}, x-token={token})",
-                    ids::redact_endpoint(&self.config.geyser_url),
-                ))
-            })?;
+        let mut client = builder.connect().await.map_err(|e| {
+            // Flatten the tonic source chain: bare `transport error`
+            // hides TLS/DNS/refused/auth-reset underneath, and the
+            // operator cannot tell those apart from the log line.
+            // Token presence (never the value) separates "no auth
+            // offered" from "auth rejected or unreachable".
+            let mut chain = e.to_string();
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                chain.push_str("; caused by: ");
+                chain.push_str(&s.to_string());
+                src = s.source();
+            }
+            let token = if self.token.as_deref().is_some_and(|t| !t.is_empty()) {
+                "set"
+            } else {
+                "unset"
+            };
+            GeyserError::Connect(format!(
+                "{chain} (endpoint={}, x-token={token})",
+                ids::redact_endpoint(&self.config.geyser_url),
+            ))
+        })?;
         let replay_slot = effective_replay_slot(commitment, from_slot);
         let request = subscribe_request(commitment, replay_slot);
         let (mut sink, mut stream) = client
@@ -478,6 +522,10 @@ impl GeyserSubscriber {
         if to == 0 {
             return;
         }
+        // AUD-017: the whole scan is budgeted: a hung/throttled RPC may
+        // not stretch blindness past the budget — unread slots are
+        // shed (counted) and the live session resumes.
+        let deadline = Instant::now() + BACKFILL_TOTAL_BUDGET;
         if skipped > 0 {
             // The missed window is shed, not backfilled: count it so
             // the heartbeat shows how much of the stream was lost.
@@ -497,8 +545,28 @@ impl GeyserSubscriber {
             if tx.is_closed() {
                 return;
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Budget expired: every unread slot is a shed gap and
+                // the live session resumes now (the reconnect loop
+                // subscribes right after this returns).
+                let shed = shed_on_budget_expiry(slot, to);
+                for _ in 0..shed {
+                    self.stats.inc_slot_gaps_shed();
+                }
+                warn!(
+                    shed,
+                    unread_from = slot,
+                    to,
+                    scanned,
+                    emitted,
+                    budget_secs = BACKFILL_TOTAL_BUDGET.as_secs(),
+                    "geyser backfill budget expired; unread slots are shed (counted as gaps) and the live session resumes"
+                );
+                break;
+            }
             let block = match tokio::time::timeout(
-                BACKFILL_BLOCK_TIMEOUT,
+                block_timeout(remaining),
                 rpc.get_block_with_config(
                     slot,
                     RpcBlockConfig {
@@ -513,7 +581,26 @@ impl GeyserSubscriber {
             .await
             {
                 Ok(Ok(block)) => block,
-                _ => continue, // Pruned, missing, or throttled: skip the slot.
+                // Pruned, missing, or throttled: an unreadable block
+                // is a coverage gap — counted, never silently skipped
+                // (AUD-017).
+                Ok(Err(e)) => {
+                    self.stats.inc_slot_gaps_shed();
+                    debug!(
+                        slot,
+                        error = %ids::redact_urls_in_text(&e.to_string()),
+                        "geyser backfill: block unreadable; counted as a shed gap"
+                    );
+                    continue;
+                }
+                Err(_elapsed) => {
+                    self.stats.inc_slot_gaps_shed();
+                    debug!(
+                        slot,
+                        "geyser backfill: block fetch timed out; counted as a shed gap"
+                    );
+                    continue;
+                }
             };
             scanned += 1;
             let empty = Vec::new();
@@ -809,10 +896,7 @@ fn subscribe_request(commitment: CommitmentLevel, from_slot: Option<u64>) -> Sub
 /// Resolve the full key table: static keys plus address-table-loaded.
 /// `None` entries (short/truncated keys) drop the whole transaction —
 /// a partial table proves nothing.
-fn resolve_keys(
-    account_keys: &[Vec<u8>],
-    meta: &TransactionStatusMeta,
-) -> Vec<Pubkey> {
+fn resolve_keys(account_keys: &[Vec<u8>], meta: &TransactionStatusMeta) -> Vec<Pubkey> {
     let mut keys = Vec::with_capacity(account_keys.len() + 8);
     for raw in account_keys
         .iter()
@@ -837,6 +921,39 @@ mod tests {
     };
 
     #[test]
+    fn backfill_budget_bounds_per_block_deadline() {
+        // AUD-017: the per-slot timeout can never exceed the total
+        // budget: a hung getBlock times out at (or before) the budget.
+        assert_eq!(
+            block_timeout(Duration::from_secs(3600)),
+            BACKFILL_BLOCK_TIMEOUT
+        );
+        assert_eq!(
+            block_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(block_timeout(Duration::ZERO), Duration::ZERO);
+        // And the overall budget actually binds a pathological full gap
+        // (64 slots x 20s ≈ 21 min of blindness under the old shape).
+        assert!(
+            BACKFILL_TOTAL_BUDGET
+                < BACKFILL_BLOCK_TIMEOUT * u32::try_from(MAX_BACKFILL_SLOTS).unwrap_or(1),
+            "budget must bound the per-slot worst case over the cap"
+        );
+    }
+
+    #[test]
+    fn budget_expiry_sheds_every_unread_slot() {
+        // Expiry at `slot` sheds slot..=to inclusive, never one fewer.
+        assert_eq!(shed_on_budget_expiry(10, 10), 1);
+        assert_eq!(shed_on_budget_expiry(10, 12), 3);
+        assert_eq!(shed_on_budget_expiry(0, 0), 1);
+        // A slot past the range end can never occur (loop range), but
+        // the helper stays total and sheds nothing there.
+        assert_eq!(shed_on_budget_expiry(20, 10), 0);
+    }
+
+    #[test]
     fn rate_limit_classifier_is_exact() {
         // Only an explicit 429 counts: transport guesses must keep the
         // fast path, or every outage degrades to minute-waits.
@@ -848,8 +965,14 @@ mod tests {
             "ping reply failed; reconnecting",
             "4290 numeric lookalike",
         ] {
-            assert!(!is_rate_limited(&GeyserError::Stream(msg.to_string())), "{msg}");
-            assert!(!is_rate_limited(&GeyserError::Connect(msg.to_string())), "{msg}");
+            assert!(
+                !is_rate_limited(&GeyserError::Stream(msg.to_string())),
+                "{msg}"
+            );
+            assert!(
+                !is_rate_limited(&GeyserError::Connect(msg.to_string())),
+                "{msg}"
+            );
         }
         assert_eq!(RATE_LIMIT_COOLDOWN, Duration::from_secs(60));
     }
@@ -890,7 +1013,10 @@ mod tests {
             effective_replay_slot(CommitmentLevel::Processed, Some(123)),
             Some(123)
         );
-        assert_eq!(effective_replay_slot(CommitmentLevel::Processed, None), None);
+        assert_eq!(
+            effective_replay_slot(CommitmentLevel::Processed, None),
+            None
+        );
         for level in [CommitmentLevel::Confirmed, CommitmentLevel::Finalized] {
             assert_eq!(effective_replay_slot(level, Some(123)), None);
             assert_eq!(effective_replay_slot(level, None), None);
@@ -953,9 +1079,18 @@ mod tests {
 
     #[test]
     fn commitment_maps_all_levels() {
-        assert_eq!(geyser_commitment("processed"), Some(CommitmentLevel::Processed));
-        assert_eq!(geyser_commitment("confirmed"), Some(CommitmentLevel::Confirmed));
-        assert_eq!(geyser_commitment("finalized"), Some(CommitmentLevel::Finalized));
+        assert_eq!(
+            geyser_commitment("processed"),
+            Some(CommitmentLevel::Processed)
+        );
+        assert_eq!(
+            geyser_commitment("confirmed"),
+            Some(CommitmentLevel::Confirmed)
+        );
+        assert_eq!(
+            geyser_commitment("finalized"),
+            Some(CommitmentLevel::Finalized)
+        );
         assert_eq!(geyser_commitment("bogus"), None);
     }
 
@@ -965,7 +1100,10 @@ mod tests {
         let filter = req.transactions.get("pump").expect("pump filter");
         assert_eq!(filter.vote, Some(false));
         assert_eq!(filter.failed, Some(false));
-        assert_eq!(filter.account_include, vec![PUMP_PROGRAM_ID_STR.to_string()]);
+        assert_eq!(
+            filter.account_include,
+            vec![PUMP_PROGRAM_ID_STR.to_string()]
+        );
         assert_eq!(req.commitment, Some(CommitmentLevel::Confirmed as i32));
         assert_eq!(req.from_slot, None);
         let replay = subscribe_request(CommitmentLevel::Finalized, Some(123));

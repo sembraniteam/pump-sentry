@@ -133,8 +133,7 @@ impl ExitRegime {
 /// a fourth regime extends here and nowhere else except the two
 /// functions that must stay in mechanical sync (`as_str`,
 /// `FromStr`), both pinned by pairwise-distinct tests.
-pub const EXIT_REGIME_NAMES: [&str; 3] =
-    ["conservative", "momentum", "liquidity_sensitive"];
+pub const EXIT_REGIME_NAMES: [&str; 3] = ["conservative", "momentum", "liquidity_sensitive"];
 
 impl std::str::FromStr for ExitRegime {
     type Err = String;
@@ -505,7 +504,13 @@ mod tests {
             regime: ExitRegime::Conservative,
         };
         assert!(capped.is_valid());
-        assert!(!RiskProfile { moonbag_percent: 100.0, ..capped }.is_valid());
+        assert!(
+            !RiskProfile {
+                moonbag_percent: 100.0,
+                ..capped
+            }
+            .is_valid()
+        );
 
         // Near-zero model outputs count as zeroed PASS targets.
         let dusty_pass = RiskProfile {

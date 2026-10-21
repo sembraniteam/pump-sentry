@@ -25,9 +25,26 @@ pub fn default_pid_file() -> PathBuf {
 /// Kill-switch marker filename in the state dir.
 pub const ENTRIES_PAUSED_FILE: &str = "entries-paused";
 
+/// State dir for a log path. A bare filename (or a path with no
+/// parent) lives in the current working directory: `Path::parent()`
+/// returns `Some("")` there, so that case maps to `.` explicitly —
+/// every state artifact (WAL, day-state, sell requests, lock files)
+/// must agree on one directory for a given `LOG_FILE`, including the
+/// relative form (AUD-012: `pending_sell_requests` used to see no
+/// directory at all for `LOG_FILE=bot.log`, silently dropping every
+/// queued manual sell).
+pub fn state_dir_for_log(log_file: &Path) -> PathBuf {
+    match log_file.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 /// State file next to the daemon log (WAL, day-state, kill switch):
 /// one directory holds everything the operator inspects, and a
-/// `LOG_FILE` override keeps them together.
+/// `LOG_FILE` override keeps them together. A bare-filename log keeps
+/// bare-filename state files (both resolve to the CWD, same as
+/// [`state_dir_for_log`]).
 pub fn state_file_beside_log(log_file: &Path, name: &str) -> PathBuf {
     log_file
         .parent()
@@ -112,26 +129,17 @@ Examples:
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliAction {
     /// Background the pipeline.
-    Start {
-        live: bool,
-    },
+    Start { live: bool },
     /// Stop the daemon.
     Stop,
     /// Stop then start.
-    Restart {
-        live: bool,
-    },
+    Restart { live: bool },
     /// Daemon liveness.
     Status,
     /// Log tail.
-    Logs {
-        lines: usize,
-        follow: bool,
-    },
+    Logs { lines: usize, follow: bool },
     /// Foreground pipeline.
-    Run {
-        live: bool,
-    },
+    Run { live: bool },
     /// Write the categorized default config when missing.
     InitConfig,
     /// Install the latest release over this binary.
@@ -139,9 +147,7 @@ pub enum CliAction {
     /// unverified unless `--allow-unverified` is passed.
     Upgrade { allow_unverified: bool },
     /// Manual full exit for one mint.
-    Sell {
-        mint: String,
-    },
+    Sell { mint: String },
     /// Kill switch: halt new entries (open positions keep managing).
     Pause,
     /// Clear the kill switch.
@@ -151,9 +157,7 @@ pub enum CliAction {
     /// Offline loss-pattern analysis over the journal (read-only).
     Research { file: Option<String> },
     /// Usage; `Some` is the cause.
-    Help {
-        error: Option<String>,
-    },
+    Help { error: Option<String> },
 }
 
 /// True when `--live` or `IS_LIVE=true` is set.
@@ -188,7 +192,9 @@ pub fn parse_cli(args: &[String]) -> CliAction {
             "" => CliAction::Help {
                 error: Some("`sell` needs a mint: `pump-sentry sell <mint>`.".to_string()),
             },
-            mint => CliAction::Sell { mint: mint.to_string() },
+            mint => CliAction::Sell {
+                mint: mint.to_string(),
+            },
         },
         "pause" => CliAction::Pause,
         "resume" => CliAction::Resume,
@@ -315,11 +321,152 @@ pub fn running_daemon(pid_file: &Path) -> Option<PidInfo> {
     process_alive(info.pid).then_some(info)
 }
 
-/// Start-lock path (serializes `start`).
+/// Start-lock path (serializes `start`). Distinct from the
+/// state-dir process lock (`bot.lock`): the two locks must never
+/// share a file, or a lost pid file would let `start` steal the lock
+/// file a running trader holds (flock stays with the inode; a fresh
+/// `create_new` on a new inode would not conflict).
 pub fn start_lock_path(pid_file: &Path) -> PathBuf {
     let mut lock = pid_file.to_path_buf();
-    lock.set_extension("lock");
+    lock.set_extension("start.lock");
     lock
+}
+
+/// State-dir process lock path: beside the log, one per state dir.
+/// Every trader process (foreground `run` or daemon child) holds an
+/// exclusive `flock` on it for its whole lifetime, so two processes
+/// can never share a state dir / wallet / WAL (AUD-001).
+pub fn state_lock_path(log_file: &Path) -> PathBuf {
+    state_dir_for_log(log_file).join("bot.lock")
+}
+
+/// Held state-dir lock. The `File` must stay open for the lock to
+/// hold; dropping it releases.
+#[derive(Debug)]
+pub struct StateDirLock {
+    _file: std::fs::File,
+}
+
+impl StateDirLock {
+    /// Try to acquire the exclusive process lock at `path`. Fails with
+    /// `WouldBlock` when another trader holds it. Non-blocking: a
+    /// second trader must refuse fast, before reading any state.
+    pub fn try_acquire(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)?;
+            // SAFETY: `flock` on an owned fd; EWOULDBLOCK means the
+            // lock is taken and we simply return the error.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    format!("state dir already owned by another process ({err})"),
+                ));
+            }
+            Ok(Self { _file: file })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(std::io::Error::other(
+                "state-dir locking requires unix (refusing to run without a single-owner guarantee)",
+            ))
+        }
+    }
+}
+
+/// Which process a pid belongs to, as far as the platform can tell.
+/// `Some(false)` proves the pid is NOT our binary (pid reuse — refuse
+/// to signal it). `None` means the platform gives no answer (residual
+/// pid-reuse risk, reported by the caller).
+pub fn pid_is_our_binary(pid: u32) -> Option<bool> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let path = pid_binary_path(pid)?;
+    let our = std::env::current_exe().ok()?;
+    if path == our {
+        return Some(true);
+    }
+    // A different path can still be our binary (copied/upgraded);
+    // compare the file name as a fallback.
+    let same_name = path.file_name().is_some() && path.file_name() == our.file_name();
+    Some(same_name)
+}
+
+/// Executable path behind a pid, when the platform exposes it.
+#[cfg(target_os = "macos")]
+fn pid_binary_path(pid: u32) -> Option<PathBuf> {
+    // SAFETY: `proc_pidpath` fills a caller-owned buffer for a pid we
+    // only read; it writes at most `size` bytes and returns 0 on
+    // failure. No pointers outlive the call.
+    unsafe {
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let n = libc::proc_pidpath(
+            pid as libc::pid_t,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len() as u32,
+        );
+        if n <= 0 {
+            return None;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?.to_bytes();
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+}
+
+/// Executable path behind a pid, when the platform exposes it.
+#[cfg(target_os = "linux")]
+fn pid_binary_path(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// Platforms without a pid→path facility: unprovable.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn pid_binary_path(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Register THIS process in the pid file so `status`, `sell`, `stop`,
+/// and `upgrade` find a foreground `run` the same way they find the
+/// daemon (AUD-001). Best-effort: a failed write is warned, and the
+/// state-dir lock still guarantees single ownership.
+pub fn register_running(live: bool, pid_file: &Path) {
+    let info = PidInfo {
+        pid: std::process::id(),
+        live,
+        started_at: unix_secs(),
+    };
+    if let Err(e) = write_private_file(pid_file, info.to_json().as_bytes()) {
+        eprintln!("warning: pid file write failed: {e}");
+    }
+}
+
+/// Remove the pid file when it names this process (clean shutdown of
+/// a self-registered run). Never touches another process's record.
+pub fn unregister_running(pid_file: &Path) {
+    match read_pid_file(pid_file) {
+        Some(info) if info.pid == std::process::id() => {
+            let _ = std::fs::remove_file(pid_file);
+        }
+        _ => {}
+    }
 }
 
 /// Stale claim age (older is stealable).
@@ -651,8 +798,31 @@ pub fn stop_daemon() -> i32 {
     };
     if !process_alive(info.pid) {
         let _ = std::fs::remove_file(&pid_file);
-        println!("bot is not running (pid {} is dead; pid file cleaned).", info.pid);
+        println!(
+            "bot is not running (pid {} is dead; pid file cleaned).",
+            info.pid
+        );
         return 0;
+    }
+    // Pid reuse guard: a recycled pid must never take a SIGKILL meant
+    // for the trader. Where the platform can resolve the binary we
+    // refuse on mismatch; where it cannot, the residual risk is named
+    // instead of silently assumed away (AUD-001).
+    match pid_is_our_binary(info.pid) {
+        Some(false) => {
+            eprintln!(
+                "refusing to signal pid {}: it is not pump-sentry (binary path mismatch; possible pid reuse). Check `status` and the pid file.",
+                info.pid
+            );
+            return 1;
+        }
+        Some(true) => {}
+        None => {
+            eprintln!(
+                "warning: cannot verify pid {} is pump-sentry on this platform; a reused pid could be signalled instead (residual risk)",
+                info.pid
+            );
+        }
     }
     println!("stopping bot (pid {})...", info.pid);
     #[cfg(unix)]
@@ -687,7 +857,11 @@ pub fn stop_daemon() -> i32 {
     }
     append_log_line(
         &log_file,
-        &format!("=== bot stopped at unix_ts={} (pid {}) ===", unix_secs(), info.pid),
+        &format!(
+            "=== bot stopped at unix_ts={} (pid {}) ===",
+            unix_secs(),
+            info.pid
+        ),
     );
     if stopped {
         println!("bot stopped.");
@@ -731,7 +905,11 @@ pub fn cmd_status() -> ! {
         None => {
             if let Some(stale) = read_pid_file(&pid_file) {
                 let _ = std::fs::remove_file(&pid_file);
-                println!("stopped (stale pid {} cleaned; log {})", stale.pid, log_file.display());
+                println!(
+                    "stopped (stale pid {} cleaned; log {})",
+                    stale.pid,
+                    log_file.display()
+                );
             } else {
                 println!("stopped (log {})", log_file.display());
             }
@@ -840,10 +1018,7 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_err() {
-            eprintln!(
-                "warning: cannot restrict {} to owner-only",
-                path.display()
-            );
+            eprintln!("warning: cannot restrict {} to owner-only", path.display());
         }
     }
     Ok(())
@@ -857,24 +1032,42 @@ pub fn sell_request_path(log_file: &Path, mint: &str) -> PathBuf {
 /// Owner-only atomic write: staged temp beside the target, then
 /// rename. A failed write removes the staging file and leaves any
 /// existing target untouched (state files are never half-written).
+/// The staged file is fsynced before the rename (hard error
+/// otherwise: its content must be durable), and the parent directory
+/// is fsynced best-effort afterwards so the rename itself survives a
+/// host crash — a lost rename only resurrects the previous complete
+/// file (every reader handles that), never a torn one.
 pub fn atomic_write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("part");
-    let staged = write_private_file(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
+    let staged = write_private_file(&tmp, contents)
+        .and_then(|()| std::fs::File::open(&tmp))
+        .and_then(|f| f.sync_all().map(|()| f))
+        .and_then(|_| std::fs::rename(&tmp, path));
     if staged.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return staged;
+    }
+    // Best-effort: a failed dir sync keeps the complete file (rename
+    // is atomic) and only risks resurrecting the previous complete
+    // file after a host crash — loud, never silent.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = std::fs::File::open(parent)
+        && let Err(e) = dir.sync_all()
+    {
+        eprintln!("warning: cannot fsync state dir {}: {e}", parent.display());
     }
     staged
 }
 
 /// Pending sell requests, sorted by mint. A missing state dir is empty
 /// (nothing written yet); any other read failure is loud — a broken
-/// path must never look like "no requests".
+/// path must never look like "no requests". The dir comes from
+/// [`state_dir_for_log`], so a bare relative `LOG_FILE` (parent `""`)
+/// reads the CWD exactly where `cmd_sell` writes (AUD-012).
 pub fn pending_sell_requests(log_file: &Path) -> Vec<(String, PathBuf)> {
-    let dir = log_file.parent().filter(|d| !d.as_os_str().is_empty());
-    let Some(dir) = dir else {
-        return Vec::new();
-    };
-    let entries = match std::fs::read_dir(dir) {
+    let dir = state_dir_for_log(log_file);
+    let entries = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|entry| match entry {
                 Ok(e) => Some(e.path()),
@@ -903,8 +1096,15 @@ pub fn pending_sell_requests(log_file: &Path) -> Vec<(String, PathBuf)> {
         .into_iter()
         .filter_map(|p| {
             let name = p.file_name()?.to_string_lossy().into_owned();
-            let mint = name.strip_prefix("sell-")?.strip_suffix(".json")?.to_string();
-            if mint.is_empty() { None } else { Some((mint, p)) }
+            let mint = name
+                .strip_prefix("sell-")?
+                .strip_suffix(".json")?
+                .to_string();
+            if mint.is_empty() {
+                None
+            } else {
+                Some((mint, p))
+            }
         })
         .collect();
     out.sort();
@@ -1023,9 +1223,7 @@ impl ReleaseVersion {
         let num = |p: Option<&str>| -> Option<u64> {
             match p {
                 None => Some(0),
-                Some(s) if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() => {
-                    s.parse().ok()
-                }
+                Some(s) if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() => s.parse().ok(),
                 _ => None,
             }
         };
@@ -1082,7 +1280,9 @@ fn curl_fetch(url: &str) -> std::io::Result<Vec<u8>> {
         .args(["-fsSL", "--retry", "3", url])
         .output()
         .map_err(|e| {
-            std::io::Error::other(format!("need 'curl' for upgrade ({e}); install.sh requires it too"))
+            std::io::Error::other(format!(
+                "need 'curl' for upgrade ({e}); install.sh requires it too"
+            ))
         })?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
@@ -1281,14 +1481,31 @@ fn replace_binary(staged: &Path, exe: &Path) -> std::io::Result<()> {
 
 /// SHA-256 hex of a file via system tooling (`sha256sum`, else
 /// `shasum`), mirroring `install.sh`. `None` when neither exists.
+/// A missing tool skips to the next candidate (AUD-019: the old
+/// `?`-propagation made the `shasum` fallback unreachable whenever
+/// `sha256sum` was absent, pushing operators toward
+/// `--allow-unverified` on stock macOS).
 fn sha256_of_file(path: &Path) -> Option<String> {
-    for tool in [["sha256sum"].as_slice(), ["shasum", "-a", "256"].as_slice()] {
-        let arg = path.as_os_str();
-        let out = std::process::Command::new(tool[0])
-            .args(&tool[1..])
-            .arg(arg)
+    let path = path.to_path_buf();
+    sha256_via_tools(move |tool, args| {
+        std::process::Command::new(tool)
+            .args(args)
+            .arg(&path)
             .output()
-            .ok()?;
+            .ok()
+    })
+}
+
+/// Tool-selection core (pure via the injected runner): try each tool
+/// in order; a missing/unspawnable tool (`None`) tries the next, a
+/// failed run retries the next, and only a 64-hex stdout digest wins.
+fn sha256_via_tools(
+    mut run: impl FnMut(&str, &[&str]) -> Option<std::process::Output>,
+) -> Option<String> {
+    for tool in [["sha256sum"].as_slice(), ["shasum", "-a", "256"].as_slice()] {
+        let Some(out) = run(tool[0], &tool[1..]) else {
+            continue;
+        };
         if !out.status.success() {
             continue;
         }
@@ -1425,7 +1642,9 @@ mod tests {
         );
         assert_eq!(
             parse_cli(&argv(&["bot", "sell", "MINT"])),
-            CliAction::Sell { mint: "MINT".to_string() }
+            CliAction::Sell {
+                mint: "MINT".to_string()
+            }
         );
         assert!(matches!(
             parse_cli(&argv(&["bot", "sell"])),
@@ -1535,13 +1754,24 @@ mod tests {
     fn release_versions_parse_and_compare_numerically() {
         assert_eq!(
             ReleaseVersion::parse("v1.2.3"),
-            Some(ReleaseVersion { major: 1, minor: 2, patch: 3 })
+            Some(ReleaseVersion {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
         );
         assert_eq!(
             ReleaseVersion::parse("1.2"),
-            Some(ReleaseVersion { major: 1, minor: 2, patch: 0 })
+            Some(ReleaseVersion {
+                major: 1,
+                minor: 2,
+                patch: 0
+            })
         );
-        assert_eq!(ReleaseVersion::parse("  v0.2.0  ").map(|v| v.tag()), Some("v0.2.0".to_string()));
+        assert_eq!(
+            ReleaseVersion::parse("  v0.2.0  ").map(|v| v.tag()),
+            Some("v0.2.0".to_string())
+        );
         // Numeric, never lexicographic: 1.10 beats 1.9.
         assert!(
             ReleaseVersion::parse("v1.10.0").unwrap() > ReleaseVersion::parse("v1.9.0").unwrap()
@@ -1549,7 +1779,10 @@ mod tests {
         for bad in ["", "v", "latest", "v1.x.3", "1.2.3.4", "v-1.2.3"] {
             assert_eq!(ReleaseVersion::parse(bad), None, "{bad}");
         }
-        assert_eq!(ReleaseVersion::current().tag(), format!("v{}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            ReleaseVersion::current().tag(),
+            format!("v{}", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -1685,7 +1918,7 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let lock = dir.join("bot.lock");
+        let lock = dir.join("bot.start.lock");
         try_acquire_start_lock(&lock).expect("acquire");
         assert!(try_acquire_start_lock(&lock).is_err());
         std::fs::write(&lock, format!("{}:{}", u32::MAX, unix_secs())).expect("write");
@@ -1694,8 +1927,234 @@ mod tests {
         try_acquire_start_lock(&lock).expect("steal garbage");
         std::fs::write(&lock, format!("{}:1", std::process::id())).expect("write");
         try_acquire_start_lock(&lock).expect("steal ancient");
-        assert_eq!(start_lock_path(&dir.join("bot.pid")), dir.join("bot.lock"));
+        assert_eq!(
+            start_lock_path(&dir.join("bot.pid")),
+            dir.join("bot.start.lock")
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_lock_excludes_second_holder_and_reacquires_after_drop() {
+        // AUD-001 core primitive: one holder at a time on one path,
+        // released on drop. This is the same `flock` the trader
+        // process holds for its whole lifetime.
+        let dir = std::env::temp_dir().join(format!(
+            "cli-state-lock-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let lock_path = dir.join("bot.lock");
+        let first = StateDirLock::try_acquire(&lock_path).expect("first holder");
+        let second = StateDirLock::try_acquire(&lock_path);
+        assert!(
+            second.is_err(),
+            "a second holder must fail while the first holds"
+        );
+        let err = second.expect_err("checked above");
+        assert!(err.to_string().contains("state dir already owned"), "{err}");
+        drop(first);
+        let third = StateDirLock::try_acquire(&lock_path).expect("reacquire after drop");
+        drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_lock_sits_beside_the_log() {
+        // The lock is keyed on the STATE dir (the log's directory), so
+        // a second process with an overridden PID_FILE but the same
+        // LOG_FILE still collides (AUD-001 trigger).
+        assert_eq!(
+            state_lock_path(Path::new("/tmp/ps/bot.log")),
+            PathBuf::from("/tmp/ps/bot.lock")
+        );
+        // Bare filename: the CWD is the state dir.
+        assert_eq!(
+            state_lock_path(Path::new("bot.log")),
+            PathBuf::from("./bot.lock")
+        );
+    }
+
+    #[test]
+    fn pid_registration_roundtrips_and_never_touches_foreign_records() {
+        let dir = std::env::temp_dir().join(format!(
+            "cli-pid-reg-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pid_file = dir.join("bot.pid");
+        register_running(true, &pid_file);
+        let info = read_pid_file(&pid_file).expect("registered");
+        assert_eq!(info.pid, std::process::id());
+        assert!(info.live);
+        // A record naming another pid must survive our unregister.
+        std::fs::write(&pid_file, r#"{"pid":999999,"live":false,"started_at":1}"#)
+            .expect("foreign record");
+        unregister_running(&pid_file);
+        assert!(read_pid_file(&pid_file).is_some(), "foreign record kept");
+        // Our own record goes.
+        register_running(false, &pid_file);
+        unregister_running(&pid_file);
+        assert!(read_pid_file(&pid_file).is_none(), "own record removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_target_check_identifies_this_process() {
+        // This test process: resolvable and matching its own binary.
+        assert_eq!(pid_is_our_binary(std::process::id()), Some(true));
+        assert_eq!(pid_is_our_binary(0), None);
+        // An unrelated live process must read as NOT ours where the
+        // platform can resolve binaries (`sleep` stays alive for the
+        // probe; the child is reaped below).
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        let verdict = pid_is_our_binary(child.id());
+        if pid_binary_path(child.id()).is_some() {
+            assert_eq!(verdict, Some(false), "sleep is not pump-sentry");
+        } else {
+            assert_eq!(verdict, None, "platform gives no answer");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn bare_log_paths_deliver_sell_requests() {
+        // AUD-012: `LOG_FILE=bot.log` has parent Some(""), which used
+        // to make the drain see no directory at all. Request path and
+        // drain dir must agree on the CWD. Chdir is process-global:
+        // serialized like the env-mutating tests.
+        use std::sync::{Mutex, OnceLock};
+        static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = CWD_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock");
+        assert_eq!(
+            sell_request_path(Path::new("bot.log"), "MINT"),
+            PathBuf::from("sell-MINT.json")
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "cli-bare-sell-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let log = dir.join("bot.log");
+        std::fs::write(&log, "").expect("log");
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&dir).expect("chdir");
+        let request = sell_request_path(Path::new("bot.log"), "MINTA");
+        write_private_file(&request, br#"{"mint":"MINTA","ts":1}"#).expect("queue");
+        let found = pending_sell_requests(Path::new("bot.log"));
+        std::env::set_current_dir(cwd).expect("restore cwd");
+        assert_eq!(found.len(), 1, "bare-path request must be delivered");
+        assert_eq!(found[0].0, "MINTA");
+        // Absolute paths still work.
+        let abs = sell_request_path(&log, "MINTB");
+        write_private_file(&abs, br#"{"mint":"MINTB","ts":1}"#).expect("queue");
+        let found = pending_sell_requests(&log);
+        assert_eq!(found.len(), 2, "both queued requests are seen");
+        assert!(
+            found.iter().any(|(m, _)| m == "MINTB"),
+            "absolute-path request is delivered"
+        );
+        assert!(
+            found.iter().any(|(m, _)| m == "MINTA"),
+            "bare-path request stays discoverable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sha256_falls_back_when_first_tool_is_absent() {
+        // AUD-019: sha256sum missing must reach the shasum fallback,
+        // not return None from the whole function.
+        let tmp = std::env::temp_dir().join(format!(
+            "cli-sha-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let file = tmp.join("blob");
+        std::fs::write(&file, b"payload").expect("write");
+        let digest = "a".repeat(64);
+        let got = sha256_via_tools(|tool, _args| {
+            if tool == "sha256sum" {
+                None // tool not installed
+            } else {
+                Some(std::process::Output {
+                    status: std::process::ExitStatus::default(),
+                    stdout: format!("{digest}  {file:?}\n").into_bytes(),
+                    stderr: Vec::new(),
+                })
+            }
+        });
+        assert_eq!(got.as_deref(), Some(digest.as_str()));
+        // Both absent: None.
+        assert_eq!(
+            sha256_via_tools(|_tool, _args| None),
+            None,
+            "no tool anywhere stays None"
+        );
+        // A failed run falls through to the next tool.
+        let mut first = true;
+        let got = sha256_via_tools(|tool, _args| {
+            if first {
+                first = false;
+                return None;
+            }
+            assert_eq!(tool, "shasum", "fallback order");
+            Some(std::process::Output {
+                status: std::process::ExitStatus::default(),
+                stdout: b"zz-not-hex\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        });
+        assert_eq!(got, None, "non-hex output is rejected");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sha256_uses_real_shasum_when_sha256sum_absent_from_path() {
+        // End-to-end shape of AUD-019 with a PATH that only knows a
+        // fake `shasum`: the child PATH is overridden (never the
+        // process env), so `sha256sum` lookup fails and `shasum` runs.
+        let tmp = std::env::temp_dir().join(format!(
+            "cli-sha-path-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let digest = "b".repeat(64);
+        let fake = tmp.join("bin");
+        std::fs::create_dir_all(&fake).expect("mkdir");
+        let script = fake.join("shasum");
+        std::fs::write(&script, format!("#!/bin/sh\necho {digest}\n")).expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let file = tmp.join("blob");
+        std::fs::write(&file, b"payload").expect("write");
+        let fake_path = fake.clone();
+        let got = sha256_via_tools(move |tool, args| {
+            std::process::Command::new(tool)
+                .args(args)
+                .arg(&file)
+                .env("PATH", &fake_path)
+                .output()
+                .ok()
+        });
+        assert_eq!(got.as_deref(), Some(digest.as_str()));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1808,8 +2267,17 @@ mod tests {
     #[test]
     fn usage_lists_all_commands() {
         for cmd in [
-            "start", "stop", "restart", "status", "logs", "run", "sell", "init-config", "upgrade",
-            "help", "--live",
+            "start",
+            "stop",
+            "restart",
+            "status",
+            "logs",
+            "run",
+            "sell",
+            "init-config",
+            "upgrade",
+            "help",
+            "--live",
         ] {
             assert!(USAGE.contains(cmd), "usage missing {cmd}");
         }
@@ -1831,11 +2299,24 @@ mod tests {
         std::fs::write(&log, vec![0u8; 1_000]).expect("write");
         rotate_log_sized(&log, 1_000, 2);
         assert!(std::fs::metadata(&log).is_err(), "current must move away");
-        assert_eq!(std::fs::metadata(log.with_extension("log.1")).expect("m").len(), 1_000);
-        assert_eq!(std::fs::metadata(log.with_extension("log.2")).expect("m").len(), 10);
+        assert_eq!(
+            std::fs::metadata(log.with_extension("log.1"))
+                .expect("m")
+                .len(),
+            1_000
+        );
+        assert_eq!(
+            std::fs::metadata(log.with_extension("log.2"))
+                .expect("m")
+                .len(),
+            10
+        );
         std::fs::write(&log, vec![0u8; 1_000]).expect("write");
         rotate_log_sized(&log, 1_000, 2);
-        assert!(std::fs::metadata(log.with_extension("log.3")).is_err(), "no third archive");
+        assert!(
+            std::fs::metadata(log.with_extension("log.3")).is_err(),
+            "no third archive"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -12,8 +12,7 @@ pub const RAYDIUM_V4_PROGRAM_ID: Pubkey =
 pub const RAYDIUM_VAULT_AUTHORITY: Pubkey =
     Pubkey::from_str_const("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1");
 /// Wrapped SOL mint (standard quote side).
-pub const WSOL_MINT: Pubkey =
-    Pubkey::from_str_const("So11111111111111111111111111111111111111112");
+pub const WSOL_MINT: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
 
 #[cfg(test)]
 mod tests {

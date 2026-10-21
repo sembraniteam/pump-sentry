@@ -133,7 +133,7 @@ pub fn slippage_ceiling(quoted_cost_incl_fees: u64, slippage_bps: u64) -> Option
 /// (both sides delegate here). Clamped to a sane lamport cap: a giant
 /// price must not turn a cost estimate into a multi-SOL debit.
 pub fn priority_fee_lamports(compute_unit_limit: u32, micro_lamports_per_cu: u64) -> u64 {
-    let raw = (u128::from(compute_unit_limit))
+    let raw = u128::from(compute_unit_limit)
         .saturating_mul(u128::from(micro_lamports_per_cu))
         .saturating_add(999_999)
         / 1_000_000;
@@ -240,7 +240,9 @@ pub fn sell_out_after_fees(
     let gross = mul_div(
         u128::from(amount),
         u128::from(view.vq),
-        u128::from(view.vt).checked_add(u128::from(amount)).ok_or(QuoteError::MathOverflow)?,
+        u128::from(view.vt)
+            .checked_add(u128::from(amount))
+            .ok_or(QuoteError::MathOverflow)?,
     )?;
     let (proto, creator) = curve_fee_bps(schedule, gate_on, view, mint_supply)?;
     let net = gross
@@ -254,7 +256,8 @@ pub fn sell_out_after_fees(
 }
 
 /// Tokens out for an exact quote input. `Ok(0)` when input can't cover fees.
-pub fn buy_tokens_for_exact_in(    schedule: &FeeSchedule,
+pub fn buy_tokens_for_exact_in(
+    schedule: &FeeSchedule,
     gate_on: bool,
     view: &CurveView,
     mint_supply: u64,
@@ -408,11 +411,22 @@ mod tests {
     const SUPPLY: u64 = 1_000_000_000_000_000;
 
     fn sched(proto: u64, creator: u64) -> FeeSchedule {
-        let one = vec![(0u128, FeesBps { lp: 0, protocol: proto, creator })];
+        let one = vec![(
+            0u128,
+            FeesBps {
+                lp: 0,
+                protocol: proto,
+                creator,
+            },
+        )];
         FeeSchedule {
             tiers: one.clone(),
             stable: one.clone(),
-            flat: FeesBps { lp: 0, protocol: proto, creator },
+            flat: FeesBps {
+                lp: 0,
+                protocol: proto,
+                creator,
+            },
             exotic: FeesBps::default(),
         }
     }
@@ -468,8 +482,14 @@ mod tests {
             buy_tokens_for_exact_in(&s, false, &sol_curve(), 0, 2002),
             Ok(71_497_561)
         );
-        assert_eq!(buy_tokens_for_exact_in(&s, false, &sol_curve(), 0, 1), Ok(0));
-        assert_eq!(buy_tokens_for_exact_in(&s, false, &sol_curve(), 0, 0), Ok(0));
+        assert_eq!(
+            buy_tokens_for_exact_in(&s, false, &sol_curve(), 0, 1),
+            Ok(0)
+        );
+        assert_eq!(
+            buy_tokens_for_exact_in(&s, false, &sol_curve(), 0, 0),
+            Ok(0)
+        );
     }
 
     #[test]
@@ -505,13 +525,19 @@ mod tests {
         assert_eq!(pumpswap_sell_out(&v, 10_000_000_000), Ok(295_396_037));
         assert_eq!(pumpswap_sell_out(&v, 0), Ok(0));
         // Real-reserve cap below the LP-stripped gross refuses.
-        let capped = PoolView { real_quote_cap: 100_000_000, ..v };
+        let capped = PoolView {
+            real_quote_cap: 100_000_000,
+            ..v
+        };
         assert_eq!(
             pumpswap_sell_out(&capped, 10_000_000_000),
             Err(QuoteError::FeesExceedOutput)
         );
         // Empty reserves refuse.
-        let empty = PoolView { base_reserve: 0, ..v };
+        let empty = PoolView {
+            base_reserve: 0,
+            ..v
+        };
         assert_eq!(
             pumpswap_sell_out(&empty, 10_000_000_000),
             Err(QuoteError::EmptyReserves)
@@ -547,8 +573,22 @@ mod tests {
     fn pumpswap_fee_bps_follows_tiers_and_gate() {
         let sched = FeeSchedule {
             tiers: vec![
-                (0u128, FeesBps { lp: 20, protocol: 5, creator: 95 }),
-                (1_000_000_000_000u128, FeesBps { lp: 20, protocol: 5, creator: 30 }),
+                (
+                    0u128,
+                    FeesBps {
+                        lp: 20,
+                        protocol: 5,
+                        creator: 95,
+                    },
+                ),
+                (
+                    1_000_000_000_000u128,
+                    FeesBps {
+                        lp: 20,
+                        protocol: 5,
+                        creator: 30,
+                    },
+                ),
             ],
             stable: vec![],
             flat: FeesBps::default(),
@@ -557,29 +597,52 @@ mod tests {
         // Below top tier: first-row creator.
         assert_eq!(
             pumpswap_fee_bps(&sched, true, 0, false, 500),
-            Ok(FeesBps { lp: 20, protocol: 5, creator: 95 })
+            Ok(FeesBps {
+                lp: 20,
+                protocol: 5,
+                creator: 95
+            })
         );
         // At/above: top-row creator.
         assert_eq!(
             pumpswap_fee_bps(&sched, true, 0, false, 1_000_000_000_000),
-            Ok(FeesBps { lp: 20, protocol: 5, creator: 30 })
+            Ok(FeesBps {
+                lp: 20,
+                protocol: 5,
+                creator: 30
+            })
         );
         // Pool override wins only under gate + nonzero.
         assert_eq!(
             pumpswap_fee_bps(&sched, true, 100, false, 1_000_000_000_000),
-            Ok(FeesBps { lp: 20, protocol: 5, creator: 100 })
+            Ok(FeesBps {
+                lp: 20,
+                protocol: 5,
+                creator: 100
+            })
         );
         assert_eq!(
             pumpswap_fee_bps(&sched, false, 100, false, 1_000_000_000_000),
-            Ok(FeesBps { lp: 20, protocol: 5, creator: 30 })
+            Ok(FeesBps {
+                lp: 20,
+                protocol: 5,
+                creator: 30
+            })
         );
         // Creatorless pool: no creator leg.
         assert_eq!(
             pumpswap_fee_bps(&sched, true, 100, true, 1_000_000_000_000),
-            Ok(FeesBps { lp: 20, protocol: 5, creator: 0 })
+            Ok(FeesBps {
+                lp: 20,
+                protocol: 5,
+                creator: 0
+            })
         );
         // Empty tiers fail closed.
-        let empty = FeeSchedule { tiers: vec![], ..sched };
+        let empty = FeeSchedule {
+            tiers: vec![],
+            ..sched
+        };
         assert_eq!(
             pumpswap_fee_bps(&empty, true, 0, false, 0),
             Err(QuoteError::EmptyFeeTiers)
@@ -592,26 +655,45 @@ mod tests {
             include_bytes!("../../listener/tests/fixtures/amm_global_config_live.bin");
         assert_eq!(bytes.len(), ids::PUMP_AMM_GLOBAL_LEN);
         assert_eq!(parse_amm_creator_gate(bytes), Ok(true));
-        assert_eq!(parse_amm_creator_gate(&bytes[..100]), Err(QuoteError::BadAccount));
+        assert_eq!(
+            parse_amm_creator_gate(&bytes[..100]),
+            Err(QuoteError::BadAccount)
+        );
         let mut bad_gate = bytes.to_vec();
         bad_gate[ids::PUMP_AMM_GLOBAL_CREATOR_GATE_OFFSET] = 7;
-        assert_eq!(parse_amm_creator_gate(&bad_gate), Err(QuoteError::BadAccount));
+        assert_eq!(
+            parse_amm_creator_gate(&bad_gate),
+            Err(QuoteError::BadAccount)
+        );
     }
 
     #[test]
     fn amm_fee_schedule_decodes_live_tiers() {
         // Same FeeConfig layout as the curve schedule: 25 live tiers.
-        let bytes: &[u8] =
-            include_bytes!("../../listener/tests/fixtures/amm_fee_config_live.bin");
+        let bytes: &[u8] = include_bytes!("../../listener/tests/fixtures/amm_fee_config_live.bin");
         let sched = curve::fee::parse_schedule(bytes).expect("live AMM schedule decodes");
         assert_eq!(sched.tiers.len(), 25);
         assert_eq!(
             sched.tiers[0],
-            (0u128, FeesBps { lp: 2, protocol: 93, creator: 30 })
+            (
+                0u128,
+                FeesBps {
+                    lp: 2,
+                    protocol: 93,
+                    creator: 30
+                }
+            )
         );
         assert_eq!(
             sched.tiers[1],
-            (420_000_000_000u128, FeesBps { lp: 20, protocol: 5, creator: 95 })
+            (
+                420_000_000_000u128,
+                FeesBps {
+                    lp: 20,
+                    protocol: 5,
+                    creator: 95
+                }
+            )
         );
     }
 
@@ -619,21 +701,52 @@ mod tests {
     fn schedule_selection_follows_quote_kind() {
         let mk = |t: Vec<FeeTierRow>| FeeSchedule {
             tiers: t.clone(),
-            stable: vec![(0u128, FeesBps { lp: 0, protocol: 70, creator: 10 })],
-            flat: FeesBps { lp: 0, protocol: 5, creator: 0 },
+            stable: vec![(
+                0u128,
+                FeesBps {
+                    lp: 0,
+                    protocol: 70,
+                    creator: 10,
+                },
+            )],
+            flat: FeesBps {
+                lp: 0,
+                protocol: 5,
+                creator: 0,
+            },
             exotic: FeesBps::default(),
         };
         // Tier pick: highest threshold <= mcap else first.
         let s = mk(vec![
-            (0u128, FeesBps { lp: 0, protocol: 90, creator: 30 }),
-            (1_000u128, FeesBps { lp: 0, protocol: 80, creator: 20 }),
+            (
+                0u128,
+                FeesBps {
+                    lp: 0,
+                    protocol: 90,
+                    creator: 30,
+                },
+            ),
+            (
+                1_000u128,
+                FeesBps {
+                    lp: 0,
+                    protocol: 80,
+                    creator: 20,
+                },
+            ),
         ]);
         let v = sol_curve();
         assert_eq!(curve_fee_bps(&s, false, &v, SUPPLY), Ok((80, 20)));
         // USDC routes to stable; other quotes to flat when exotic unset.
-        let u = CurveView { quote: QuoteKind::Usdc, ..v };
+        let u = CurveView {
+            quote: QuoteKind::Usdc,
+            ..v
+        };
         assert_eq!(curve_fee_bps(&s, false, &u, SUPPLY), Ok((70, 10)));
-        let o = CurveView { quote: QuoteKind::Other, ..v };
+        let o = CurveView {
+            quote: QuoteKind::Other,
+            ..v
+        };
         assert_eq!(curve_fee_bps(&s, false, &o, SUPPLY), Ok((5, 0)));
         // Empty SOL tiers fail closed (program: FeeTiersEmpty).
         let e = mk(vec![]);
@@ -642,13 +755,22 @@ mod tests {
             Err(QuoteError::EmptyFeeTiers)
         );
         // Coin override wins only with gate on + nonzero stored rate.
-        let w = CurveView { coin_creator_fee_bps: 250, ..v };
+        let w = CurveView {
+            coin_creator_fee_bps: 250,
+            ..v
+        };
         assert_eq!(curve_fee_bps(&s, true, &w, SUPPLY), Ok((80, 250)));
         assert_eq!(curve_fee_bps(&s, false, &w, SUPPLY), Ok((80, 20)));
-        let z = CurveView { coin_creator_fee_bps: 0, ..v };
+        let z = CurveView {
+            coin_creator_fee_bps: 0,
+            ..v
+        };
         assert_eq!(curve_fee_bps(&s, true, &z, SUPPLY), Ok((80, 20)));
         // Creatorless curves charge no creator leg at all.
-        let d = CurveView { creator_is_default: true, ..w };
+        let d = CurveView {
+            creator_is_default: true,
+            ..w
+        };
         assert_eq!(curve_fee_bps(&s, true, &d, SUPPLY), Ok((80, 0)));
     }
 
@@ -658,11 +780,32 @@ mod tests {
         let bytes: &[u8] = include_bytes!("../../listener/tests/fixtures/fee_config_live.bin");
         assert_eq!(bytes.len(), 4097);
         let sched = curve::fee::parse_schedule(bytes).expect("live schedule decodes");
-        let one = vec![(0u128, FeesBps { lp: 0, protocol: 95, creator: 30 })];
+        let one = vec![(
+            0u128,
+            FeesBps {
+                lp: 0,
+                protocol: 95,
+                creator: 30,
+            },
+        )];
         assert_eq!(sched.tiers, one);
         assert_eq!(sched.stable, one);
-        assert_eq!(sched.flat, FeesBps { lp: 0, protocol: 95, creator: 30 });
-        assert_eq!(sched.exotic, FeesBps { lp: 0, protocol: 95, creator: 30 });
+        assert_eq!(
+            sched.flat,
+            FeesBps {
+                lp: 0,
+                protocol: 95,
+                creator: 30
+            }
+        );
+        assert_eq!(
+            sched.exotic,
+            FeesBps {
+                lp: 0,
+                protocol: 95,
+                creator: 30
+            }
+        );
         // Hostile / short buffers fail closed (shared parser).
         assert!(curve::fee::parse_schedule(&bytes[..72]).is_none());
         let mut hostile = bytes[..177].to_vec();

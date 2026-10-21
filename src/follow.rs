@@ -33,9 +33,7 @@ pub enum FollowStage {
     /// No baseline yet; the first tick seeds it (never alerts).
     Seeding,
     /// Baseline set; the 2x card fires at `entry_price * MULT`.
-    Watching {
-        entry_price: f64,
-    },
+    Watching { entry_price: f64 },
     /// Spike card fired; the leg is retained only for live exits.
     Alerted,
 }
@@ -48,7 +46,6 @@ pub const MIGRATED_TTL_SECS: u64 = 86_400;
 pub const MIGRATED_CAP: usize = 5_000;
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
-
     /// Announce each migration once.
     pub(crate) async fn report_migration_once(&self, mint: &str, curve: &str) {
         {

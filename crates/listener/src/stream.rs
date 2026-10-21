@@ -4,8 +4,8 @@
 //! Queue is drop-on-full. Reconnects use capped backoff.
 
 use crate::parser::{
-    PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR, decode_ix_data, is_pump_create_ix,
-    is_pump_create_v2_ix, parse_pump_create, parse_pump_create_v2,
+    PUMP_PROGRAM_ID, PUMP_PROGRAM_ID_STR, decode_ix_data, is_pump_create_ix, is_pump_create_v2_ix,
+    parse_pump_create, parse_pump_create_v2,
 };
 use crate::types::{EVENT_CHANNEL_CAPACITY, ListenerConfig, ListenerEvent, ListenerStats};
 use futures_util::StreamExt;
@@ -109,9 +109,7 @@ fn jitter_ms(max: u64) -> u64 {
         .map(|d| u64::from(d.subsec_nanos()))
         .unwrap_or(0);
     // Spread calls across the window when the clock is stuck.
-    nanos
-        .wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-        % max
+    nanos.wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % max
 }
 
 /// Pump.fun log listener.
@@ -154,7 +152,9 @@ impl LogSubscription {
 impl Drop for LogSubscription {
     fn drop(&mut self) {
         if self.unsub.is_some() {
-            debug!("log subscription dropped without explicit shutdown; server sub lingers until timeout");
+            debug!(
+                "log subscription dropped without explicit shutdown; server sub lingers until timeout"
+            );
         }
     }
 }
@@ -229,8 +229,7 @@ impl PumpFunListener {
             Ok(mut guard) => {
                 if guard.len() >= SEEN_SIG_CAP {
                     let drop_n = guard.len() / 2;
-                    let victims: Vec<String> =
-                        guard.iter().take(drop_n).cloned().collect();
+                    let victims: Vec<String> = guard.iter().take(drop_n).cloned().collect();
                     for v in victims {
                         guard.remove(&v);
                     }
@@ -421,7 +420,11 @@ impl PumpFunListener {
                     warn!(error = %ids::redact_urls_in_text(&e.to_string()), attempt, "subscription error; backing off");
                 }
             }
-            attempt = if healthy { 0 } else { attempt.saturating_add(1) };
+            attempt = if healthy {
+                0
+            } else {
+                attempt.saturating_add(1)
+            };
             if self.is_shutdown() {
                 info!("shutdown requested; not reconnecting");
                 return Ok(());
@@ -473,7 +476,9 @@ impl PumpFunListener {
             Ok(Ok(sub)) => sub,
             Ok(Err(e)) => return Err(ListenerError::Pubsub(e)),
             Err(_) => {
-                return Err(ListenerError::Terminated("logsSubscribe timed out".to_string()));
+                return Err(ListenerError::Terminated(
+                    "logsSubscribe timed out".to_string(),
+                ));
             }
         };
         // Held for the session: `shutdown()` unsubscribes instead of
@@ -642,7 +647,8 @@ async fn fetch_tx_permit_bound(
 }
 
 /// True for rate limits (`429`). Worth a longer backoff.
-fn is_rate_limited(e: &ClientError) -> bool {    use solana_client::client_error::ClientErrorKind;
+fn is_rate_limited(e: &ClientError) -> bool {
+    use solana_client::client_error::ClientErrorKind;
     match e.kind() {
         ClientErrorKind::RpcError(solana_client::rpc_request::RpcError::RpcResponseError {
             code: 429,
@@ -689,13 +695,11 @@ async fn fetch_and_emit(
     commitment: CommitmentConfig,
     seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
-    let unmark = |why: &str| {
-        match seen.lock() {
-            Ok(mut guard) => {
-                guard.remove(sig_str);
-            }
-            Err(_) => debug!(signature = %sig_str, why, "seen-set lock poisoned; unmark skipped"),
+    let unmark = |why: &str| match seen.lock() {
+        Ok(mut guard) => {
+            guard.remove(sig_str);
         }
+        Err(_) => debug!(signature = %sig_str, why, "seen-set lock poisoned; unmark skipped"),
     };
     let signature = match Signature::from_str(sig_str) {
         Ok(s) => s,
@@ -714,7 +718,8 @@ async fn fetch_and_emit(
         std::time::Duration::from_secs(10),
         fetch_tx_permit_bound(rpc, &signature, tx_config, sem, stats, sig_str),
     )
-    .await    {
+    .await
+    {
         Ok(Some(v)) => v,
         Ok(None) => {
             unmark("fetch failed; backfill may retry");
@@ -759,7 +764,11 @@ fn extract_events(
 ) -> Vec<crate::parser::PumpTokenLaunchEvent> {
     let mut out = Vec::new();
     // Chain slot wins. Falls back to log slot on 0.
-    let slot = if fetched.slot == 0 { slot_hint } else { fetched.slot };
+    let slot = if fetched.slot == 0 {
+        slot_hint
+    } else {
+        fetched.slot
+    };
 
     let (_account_keys, top_ixs, inner_ixs) = match build_ix_lists(fetched) {
         Ok(lists) => lists,
@@ -945,7 +954,11 @@ fn decode_compiled_ix(cix: &UiCompiledInstruction, account_keys: &[Pubkey]) -> O
     let program_id = match account_keys.get(usize::from(cix.program_id_index)) {
         Some(p) => *p,
         None => {
-            debug!(program_id_index = cix.program_id_index, keys = account_keys.len(), "compiled ix program index out of bounds");
+            debug!(
+                program_id_index = cix.program_id_index,
+                keys = account_keys.len(),
+                "compiled ix program index out of bounds"
+            );
             return None;
         }
     };
@@ -954,7 +967,11 @@ fn decode_compiled_ix(cix: &UiCompiledInstruction, account_keys: &[Pubkey]) -> O
         match account_keys.get(usize::from(*idx)) {
             Some(key) => accounts.push(*key),
             None => {
-                debug!(index = idx, keys = account_keys.len(), "compiled ix account index out of bounds");
+                debug!(
+                    index = idx,
+                    keys = account_keys.len(),
+                    "compiled ix account index out of bounds"
+                );
                 return None;
             }
         }

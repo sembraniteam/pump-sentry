@@ -37,21 +37,27 @@ use live::LiveTrader;
 use pipeline::{AlertSink, Pipeline};
 use settings::Settings;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let argv: Vec<String> = std::env::args().collect();
     match cli::parse_cli(&argv) {
-        cli::CliAction::Run { live } => run_pipeline(live).await,
+        // The trader runs through the synchronous boot phase first:
+        // lock, settings, and secret capture happen before any thread
+        // exists (AUD-001, AUD-015).
+        cli::CliAction::Run { live } => run_binary(live),
         cli::CliAction::Start { live } => cli::cmd_start(live, "start"),
         cli::CliAction::Restart { live } => cli::cmd_restart(live),
         cli::CliAction::Stop => cli::cmd_stop(),
         cli::CliAction::Status => cli::cmd_status(),
-        cli::CliAction::Logs { lines, follow } => cli::cmd_logs(lines, follow).await,
+        // Read-only/aux actions never mutate the environment or touch
+        // state files: a minimal current-thread runtime is enough.
+        cli::CliAction::Logs { lines, follow } => {
+            aux_runtime().block_on(cli::cmd_logs(lines, follow))
+        }
         cli::CliAction::Sell { mint } => cli::cmd_sell(&mint),
         cli::CliAction::Pause => cli::cmd_pause(),
         cli::CliAction::Resume => cli::cmd_resume(),
-        cli::CliAction::Replay { file } => replay::cmd_replay(file).await,
-        cli::CliAction::Research { file } => research::cmd_research(file).await,
+        cli::CliAction::Replay { file } => aux_runtime().block_on(replay::cmd_replay(file)),
+        cli::CliAction::Research { file } => aux_runtime().block_on(research::cmd_research(file)),
         cli::CliAction::Upgrade { allow_unverified } => cli::cmd_upgrade(allow_unverified),
         cli::CliAction::InitConfig => {
             let path = config::resolve_config_path();
@@ -72,6 +78,196 @@ async fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// Runtime for the aux commands (logs/replay/research): no env
+/// mutation, no state ownership — current-thread is enough and keeps
+/// those paths off the trader's boot phase.
+fn aux_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("aux tokio runtime")
+}
+
+/// Values captured in the synchronous boot phase, before any thread
+/// exists. Secrets and env-derived settings cross into the async world
+/// as owned data; nothing re-reads (or mutates) the environment after
+/// boot (AUD-015). The state-dir lock is acquired here too — before
+/// the config file, secrets, WAL, or day-state are touched (AUD-001).
+struct Boot {
+    live: bool,
+    live_via: &'static str,
+    settings: Settings,
+    wallet: Option<WalletGuard>,
+    yellowstone_token: Option<String>,
+    /// Held for the whole process lifetime: one writer per state dir.
+    _state_lock: cli::StateDirLock,
+}
+
+/// Secret-bearing environment variables scrubbed in the sync boot
+/// phase (AUD-015) once Settings/captured values own the data: RPC
+/// URLs carry `?api-key=`/path keys. Nothing re-reads them after boot;
+/// later children (alert Hermes, upgrade checks) inherit a clean env.
+/// `_FILE` variants are NOT here (paths, not secrets);
+/// `SOLANA_PRIVATE_KEY` is scrubbed by its own loader
+/// (`WalletGuard::load_from_env`).
+const SECRET_ENV_VARS: &[&str] = &[
+    "INFERENCE_API_KEY",
+    "MAINNET_RPC_URL",
+    "MAINNET_WSS_RPC_URL",
+    "MAINNET_RPC_URLS_FALLBACK",
+    listener::YELLOWSTONE_TOKEN_ENV,
+];
+
+/// Remove every [`SECRET_ENV_VARS`] entry. SAFETY: `env::remove_var`
+/// mutates the process-global environment — call before any thread
+/// exists (the sync boot phase owns that ordering).
+fn scrub_secret_env() {
+    for name in SECRET_ENV_VARS {
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+/// Synchronous boot phase, then the async pipeline. Every environment
+/// read-and-scrub, the config load, and the wallet load happen here —
+/// before the Tokio runtime spawns worker threads (env is process-
+/// global and not thread-safe; `remove_var` after thread spawn is UB
+/// territory under Rust 2024) and before any state file is read (two
+/// processes must never share a state dir). Returns normally on a
+/// clean shutdown so destructors run (the journal flushes its queue).
+fn run_binary(live_arg: bool) {
+    // Must run before TLS: dual providers panic on auto-detect.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let daemon = std::env::var("BOT_DAEMON").is_ok_and(|v| v == "1");
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_ansi(!daemon)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,pump_sentry=debug")),
+        )
+        .init();
+
+    // One process per state dir, before anything else reads state
+    // (config, secrets, WAL, day-state). A second `run`/daemon on the
+    // same LOG_FILE directory refuses here instead of double-spending
+    // the wallet's risk caps against another holder of the same book.
+    let (_, log_file) = cli::resolve_paths();
+    let state_lock = match cli::StateDirLock::try_acquire(&cli::state_lock_path(&log_file)) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!(
+                "refusing to start: {e}\nstate dir {} is already owned by a running pump-sentry (run/start). Two traders must never share a state dir, wallet, WAL, or day-state.",
+                cli::state_dir_for_log(&log_file).display()
+            );
+            std::process::exit(1);
+        }
+    };
+    // Foreground `run` registers itself so `status`/`sell`/`stop` find
+    // it exactly like the daemon (the daemon child overwrites the same
+    // record with its own pid, same values).
+    {
+        let (pid_file, _) = cli::resolve_paths();
+        cli::register_running(live_arg, &pid_file);
+    }
+
+    // Paper unless explicitly live. Only exact `true` enables live;
+    // attribute the source (a lingering IS_LIVE=true in the shell is
+    // the sharpest mode footgun).
+    let live_mode = live_arg || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
+    let live_via: &'static str = if live_arg { "--live" } else { "IS_LIVE=true" };
+    if !live_mode
+        && let Ok(v) = std::env::var("IS_LIVE")
+        && !v.is_empty()
+        && v != "false"
+        && v != "0"
+        && v != "no"
+    {
+        tracing::warn!(
+            "config: IS_LIVE='{v}' ignored (only the exact value 'true' enables live; paper mode)"
+        );
+    }
+
+    // File config: categorized config.toml is the only source for
+    // tunables (INFERENCE_API_KEY stays env-only). The file is
+    // auto-created (template with every tunable); a missing file
+    // simply means defaults rule. Parse errors are fatal — a typo'd
+    // value must never silently become a default.
+    let config_path = config::resolve_config_path();
+    match config::ensure_config_file(&config_path) {
+        Ok(true) => println!("wrote default config to {}", config_path.display()),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("cannot set up config at {}: {e}", config_path.display());
+            std::process::exit(1);
+        }
+    }
+    let table = match config::read_table(&config_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bad config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let settings = Settings::from_file(table.as_ref());
+
+    // Capture the geyser token (if any) BEFORE scrubbing: it crosses
+    // into the listener as owned data and never re-reads the env.
+    let yellowstone_token = std::env::var(listener::YELLOWSTONE_TOKEN_ENV)
+        .ok()
+        .or_else(|| {
+            std::env::var(format!("{}_FILE", listener::YELLOWSTONE_TOKEN_ENV))
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .filter(|s| !s.is_empty());
+
+    // Scrub endpoint secrets from the process environment now that
+    // Settings owns copies: the RPC URLs carry `?api-key=` / path keys,
+    // and nothing re-reads them after boot (same rule as the bearer
+    // token and the trading keypair — secrets live in guarded memory,
+    // not in `/proc` environ or later children). This happens BEFORE
+    // any thread exists: `env::remove_var` is process-global and not
+    // thread-safe (AUD-015). `_FILE` variables stay: they name
+    // paths, they are not secrets.
+    scrub_secret_env();
+
+    // Live wallet load happens in the sync phase too: the keypair is
+    // scrubbed from the environment inside `load_from_env`, and that
+    // mutation must not race a worker thread (AUD-015). A load failure
+    // exits before the live banner (fail fast; same message).
+    let wallet = if live_mode {
+        match WalletGuard::load_from_env() {
+            Ok(wallet) => Some(wallet),
+            Err(e) => {
+                eprintln!("live mode cannot load the wallet: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let boot = Boot {
+        live: live_mode,
+        live_via,
+        settings,
+        wallet,
+        yellowstone_token,
+        _state_lock: state_lock,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(run_pipeline(boot));
+    // Returning drops the runtime and the boot values (journal flush
+    // rides the pipeline Arc drop); the process then exits 0. Non-
+    // clean paths exit(1) inside `run_pipeline`.
 }
 
 /// WAL path next to the log file.
@@ -96,7 +292,7 @@ async fn replay_live_wal(
     // An unreadable WAL is not an empty WAL: custody (bags, pending
     // buys, resend guard) would come back UNKNOWN, so live must not
     // start blind — refuse, loudly, and let the operator fix the file.
-    let replay = match wal::replay_file(&path) {
+    let mut replay = match wal::replay_file(&path) {
         Ok(replay) => replay,
         Err(e) => {
             eprintln!(
@@ -133,7 +329,34 @@ async fn replay_live_wal(
         trader.wal_write_meta(crate::settings::now_secs());
         // Seed before the pending move below (borrow discipline).
         let recent = replay.recent_sell_pending(crate::settings::now_secs());
-        n_pending = trader.import_pending(replay.pending);
+        // AUD-009: import what the rechecker can own; a second pending
+        // for the same mint is held out for a visible parked claim —
+        // either bundle may have landed, so silent loss is not an
+        // option. `played_pending` is not otherwise used after this.
+        let mut played_pending = std::mem::take(&mut replay.pending);
+        let (imported, skipped) = trader.import_pending(std::mem::take(&mut played_pending));
+        n_pending = imported;
+        // Park the skipped pendings: same mint the rechecker owns, but
+        // a different bundle — real exposure if that bundle landed.
+        {
+            let mut guard = pipeline.exec.live_manual.lock().await;
+            for item in &skipped {
+                watched.push((
+                    item.position.mint.to_string(),
+                    item.position.curve.to_string(),
+                ));
+                let key = item.position.mint.to_string();
+                let key = if guard.contains_key(key.as_str()) {
+                    format!("{key}#wal-dup-{n_manual}")
+                } else {
+                    key
+                };
+                guard.insert(key, item.position.clone());
+                n_manual += 1;
+                warn!(mint = %item.position.mint, bundle = %item.bundle_id,
+                    "WAL replay: duplicate pending parked as manual (custody check: explorer lookup by bundle)");
+            }
+        }
         // Reseed the resend guard from recent unsettled sell traces:
         // a crash between dispatch and confirm leaves the bundle
         // inflight but the in-memory guard empty. Only engine-pending
@@ -300,7 +523,7 @@ async fn custody_recheck(
         let chain = match trader.observe_token_balance(&mint).await {
             Ok(chain) => chain.unwrap_or(0),
             Err(e) => {
-                warn!(%mint, error = %e,
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()),
                     "custody recheck: balance unreadable; claims kept (preflights still fail closed)");
                 continue;
             }
@@ -348,7 +571,8 @@ async fn reconcile_boot_custody(
             Ok(chain) => chain.unwrap_or(0),
             Err(e) => {
                 counts.unreadable += 1;
-                warn!(%mint, tracked = claim.tracked, manual = claim.manual, error = %e,
+                warn!(%mint, tracked = claim.tracked, manual = claim.manual,
+                    error = %ids::strip_error_url(&e.to_string()),
                     "boot reconcile: ATA balance unreadable; claims kept (preflights still fail closed)");
                 continue;
             }
@@ -403,32 +627,65 @@ async fn reconcile_boot_custody(
     counts
 }
 
-/// Foreground pipeline.
-async fn run_pipeline(live_arg: bool) {
-    // Must run before TLS: dual providers panic on auto-detect.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+/// Heartbeat cadence: the mode/status card only (AUD-003). All
+/// execution-quality/custody monitors run on [`SUPERVISION_SECS`].
+const HEARTBEAT_SECS: u64 = 6 * 3_600;
 
-    let daemon = std::env::var("BOT_DAEMON").is_ok_and(|v| v == "1");
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_ansi(!daemon)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info,pump_sentry=debug")
-            }),
-        )
-        .init();
+/// Supervision cadence: the custody recheck, GiveUp burst monitor,
+/// and overdue-exit warning are sampled this often (AUD-003).
+const SUPERVISION_SECS: u64 = 60;
+
+/// Mid-run custody drift check cadence in seconds (30 minutes, the
+/// documented README cadence; boot reconcile owns boot).
+const CUSTODY_RECHECK_SECS: u64 = 1_800;
+
+/// Oldest-open warn threshold: paper timeouts are minutes; an open
+/// position older than this reads as a stuck exit (log-only).
+const STALE_OPEN_WARN_SECS: u64 = 3_600;
+
+/// GiveUp window surfaced in the heartbeat (trailing giveups card).
+const GIVEUP_HEARTBEAT_WINDOW_SECS: u64 = 3_600;
+
+/// Exit-lane reserve (AUD-008): curve ticks, pool ticks, and manual
+/// sells dispatch from their own permit budget, so a launch flood
+/// (audits, dev screens, forensics burning every launch permit) can
+/// never consume the lanes exits dispatch on. The two lanes together
+/// still cap concurrent units at [`MAX_IN_FLIGHT`].
+pub(crate) const EXIT_LANE_PERMITS: usize = 8;
+
+/// Concurrent-unit bound across both lanes plus the in-flight JoinSet.
+pub(crate) const MAX_IN_FLIGHT: usize = 32;
+
+/// Time-injected cadence check for the supervision timers (AUD-003):
+/// `true` once at least `interval_secs` have elapsed since `last`.
+/// Pure so the supervision cadences are testable without running the
+/// event loop.
+fn supervision_due(last: u64, now: u64, interval_secs: u64) -> bool {
+    now.saturating_sub(last) >= interval_secs
+}
+
+/// Foreground pipeline.
+async fn run_pipeline(boot: Boot) {
+    let Boot {
+        live: live_mode,
+        live_via,
+        settings,
+        mut wallet,
+        yellowstone_token,
+        // Held until this function returns: this process owns the
+        // state dir for its whole lifetime (AUD-001).
+        _state_lock,
+    } = boot;
 
     // SIGHUP reopens the log for logrotate.
     #[cfg(unix)]
     {
         tokio::spawn(async {
-            let mut hup = match tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::hangup(),
-            ) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
+            let mut hup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
             loop {
                 hup.recv().await;
                 let (_, log_file) = cli::resolve_paths();
@@ -444,61 +701,11 @@ async fn run_pipeline(live_arg: bool) {
         });
     }
 
-    // File config: categorized config.toml is the only source for
-    // tunables (INFERENCE_API_KEY stays env-only). The file is
-    // auto-created (template with every tunable); a missing file
-    // simply means defaults rule. Parse errors are fatal — a typo'd
-    // value must never silently become a default.
-    let config_path = config::resolve_config_path();
-    match config::ensure_config_file(&config_path) {
-        Ok(true) => println!("wrote default config to {}", config_path.display()),
-        Ok(false) => {}
-        Err(e) => {
-            eprintln!("cannot set up config at {}: {e}", config_path.display());
-            std::process::exit(1);
-        }
-    }
-    let table = match config::read_table(&config_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("bad config: {e}");
-            std::process::exit(1);
-        }
-    };
-    let settings = Settings::from_file(table.as_ref());
-    // Scrub endpoint secrets from the process environment now that
-    // Settings owns copies: the RPC URLs carry `?api-key=` / path keys,
-    // and nothing re-reads them after boot (same rule as the bearer
-    // token and the trading keypair — secrets live in guarded memory,
-    // not in `/proc` environ or later children).
-    // (Test-only: tests set their own maps and never rely on this.)
-    unsafe {
-        std::env::remove_var("INFERENCE_API_KEY");
-        std::env::remove_var("MAINNET_RPC_URL");
-        std::env::remove_var("MAINNET_WSS_RPC_URL");
-    }
-
     if CurveTicker::parse_commitment(&settings.commitment).is_none() {
         eprintln!("bad COMMITMENT: {}", settings.commitment);
         std::process::exit(1);
     }
 
-    // Paper unless explicitly live.
-    let live_mode = live_arg || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
-    // Attribute the source: a lingering IS_LIVE=true in the shell is the
-    // sharpest mode footgun (every later invocation boots live). Naming
-    // the source in the boot line makes that visible before funds move.
-    let live_via = if live_arg { "--live" } else { "IS_LIVE=true" };
-    // Only exact `true` enables live.
-    if !live_mode
-        && let Ok(v) = std::env::var("IS_LIVE")
-        && !v.is_empty()
-        && v != "false"
-        && v != "0"
-        && v != "no"
-    {
-        warn!("config: IS_LIVE='{v}' ignored (only the exact value 'true' enables live; paper mode)");
-    }
     {
         let invocation = std::env::var("BOT_INVOCATION").unwrap_or_else(|_| "run".to_string());
         let first_run = std::env::var("BOT_FIRST_RUN").is_ok_and(|v| v == "1");
@@ -543,12 +750,22 @@ async fn run_pipeline(live_arg: bool) {
     }
     // Live gates: real funds never run on defaults.
     if live_mode {
+        // Day-tally writability BEFORE the funding gate (AUD-006): the
+        // restart-persistent loss breaker is mandatory in live, and a
+        // tally the process cannot write would read back as a fresh
+        // day across a restart.
+        if let Err(err) = day_state::ensure_writable(&day_state_path()) {
+            eprintln!("live mode refuses to start: {err}");
+            std::process::exit(1);
+        }
         if !(settings.max_daily_loss_usd.is_finite() && settings.max_daily_loss_usd > 0.0) {
             eprintln!("live mode requires MAX_DAILY_LOSS_USD>0 (portfolio circuit breaker)");
             std::process::exit(1);
         }
         if !settings.sim_strict {
-            eprintln!("live mode requires SIM_STRICT=true (unproven sims must refuse, not warn-and-proceed)");
+            eprintln!(
+                "live mode requires SIM_STRICT=true (unproven sims must refuse, not warn-and-proceed)"
+            );
             std::process::exit(1);
         }
         if settings.tip_lamports == 0 {
@@ -556,49 +773,70 @@ async fn run_pipeline(live_arg: bool) {
             std::process::exit(1);
         }
         if settings.commitment == "processed" {
-            eprintln!("live mode refuses COMMITMENT=processed (reorgable prints drive exits); use confirmed/finalized");
+            eprintln!(
+                "live mode refuses COMMITMENT=processed (reorgable prints drive exits); use confirmed/finalized"
+            );
             std::process::exit(1);
         }
         if settings.quote_usd.is_some() {
-            eprintln!("live mode refuses QUOTE_USD override (static fallback is paper-only by construction)");
+            eprintln!(
+                "live mode refuses QUOTE_USD override (static fallback is paper-only by construction)"
+            );
+            std::process::exit(1);
+        }
+        // AUD-007: an invalid commission must not boot live. Paper
+        // settlement fails closed at/above 100% on its own, and the
+        // gate's stop widening only consumes the typed value now — but
+        // a mistyped FEE_BPS silently changes live risk geometry, so
+        // live refuses an untyped (None) fee.
+        if settings.fee().is_none() {
+            eprintln!(
+                "live mode refuses FEE_BPS={} (must be a finite, non-negative bps value below 100%)",
+                settings.fee_bps
+            );
             std::process::exit(1);
         }
         if settings.inference_api_key.is_some()
             && crate::settings::is_plain_http_remote(&settings.inference_endpoint)
         {
-            eprintln!("live mode refuses INFERENCE_API_KEY over plain-http remote INFERENCE_ENDPOINT (bearer travels in cleartext); use https or localhost");
+            eprintln!(
+                "live mode refuses INFERENCE_API_KEY over plain-http remote INFERENCE_ENDPOINT (bearer travels in cleartext); use https or localhost"
+            );
             std::process::exit(1);
         }
-        // Split-brain clusters can never land. Enforced when both identify.
-        fn cluster_of(url: &str) -> Option<&'static str> {
-            let lower = url.to_ascii_lowercase();
-            if lower.contains("devnet") {
-                Some("devnet")
-            } else if lower.contains("testnet") {
-                Some("testnet")
-            } else if lower.contains("mainnet") {
-                Some("mainnet")
-            } else {
-                None
-            }
+        // AUD-016: endpoint trust — remote cleartext endpoints and
+        // cross-cluster fallbacks never back live reads/dispatch (the
+        // override, set + logged, downgrades a flagged fallback).
+        let (fatals, _) = settings.endpoint_trust(
+            std::env::var("ALLOW_FALLBACK_CLUSTER_MISMATCH").is_ok_and(|v| v == "1" || v == "true"),
+        );
+        for fatal in &fatals {
+            eprintln!("live mode refuses to start: {fatal}");
         }
-        match (
-            cluster_of(&settings.http_url),
-            cluster_of(&settings.jito_endpoint),
-        ) {
-            (Some(rpc), Some(jito)) if rpc != jito => {
-                eprintln!(
-                    "live mode refuses split-brain clusters: RPC is {rpc}, Jito is {jito} (tips would never land)"
-                );
-                std::process::exit(1);
-            }
-            (None, _) | (_, None) => {
-                warn!("config: RPC/Jito cluster unidentifiable from URLs; ensure both serve the same cluster");
-            }
-            _ => {}
+        if !fatals.is_empty() {
+            std::process::exit(1);
+        }
+        // AUD-005: live never silently boots on the public RPC default —
+        // the project documents it dropping candidates and truncating
+        // quorum reads. Refuse unless the operator explicitly opts in.
+        let public_rpc_optin =
+            std::env::var("ALLOW_PUBLIC_RPC_LIVE").is_ok_and(|v| v == "1" || v == "true");
+        if settings.on_public_rpc_default() && !public_rpc_optin {
+            eprintln!(
+                "live mode refuses the public RPC default ({}): documented unfit for live reads (drops candidates, truncates quorum, rate limits). Set MAINNET_RPC_URL to a paid endpoint, or ALLOW_PUBLIC_RPC_LIVE=1 to override explicitly",
+                ids::redact_endpoint(&settings.http_url)
+            );
+            std::process::exit(1);
+        }
+        if settings.on_public_rpc_default() {
+            warn!(
+                "ALLOW_PUBLIC_RPC_LIVE: live mode boots on the public RPC default; unreliable reads (missed candidates, truncated quorum, rate limits) are operator-acknowledged"
+            );
         }
         if settings.priority_fee_micro_lamports == 0 {
-            warn!("config: live without PRIORITY_FEE_MICRO_LAMPORTS — landing odds drop under congestion");
+            warn!(
+                "config: live without PRIORITY_FEE_MICRO_LAMPORTS — landing odds drop under congestion"
+            );
         }
     }
 
@@ -612,7 +850,10 @@ async fn run_pipeline(live_arg: bool) {
     match url::Url::parse(&settings.http_url) {
         Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
         _ => {
-            eprintln!("bad MAINNET_RPC_URL: {}", ids::redact_endpoint(&settings.http_url));
+            eprintln!(
+                "bad MAINNET_RPC_URL: {}",
+                ids::redact_endpoint(&settings.http_url)
+            );
             std::process::exit(1);
         }
     }
@@ -641,17 +882,11 @@ async fn run_pipeline(live_arg: bool) {
     let (mut rx, stats, listener_handle) = if !settings.yellowstone_endpoint.is_empty() {
         // Geyser replaces WS ingestion (never both): full transactions
         // arrive inline. REST stays for ticks/screens/sim. The x-token
-        // is env-only (secret, never the config file, never logged).
-        // `_FILE` avoids exporting it into shell history either.
-        let token = std::env::var(listener::YELLOWSTONE_TOKEN_ENV)
-            .ok()
-            .or_else(|| {
-                std::env::var(format!("{}_FILE", listener::YELLOWSTONE_TOKEN_ENV))
-                    .ok()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            });
+        // is env-only (secret, never the config file, never logged);
+        // `_FILE` avoids exporting it into shell history. The token
+        // was captured and scrubbed in the sync boot phase (AUD-015)
+        // and crosses here as owned data.
+        let token = yellowstone_token;
         match listener::GeyserSubscriber::subscribe_with_rpc(
             ListenerConfig {
                 ws_url: settings.ws_url.clone(),
@@ -669,7 +904,10 @@ async fn run_pipeline(live_arg: bool) {
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("failed to subscribe (geyser): {}", ids::redact_urls_in_text(&e.to_string()));
+                eprintln!(
+                    "failed to subscribe (geyser): {}",
+                    ids::redact_urls_in_text(&e.to_string())
+                );
                 std::process::exit(1);
             }
         }
@@ -690,14 +928,16 @@ async fn run_pipeline(live_arg: bool) {
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("failed to subscribe: {}", ids::redact_urls_in_text(&e.to_string()));
+                eprintln!(
+                    "failed to subscribe: {}",
+                    ids::redact_urls_in_text(&e.to_string())
+                );
                 std::process::exit(1);
             }
         }
     };
-    // The subscriber (if any) already owns a clone: scrub the token so
-    // it lives in guarded memory only, like the inference key below.
-    unsafe { std::env::remove_var(listener::YELLOWSTONE_TOKEN_ENV) };
+    // The token lives in guarded memory only from the sync boot scrub
+    // onward (AUD-015); nothing re-reads the environment here.
 
     let mut engine_builder = RiskEngine::builder()
         .endpoint(&settings.inference_endpoint)
@@ -723,16 +963,16 @@ async fn run_pipeline(live_arg: bool) {
         // Hot-wallet ceiling in lamports (`0` = off): buys refuse while
         // the wallet holds more, so a leaked key or an un-swept wallet
         // can only lose what the operator allows to sit there. Exits
-        // never consult it.
+        // never consult it. The wallet was loaded (and the key env
+        // scrubbed) in the sync boot phase (AUD-015).
         let hot_cap = settings.hot_wallet_cap_lamports();
-        let wallet = match WalletGuard::load_from_env() {
-            Ok(wallet) => wallet,
-            Err(e) => {
-                eprintln!("live mode cannot load the wallet: {e}");
+        let wallet = match wallet.take() {
+            Some(wallet) => wallet.with_hot_wallet_cap(hot_cap),
+            None => {
+                eprintln!("live mode requires a loaded wallet");
                 std::process::exit(1);
             }
-        }
-        .with_hot_wallet_cap(hot_cap);
+        };
         info!(payer = %wallet.pubkey(), "live wallet loaded");
         if hot_cap > 0 {
             info!(
@@ -746,14 +986,53 @@ async fn run_pipeline(live_arg: bool) {
         let jito = match JitoClient::new(&settings.jito_endpoint) {
             Ok(jito) => jito,
             Err(e) => {
-                eprintln!("bad JITO_ENDPOINT '{}': {e}", ids::redact_endpoint(&settings.jito_endpoint));
+                eprintln!(
+                    "bad JITO_ENDPOINT '{}': {e}",
+                    ids::redact_endpoint(&settings.jito_endpoint)
+                );
                 std::process::exit(1);
             }
         };
         let executor = SwapExecutor::with_rpc(Arc::clone(&shared_rpc), wallet)
-            .with_jito(jito)
-            .with_compute_budget(settings.compute_unit_limit, settings.priority_fee_micro_lamports)
+            .with_jito(jito.clone())
+            .with_compute_budget(
+                settings.compute_unit_limit,
+                settings.priority_fee_micro_lamports,
+            )
             .with_strict_sim(settings.sim_strict);
+        // Background tip refresher (AUD-011): the tip-list cache lives so
+        // dispatch never waits on `getTipAccounts` — the refresher owns
+        // the fetch, and dispatch reads the cache (fallback: official
+        // constants). A half-TTL cadence repairs past a blip faster than
+        // the 15-minute TTL.
+        let tip_refresher = jito.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                executor::jito::TIP_ACCOUNTS_TTL_SECS / 2,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // first tick fires immediately: refresh once at boot
+            loop {
+                tip_refresher.refresh_tips().await;
+                ticker.tick().await;
+            }
+        });
+        // Background tip-floor refresher (AUD-006): same contract for
+        // the landed-tip floor — `tip_floor_lamports` is a cache read on
+        // the dispatch path; a stalled oracle costs freshness, never
+        // dispatch latency. Half-TTL (30s) cadence.
+        let floor_refresher = jito.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                executor::jito::TIP_FLOOR_TTL_SECS / 2,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // first tick fires immediately: refresh once at boot
+            loop {
+                floor_refresher.refresh_tip_floor().await;
+                ticker.tick().await;
+            }
+        });
         // Funding gate (read-only): native shortfall fails closed.
         // Principal needs a SOL price: one-shot fetch, skipped loudly
         // when unreadable (dispatch legs still enforced; per-trade
@@ -766,7 +1045,7 @@ async fn run_pipeline(live_arg: bool) {
                     sol_usd,
                 }),
                 Err(e) => {
-                    warn!(error = %e, "SOL price unreadable at funding gate; principal unchecked (dispatch legs still enforced)");
+                    warn!(error = %ids::strip_error_url(&e.to_string()), "SOL price unreadable at funding gate; principal unchecked (dispatch legs still enforced)");
                     None
                 }
             };
@@ -778,7 +1057,9 @@ async fn run_pipeline(live_arg: bool) {
                 )
                 .await;
             match report.native_ok() {
-                Some(true) => info!(payer = %report.payer, balance = report.native_balance, required = report.native_required, max_open = settings.max_open_positions, "live native SOL covers full-book principal + dispatch + reserve"),
+                Some(true) => {
+                    info!(payer = %report.payer, balance = report.native_balance, required = report.native_required, max_open = settings.max_open_positions, "live native SOL covers full-book principal + dispatch + reserve")
+                }
                 Some(false) => {
                     eprintln!(
                         "live wallet {} short native SOL: have {} lamports, need {} for {} positions (principal + dispatch + ATA rent + 0.05 reserve); fund before live",
@@ -792,9 +1073,14 @@ async fn run_pipeline(live_arg: bool) {
                 None => warn!("live native balance unreadable; per-trade solvency decides"),
             }
             match report.wsol_funded() {
-                Some(true) => info!(ata = %report.wsol_ata, held = report.wsol_balance, "live WSOL float covers token-paired quotes"),
+                Some(true) => {
+                    info!(ata = %report.wsol_ata, held = report.wsol_balance, "live WSOL float covers token-paired quotes")
+                }
                 _ => {
-                    warn!("no WSOL float at {} — token-paired quotes need one (SOL-pair buys pay native SOL and are unaffected).", report.wsol_ata);
+                    warn!(
+                        "no WSOL float at {} — token-paired quotes need one (SOL-pair buys pay native SOL and are unaffected).",
+                        report.wsol_ata
+                    );
                 }
             }
             if hot_cap > 0
@@ -808,11 +1094,18 @@ async fn run_pipeline(live_arg: bool) {
                 );
             }
         }
-        Some(LiveTrader::new(
-            executor,
-            settings.slippage_bps,
-            settings.tip_lamports,
-        ).with_dispatch_fees(settings.compute_unit_limit, settings.priority_fee_micro_lamports).with_adaptive_slippage(settings.slippage_vol_window_secs, settings.slippage_vol_extra_cap_bps).with_wal(live_wal_path()))
+        Some(
+            LiveTrader::new(executor, settings.slippage_bps, settings.tip_lamports)
+                .with_dispatch_fees(
+                    settings.compute_unit_limit,
+                    settings.priority_fee_micro_lamports,
+                )
+                .with_adaptive_slippage(
+                    settings.slippage_vol_window_secs,
+                    settings.slippage_vol_extra_cap_bps,
+                )
+                .with_wal(live_wal_path()),
+        )
     } else {
         None
     };
@@ -824,7 +1117,10 @@ async fn run_pipeline(live_arg: bool) {
             min_age_secs: settings.dev_min_age_secs,
             max_prior_launches: settings.dev_max_prior_launches,
             sample_txs: settings.dev_screen_sample_txs,
-            sig_limit: settings.dev_sig_limit.max(settings.dev_screen_sample_txs).clamp(1, 1000),
+            sig_limit: settings
+                .dev_sig_limit
+                .max(settings.dev_screen_sample_txs)
+                .clamp(1, 1000),
         },
     );
 
@@ -844,13 +1140,15 @@ async fn run_pipeline(live_arg: bool) {
         std::process::exit(1);
     }
 
-    let alerts = settings.discord_alerts.then(|| match &settings.discord_channel {
-        Some(channel) => {
-            info!(%channel, "discord alerts routed to channel");
-            Alerter::new().with_channel(channel)
-        }
-        None => Alerter::new(),
-    });
+    let alerts = settings
+        .discord_alerts
+        .then(|| match &settings.discord_channel {
+            Some(channel) => {
+                info!(%channel, "discord alerts routed to channel");
+                Alerter::new().with_channel(channel)
+            }
+            None => Alerter::new(),
+        });
     if alerts.is_none() {
         info!("discord alerts disabled (DISCORD_ALERTS=false)");
     }
@@ -913,6 +1211,40 @@ async fn run_pipeline(live_arg: bool) {
         replay_live_wal(&pipeline, &ticker).await;
     }
 
+    // Pending-buy rechecks (AUD-013): a dedicated supervisor task, NOT
+    // the tick path — a recheck round runs a 60-second confirm deadline
+    // per entry, and a tick that waits behind it can starve its own
+    // exit for a minute. The existing `recheck_busy` still bounds
+    // rounds to one, `maybe_unwatch` pins pending mints to the
+    // watchlist, and WAL replay recovers anything lost at shutdown.
+    // The task is stopped between rounds at shutdown (a trailing round
+    // is joined so confirm outcomes are never dropped mid-handoff).
+    let mut pending_recheck_stop: Option<tokio::sync::oneshot::Sender<()>> = None;
+    let mut pending_recheck_handle = if live_mode {
+        /// Pending recheck cadence: at the tick cadence the old inline
+        /// path effectively ran at; `recheck_busy` keeps it to one round.
+        const PENDING_RECHECK_SECS: u64 = 2;
+        let recheck_pipeline = Arc::clone(&pipeline);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(PENDING_RECHECK_SECS));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            timer.tick().await; // interval's immediate first tick
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        recheck_pipeline.recheck_live_pending().await;
+                    }
+                    _ = &mut stop_rx => break,
+                }
+            }
+        });
+        pending_recheck_stop = Some(stop_tx);
+        Some(handle)
+    } else {
+        None
+    };
+
     // Ticker loop: poll curves, auto-close.
     let (tick_tx, mut tick_rx) = mpsc::channel::<PriceTick>(1024);
     let tick_handle = tokio::spawn(async move { ticker.run(tick_tx).await });
@@ -925,15 +1257,24 @@ async fn run_pipeline(live_arg: bool) {
     let mut gate_timer = tokio::time::interval(gate_interval);
     gate_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    /// Heartbeat cadence.
-    const HEARTBEAT_SECS: u64 = 6 * 3_600;
+    // Heartbeat cadence (mode/status card only; the supervision
+    // monitors live on `SUPERVISION_SECS`, AUD-003).
     let boot_ts = settings::now_secs();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Supervision cadence (AUD-003): the short timer that runs the
+    // execution-quality/custody monitors — the custody recheck at its
+    // documented 30-minute cadence, the GiveUp burst monitor on its own
+    // configured window, and the overdue-exit warning. Sampling these
+    // only at the 6-hour heartbeat made every window at least six
+    // hours wide (a custody short escaped detection for hours; a
+    // GiveUp burst was visible only if it fell just before a heartbeat).
+    let mut supervision = tokio::time::interval(Duration::from_secs(SUPERVISION_SECS));
+    supervision.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // In-flight tasks never cancel mid-commit. Bounded; drops loudly.
     let mut in_flight = tokio::task::JoinSet::new();
-    const MAX_IN_FLIGHT: usize = 32;
     /// Manual-sell drain cadence in gate rounds.
     const MANUAL_SELL_DRAIN_EVERY: u64 = 15;
     let mut gate_rounds: u64 = 0;
@@ -944,6 +1285,11 @@ async fn run_pipeline(live_arg: bool) {
     let mut ingestion_banned_seen = false;
     // Data-degrade card mirror (rising-edge card, same policy).
     let mut data_degraded_seen = false;
+    // Rising-edge mirrors for the supervision monitors (AUD-003): a
+    // warn fires when the condition starts and clears when it ends —
+    // a 60-second sampler must not spam every tick.
+    let mut overdue_warned = false;
+    let mut giveup_burst_seen = false;
     // Listener-stall mirror: last logs_seen advance (both modes; the
     // ban latch is geyser-only, silence covers WS too).
     let mut last_logs_seen = 0u64;
@@ -954,13 +1300,6 @@ async fn run_pipeline(live_arg: bool) {
     // fell short of the claims at the last recheck. Refreshed only by
     // a passing recheck — the pause outlives the timer by design.
     let mut ledger_shorts: Vec<String> = Vec::new();
-    /// Mid-run custody drift check cadence (boot reconcile owns boot).
-    const CUSTODY_RECHECK_SECS: u64 = 1_800;
-    /// Oldest-open warn threshold: paper timeouts are minutes; an open
-    /// position older than this reads as a stuck exit (log-only).
-    const STALE_OPEN_WARN_SECS: u64 = 3_600;
-    /// GiveUp window surfaced in the heartbeat (kegagalan buy/sell).
-    const GIVEUP_HEARTBEAT_WINDOW_SECS: u64 = 3_600;
     /// SOL-feed boot grace: a feed that never priced since boot pauses
     /// entries only after this (a fresh boot without a price yet is
     /// normal startup, not degradation; losing an HAD price is).
@@ -970,7 +1309,10 @@ async fn run_pipeline(live_arg: bool) {
     /// pump.fun launches are seconds apart, so 30 silent minutes is
     /// never a quiet chain; a chain halt also correctly pauses entries).
     const LISTENER_STALL_SECS: u64 = 1_800;
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+    let permits = Arc::new(tokio::sync::Semaphore::new(
+        MAX_IN_FLIGHT - EXIT_LANE_PERMITS,
+    ));
+    let exit_permits = Arc::new(tokio::sync::Semaphore::new(EXIT_LANE_PERMITS));
     // Saturation drops are latency signal: an exit delayed a tick is
     // slippage paper never pays, so they ride the heartbeat.
     let tick_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1016,13 +1358,13 @@ async fn run_pipeline(live_arg: bool) {
             tick = tick_rx.recv() => {
                 let Some(tick) = tick else { break };
                 let pipeline = Arc::clone(&pipeline);
-                let permits = Arc::clone(&permits);
+                let exit_permits = Arc::clone(&exit_permits);
                 let tick_drops = Arc::clone(&tick_drops);
                 in_flight.spawn(async move {
-                    let Ok(_permit) = permits.try_acquire_owned() else {
+                    let Ok(_permit) = exit_permits.try_acquire_owned() else {
                         // Tick drops are warn (launches stay debug).
                         tick_drops.fetch_add(1, Ordering::Relaxed);
-                        warn!(mint = %tick.mint, "tick dropped: dispatch saturated; exit delayed");
+                        warn!(mint = %tick.mint, "tick dropped: exit lane saturated; exit delayed");
                         return;
                     };
                     pipeline.on_tick(&tick).await;
@@ -1031,16 +1373,66 @@ async fn run_pipeline(live_arg: bool) {
             pool = pool_rx.recv() => {
                 let Some(pool) = pool else { break };
                 let pipeline = Arc::clone(&pipeline);
-                let permits = Arc::clone(&permits);
+                let exit_permits = Arc::clone(&exit_permits);
                 let pool_drops = Arc::clone(&pool_drops);
                 in_flight.spawn(async move {
-                    let Ok(_permit) = permits.try_acquire_owned() else {
+                    let Ok(_permit) = exit_permits.try_acquire_owned() else {
                         pool_drops.fetch_add(1, Ordering::Relaxed);
-                        debug!(mint = %pool.mint, "pool tick dropped: dispatch saturated");
+                        debug!(mint = %pool.mint, "pool tick dropped: exit lane saturated");
                         return;
                     };
                     pipeline.on_pool_tick(&pool).await;
                 });
+            }
+            _ = supervision.tick() => {
+                // Custody recheck (live only) at its documented
+                // 30-minute cadence, sampled every supervision tick
+                // (AUD-003: it was only reachable at the 6-hour
+                // heartbeat). A short ledger latches the entry pause
+                // until a later recheck passes — recovery is a passing
+                // re-check, never elapsed time.
+                if live_mode
+                    && supervision_due(last_custody_check, settings::now_secs(), CUSTODY_RECHECK_SECS)
+                {
+                    last_custody_check = settings::now_secs();
+                    ledger_shorts = custody_recheck(&pipeline).await;
+                }
+                // Positions outliving their OWN timeouts read as stuck
+                // exits (drained pools, guard holds) — log-only warn
+                // per the alert burn-in doctrine (never a card).
+                // Overdue (not raw age) respects runner timeout lifts.
+                // Rising edge: fire when stuck, clear when unstuck, no
+                // per-tick spam.
+                let overdue =
+                    pipeline.oldest_open_overdue_secs(settings::now_secs()).await;
+                if overdue > STALE_OPEN_WARN_SECS {
+                    if !overdue_warned {
+                        overdue_warned = true;
+                        warn!("oldest open position {overdue}s past its timeout (> {STALE_OPEN_WARN_SECS}s overdue): exits stuck? check pool depth / pending rechecks before assuming the book is live");
+                    }
+                } else {
+                    overdue_warned = false;
+                }
+                // GiveUp burst monitor on its configured trailing
+                // window, sampled every supervision tick (AUD-003: a
+                // burst was only visible if it fell just before a
+                // 6-hour heartbeat). Rising edge, like the other
+                // supervision latches.
+                if pipeline.settings.alert_giveup_burst_n > 0 {
+                    let now = settings::now_secs();
+                    let burst = pipeline
+                        .exec
+                        .giveups_since(pipeline.settings.alert_giveup_window_secs, now)
+                        .await;
+                    if burst as u64 >= pipeline.settings.alert_giveup_burst_n {
+                        if !giveup_burst_seen {
+                            giveup_burst_seen = true;
+                            warn!("alert: {burst} GiveUps in trailing {}s >= ALERT_GIVEUP_BURST_N={}; systemic dispatch trouble, check RPC/Jito before funding more", pipeline.settings.alert_giveup_window_secs, pipeline.settings.alert_giveup_burst_n);
+                        }
+                    } else {
+                        giveup_burst_seen = false;
+                    }
+                }
             }
             _ = heartbeat.tick() => {
                 let snap = stats_task.snapshot();
@@ -1063,29 +1455,11 @@ async fn run_pipeline(live_arg: bool) {
                     pipeline.oldest_open_age_secs(settings::now_secs()).await;
                 let giveups_window =
                     pipeline.exec.giveups_since(GIVEUP_HEARTBEAT_WINDOW_SECS, settings::now_secs()).await as u64;
-                // Positions outliving their OWN timeouts by hours read as
-                // stuck exits (drained pools, guard holds) — log-only
-                // warn per the alert burn-in doctrine (never a card).
-                // Overdue (not raw age) respects runner timeout lifts.
-                let overdue =
-                    pipeline.oldest_open_overdue_secs(settings::now_secs()).await;
-                if overdue > STALE_OPEN_WARN_SECS {
-                    warn!("oldest open position {overdue}s past its timeout (> {STALE_OPEN_WARN_SECS}s overdue): exits stuck? check pool depth / pending rechecks before assuming the book is live");
-                }
-                // Custody recheck (live only, every CUSTODY_RECHECK_SECS):
-                // WAL claims per mint vs the chain ATA balance. Boot
-                // reconcile owns boot; this catches mid-run drift. A
-                // short ledger latches the entry pause until a later
-                // recheck passes — recovery is a passing re-check,
-                // never elapsed time.
-                if live_mode
-                    && settings::now_secs()
-                        .saturating_sub(last_custody_check)
-                        >= CUSTODY_RECHECK_SECS
-                {
-                    last_custody_check = settings::now_secs();
-                    ledger_shorts = custody_recheck(&pipeline).await;
-                }
+                // Custody recheck, the overdue-exit warning, and the
+                // GiveUp burst monitor live on the 60-second
+                // supervision tick (AUD-003); the heartbeat card
+                // keeps its own 6-hour cadence and surfaces their
+                // latest state above.
                 let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
                     mode: if live_mode { "live" } else { "paper" },
                     uptime_secs: settings::now_secs().saturating_sub(boot_ts),
@@ -1144,6 +1518,13 @@ async fn run_pipeline(live_arg: bool) {
                 let pool_dropped = pool_drops.load(Ordering::Relaxed);
                 if tick_dropped > 0 || pool_dropped > 0 {
                     warn!("saturation drops: curve_ticks={tick_dropped} pool_ticks={pool_dropped} (delayed exits are slippage paper never pays)");
+                }
+                // Paper-ledger overdraft (AUD-010): dispatch costs past
+                // available cash surface as a warning instead of being
+                // absorbed at a zero cash floor.
+                let overdraft_usd = pipeline.paper_overdraft_usd().await;
+                if overdraft_usd > 0.0 {
+                    warn!("paper ledger OVERDRAWN: dispatch costs exceed cash by ${overdraft_usd:.2}; equity carries the shortfall and new Long opens refuse");
                 }
                 // Adaptive slippage widens live guards/floors with
                 // volatility while paper models base slippage only: say
@@ -1253,13 +1634,6 @@ async fn run_pipeline(live_arg: bool) {
                             engine.model(), engine.fallback_buy_count(), engine.fallback_pass_count());
                     }
                 }
-                if thresholds.alert_giveup_burst_n > 0 {
-                    let now = settings::now_secs();
-                    let burst = pipeline.exec.giveups_since(thresholds.alert_giveup_window_secs, now).await;
-                    if burst as u64 >= thresholds.alert_giveup_burst_n {
-                        warn!("alert: {burst} GiveUps in trailing {}s >= ALERT_GIVEUP_BURST_N={}; systemic dispatch trouble, check RPC/Jito before funding more", thresholds.alert_giveup_window_secs, thresholds.alert_giveup_burst_n);
-                    }
-                }
                 if let Some(alerts) = pipeline.alerts.as_ref() {
                     alerts.alert(card);
                 }
@@ -1366,7 +1740,10 @@ async fn run_pipeline(live_arg: bool) {
                     data_degraded_seen = false;
                     pipeline.emit("Data sources healthy again: entries resume.".to_string());
                 }
-                // Manual-sell drain every 15th round.
+                // Manual-sell drain every 15th round (AUD-008): each sell
+                // dispatches from the exit lane inside the bounded
+                // JoinSet — the event loop never awaits a sell, so a
+                // slow dispatch+confirm cannot stall ticks/launches.
                 gate_rounds = gate_rounds.wrapping_add(1);
                 if gate_rounds.is_multiple_of(MANUAL_SELL_DRAIN_EVERY) {
                     let (_, log_file) = cli::resolve_paths();
@@ -1387,9 +1764,15 @@ async fn run_pipeline(live_arg: bool) {
                             let _ = std::fs::remove_file(&path);
                             continue;
                         }
-                        if pipeline.manual_sell(&mint).await {
-                            let _ = std::fs::remove_file(&path);
-                        }
+                        let pipeline = Arc::clone(&pipeline);
+                        let exit_permits = Arc::clone(&exit_permits);
+                        in_flight.spawn(async move {
+                            let _permit = exit_permits.acquire_owned().await;
+                            let settled = pipeline.manual_sell(&mint).await;
+                            if settled {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        });
                     }
                 }
                 if pipeline.try_begin_poll().await {
@@ -1415,6 +1798,23 @@ async fn run_pipeline(live_arg: bool) {
     listener_handle.abort();
     sol_handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
+    // Pending rechecks stop between rounds and join BEFORE the
+    // snapshot (AUD-013): a trailing round may still park resolved
+    // confirmations, which the snapshot must see. A round that
+    // outlives the stop window is aborted loudly; WAL replay
+    // recovers its pending state on the next boot.
+    if let Some(stop) = pending_recheck_stop.take() {
+        let _ = stop.send(());
+        if let Some(handle) = pending_recheck_handle.take() {
+            match tokio::time::timeout(Duration::from_secs(65), handle).await {
+                Ok(Ok(())) => {}
+                Err(_) => warn!(
+                    "pending recheck round outlived the 65s stop window; aborting (trailing confirm outcomes may be dropped; WAL replay recovers them next boot)"
+                ),
+                Ok(Err(join)) => warn!("pending recheck task ended with error: {join}"),
+            }
+        }
+    }
 
     // Snapshot BEFORE the drain.
     let snap_ts = settings::now_secs();
@@ -1466,9 +1866,7 @@ async fn run_pipeline(live_arg: bool) {
         info!("shutdown with {watchlist_pending} watchlisted mint(s) pending quorum (dropped)");
     }
 
-    let drain = async {
-        while in_flight.join_next().await.is_some() {}
-    };
+    let drain = async { while in_flight.join_next().await.is_some() {} };
     // Second signal force-aborts.
     let drained = tokio::select! {
         out = tokio::time::timeout(Duration::from_secs(30), drain) => out.is_ok(),
@@ -1500,10 +1898,15 @@ async fn run_pipeline(live_arg: bool) {
         );
     }
     if !drained {
-        warn!("in-flight units were aborted; any live dispatch mid-confirm has an UNKNOWN fill — check the explorer for the tracked mints above");
+        warn!(
+            "in-flight units were aborted; any live dispatch mid-confirm has an UNKNOWN fill — check the explorer for the tracked mints above"
+        );
     }
 
     if clean_shutdown {
+        // A self-registered run removes its own pid record on a clean
+        // exit (stop/daemon flows own their own cleanup).
+        cli::unregister_running(&cli::resolve_paths().0);
         info!("shutdown complete (drained={drained})");
     } else {
         // Streams ended: exit nonzero so supervisors notice.
@@ -1514,6 +1917,159 @@ async fn run_pipeline(live_arg: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        CUSTODY_RECHECK_SECS, EXIT_LANE_PERMITS, HEARTBEAT_SECS, MAX_IN_FLIGHT, SECRET_ENV_VARS,
+        SUPERVISION_SECS, supervision_due,
+    };
+
+    /// AUD-008: a launch flood that holds every launch-lane permit
+    /// cannot consume the exits' reserve — the dispatch-lane split
+    /// keeps a curve/pool tick's and a manual sell's dispatcher
+    /// independently available.
+    #[test]
+    fn launch_flood_cannot_starve_the_exit_lane() {
+        let launch = tokio::sync::Semaphore::new(MAX_IN_FLIGHT - EXIT_LANE_PERMITS);
+        let exit = tokio::sync::Semaphore::new(EXIT_LANE_PERMITS);
+        let _flood = launch
+            .try_acquire_many((MAX_IN_FLIGHT - EXIT_LANE_PERMITS) as u32)
+            .expect("simulated launch flood");
+        assert_eq!(
+            launch.available_permits(),
+            0,
+            "lane is fully saturated by the flood"
+        );
+        let tick = exit
+            .try_acquire()
+            .expect("exit permits remain under launch flood");
+        drop(tick);
+        assert_eq!(
+            exit.available_permits(),
+            EXIT_LANE_PERMITS,
+            "exit budget is a separate pool, never shared"
+        );
+    }
+
+    /// AUD-015: the boot scrub list covers every secret-bearing env
+    /// var the boot owns; `_FILE` variants (paths) stay.
+    #[test]
+    fn secret_env_scrub_covers_every_secret() {
+        for name in [
+            "INFERENCE_API_KEY",
+            "MAINNET_RPC_URL",
+            "MAINNET_WSS_RPC_URL",
+            "MAINNET_RPC_URLS_FALLBACK",
+            listener::YELLOWSTONE_TOKEN_ENV,
+        ] {
+            assert!(
+                SECRET_ENV_VARS.contains(&name),
+                "{name} must be in SECRET_ENV_VARS (scrubs before any thread exists)"
+            );
+        }
+        for name in SECRET_ENV_VARS {
+            assert!(!name.ends_with("_FILE"), "{name} is a path, not a secret");
+        }
+    }
+
+    /// AUD-015 acceptance: after the boot scrub, child processes
+    /// (the alert Hermes spawn path, which inherits the process env)
+    /// see no secret variables/values.
+    #[test]
+    #[cfg(unix)]
+    fn children_inherited_env_carries_no_secrets() {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock");
+        // Fictitious secret fixtures (never real values).
+        let secrets = [
+            ("INFERENCE_API_KEY", "test-key-fixture-1"),
+            (
+                "MAINNET_RPC_URL",
+                "https://test.example/?api-key=test-victim-2",
+            ),
+            (
+                "MAINNET_RPC_URLS_FALLBACK",
+                "https://test.example/?api-key=test-victim-3",
+            ),
+            (listener::YELLOWSTONE_TOKEN_ENV, "test-token-fixture-4"),
+            ("SOLANA_PRIVATE_KEY", "test-mint-fixture-5"),
+        ];
+        let saved: Vec<(&str, Option<String>)> = secrets
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        let restore = || {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        };
+        for (k, v) in secrets {
+            unsafe { std::env::set_var(k, v) };
+        }
+        // The exact sync-boot scrub (SOLANA_PRIVATE_KEY included: in
+        // live boot the wallet loader scrubs it after `load_from_env`).
+        super::scrub_secret_env();
+        unsafe { std::env::remove_var("SOLANA_PRIVATE_KEY") };
+        // A child spawned after boot (the alert path shape: any
+        // `process::Command`) inherits the scrubbed environment.
+        let out = std::process::Command::new("env")
+            .output()
+            .expect("spawn env");
+        restore();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for (_, value) in secrets {
+            assert!(
+                !stdout.contains(value),
+                "secret fixture value must not reach child env"
+            );
+        }
+        // Sanity: `env` did run.
+        assert!(out.status.success());
+        assert!(stdout.contains("="), "expected name=value lines");
+    }
+
+    /// AUD-003: the supervision sampler must be shorter than every
+    /// window it observes — the documented 30-minute custody recheck
+    /// and the one-hour GiveUp window — and the heartbeat card keeps
+    /// its own 6-hour cadence.
+    #[test]
+    fn supervision_cadence_observes_its_windows() {
+        assert_eq!(
+            CUSTODY_RECHECK_SECS, 1_800,
+            "documented 30-minute custody recheck"
+        );
+        assert_eq!(HEARTBEAT_SECS, 21_600, "heartbeat card cadence unchanged");
+        assert_eq!(SUPERVISION_SECS, 60, "short supervision sampling");
+        // The sampler must be shorter than both windows
+        // (compile-time check; constant asserts belong in const).
+        const _: () = const { assert!(SUPERVISION_SECS < CUSTODY_RECHECK_SECS) };
+        const _: () = const { assert!(SUPERVISION_SECS < 3_600) };
+        // A recheck due at t+1800 is found by the first supervision
+        // tick at or past it: cadence at most 30 min + one tick, never
+        // six hours.
+        assert!(!supervision_due(0, 1_799, CUSTODY_RECHECK_SECS));
+        assert!(supervision_due(0, 1_800, CUSTODY_RECHECK_SECS));
+        assert!(supervision_due(0, 1_860, CUSTODY_RECHECK_SECS));
+        // Time-injected GiveUp observation: a burst of three GiveUps
+        // at t=100 (one-hour window, threshold 3) must be counted by
+        // the next 60-second supervision tick, using the same
+        // trailing-window predicate the supervision arm runs.
+        let gives = [100u64, 100, 100];
+        let window = 3_600;
+        let count_at = |now: u64| {
+            gives
+                .iter()
+                .filter(|t| now >= **t && now - **t <= window)
+                .count()
+        };
+        let next_supervision_tick = 120;
+        assert!(
+            count_at(next_supervision_tick) >= 3,
+            "the next supervision tick evaluates the burst"
+        );
+    }
     use super::{BootCustody, boot_custody};
 
     /// Guards the rustls fix: a default must be installed.

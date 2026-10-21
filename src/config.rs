@@ -42,10 +42,18 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("network", "yellowstone_endpoint", "YELLOWSTONE_ENDPOINT"),
     ("network", "commitment", "COMMITMENT"),
     ("network", "tick_interval_ms", "TICK_INTERVAL_MS"),
-    ("network", "vault_tick_interval_ms", "VAULT_TICK_INTERVAL_MS"),
+    (
+        "network",
+        "vault_tick_interval_ms",
+        "VAULT_TICK_INTERVAL_MS",
+    ),
     ("network", "fetch_concurrency", "FETCH_CONCURRENCY"),
     ("network", "backfill_sig_limit", "BACKFILL_SIG_LIMIT"),
-    ("network", "reconnect_backoff_max_ms", "RECONNECT_BACKOFF_MAX_MS"),
+    (
+        "network",
+        "reconnect_backoff_max_ms",
+        "RECONNECT_BACKOFF_MAX_MS",
+    ),
     ("trading", "start_balance", "START_BALANCE"),
     ("trading", "fee_bps", "FEE_BPS"),
     ("trading", "notional_usd", "NOTIONAL_USD"),
@@ -89,8 +97,16 @@ pub const KEYMAP: &[(&str, &str, &str)] = &[
     ("risk", "inference_timeout_ms", "INFERENCE_TIMEOUT_MS"),
     ("risk", "inference_headers", "INFERENCE_HEADERS"),
     ("execution", "slippage_bps", "SLIPPAGE_BPS"),
-    ("execution", "slippage_vol_window_secs", "SLIPPAGE_VOL_WINDOW_SECS"),
-    ("execution", "slippage_vol_extra_cap_bps", "SLIPPAGE_VOL_EXTRA_CAP_BPS"),
+    (
+        "execution",
+        "slippage_vol_window_secs",
+        "SLIPPAGE_VOL_WINDOW_SECS",
+    ),
+    (
+        "execution",
+        "slippage_vol_extra_cap_bps",
+        "SLIPPAGE_VOL_EXTRA_CAP_BPS",
+    ),
     (
         "execution",
         "priority_fee_micro_lamports",
@@ -126,7 +142,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# pump-sentry config — auto-created o
 [network]
 # Dedicated RPC recommended; empty falls back to the public endpoint.
 mainnet_rpc_url = ""        # dedicated RPC recommended; empty = public endpoint
-mainnet_rpc_urls_fallback = [] # read-path failover endpoints (comma list via MAINNET_RPC_URLS_FALLBACK); READS ONLY — dispatch never fans out
+mainnet_rpc_urls_fallback = [] # read-path failover endpoints (comma list via MAINNET_RPC_URLS_FALLBACK); READS ONLY — dispatch never fans out; same-cluster https required live (override: ALLOW_FALLBACK_CLUSTER_MISMATCH=1, logged)
 mainnet_wss_rpc_url = ""    # empty = public endpoint
 yellowstone_endpoint = ""   # Yellowstone gRPC (https URL); non-empty REPLACES ws ingestion (x-token via YELLOWSTONE_TOKEN env, never here)
 commitment = "confirmed"    # (confirmed|finalized; processed is refused live)
@@ -205,12 +221,14 @@ pub fn default_config_path() -> PathBuf {
     dir
 }
 
-/// State dir (`~/.pump-sentry`), `HOME`-rooted like pid/log.
+/// State dir (`~/.pump-sentry`), `HOME`-rooted like pid/log. When
+/// `HOME` is unset there is deliberately NO `/tmp` fallback: a
+/// world-writable shared dir is a predictable-path/symlink risk for
+/// the config template and everything derived from it. Fall back to
+/// the CWD-relative `logs/` dir instead (same as the daemon log
+/// fallback in `cli`), or set `CONFIG_FILE` explicitly.
 fn default_state_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".pump-sentry")
+    crate::cli::default_state_dir().unwrap_or_else(|| PathBuf::from("logs"))
 }
 
 /// Config path from `CONFIG_FILE`, else the state-dir default.
@@ -237,6 +255,7 @@ pub fn resolve_config_path() -> PathBuf {
 /// operator-pasted `?api-key=` RPC URL would be one, so restrictive
 /// from birth costs nothing.
 pub fn ensure_config_file(path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     if path.exists() {
         return Ok(false);
@@ -245,7 +264,9 @@ pub fn ensure_config_file(path: &Path) -> std::io::Result<bool> {
         std::fs::create_dir_all(parent)?;
     }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true).mode(0o600);
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
     let mut file = opts.open(path)?;
     use std::io::Write;
     file.write_all(DEFAULT_CONFIG_TOML.as_bytes())?;
@@ -260,9 +281,9 @@ pub fn read_table(path: &Path) -> Result<Option<toml::Table>, ConfigError> {
     }
     let raw = std::fs::read_to_string(path)
         .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
-    let table: toml::Table = raw
-        .parse()
-        .map_err(|e: toml::de::Error| ConfigError::Parse(path.display().to_string(), e.to_string()))?;
+    let table: toml::Table = raw.parse().map_err(|e: toml::de::Error| {
+        ConfigError::Parse(path.display().to_string(), e.to_string())
+    })?;
     Ok(Some(table))
 }
 
@@ -275,8 +296,7 @@ pub fn overlay(table: Option<&toml::Table>) -> (HashMap<String, String>, Vec<Str
     let mut merged = HashMap::new();
     let mut notes = Vec::new();
     if let Some(table) = table {
-        let mut known: std::collections::HashSet<(&str, &str)> =
-            std::collections::HashSet::new();
+        let mut known: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
         for (section, key, flat) in KEYMAP {
             known.insert((section, key));
             let value = table
@@ -382,6 +402,35 @@ mod tests {
     }
 
     #[test]
+    fn no_shared_tmp_fallback_without_home() {
+        // Without HOME (and no CONFIG_FILE override) the config path
+        // must never land in world-writable /tmp: a predictable shared
+        // dir is a symlink risk for the template and everything read
+        // from it.
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock");
+        let saved_home = std::env::var_os("HOME");
+        let saved_cfg = std::env::var_os(CONFIG_FILE_ENV);
+        unsafe { std::env::remove_var("HOME") };
+        unsafe { std::env::remove_var(CONFIG_FILE_ENV) };
+        let path = resolve_config_path();
+        assert!(
+            !path.starts_with("/tmp"),
+            "no /tmp fallback, got {}",
+            path.display()
+        );
+        match saved_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match saved_cfg {
+            Some(v) => unsafe { std::env::set_var(CONFIG_FILE_ENV, v) },
+            None => unsafe { std::env::remove_var(CONFIG_FILE_ENV) },
+        }
+    }
+
+    #[test]
     fn overlay_reads_file_only() {
         let t = table("[trading]\nnotional_usd = 42.0\n");
         let (m, notes) = overlay(Some(&t));
@@ -396,11 +445,20 @@ mod tests {
         );
         let (m, notes) = overlay(Some(&t));
         assert!(!m.contains_key("MAINNET_RPC_URL"), "empty must stay unset");
-        assert!(!m.contains_key("NOTIONAL_USD"), "non-scalar must not enter the map");
+        assert!(
+            !m.contains_key("NOTIONAL_USD"),
+            "non-scalar must not enter the map"
+        );
         let joined = notes.join("\n");
-        assert!(joined.contains("[trading].notional_usd ignored"), "{joined}");
+        assert!(
+            joined.contains("[trading].notional_usd ignored"),
+            "{joined}"
+        );
         assert!(joined.contains("[nope].x unknown"), "{joined}");
-        assert!(joined.contains("[gate].gate_window_sec unknown"), "{joined}");
+        assert!(
+            joined.contains("[gate].gate_window_sec unknown"),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -441,7 +499,10 @@ mod tests {
         assert!(body.contains("[trading]"), "template content");
         std::fs::write(&path, "custom = true\n").expect("overwrite");
         assert!(!ensure_config_file(&path).expect("third call"));
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), "custom = true\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "custom = true\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

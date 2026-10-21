@@ -154,8 +154,9 @@ mod tests {
 
     #[test]
     fn rugged_flag_defaults_absent() {
-        let flagged: RugCheckReport = serde_json::from_str(r#"{"mint": "M", "score": 0, "rugged": true}"#)
-            .expect("valid JSON");
+        let flagged: RugCheckReport =
+            serde_json::from_str(r#"{"mint": "M", "score": 0, "rugged": true}"#)
+                .expect("valid JSON");
         assert!(flagged.rugged);
         let missing: RugCheckReport =
             serde_json::from_str(r#"{"mint": "M", "score": 0}"#).expect("valid JSON");
@@ -175,7 +176,8 @@ mod tests {
     #[test]
     fn missing_score_fails_closed() {
         // No score must not parse as 0 (a free pass through the gate).
-        let err = serde_json::from_str::<RugCheckReport>(r#"{"mint": "ABC"}"#).expect_err("must fail");
+        let err =
+            serde_json::from_str::<RugCheckReport>(r#"{"mint": "ABC"}"#).expect_err("must fail");
         assert!(err.to_string().contains("score"));
     }
 
@@ -187,10 +189,12 @@ mod tests {
         assert!(RugCheckError::HttpStatus(StatusCode::REQUEST_TIMEOUT).is_retryable());
         assert!(RugCheckError::HttpStatus(StatusCode::INTERNAL_SERVER_ERROR).is_retryable());
         // Schema breaks are permanent: terminal, never re-polled.
-        assert!(!RugCheckError::Deserialization(
-            serde_json::from_str::<u32>("bogus").expect_err("must fail")
-        )
-        .is_retryable());
+        assert!(
+            !RugCheckError::Deserialization(
+                serde_json::from_str::<u32>("bogus").expect_err("must fail")
+            )
+            .is_retryable()
+        );
         // Policy, config, and oversize bodies: drop at once.
         assert!(!RugCheckError::SecurityRejection("rug".to_string()).is_retryable());
         assert!(!RugCheckError::BadUrl(":::".to_string()).is_retryable());

@@ -165,11 +165,7 @@ mod tests {
     #[test]
     fn classifies_raydium_migration() {
         let monitor = MigrationMonitor::new();
-        let keys = vec![
-            PUMP_MIGRATION_AUTHORITY,
-            RAYDIUM_V4_PROGRAM_ID,
-            curve_key(),
-        ];
+        let keys = vec![PUMP_MIGRATION_AUTHORITY, RAYDIUM_V4_PROGRAM_ID, curve_key()];
         let logs = vec!["Program log: initialize2: InitializeInstruction2".to_string()];
         assert_eq!(
             monitor.classify_migration(&keys, &[], &logs, &curve_key(), &base_key()),
@@ -225,7 +221,13 @@ mod tests {
         let raydium_keys = vec![PUMP_MIGRATION_AUTHORITY, RAYDIUM_V4_PROGRAM_ID, curve_key()];
         for log in ["INITIALIZE2", "Initialize2", "initialize2"] {
             assert_eq!(
-                monitor.classify_migration(&raydium_keys, &[], &[log.to_string()], &curve_key(), &base_key()),
+                monitor.classify_migration(
+                    &raydium_keys,
+                    &[],
+                    &[log.to_string()],
+                    &curve_key(),
+                    &base_key()
+                ),
                 Some(MigrationDestination::RaydiumV4),
                 "log={log}"
             );
@@ -233,14 +235,26 @@ mod tests {
         let pump_keys = vec![PUMP_PROGRAM_ID, base_key()];
         for log in ["MIGRATEV2", "MigrateV2", "migratev2"] {
             assert_eq!(
-                monitor.classify_migration(&pump_keys, &[], &[log.to_string()], &curve_key(), &base_key()),
+                monitor.classify_migration(
+                    &pump_keys,
+                    &[],
+                    &[log.to_string()],
+                    &curve_key(),
+                    &base_key()
+                ),
                 Some(MigrationDestination::PumpSwap),
                 "log={log}"
             );
         }
         // The program/authority key must also be present.
         assert_eq!(
-            monitor.classify_migration(&[], &[], &["initialize2".to_string()], &curve_key(), &base_key()),
+            monitor.classify_migration(
+                &[],
+                &[],
+                &["initialize2".to_string()],
+                &curve_key(),
+                &base_key()
+            ),
             None
         );
     }

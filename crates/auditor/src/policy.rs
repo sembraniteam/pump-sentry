@@ -55,9 +55,9 @@ impl Verdict {
             Verdict::Reject { reasons } if reasons.is_empty() => {
                 Err(RugCheckError::SecurityRejection("rejected".to_string()))
             }
-            Verdict::Reject { reasons } => Err(RugCheckError::SecurityRejection(
-                reasons.join("; "),
-            )),
+            Verdict::Reject { reasons } => {
+                Err(RugCheckError::SecurityRejection(reasons.join("; ")))
+            }
         }
     }
 }

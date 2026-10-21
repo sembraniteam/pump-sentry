@@ -357,8 +357,7 @@ impl FillGapTracker {
                 cell_of(n, total).map(|c| (venue, size, liq, c))
             })
             .min_by(|a, b| {
-                a.3
-                    .avg_gap_usd
+                a.3.avg_gap_usd
                     .partial_cmp(&b.3.avg_gap_usd)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
@@ -384,8 +383,7 @@ impl FillGapTracker {
                 cell_of(n, total).map(|c| (venue, size, liq, c))
             })
             .min_by(|a, b| {
-                a.3
-                    .avg_gap_usd
+                a.3.avg_gap_usd
                     .partial_cmp(&b.3.avg_gap_usd)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
@@ -517,7 +515,7 @@ use crate::live::{
     SELL_RETRY_COOLDOWN, six_decimals,
 };
 use crate::pipeline::{
-    AlertSink, Auditor, LiveSink, Pipeline, ReserveFeed, Screener, CURVE_TICK_STALE_SECS,
+    AlertSink, Auditor, CURVE_TICK_STALE_SECS, LiveSink, Pipeline, ReserveFeed, Screener,
 };
 use crate::settings::now_secs;
 
@@ -567,6 +565,11 @@ pub struct LiveExecution<L = LiveTrader> {
     pub gaps: Mutex<FillGapTracker>,
     /// Terminal buy outcomes (fill-rate trip signal).
     pub outcomes: Mutex<FillOutcomeTracker>,
+    /// Paper mints whose live leg actually landed (tracked custody).
+    /// Uncovered paper PnL never feeds the live day-loss breaker
+    /// (AUD-002): a diverged or bundle-suspect paper open must not
+    /// simulate a loss/win that trips or loosens a live circuit breaker.
+    pub paper_covered: Mutex<std::collections::HashSet<String>>,
 }
 
 impl<L> LiveExecution<L> {
@@ -584,6 +587,7 @@ impl<L> LiveExecution<L> {
             giveup_stamps: Mutex::new(Vec::new()),
             gaps: Mutex::new(FillGapTracker::new()),
             outcomes: Mutex::new(FillOutcomeTracker::new()),
+            paper_covered: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -709,12 +713,74 @@ impl<L> LiveExecution<L> {
         self.live_manual.lock().await.keys().cloned().collect()
     }
 
+    /// Live bag count that pairs against paper positions: one ticket
+    /// per UNPAIRED live bag (AUD-014). Tracked and parked keys count
+    /// individually (duplicate fills on one mint are two bags, not
+    /// one), pending buys count when that mint holds no other bag,
+    /// and at most one bag is paired away per paper mint it covers.
+    pub async fn live_unpaired_bag_count(
+        &self,
+        paper_mints: &std::collections::HashSet<String>,
+    ) -> usize
+    where
+        L: LiveSink,
+    {
+        let mut bags: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let bump = |m: &str, bags: &mut std::collections::HashMap<String, usize>| {
+            *bags.entry(m.to_string()).or_insert(0) += 1;
+        };
+        for key in self.live_positions.lock().await.keys() {
+            bump(live_base_mint(key), &mut bags);
+        }
+        for key in self.live_manual.lock().await.keys() {
+            bump(live_base_mint(key), &mut bags);
+        }
+        if let Some(trader) = self.live.as_ref() {
+            for mint in trader.pending_mints() {
+                bags.entry(mint).or_insert(0);
+                // A pending buy on a mint with no other tracked/parked
+                // bag is itself a ticket-level exposure; one with bags
+                // underneath adds nothing to the ticket estimate (the
+                // floor of what could lock is covered by the bags).
+            }
+        }
+        let mut count = 0usize;
+        for (mint, held) in bags {
+            // Pair at most one bag per paper position on that mint.
+            let paired = if paper_mints.contains(&mint) { 1 } else { 0 };
+            count += held.saturating_sub(paired);
+        }
+        count
+    }
+
     /// Mark paper-open but live-missing.
     pub async fn mark_diverged(&self, mint: &str, reason: String) {
         self.live_diverged
             .lock()
             .await
             .insert(mint.to_string(), reason);
+        // Any divergence means this open's live leg never landed:
+        // its simulated PnL must not reach the live breaker (AUD-002).
+        self.paper_covered.lock().await.remove(mint);
+    }
+
+    /// Live custody confirmed for the mint's paper open (AUD-002):
+    /// its simulated closes may reflect the mirrored trade's modeled
+    /// PnL to the breaker while the book is covered.
+    pub async fn mark_live_covered(&self, mint: &str) {
+        self.paper_covered.lock().await.insert(mint.to_string());
+    }
+
+    /// Drop a mint's coverage stamp (terminal full paper close).
+    pub async fn clear_live_covered(&self, mint: &str) {
+        self.paper_covered.lock().await.remove(mint);
+    }
+
+    /// Whether this mint's simulated paper PnL may feed the
+    /// day-loss breaker: paper-only mode always feeds (its own
+    /// semantics are unchanged); live mode feeds only covered legs.
+    pub async fn breaker_eligible(&self, mint: &str) -> bool {
+        self.live.is_none() || self.paper_covered.lock().await.contains(mint)
     }
 
     /// Clear the diverged mark.
@@ -923,14 +989,21 @@ impl<L> LiveExecution<L> {
 
     /// True when the last failure is still cooling.
     pub async fn cooling(&self, mint: &str, now: u64, cooldown_secs: u64) -> bool {
-        self.live_retry.lock().await.get(mint).is_some_and(
-            |(_, last)| now.saturating_sub(*last) < cooldown_secs,
-        )
+        self.live_retry
+            .lock()
+            .await
+            .get(mint)
+            .is_some_and(|(_, last)| now.saturating_sub(*last) < cooldown_secs)
     }
 
     /// Prior sell failures (tip escalation input; 0 when clean).
     pub async fn retry_attempts(&self, mint: &str) -> u32 {
-        self.live_retry.lock().await.get(mint).map(|(n, _)| *n).unwrap_or(0)
+        self.live_retry
+            .lock()
+            .await
+            .get(mint)
+            .map(|(n, _)| *n)
+            .unwrap_or(0)
     }
 
     /// Mark a mint synthetic (override paper).
@@ -970,8 +1043,7 @@ impl<L> LiveExecution<L> {
 
     /// Distinct live mints: tracked plus manual (base) plus pending.
     pub async fn exposure_mints(&self, pending: Vec<String>) -> Vec<String> {
-        let mut exposure: Vec<String> =
-            self.live_positions.lock().await.keys().cloned().collect();
+        let mut exposure: Vec<String> = self.live_positions.lock().await.keys().cloned().collect();
         exposure.extend(
             self.live_manual
                 .lock()
@@ -1009,7 +1081,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         sol: Option<(f64, u64)>,
         creator: Option<&str>,
     ) {
-        let Some(trader) = &self.exec.live else { return };
+        let Some(trader) = &self.exec.live else {
+            return;
+        };
         let entry_quote = mark.price;
         let Some((sol_usd, _ts)) = sol.filter(|(_, ts)| self.sol_feed.age_ok(*ts)) else {
             warn!(%mint, "stale SOL/USD — live buy skipped (no static fallback)");
@@ -1018,7 +1092,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             self.exec
                 .mark_diverged(mint, "live buy skipped: stale SOL/USD".to_string())
                 .await;
-            self.emit(format!("LIVE buy skipped on {mint} (stale SOL/USD); paper open WITHOUT live cover"));
+            self.emit(format!(
+                "LIVE buy skipped on {mint} (stale SOL/USD); paper open WITHOUT live cover"
+            ));
             return;
         };
         // Per-mint lock: one mint never blocks others.
@@ -1034,7 +1110,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.exec
                     .mark_diverged(mint, "live buy skipped: heat limit".to_string())
                     .await;
-                self.emit(format!("live heat limit on {mint}: paper-only, live skipped (exposure at cap)"));
+                self.emit(format!(
+                    "live heat limit on {mint}: paper-only, live skipped (exposure at cap)"
+                ));
                 return;
             }
         }
@@ -1042,7 +1120,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if self.is_live_tracked(trader, mint).await {
             warn!(%mint, "LIVE buy skipped: mint already tracked/manual/pending; no dispatch (paper stays open, no new funds)");
             self.journal_buy_skip(mint, "already tracked");
-            self.emit(format!("LIVE buy skipped on already-tracked {mint}; no dispatch"));
+            self.emit(format!(
+                "LIVE buy skipped on already-tracked {mint}; no dispatch"
+            ));
             return;
         }
         // Decimals explicit (cached read): sizing assumes per-mint units.
@@ -1056,7 +1136,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.exec
                     .mark_diverged(mint, "live buy skipped: non-6 decimals".to_string())
                     .await;
-                self.emit(format!("LIVE buy skipped on {mint} (non-6 decimals); paper open WITHOUT live cover"));
+                self.emit(format!(
+                    "LIVE buy skipped on {mint} (non-6 decimals); paper open WITHOUT live cover"
+                ));
                 return;
             }
             Err(DecimalsRefusal::Unreadable(error)) => {
@@ -1078,26 +1160,32 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 None
             }
         };
-        let (Some(mint_key), Some(curve_key), Some(assoc_key)) =
-            (parsed("mint", mint), parsed("curve", curve), parsed("assoc_curve", assoc_curve))
-        else {
+        let (Some(mint_key), Some(curve_key), Some(assoc_key)) = (
+            parsed("mint", mint),
+            parsed("curve", curve),
+            parsed("assoc_curve", assoc_curve),
+        ) else {
             self.exec
                 .mark_diverged(mint, "live buy skipped: unparseable address".to_string())
                 .await;
-            self.emit(format!("LIVE buy skipped on {mint} (bad address); paper open WITHOUT live cover"));
+            self.emit(format!(
+                "LIVE buy skipped on {mint} (bad address); paper open WITHOUT live cover"
+            ));
             return;
         };
         let creator_key = match creator {
-            Some(c) => match parsed("creator", c) {
-                Some(p) => Some(p),
-                None => {
-                    self.exec
-                        .mark_diverged(mint, "live buy skipped: bad creator".to_string())
-                        .await;
-                    self.emit(format!("LIVE buy skipped on {mint} (bad creator); paper open WITHOUT live cover"));
-                    return;
+            Some(c) => {
+                match parsed("creator", c) {
+                    Some(p) => Some(p),
+                    None => {
+                        self.exec
+                            .mark_diverged(mint, "live buy skipped: bad creator".to_string())
+                            .await;
+                        self.emit(format!("LIVE buy skipped on {mint} (bad creator); paper open WITHOUT live cover"));
+                        return;
+                    }
                 }
-            },
+            }
             None => None,
         };
         // Read the tier BEFORE the match: a lock taken inside the
@@ -1128,7 +1216,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.exec
                         .park_manual(format!("{mint}#2-{}", short_tag(&bundle)), position)
                         .await;
-                    self.emit(format!("second LIVE bag on {mint} ({bundle}); MANUAL EXIT REQUIRED"));
+                    self.emit(format!(
+                        "second LIVE bag on {mint} ({bundle}); MANUAL EXIT REQUIRED"
+                    ));
                     return;
                 }
                 let amount = position.amount_tokens;
@@ -1136,21 +1226,25 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 trader.acknowledge_buy(&position, &bundle);
                 self.exec.insert_tracked(position).await;
                 self.exec.clear_diverged(mint).await;
+                // Tracked custody proves the live leg: its paper
+                // closes may feed the live breaker (AUD-002).
+                self.exec.mark_live_covered(mint).await;
                 // Entry-gap calibration: paper model vs landed fill.
                 // Skipped when unobservable (late-confirm path never
                 // carries one either) — absence is documented, not hidden.
                 let entry_gap = if let Some(fill) = entry_fill {
-                    self.exec.note_entry_gap(
-                        mint,
-                        entry_quote,
-                        fill.fill_price_usd,
-                        fill.tokens,
-                        // Buys never ride pool legs (no pool-buy path
-                        // exists): the venue is structural, not read.
-                        "curve",
-                        mark.liquidity_usd,
-                    )
-                    .await
+                    self.exec
+                        .note_entry_gap(
+                            mint,
+                            entry_quote,
+                            fill.fill_price_usd,
+                            fill.tokens,
+                            // Buys never ride pool legs (no pool-buy path
+                            // exists): the venue is structural, not read.
+                            "curve",
+                            mark.liquidity_usd,
+                        )
+                        .await
                 } else {
                     None
                 };
@@ -1194,18 +1288,27 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     // buy gets exactly one outcome line, so confirmed
                     // counts include at-dispatch confirms (the debit is
                     // NOT repeated — the Attempt line owns it).
-                    self.journal_buy_outcome(mint, Some(bundle.clone()), "confirmed", None, None).await;
+                    self.journal_buy_outcome(mint, Some(bundle.clone()), "confirmed", None, None)
+                        .await;
                 }
                 warn!(%mint, "LIVE buy dispatched via Jito (real funds)");
-                self.emit(Alerter::format_live_buy(&self.card_ctx(), mint, &bundle, amount));
+                self.emit(Alerter::format_live_buy(
+                    &self.card_ctx(),
+                    mint,
+                    &bundle,
+                    amount,
+                ));
             }
             Err(LiveError::UnknownDispatch { position, reason }) => {
                 // No signature: fill unknown, park manual.
                 warn!(%mint, error = %reason, "LIVE buy dispatch unknown; parked for manual review (may hold — check mint activity on explorer, no signature exists)");
-                self.journal_buy_outcome(mint, None, "unknown", Some(reason.to_string()), None).await;
+                self.journal_buy_outcome(mint, None, "unknown", Some(reason.to_string()), None)
+                    .await;
                 trader.record_manual(&position, "dispatch-unknown");
                 self.exec.park_manual(mint.to_string(), *position).await;
-                self.emit(format!("LIVE buy dispatch unknown on {mint}; MANUAL REVIEW REQUIRED (fill unknown)"));
+                self.emit(format!(
+                    "LIVE buy dispatch unknown on {mint}; MANUAL REVIEW REQUIRED (fill unknown)"
+                ));
             }
             Err(LiveError::Dead { reason, context }) => {
                 // Proven no-fill. Only an on-chain failure burned money:
@@ -1218,7 +1321,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.debit_dispatch_usd(usd).await;
                 }
                 warn!(%mint, %reason, error = %context, "LIVE buy provably dead (no fill); paper still open but DIVERGED");
-                self.journal_buy_outcome(mint, None, "dead", Some(context.clone()), debit).await;
+                self.journal_buy_outcome(mint, None, "dead", Some(context.clone()), debit)
+                    .await;
                 self.exec.mark_diverged(mint, context).await;
                 self.emit(format!(
                     "LIVE buy provably dead on {mint} ({reason}); paper open WITHOUT live cover"
@@ -1227,14 +1331,23 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Err(LiveError::Unconfirmed(msg)) => {
                 // Pending stays with recheck; GiveUp parks it.
                 warn!(%mint, error = %msg, "LIVE buy unconfirmed; tracked as pending, rechecking");
-                self.journal_buy_outcome(mint, None, "unknown", Some(msg), None).await;
+                self.journal_buy_outcome(mint, None, "unknown", Some(msg), None)
+                    .await;
             }
             Err(e) => {
-                // No fill: paper stays open but diverged.
-                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
-                self.journal_buy_outcome(mint, None, "unknown", Some(e.to_string()), None).await;
-                self.exec.mark_diverged(mint, e.to_string()).await;
-                self.emit(format!("LIVE buy failed on {mint} ({e}); paper open WITHOUT live cover"));
+                // No fill: paper stays open but diverged. Every surface
+                // here crosses a boundary (journal, alert, in-memory
+                // reason) — redact the transport text so an api-key URL
+                // inside the executor error never reaches log, Discord,
+                // or the journal (AUD-005).
+                let redacted = ids::strip_error_url(&e.to_string());
+                warn!(%mint, error = %redacted, "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
+                self.journal_buy_outcome(mint, None, "unknown", Some(redacted.clone()), None)
+                    .await;
+                self.exec.mark_diverged(mint, redacted.clone()).await;
+                self.emit(format!(
+                    "LIVE buy failed on {mint} ({redacted}); paper open WITHOUT live cover"
+                ));
             }
         }
     }
@@ -1309,7 +1422,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
     /// Re-poll pending buys. No-op when empty.
     pub(crate) async fn recheck_live_pending(&self) {
-        let Some(trader) = &self.exec.live else { return };
+        let Some(trader) = &self.exec.live else {
+            return;
+        };
         if !trader.has_pending() {
             return;
         }
@@ -1327,7 +1442,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             "confirmed",
                             Some("late confirm parked as manual (still held)".to_string()),
                             None,
-                        ).await;
+                        )
+                        .await;
                         trader.record_manual(&recheck.position, &recheck.bundle_id);
                         self.exec
                             .park_manual(
@@ -1343,6 +1459,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     trader.acknowledge_buy(&recheck.position, &recheck.bundle_id);
                     self.exec.insert_tracked(recheck.position).await;
                     self.exec.clear_diverged(&mint).await;
+                    // Late confirm establishes live coverage too (AUD-002).
+                    self.exec.mark_live_covered(&mint).await;
                     // Same first-touch cost; stale feed skips.
                     let confirmed_debit = self.sol_feed.price().map(|sol_usd| {
                         Self::dispatch_usd(trader.first_touch_cost_lamports(), sol_usd)
@@ -1356,9 +1474,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         "confirmed",
                         None,
                         confirmed_debit,
-                    ).await;
+                    )
+                    .await;
                     warn!(mint = %mint, "LIVE buy confirmed late; now tracked with exits");
-                    self.emit(Alerter::format_live_buy(&self.card_ctx(), &mint, &recheck.bundle_id, amount));
+                    self.emit(Alerter::format_live_buy(
+                        &self.card_ctx(),
+                        &mint,
+                        &recheck.bundle_id,
+                        amount,
+                    ));
                 }
                 RecheckOutcome::Dead(reason) => {
                     // Same honest burn as the direct path: only an
@@ -1373,13 +1497,20 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         self.debit_dispatch_usd(usd).await;
                     }
                     warn!(mint = %mint, bundle = %recheck.bundle_id, %reason, "pending LIVE buy provably dead; no fill, dropping");
+                    // The paper open now has no live cover, matching
+                    // the direct-dead path: the heartbeat count must
+                    // see the gap until the paper position closes.
+                    self.exec
+                        .mark_diverged(&mint, format!("pending buy dead: {reason}"))
+                        .await;
                     self.journal_buy_outcome(
                         &mint,
                         Some(recheck.bundle_id.clone()),
                         "dead",
                         Some(reason.to_string()),
                         dead_debit,
-                    ).await;
+                    )
+                    .await;
                 }
                 RecheckOutcome::StillUnknown => {
                     warn!(mint = %mint, bundle = %recheck.bundle_id, "pending LIVE buy still unconfirmed; keeping for next round");
@@ -1389,7 +1520,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         "unknown",
                         None,
                         None,
-                    ).await;
+                    )
+                    .await;
                 }
                 RecheckOutcome::GiveUp => {
                     // No verdict: may hold, park manual.
@@ -1400,7 +1532,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         "giveup",
                         Some(format!("sig {}", recheck.signature)),
                         None,
-                    ).await;
+                    )
+                    .await;
                     trader.record_manual(&recheck.position, &recheck.signature);
                     self.exec.park_manual(mint.clone(), recheck.position).await;
                     self.exec.note_giveup(now_secs()).await;
@@ -1421,10 +1554,41 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(mint = %mint, n, "synthetic deferred PnL excluded from day-loss breaker (override price, no market)");
             return;
         }
+        // AUD-002: deferred legs of an uncovered paper open never
+        // reach the live breaker, however late the settle resolves.
+        if !self.exec.breaker_eligible(mint).await {
+            warn!(mint = %mint, n,
+                "deferred uncovered paper PnL dropped (simulated PnL never feeds the live day-loss breaker)");
+            return;
+        }
         let now = now_secs();
         let mut daily = self.daily.lock().await;
         if total.is_finite() {
             daily.record(total, now);
+        }
+    }
+
+    /// Feed closed paper PnL into the day-loss breaker. Paper-only
+    /// mode always feeds (semantics unchanged); live mode feeds only
+    /// legs whose live mirror actually landed. Synthetic mints are
+    /// excluded as before; uncovered mints are dropped — and any
+    /// stashed legs with them — never reaching the breaker.
+    pub(crate) async fn record_breaker_pnls(&self, mint: &str, pnls: Vec<f64>, now: u64) {
+        if self.exec.is_synthetic(mint).await {
+            warn!(mint = %mint, n = pnls.len(), "synthetic paper PnL excluded from day-loss breaker (override price, no market)");
+            return;
+        }
+        if !self.exec.breaker_eligible(mint).await {
+            warn!(mint = %mint, n = pnls.len(),
+                "uncovered paper PnL excluded from day-loss breaker (simulated, no live custody)");
+            if let Some((stash_total, stash_n)) = self.exec.take_deferred(mint).await {
+                warn!(mint = %mint, n = stash_n, stash_total,
+                    "stashed uncovered paper PnL dropped with its uncovered open");
+            }
+            return;
+        }
+        for pnl in pnls {
+            self.daily.lock().await.record(pnl, now);
         }
     }
 
@@ -1447,7 +1611,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         self.exec.note_giveup(now).await;
         self.journal_mint_giveup(mint, cause);
         warn!(%mint, cause, "LIVE sell gave up; parked for manual exit (still HELD)");
-        self.emit(format!("LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"));
+        self.emit(format!(
+            "LIVE sell gave up on {mint}; MANUAL EXIT REQUIRED (bag still held)"
+        ));
         false
     }
 
@@ -1458,12 +1624,16 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         mark: &simulator::Mark,
         fraction_closed: f64,
     ) -> bool {
-        let Some(trader) = &self.exec.live else { return true };
+        let Some(trader) = &self.exec.live else {
+            return true;
+        };
         // Local name for the body; exact reserves ride `mark.curve`.
         let price_usd = mark.price;
         let Some(sol_usd) = self.sol_feed.price() else {
             warn!(%mint, "stale SOL/USD — live sell skipped (no static fallback); will retry next tick");
-            self.emit(format!("stale SOL/USD — live sell stalled on {mint}; exits resume when feed recovers"));
+            self.emit(format!(
+                "stale SOL/USD — live sell stalled on {mint}; exits resume when feed recovers"
+            ));
             return !self.is_live_tracked(trader, mint).await;
         };
         // Per-mint lock; other mints exit freely.
@@ -1498,6 +1668,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         let probe = {
             let Some(tracked) = self.exec.tracked(mint).await else {
+                // AUD-008: an unresolved pending buy for this mint is
+                // live exposure not yet tracked — the paper close must
+                // stay deferred (PnL stashed) until the recheck confirms
+                // the bag (then it sells) or resolves it dead.
+                if trader.has_pending_for(mint) {
+                    warn!(%mint, "live sell on a mint with an unresolved pending buy; settlement deferred");
+                    return false;
+                }
                 // Nothing tracked: settle only when no manual bag
                 // remains either. A parked manual bag is still live
                 // exposure, so this tick's paper close must defer like
@@ -1584,19 +1762,23 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             Some(leg) => match leg.venue {
                 crate::live::PoolVenue::PumpSwap => {
                     warn!(%mint, amm = %leg.amm, leg_mint = %leg.mint, "routing post-migration exit via PumpSwap");
-                    trader.sell_pumpswap(&PumpSwapSellParams {
-                        position: &probe,
-                        pool: leg,
-                        tip_lamports: tip,
-                    }).await
+                    trader
+                        .sell_pumpswap(&PumpSwapSellParams {
+                            position: &probe,
+                            pool: leg,
+                            tip_lamports: tip,
+                        })
+                        .await
                 }
                 crate::live::PoolVenue::RaydiumV4 => {
                     warn!(%mint, amm = %leg.amm, leg_mint = %leg.mint, "routing post-migration exit via Raydium");
-                    trader.sell_raydium(&RaydiumSellParams {
-                        position: &probe,
-                        pool: leg,
-                        tip_lamports: tip,
-                    }).await
+                    trader
+                        .sell_raydium(&RaydiumSellParams {
+                            position: &probe,
+                            pool: leg,
+                            tip_lamports: tip,
+                        })
+                        .await
                 }
             },
             None => {
@@ -1674,11 +1856,38 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 true
             }
             Err(e) => {
+                // Unknown custody (dispatch timeout with no receipt, or a
+                // timed-out confirm): no guard entry holds resends, so a
+                // blind retry could double-spend a landed-but-unseen
+                // bundle — park immediately for manual exit, never retry
+                // into the ambiguity.
+                if let LiveError::UnknownDispatch { reason, .. } = &e {
+                    return self.park_for_manual_exit(trader, mint, now, reason).await;
+                }
+                // Signed but unacknowledged: the POST may still land, so
+                // a blind resend could double-spend — park immediately
+                // for manual exit, never retry into the ambiguity.
+                if let LiveError::Dispatch(ExecutorError::SendUnknown {
+                    signature,
+                    blockhash,
+                    ..
+                }) = &e
+                {
+                    return self
+                        .park_for_manual_exit(
+                            trader,
+                            mint,
+                            now,
+                            &format!(
+                                "sell bundle POST failed after signing (sig {signature}, blockhash {blockhash}); may still land — MANUAL REVIEW, no resend"
+                            ),
+                        )
+                        .await;
+                }
                 // Deterministic rejects re-probe; unroutable parks after budget.
                 let deterministic = matches!(
                     &e,
-                    LiveError::BadOrder(_)
-                        | LiveError::Dispatch(ExecutorError::BadOrder(_))
+                    LiveError::BadOrder(_) | LiveError::Dispatch(ExecutorError::BadOrder(_))
                 );
                 let attempts = self.exec.note_failure(mint, now).await;
                 if attempts >= SELL_MAX_ATTEMPTS {
@@ -1711,6 +1920,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return true;
         }
         let _serial = self.mint_serial(mint).await;
+        // AUD-007: an unresolved live buy for this mint means exposure may
+        // still arrive (dispatch has a receipt but the chain has not
+        // confirmed). Keep the request queued: the drain retries after the
+        // pending recheck resolves, so forcing a settled verdict here would
+        // delete the operator's exit.
+        if let Some(trader) = self.exec.live.as_ref()
+            && trader.has_pending_for(mint)
+        {
+            warn!(%mint, "manual sell while a LIVE buy for this mint is pending; keeping request until the buy resolves");
+            return false;
+        }
         let curve = {
             if let Some(tracked) = self.exec.tracked(mint).await {
                 Some(tracked.curve)
@@ -1731,7 +1951,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         };
         let Some(curve) = curve else {
-            let paper_open = !self.portfolio.lock().await.positions_for_mint(mint).is_empty();
+            let paper_open = !self
+                .portfolio
+                .lock()
+                .await
+                .positions_for_mint(mint)
+                .is_empty();
             if paper_open {
                 warn!(%mint, "manual sell on a paper-only mint: no live bag to exit; paper automation continues");
             } else {
@@ -1838,11 +2063,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         for (reason, pnl, pct, equity, moonbag) in closed_cards {
             self.emit(Alerter::format_exit(
                 &self.card_ctx(),
-                &tick.mint, &reason, pnl, pct, equity, moonbag,
+                &tick.mint,
+                &reason,
+                pnl,
+                pct,
+                equity,
+                moonbag,
             ));
         }
         for (paper_price, qty) in gap_notes {
-            self.exec.note_gap_paper_close(&tick.mint, paper_price, qty).await;
+            self.exec
+                .note_gap_paper_close(&tick.mint, paper_price, qty)
+                .await;
         }
         // Live first, breaker second: sell whatever is tracked
         // (primary, or a parked bag resurrected above), pulling parked
@@ -1862,8 +2094,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     else {
                         break;
                     };
-                    let Some(held) = self.exec.take_manual_exact(&dup_key).await
-                    else {
+                    let Some(held) = self.exec.take_manual_exact(&dup_key).await else {
                         break;
                     };
                     if let Some(trader) = self.exec.live.as_ref() {
@@ -1871,21 +2102,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                     self.exec.insert_tracked(held).await;
                 }
-                if !self.live_sell(&tick.mint, &mark, 1.0).await
-                {
+                if !self.live_sell(&tick.mint, &mark, 1.0).await {
                     warn!(mint = %tick.mint, "manual sell: live still holds; breaker PnL deferred, request kept");
                     self.exec.stash_deferred_pnl(&tick.mint, closed_pnls).await;
                     return false;
                 }
             }
         }
-        if self.exec.is_synthetic(&tick.mint).await {
-            warn!(mint = %tick.mint, "synthetic paper PnL excluded from day-loss breaker (override price, no market)");
-        } else {
-            for pnl in closed_pnls {
-                self.daily.lock().await.record(pnl, now);
-            }
-        }
+        // Same shared recorder as the tick path (AUD-002).
+        self.record_breaker_pnls(&tick.mint, closed_pnls, now).await;
         self.settle_close_tail(&tick).await;
         // Bags may remain (GiveUp-parked): keep the request so the
         // next `sell` round continues the drain instead of dropping a
@@ -1943,13 +2168,19 @@ mod tests {
         let mut t = FillGapTracker::new();
         assert_eq!(t.stats(), (0, 0.0, 0.0));
         // Unmatched settle records nothing (orphan legs, never fabricated).
-        assert!(t.note_live_settle("M", 1.0, 0.05, "curve", 50_000.0).is_none());
+        assert!(
+            t.note_live_settle("M", 1.0, 0.05, "curve", 50_000.0)
+                .is_none()
+        );
         assert_eq!(t.stats(), (0, 0.0, 0.0));
         // Degenerate paper notes are ignored.
         t.note_paper_close("M", f64::NAN, 10);
         t.note_paper_close("M", 0.0, 10);
         t.note_paper_close("M", 1.0, 0);
-        assert!(t.note_live_settle("M", 1.0, 0.05, "curve", 50_000.0).is_none());
+        assert!(
+            t.note_live_settle("M", 1.0, 0.05, "curve", 50_000.0)
+                .is_none()
+        );
         // Paper 2.0 x 10 tokens, live settles 1.9 + 0.05 tip:
         // (1.9 - 2.0) * 10 - 0.05 = -1.05.
         t.note_paper_close("M", 2.0, 10);
@@ -1959,14 +2190,20 @@ mod tests {
         assert_eq!(gap.qty_tokens, 10);
         assert!((gap.gap_usd + 1.05).abs() < 1e-9, "gap={}", gap.gap_usd);
         // Consumed: a second settle without a new paper note is orphan.
-        assert!(t.note_live_settle("M", 1.9, 0.05, "curve", 50_000.0).is_none());
+        assert!(
+            t.note_live_settle("M", 1.9, 0.05, "curve", 50_000.0)
+                .is_none()
+        );
         let (n, avg, total) = t.stats();
         assert_eq!(n, 1);
         assert!((avg + 1.05).abs() < 1e-9);
         assert!((total + 1.05).abs() < 1e-9);
         // Non-finite settle keeps the pending note for the next round.
         t.note_paper_close("N", 3.0, 5);
-        assert!(t.note_live_settle("N", f64::NAN, 0.05, "curve", 50_000.0).is_none());
+        assert!(
+            t.note_live_settle("N", f64::NAN, 0.05, "curve", 50_000.0)
+                .is_none()
+        );
         let gap = t
             .note_live_settle("N", 3.0, 0.05, "curve", 50_000.0)
             .expect("kept");
@@ -2040,9 +2277,18 @@ mod tests {
         let mut t = FillGapTracker::new();
         assert_eq!(t.entry_stats(), (0, 0.0, 0.0));
         // Degenerate inputs record nothing.
-        assert!(t.note_entry_gap("M", f64::NAN, 1.0, 10.0, "curve", 50_000.0, 1_000).is_none());
-        assert!(t.note_entry_gap("M", 1.0, 0.0, 10.0, "curve", 50_000.0, 1_000).is_none());
-        assert!(t.note_entry_gap("M", 1.0, 1.0, 0.0, "curve", 50_000.0, 1_000).is_none());
+        assert!(
+            t.note_entry_gap("M", f64::NAN, 1.0, 10.0, "curve", 50_000.0, 1_000)
+                .is_none()
+        );
+        assert!(
+            t.note_entry_gap("M", 1.0, 0.0, 10.0, "curve", 50_000.0, 1_000)
+                .is_none()
+        );
+        assert!(
+            t.note_entry_gap("M", 1.0, 1.0, 0.0, "curve", 50_000.0, 1_000)
+                .is_none()
+        );
         assert_eq!(t.entry_stats(), (0, 0.0, 0.0));
         // Paper 0.0000042, landed 0.0000045 over 2.35M tokens: live
         // paid more, so the gap is negative like the exit leg
@@ -2080,9 +2326,10 @@ mod tests {
             .note_live_settle("M", 2.9, 0.0, "curve", 50_000.0)
             .expect("second leg");
         assert_eq!((second.paper_price_usd, second.qty_tokens), (3.0, 2));
-        assert!(t
-            .note_live_settle("M", 2.9, 0.0, "curve", 50_000.0)
-            .is_none());
+        assert!(
+            t.note_live_settle("M", 2.9, 0.0, "curve", 50_000.0)
+                .is_none()
+        );
         let (n, _, _) = t.stats();
         assert_eq!(n, 2);
     }
@@ -2136,7 +2383,11 @@ mod tests {
         assert_eq!(venue, "curve");
         assert_eq!((size, liq), (1, 0));
         assert_eq!(cell.n, 3);
-        assert!((cell.avg_gap_usd + 2.0).abs() < 1e-9, "avg={}", cell.avg_gap_usd);
+        assert!(
+            (cell.avg_gap_usd + 2.0).abs() < 1e-9,
+            "avg={}",
+            cell.avg_gap_usd
+        );
         // Entry window has no samples yet: no twin verdict either.
         assert!(t.worst_entry_cell().is_none());
     }
@@ -2277,7 +2528,8 @@ mod tests {
     async fn deferred_stash_aggregates_finite_only() {
         let exec = exec();
         assert!(exec.take_deferred("MINT").await.is_none());
-        exec.stash_deferred_pnl("MINT", vec![10.0, -3.0, f64::NAN]).await;
+        exec.stash_deferred_pnl("MINT", vec![10.0, -3.0, f64::NAN])
+            .await;
         assert_eq!(exec.take_deferred("MINT").await, Some((7.0, 2)));
         assert!(exec.take_deferred("MINT").await.is_none());
         exec.stash_deferred_pnl("MINT", Vec::new()).await;
@@ -2290,8 +2542,10 @@ mod tests {
         let (a, b) = (key_of("A").1, key_of("B").1);
         exec.insert_tracked(bag("B", 10)).await;
         exec.insert_tracked(bag("A", 10)).await;
-        exec.park_manual(format!("{a}#2-abcdef12"), bag("A", 5)).await;
-        exec.park_manual(format!("{}#late-12345678", key_of("C").1), bag("C", 5)).await;
+        exec.park_manual(format!("{a}#2-abcdef12"), bag("A", 5))
+            .await;
+        exec.park_manual(format!("{}#late-12345678", key_of("C").1), bag("C", 5))
+            .await;
         let exposure = exec
             .exposure_mints(vec![key_of("C").1, "D".to_string()])
             .await;

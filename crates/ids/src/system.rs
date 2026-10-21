@@ -13,8 +13,7 @@ pub const TOKEN_2022_PROGRAM_ID: Pubkey =
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 /// System program.
-pub const SYSTEM_PROGRAM_ID: Pubkey =
-    Pubkey::from_str_const("11111111111111111111111111111111");
+pub const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::from_str_const("11111111111111111111111111111111");
 /// Rent sysvar.
 pub const RENT_SYSVAR_ID: Pubkey =
     Pubkey::from_str_const("SysvarRent111111111111111111111111111111111");

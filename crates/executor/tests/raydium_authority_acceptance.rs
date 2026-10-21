@@ -213,16 +213,22 @@ async fn raydium_authority_and_bundle_simulate() {
         let (owner6, _, _) = match common::token_account(&rpc, &cacc[6]).await {
             Some(v) => v,
             None => {
-                failures.push(format!("{csig}: dest [6] missing (swept?); skipping sample"));
+                failures.push(format!(
+                    "{csig}: dest [6] missing (swept?); skipping sample"
+                ));
                 continue;
             }
         };
         if owner5 != cacc[7] {
-            failures.push(format!("{csig}: source owner != [7] (composed frame?); skipping"));
+            failures.push(format!(
+                "{csig}: source owner != [7] (composed frame?); skipping"
+            ));
             continue;
         }
         if owner6 != cacc[7] {
-            failures.push(format!("{csig}: dest owner != [7] (composed frame?); skipping"));
+            failures.push(format!(
+                "{csig}: dest owner != [7] (composed frame?); skipping"
+            ));
             continue;
         }
         if bal5 < 1_000 {
@@ -275,7 +281,9 @@ async fn raydium_authority_and_bundle_simulate() {
                 }
             };
             if common::token_account(&rpc, &sell_dst).await.is_none() {
-                failures.push(format!("{csig}: sell dest missing (swept?); skipping sample"));
+                failures.push(format!(
+                    "{csig}: sell dest missing (swept?); skipping sample"
+                ));
                 continue;
             }
             if sell_bal < 1_000 {

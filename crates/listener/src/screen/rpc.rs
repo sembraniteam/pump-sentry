@@ -1,5 +1,14 @@
-use super::*;
 use super::swaps::{for_each_compiled_ix, resolve_keys};
+use super::*;
+use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+/// Dev-history backward walk budget (AUD-010): a serial launcher with
+/// a full signature window can hide prior launches beyond the newest
+/// page, so the walk accumulates pages until the history is really
+/// exhausted or this budget is hit — a capped-but-unexhausted walk
+/// then FAILS CLOSED instead of passing on its lower-bound count.
+/// Three pages at the default 100-sig `sig_limit` covers 300 sigs.
+pub(crate) const DEV_HISTORY_MAX_PAGES: usize = 3;
 
 pub async fn screen_developer(
     rpc: &RpcClient,
@@ -8,39 +17,66 @@ pub async fn screen_developer(
     now_secs: u64,
     cfg: &DevScreenConfig,
 ) -> Result<DevVerdict, ClientError> {
-    let sigs = rpc
-        .get_signatures_for_address_with_config(
-            dev,
-            GetConfirmedSignaturesForAddress2Config {
-                before: None,
-                until: None,
-                limit: Some(cfg.sig_limit),
-                commitment: Some(commitment),
-            },
-        )
-        .await?;
-    if sigs.is_empty() {
-        return Ok(judge_developer(None, 0, cfg));
+    // Backward page walk (AUD-010): the launch count must come from the
+    // WHOLE walked history, and the walk must prove its own
+    // completeness (last page ended short/empty). Newest first.
+    let mut sigs: Vec<RpcConfirmedTransactionStatusWithSignature> = Vec::new();
+    let mut before: Option<Signature> = None;
+    let mut walk_truncated = true;
+    for _ in 0..DEV_HISTORY_MAX_PAGES {
+        let page = rpc
+            .get_signatures_for_address_with_config(
+                dev,
+                GetConfirmedSignaturesForAddress2Config {
+                    before,
+                    until: None,
+                    limit: Some(cfg.sig_limit),
+                    commitment: Some(commitment),
+                },
+            )
+            .await?;
+        let page_full = page.len() >= cfg.sig_limit;
+        if page.is_empty() || !page_full {
+            walk_truncated = false;
+        }
+        before = page
+            .last()
+            .and_then(|s| Signature::from_str(&s.signature).ok());
+        sigs.extend(page);
+        // A short page means the history ended; a cursor that failed to
+        // parse cannot back a further page anyway.
+        if walk_truncated {
+            let Some(cursor) = before else {
+                break;
+            };
+            before = Some(cursor);
+        }
     }
-    // Window full: older history hides beyond `sig_limit`. The launch
-    // count below is a lower bound; a zero count on a full window proves
-    // nothing and must fail closed.
-    let history_truncated = sigs.len() >= cfg.sig_limit;
-    // Newest first. Last entry is oldest activity.
+    if sigs.is_empty() {
+        return Ok(DevVerdict {
+            pass: false,
+            age_secs: None,
+            prior_launches: 0,
+            history_truncated: false,
+            reason: "no on-chain history (fresh wallet)".to_string(),
+        });
+    }
+    // Oldest activity across the WHOLE walk.
     let age_secs = sigs
         .last()
         .and_then(|s| s.block_time)
         .map(|t| now_secs.saturating_sub(t.max(0) as u64));
     // Early reject skips the fan-out: failing age can never pass.
     if age_secs.is_none_or(|age| age < cfg.min_age_secs) {
-        return Ok(judge_developer(age_secs, 0, cfg));
+        return Ok(walk_verdict(age_secs, 0, walk_truncated, cfg));
     }
 
     let tx_config = json_tx_config(commitment);
     // Bounded fan-out (5-wide). Failed txs skipped. Unreadable counted.
+    // Every walked sig is a candidate: the count is over the history,
+    // not a newest-slice sample (AUD-010).
     let candidates: Vec<(Signature, bool)> = sigs
         .iter()
-        .take(cfg.sample_txs)
         .filter_map(|s| {
             Signature::from_str(&s.signature)
                 .ok()
@@ -56,6 +92,7 @@ pub async fn screen_developer(
             pass: false,
             age_secs,
             prior_launches: 0,
+            history_truncated: walk_truncated,
             reason: format!(
                 "dev history mostly failed txs ({err_skipped} of {total} errored); failing closed",
             ),
@@ -107,25 +144,42 @@ pub async fn screen_developer(
             pass: false,
             age_secs,
             prior_launches,
+            history_truncated: walk_truncated,
             reason: format!(
                 "dev history unreadable ({fetch_failed} of {total} fetches failed); failing closed",
             ),
         });
     }
-    if history_truncated && prior_launches == 0 {
-        // Full window with zero hits: older launches may hide beyond
-        // `sig_limit`. A zero count here is a lower bound, not proof.
-        return Ok(DevVerdict {
+    Ok(walk_verdict(age_secs, prior_launches, walk_truncated, cfg))
+}
+
+/// Verdict for a walked dev history (pure, AUD-010). Truncation is
+/// never a pass: the observed launch count is a lower bound, so a
+/// wallet whose walk stopped at the page budget is rejected until its
+/// whole history provably fits the walk. Age rules still dominate
+/// (a below-minimum wallet rejects regardless of truncation).
+fn walk_verdict(
+    age_secs: Option<u64>,
+    prior_launches: usize,
+    walk_truncated: bool,
+    cfg: &DevScreenConfig,
+) -> DevVerdict {
+    if walk_truncated && age_secs.is_some_and(|age| age >= cfg.min_age_secs) {
+        return DevVerdict {
             pass: false,
             age_secs,
             prior_launches,
+            history_truncated: true,
             reason: format!(
-                "dev history window full ({total} sampled of {} sigs); zero launches unproven, failing closed",
-                cfg.sig_limit,
+                "dev history truncated (page budget {DEV_HISTORY_MAX_PAGES}): {prior_launches} observed is a lower bound only, failing closed",
             ),
-        });
+        };
     }
-    Ok(judge_developer(age_secs, prior_launches, cfg))
+    let verdict = judge_developer(age_secs, prior_launches, cfg);
+    DevVerdict {
+        history_truncated: walk_truncated && verdict.pass,
+        ..verdict
+    }
 }
 
 /// True when a dev sample is trusted.
@@ -137,19 +191,29 @@ pub(crate) fn sample_trustworthy(failed: usize, total: usize) -> bool {
 /// Swap reader for one curve since `since_sig`.
 /// Returns `(records, newest_sig, truncated)`.
 /// Truncated rounds must not advance quorum.
+///
+/// Paging (AUD-004): every page's fullness is recorded; the read is
+/// "exhausted" only when it terminated on an empty or short page — a
+/// full-page run stopped by the cap means older history exists and the
+/// view is partial, for first reads AND detailed reads alike. A missed
+/// watermark on an exhausted read is still complete (all available
+/// history was read); one on a capped read is partial.
 pub async fn read_curve_swaps(
     rpc: &RpcClient,
     commitment: CommitmentConfig,
     curve: &Pubkey,
     since_sig: Option<&str>,
-    exhaustive: bool,
 ) -> Result<(Vec<SwapRecord>, Option<String>, bool), ClientError> {
     let tx_config = json_tx_config(commitment);
     let mut records = Vec::new();
     let mut newest: Option<String> = None;
     let mut before: Option<Signature> = None;
-    let mut watermark_found = since_sig.is_none();
+    let mut watermark_found = false;
     let mut pages = 0usize;
+    let mut fetch_failed = false;
+    // Fullness flag per READ page (AUD-004): `true` = the page hit the
+    // 25-sig fetch limit. The last flag decides "history exhausted".
+    let mut page_full_flags: Vec<bool> = Vec::new();
 
     for _ in 0..CURVE_SWAP_MAX_PAGES {
         let sigs = rpc
@@ -164,17 +228,17 @@ pub async fn read_curve_swaps(
             )
             .await?;
         if sigs.is_empty() {
+            // History ran out: a terminator page that is by definition
+            // not full, so `history_exhausted` reads true.
+            page_full_flags.push(false);
             break;
         }
         pages += 1;
         let page_full = sigs.len() >= CURVE_SWAP_PAGE_LIMIT;
+        page_full_flags.push(page_full);
 
         // Watermark cutoff first: sigs at/after it never fetch.
-        if since_sig.is_some()
-            && sigs
-                .iter()
-                .any(|s| Some(s.signature.as_str()) == since_sig)
-        {
+        if since_sig.is_some() && sigs.iter().any(|s| Some(s.signature.as_str()) == since_sig) {
             watermark_found = true;
         }
         let end = since_sig
@@ -189,7 +253,7 @@ pub async fn read_curve_swaps(
         // Bounded concurrency: serial page reads stall confirms (75
         // serial fetches blow the 15s screen budget). Jobs are owned
         // up front (Send-safe); order restored by index; 429s degrade
-        // to skips (fail-closed), never errors.
+        // to truncated (fail-closed), never errors.
         use futures_util::stream::{self, StreamExt};
         let jobs: Vec<(usize, Signature, String)> = sigs[..end]
             .iter()
@@ -202,7 +266,7 @@ pub async fn read_curve_swaps(
                 Some((i, signature, status.signature.clone()))
             })
             .collect();
-        let mut fetched: Vec<(usize, Vec<SwapRecord>)> = stream::iter(jobs)
+        let fetched: Vec<(usize, Option<Vec<SwapRecord>>)> = stream::iter(jobs)
             .map(|(i, signature, sig_str)| async move {
                 let records = match tokio::time::timeout(
                     TX_FETCH_TIMEOUT,
@@ -210,17 +274,20 @@ pub async fn read_curve_swaps(
                 )
                 .await
                 {
-                    Ok(Ok(fetched)) => extract_pump_swaps(&fetched, &sig_str),
-                    _ => Vec::new(),
+                    // A transport failure (`None`) can hide any swap —
+                    // including the watched dev sell — so the page fold
+                    // below marks the whole view truncated instead of
+                    // handing quorum a hole.
+                    Ok(Ok(fetched)) => Some(extract_pump_swaps(&fetched, &sig_str)),
+                    _ => None,
                 };
                 (i, records)
             })
             .buffered(CURVE_SWAP_FETCH_FANOUT)
             .collect()
             .await;
-        fetched.sort_by_key(|(i, _)| *i);
-        for (_, recs) in fetched {
-            records.extend(recs);
+        if merge_page_fetches(&mut records, fetched) {
+            fetch_failed = true;
         }
         if watermark_found {
             break;
@@ -236,23 +303,74 @@ pub async fn read_curve_swaps(
         before = Some(cursor);
     }
 
-    let truncated = match (since_sig, exhaustive) {
-        // Watermark missed: partial view.
-        (Some(_), _) => !watermark_found,
-        // Exhaustive read hitting the cap: more history exists.
-        (None, true) => pages >= CURVE_SWAP_MAX_PAGES,
-        // First read is complete by definition.
-        (None, false) => false,
-    };
+    let truncated = curve_truncated(
+        since_sig.is_some(),
+        watermark_found,
+        history_exhausted(&page_full_flags),
+        fetch_failed,
+    );
     if truncated {
         // Callers must not advance quorum on this partial view.
         debug!(
             pages,
             fetched = records.len(),
-            "curve read truncated at page cap; watermark stale"
+            "curve read truncated: history may continue past the page cap"
         );
     }
     Ok((records, newest, truncated))
+}
+
+/// Fold one page of fetched txs into `records` (index order
+/// restored). Returns true when any fetch in the page failed: a
+/// transport failure can hide any swap — including the watched dev
+/// sell — so the caller must treat the whole view as truncated
+/// rather than hand quorum a hole.
+fn merge_page_fetches(
+    records: &mut Vec<SwapRecord>,
+    mut fetched: Vec<(usize, Option<Vec<SwapRecord>>)>,
+) -> bool {
+    fetched.sort_by_key(|(i, _)| *i);
+    let mut failed = false;
+    for (_, recs) in fetched {
+        match recs {
+            Some(recs) => records.extend(recs),
+            None => failed = true,
+        }
+    }
+    failed
+}
+
+/// Truncation rule for a curve read. Pure, pinned by tests: any fetch
+/// failure forces the truncated path (the hole could hide the abort
+/// signal). Exhaustion, not the `exhaustive` read mode, decides
+/// completeness (AUD-004): a full-page run stopped by the cap is a
+/// partial view even on the first (watermark-less) read — never
+/// confirm, never advance quorum on it; a truncated-history read that
+/// ran out of pages-by-history is complete over all available
+/// history, so a missed watermark late in a dead tape does not pin
+/// quorum forever.
+fn curve_truncated(
+    has_since: bool,
+    watermark_found: bool,
+    history_exhausted: bool,
+    fetch_failed: bool,
+) -> bool {
+    if fetch_failed {
+        return true;
+    }
+    if has_since {
+        return !watermark_found && !history_exhausted;
+    }
+    !history_exhausted
+}
+
+/// Pure exhaustion rule over the pages actually read (AUD-004): the
+/// read saw all available history only when its LAST page ran short
+/// (or was empty; an empty flag list has no history at all). `true`
+/// for every page of a full-page run = the read stopped at the cap
+/// with more history below it — partial.
+fn history_exhausted(page_full_flags: &[bool]) -> bool {
+    !page_full_flags.last().copied().unwrap_or(false)
 }
 
 /// Screening deadline. No unbounded hangs.
@@ -394,7 +512,11 @@ pub(crate) fn decode_migration_tx(
         }
         // One shared decode: bs58 first, base64 fallback.
         let raw = decode_ix_data(data_str)?;
-        decoded.push(DecodedIx { program, accounts: resolved, data: raw });
+        decoded.push(DecodedIx {
+            program,
+            accounts: resolved,
+            data: raw,
+        });
         Some(())
     };
     let mut visit = |program_id_index: u8, accounts: &[u8], data_str: &str| {
@@ -404,7 +526,11 @@ pub(crate) fn decode_migration_tx(
     };
     for_each_compiled_ix(raw, &tx_with_meta.meta, &mut visit);
     if skipped > 0 {
-        debug!(skipped, decoded = decoded.len(), "migration tx had undecodable ixs; continuing with partial view");
+        debug!(
+            skipped,
+            decoded = decoded.len(),
+            "migration tx had undecodable ixs; continuing with partial view"
+        );
     }
 
     let logs = match &tx_with_meta.meta {
@@ -476,7 +602,33 @@ impl RpcScreener {
         if let Some(hit) = self.dev_cache.lock().await.get(&dev.to_string(), now_secs) {
             return Ok(hit);
         }
-        let verdict = match with_screen_timeout(screen_developer(
+        self.dev_fetch(dev, now_secs).await
+    }
+
+    /// Dev verdict that bypasses the cache. Confirm-time screening
+    /// must observe fresh history: a new launch by the same dev inside
+    /// the cache TTL must not ride a stale pass (AUD-004). The fresh
+    /// result replenishes the cache so repeat screens within one
+    /// launch still share one read.
+    pub async fn dev_verdict_fresh(
+        &self,
+        dev: &Pubkey,
+        now_secs: u64,
+    ) -> Result<DevVerdict, ScreenError> {
+        let verdict = self.dev_fetch(dev, now_secs).await?;
+        if verdict.pass || verdict.prior_launches > 0 {
+            self.dev_cache
+                .lock()
+                .await
+                .put(dev.to_string(), verdict.clone(), now_secs);
+        }
+        Ok(verdict)
+    }
+
+    /// One walk: query, timeout, decode. Shared by the cached and
+    /// fresh paths so both agree on failure semantics.
+    async fn dev_fetch(&self, dev: &Pubkey, now_secs: u64) -> Result<DevVerdict, ScreenError> {
+        match with_screen_timeout(screen_developer(
             &self.rpc,
             self.commitment,
             dev,
@@ -485,17 +637,13 @@ impl RpcScreener {
         ))
         .await
         {
-            None => return Err(ScreenError::Timeout("dev_verdict")),
-            Some(result) => result?,
-        };
-        // Only full verdicts cache. Early rejects would freeze youth.
-        if verdict.pass || verdict.prior_launches > 0 {
-            self.dev_cache
-                .lock()
-                .await
-                .put(dev.to_string(), verdict.clone(), now_secs);
+            None => Err(ScreenError::Timeout("dev_verdict")),
+            Some(result) => {
+                // Only full verdicts cache (early rejects would freeze
+                // youth); fetch callers decide, this is the raw walk.
+                result.map_err(ScreenError::Rpc)
+            }
         }
-        Ok(verdict)
     }
 
     /// Swaps for a curve since `since_sig`. Truncated rounds hold quorum.
@@ -509,7 +657,6 @@ impl RpcScreener {
             self.commitment,
             curve,
             since_sig,
-            false,
         ))
         .await
         {
@@ -673,7 +820,9 @@ impl RpcScreener {
                                 }
                             }
                             None => {
-                                debug!("raydium migration without resolvable AMM; skipping unproven hit, continuing hunt");
+                                debug!(
+                                    "raydium migration without resolvable AMM; skipping unproven hit, continuing hunt"
+                                );
                                 continue;
                             }
                         };
@@ -714,7 +863,9 @@ impl RpcScreener {
                                 }
                             }
                             None => {
-                                debug!("pumpswap migration without resolvable pool; skipping unproven hit, continuing hunt");
+                                debug!(
+                                    "pumpswap migration without resolvable pool; skipping unproven hit, continuing hunt"
+                                );
                                 continue;
                             }
                         };
@@ -752,7 +903,9 @@ impl RpcScreener {
     ) -> Result<BundleAnalysis, ScreenError> {
         match with_screen_timeout(self.bundle_verdict_tiered(curve, creation_slot)).await {
             None => Err(ScreenError::Timeout("bundle_verdict")),
-            Some(result) => result.map(|(analysis, _)| analysis).map_err(ScreenError::Rpc),
+            Some(result) => result
+                .map(|(analysis, _)| analysis)
+                .map_err(ScreenError::Rpc),
         }
     }
 
@@ -767,7 +920,7 @@ impl RpcScreener {
         creation_slot: u64,
     ) -> Result<(BundleAnalysis, bool), ClientError> {
         let (records, _, truncated) =
-            read_curve_swaps(&self.rpc, self.commitment, curve, None, true).await?;
+            read_curve_swaps(&self.rpc, self.commitment, curve, None).await?;
         if truncated {
             // Partial view: early buys may hide. Fail closed.
             return Ok((
@@ -791,11 +944,7 @@ impl RpcScreener {
         // the window and the monopoly math undercounts (fail-open).
         let mut seen: HashSet<Pubkey> = HashSet::new();
         let mut buyers: Vec<Pubkey> = Vec::new();
-        for record in records
-            .iter()
-            .filter(|r| r.side == SwapSide::Buy)
-            .rev()
-        {
+        for record in records.iter().filter(|r| r.side == SwapSide::Buy).rev() {
             if seen.insert(record.wallet) {
                 buyers.push(record.wallet);
             }
@@ -866,8 +1015,7 @@ impl RpcScreener {
         }
         // Few traces resolved: Safe becomes Suspect.
         if walked && analysis.verdict == BundleVerdict::SafeOrganic {
-            let traced: HashSet<Pubkey> =
-                funding_parents.iter().map(|(b, _)| *b).collect();
+            let traced: HashSet<Pubkey> = funding_parents.iter().map(|(b, _)| *b).collect();
             let resolved = buyers.iter().filter(|b| traced.contains(b)).count();
             // Threshold is below half.
             if !buyers.is_empty() && resolved * 2 < buyers.len() {
@@ -902,23 +1050,20 @@ impl RpcScreener {
         }
         use futures_util::stream::{self, StreamExt};
         // Transport errors never cache. Found and untraceable cache 24h.
-        let fresh: Vec<(Pubkey, Result<Option<String>, ()>)> =
-            stream::iter(missing)
-                .map(|buyer| async move {
-                    let found = match tokio::time::timeout(
-                        FUNDER_TRACE_TIMEOUT,
-                        self.genesis_funder(&buyer),
-                    )
-                    .await
+        let fresh: Vec<(Pubkey, Result<Option<String>, ()>)> = stream::iter(missing)
+            .map(|buyer| async move {
+                let found =
+                    match tokio::time::timeout(FUNDER_TRACE_TIMEOUT, self.genesis_funder(&buyer))
+                        .await
                     {
                         Err(_) | Ok(Err(())) => Err(()),
                         Ok(Ok(found)) => Ok(found.map(|funder| funder.to_string())),
                     };
-                    (buyer, found)
-                })
-                .buffered(FUNDER_TRACE_FANOUT)
-                .collect()
-                .await;
+                (buyer, found)
+            })
+            .buffered(FUNDER_TRACE_FANOUT)
+            .collect()
+            .await;
         {
             let mut cache = self.funder_cache.lock().await;
             for (buyer, found) in &fresh {
@@ -936,17 +1081,17 @@ impl RpcScreener {
 
     /// Total supply from the curve account. Errors propagate.
     async fn curve_total_supply(&self, curve: &Pubkey) -> Result<u64, ClientError> {
-        let account = match tokio::time::timeout(TX_FETCH_TIMEOUT, self.rpc.get_account(curve)).await
-        {
-            Ok(Ok(account)) => account,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(solana_client::client_error::ClientErrorKind::Custom(
-                    "curve_total_supply timed out".to_string(),
-                )
-                .into());
-            }
-        };
+        let account =
+            match tokio::time::timeout(TX_FETCH_TIMEOUT, self.rpc.get_account(curve)).await {
+                Ok(Ok(account)) => account,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(solana_client::client_error::ClientErrorKind::Custom(
+                        "curve_total_supply timed out".to_string(),
+                    )
+                    .into());
+                }
+            };
         let supply = account
             .data
             .get(curve::TOKEN_SUPPLY_OFFSET..curve::TOKEN_SUPPLY_OFFSET + curve::TOKEN_SUPPLY_LEN)
@@ -1163,4 +1308,143 @@ fn scan_ata_funding(
     let payer = keys.get(usize::from(accounts[0])).copied()?;
     let owner = keys.get(usize::from(accounts[2])).copied()?;
     (owner == *beneficiary).then_some(payer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::swaps::SwapSide;
+    use super::*;
+
+    fn rec(sig: &str) -> Vec<SwapRecord> {
+        vec![
+            SwapRecord::new(
+                sig,
+                "11111111111111111111111111111111",
+                SwapSide::Buy,
+                1,
+                100,
+            )
+            .expect("fixture wallet parses"),
+        ]
+    }
+
+    #[test]
+    fn page_fold_keeps_order_and_reports_clean() {
+        let mut records = Vec::new();
+        let failed =
+            merge_page_fetches(&mut records, vec![(1, Some(rec("b"))), (0, Some(rec("a")))]);
+        assert!(!failed);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.signature.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "index order restored so quorum sees swaps in page order"
+        );
+    }
+
+    #[test]
+    fn one_failed_fetch_truncates_the_whole_view() {
+        // A single transport failure can hide the watched dev sell:
+        // the fold must flag the page even when siblings decoded.
+        let mut records = Vec::new();
+        let failed = merge_page_fetches(&mut records, vec![(0, Some(rec("a"))), (1, None)]);
+        assert!(failed, "any fetch failure forces the truncated path");
+        assert_eq!(records.len(), 1, "decoded siblings are kept, not dropped");
+    }
+
+    #[test]
+    fn truncation_rule_pins_fetch_failure_overrides() {
+        // Fetch failure forces truncated in every paging shape.
+        for (has_since, found, exhausted) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (true, false, false),
+            (false, true, true),
+            (false, true, false),
+        ] {
+            assert!(
+                curve_truncated(has_since, found, exhausted, true),
+                "fetch failure must truncate (shape {has_since}/{found}/{exhausted})"
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustion_rule_is_decided_by_the_last_page() {
+        // AUD-004: fullness flags decide "all available history read".
+        assert!(history_exhausted(&[]), "no pages at all: nothing to miss");
+        assert!(
+            !history_exhausted(&[true, true, true]),
+            "a cap-stopped run of full pages has more history below it"
+        );
+        assert!(
+            history_exhausted(&[true, true, false]),
+            "a short final page ends the history"
+        );
+        assert!(
+            history_exhausted(&[true, false]),
+            "an empty page after a full one also ends the history"
+        );
+        assert!(history_exhausted(&[false]), "single short page: complete");
+    }
+
+    #[test]
+    fn truncation_rule_pins_watermark_and_cap_shapes() {
+        // First read (no watermark) that stops at the cap with full
+        // pages: PARTIAL. Older pages may hide the dev sell — never
+        // confirm on it (AUD-004 core).
+        assert!(curve_truncated(false, false, false, false));
+        // First read where history ran out: complete.
+        assert!(!curve_truncated(false, false, true, false));
+        // Watermark read: found → complete...
+        assert!(!curve_truncated(true, true, false, false));
+        // ...missed with history remaining → partial...
+        assert!(curve_truncated(true, false, false, false));
+        // ...and missed only because history ran out: complete over
+        // all available history (do not hold quorum forever).
+        assert!(!curve_truncated(true, false, true, false));
+    }
+
+    fn dev_cfg() -> DevScreenConfig {
+        DevScreenConfig {
+            min_age_secs: 3_600,
+            max_prior_launches: 1,
+            sample_txs: 20,
+            sig_limit: 100,
+        }
+    }
+
+    #[test]
+    fn walk_verdict_never_passes_a_truncated_history() {
+        // AUD-010: a full newest window with a hidden create beyond
+        // the walk budget is a lower-bound count — reject even when
+        // the visible count is zero or exactly at the max.
+        let cfg = dev_cfg();
+        for priors in [0usize, 1, 3] {
+            let verdict = walk_verdict(Some(7_200), priors, true, &cfg);
+            assert!(!verdict.pass, "truncated history must reject ({priors})");
+            assert!(verdict.history_truncated, "truncation is operator evidence");
+            assert!(verdict.reason.contains("lower bound"), "{}", verdict.reason);
+        }
+        // An aged-out or fresh wallet rejects regardless (age rule
+        // dominates; the truncation evidence carries anyway).
+        assert!(!walk_verdict(Some(10), 0, true, &cfg).pass);
+        assert!(!walk_verdict(None, 0, true, &cfg).pass);
+    }
+
+    #[test]
+    fn walk_verdict_passes_only_a_proven_history() {
+        let cfg = dev_cfg();
+        // History exhausted (walk complete), one create, max 1 → pass.
+        let pass = walk_verdict(Some(7_200), 1, false, &cfg);
+        assert!(pass.pass, "{}", pass.reason);
+        assert!(!pass.history_truncated);
+        // Complete history but serial → reject via the serial rule.
+        let serial = walk_verdict(Some(7_200), 2, false, &cfg);
+        assert!(!serial.pass);
+        assert!(serial.reason.contains("serial launcher"));
+    }
 }

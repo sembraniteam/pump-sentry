@@ -6,10 +6,10 @@ use crate::parser::{
 };
 pub use ids::{
     ASSOCIATED_TOKEN_PROGRAM_ID, MIGRATE_POOL_ACCOUNT_INDEX, MIGRATE_V2_POOL_ACCOUNT_INDEX,
-    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR,
-    PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR,
-    PUMP_MIGRATE_V2_DISCRIMINATOR, PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR,
-    PUMP_SELL_V3_DISCRIMINATOR, SYSTEM_PROGRAM_ID,
+    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_EXACT_QUOTE_IN_V3_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR,
+    PUMP_BUY_V3_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR, PUMP_MIGRATE_V2_DISCRIMINATOR,
+    PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR, PUMP_SELL_V3_DISCRIMINATOR,
+    SYSTEM_PROGRAM_ID,
 };
 use migration::{
     MigratedPool, MigrationDestination, MigrationMonitor, PumpSwapPool, RAYDIUM_V4_PROGRAM_ID,
@@ -52,13 +52,13 @@ pub use entry::{
 };
 pub use micro::{MicroSignals, TapePoint, micro_signals};
 pub use rpc::{
-    DecodedIx, DetectedMigration, MigrationReport, RpcScreener, INITIALIZE2_AMM_INDEX,
-    MAX_TRACED_BUYERS, find_funding_source, initialize2_amm_id, migrate_pool_id, read_curve_swaps,
+    DecodedIx, DetectedMigration, INITIALIZE2_AMM_INDEX, MAX_TRACED_BUYERS, MigrationReport,
+    RpcScreener, find_funding_source, initialize2_amm_id, migrate_pool_id, read_curve_swaps,
     screen_developer,
 };
 pub use swaps::{
-    IDX_CREATE_USER, IDX_SWAP_USER, IDX_SWAP_V2_USER, IDX_SWAP_V3_USER, SwapRecord,
-    SwapSide, count_dev_creates, extract_pump_swaps, fixture_wallet, json_tx_config, parse_address,
+    IDX_CREATE_USER, IDX_SWAP_USER, IDX_SWAP_V2_USER, IDX_SWAP_V3_USER, SwapRecord, SwapSide,
+    count_dev_creates, extract_pump_swaps, fixture_wallet, json_tx_config, parse_address,
     tape_volume_base_units,
 };
 /// Screening failures: config, keys, transport.
@@ -80,8 +80,8 @@ pub enum ScreenError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::rpc::{decode_migration_tx, sample_trustworthy};
+    use super::*;
     use solana_transaction_status::{
         EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiInnerInstructions, UiRawMessage,
         UiTransaction, UiTransactionTokenBalance,
@@ -184,7 +184,11 @@ mod tests {
         // attributes `min_tokens_out` (second u64, conservative bound).
         let cases = [
             (PUMP_BUY_V3_DISCRIMINATOR.to_vec(), [7u8; 16], SwapSide::Buy),
-            (PUMP_SELL_V3_DISCRIMINATOR.to_vec(), [7u8; 16], SwapSide::Sell),
+            (
+                PUMP_SELL_V3_DISCRIMINATOR.to_vec(),
+                [7u8; 16],
+                SwapSide::Sell,
+            ),
         ];
         for (disc, payload, want_side) in cases {
             let mut data = disc;
@@ -520,7 +524,8 @@ mod tests {
     }
 
     #[test]
-    fn gate_confirms_on_quorum() {        let mut gate = EntryGate::new(60, 3);
+    fn gate_confirms_on_quorum() {
+        let mut gate = EntryGate::new(60, 3);
         let dev = Pubkey::new_from_array([7; 32]);
         assert!(gate.submit("MINT", &dev.to_string(), 1000));
         let buyers = [11u8, 12, 13].map(|b| SwapRecord {
@@ -1008,7 +1013,8 @@ mod tests {
     }
 
     #[test]
-    fn gate_relaunch_refresh_is_capped() {        // Regression: spammed relaunches must not extend the window forever.
+    fn gate_relaunch_refresh_is_capped() {
+        // Regression: spammed relaunches must not extend the window forever.
         let mut gate = EntryGate::new(60, 3);
         let dev = Pubkey::new_from_array([7; 32]);
         assert!(gate.submit("MINT", &dev.to_string(), 1000));
@@ -1260,8 +1266,11 @@ mod tests {
         // Exactly one real swap; the rest are non-swap pump ixs.
         let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
         assert_eq!(buys.len(), 1, "exactly one v3 buy");
-        assert!(records.iter().all(|r| r.side == SwapSide::Buy
-            || r.side == SwapSide::Unknown));
+        assert!(
+            records
+                .iter()
+                .all(|r| r.side == SwapSide::Buy || r.side == SwapSide::Unknown)
+        );
         let r = buys[0];
         assert_eq!(
             r.wallet,
@@ -1273,10 +1282,16 @@ mod tests {
     #[test]
     fn replay_sell_v3_mainnet() {
         let records = v3_records(include_str!("../../tests/fixtures/sell_v3_mainnet.json"));
-        let sells: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Sell).collect();
+        let sells: Vec<_> = records
+            .iter()
+            .filter(|r| r.side == SwapSide::Sell)
+            .collect();
         assert_eq!(sells.len(), 1, "exactly one v3 sell");
-        assert!(records.iter().all(|r| r.side == SwapSide::Sell
-            || r.side == SwapSide::Unknown));
+        assert!(
+            records
+                .iter()
+                .all(|r| r.side == SwapSide::Sell || r.side == SwapSide::Unknown)
+        );
         let r = sells[0];
         assert_eq!(
             r.wallet,
@@ -1313,7 +1328,7 @@ mod tests {
         // Independent proof: the buyer token-balance delta equals the
         // classified amount to the unit (same bar as the v2 pin).
         let raw = include_str!("../../tests/fixtures/legacy_buy_18_mainnet.json");
-        let fetched: solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta =
+        let fetched: EncodedConfirmedTransactionWithStatusMeta =
             serde_json::from_str(raw).expect("fixture");
         let records = extract_pump_swaps(&fetched, "frozen-18");
         let buy = records
@@ -1339,12 +1354,16 @@ mod tests {
 
     #[test]
     fn replay_buy_exact_quote_in_v3_mainnet() {
-        let records =
-            v3_records(include_str!("../../tests/fixtures/buy_exact_quote_in_v3_mainnet.json"));
+        let records = v3_records(include_str!(
+            "../../tests/fixtures/buy_exact_quote_in_v3_mainnet.json"
+        ));
         let buys: Vec<_> = records.iter().filter(|r| r.side == SwapSide::Buy).collect();
         assert_eq!(buys.len(), 1, "exactly one exact-quote v3 buy");
-        assert!(records.iter().all(|r| r.side == SwapSide::Buy
-            || r.side == SwapSide::Unknown));
+        assert!(
+            records
+                .iter()
+                .all(|r| r.side == SwapSide::Buy || r.side == SwapSide::Unknown)
+        );
         let r = buys[0];
         assert_eq!(
             r.wallet,

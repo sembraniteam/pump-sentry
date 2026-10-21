@@ -93,16 +93,14 @@ pub fn micro_signals(
                 buys = buys.saturating_add(1);
                 buy_volume = buy_volume.saturating_add(s.amount_base_units);
                 if is_insider(&s.wallet) {
-                    creator_net =
-                        creator_net.saturating_add(s.amount_base_units as i128);
+                    creator_net = creator_net.saturating_add(s.amount_base_units as i128);
                 }
             }
             SwapSide::Sell => {
                 sells = sells.saturating_add(1);
                 sell_volume = sell_volume.saturating_add(s.amount_base_units);
                 if is_insider(&s.wallet) {
-                    creator_net =
-                        creator_net.saturating_sub(s.amount_base_units as i128);
+                    creator_net = creator_net.saturating_sub(s.amount_base_units as i128);
                 }
             }
             SwapSide::Unknown => {}

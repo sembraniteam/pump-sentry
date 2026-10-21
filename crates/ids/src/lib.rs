@@ -1,6 +1,5 @@
 //! On-chain addresses and discriminators. Edit once here.
 
-
 pub mod pump;
 pub mod pumpswap;
 pub mod raydium;
@@ -107,10 +106,7 @@ pub fn redact_urls_in_text(msg: &str) -> String {
         out.push_str(&rest[..i + scheme.len()]);
         let after = &rest[i + scheme.len()..];
         // Host ends at path/query/fragment; userinfo (if any) is dropped.
-        let host_part = after
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("");
+        let host_part = after.split(['/', '?', '#']).next().unwrap_or("");
         let host = host_part.rsplit('@').next().unwrap_or("");
         if host.is_empty() {
             // Not really a URL (e.g. sentence ending in "https://"):
@@ -169,6 +165,12 @@ mod test {
             strip_error_url(msg),
             "HTTP status client error (400 Bad Request) for url (<redacted>) extra"
         );
+        // The plan's leak class: a query-string API key inside a
+        // reqwest error span.
+        assert_eq!(
+            strip_error_url("error sending request for url (https://host/?api-key=SECRET)"),
+            "error sending request for url (<redacted>)"
+        );
     }
 
     #[test]
@@ -204,7 +206,12 @@ mod test {
             "auth https://host.example gone"
         );
         // Non-URLs and secret-free text pass through identical.
-        for msg in ["timeout", "", "rpc error: connection closed", "see https:// please"] {
+        for msg in [
+            "timeout",
+            "",
+            "rpc error: connection closed",
+            "see https:// please",
+        ] {
             assert_eq!(redact_urls_in_text(msg), msg, "{msg}");
         }
     }

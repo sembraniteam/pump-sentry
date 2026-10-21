@@ -164,9 +164,18 @@ mod tests {
     fn prompt_bands_match_heuristic_constants() {
         // SYSTEM_PROMPT duplicates the bands; constants and prompt move together.
         let prompt = crate::schema::SYSTEM_PROMPT;
-        assert!(prompt.contains(&DEV_REPUTATION_FLOOR.to_string()), "dev floor");
-        assert!(prompt.contains(&RUGCHECK_SCORE_CAP.to_string()), "score cap");
-        assert!(prompt.contains(&HIGH_MOMENTUM_VELOCITY.to_string()), "high velocity");
+        assert!(
+            prompt.contains(&DEV_REPUTATION_FLOOR.to_string()),
+            "dev floor"
+        );
+        assert!(
+            prompt.contains(&RUGCHECK_SCORE_CAP.to_string()),
+            "score cap"
+        );
+        assert!(
+            prompt.contains(&HIGH_MOMENTUM_VELOCITY.to_string()),
+            "high velocity"
+        );
         assert!(
             prompt.contains(&HIGH_MOMENTUM_LIQUIDITY_USD.to_string()),
             "high liquidity"

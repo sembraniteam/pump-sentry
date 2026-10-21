@@ -17,10 +17,7 @@ pub enum PortfolioError {
     #[error("invalid notional: {0}")]
     InvalidNotional(f64),
     #[error("insufficient funds: need {need:.2}, have {have:.2}")]
-    InsufficientFunds {
-        need: f64,
-        have: f64,
-    },
+    InsufficientFunds { need: f64, have: f64 },
     #[error("position not found: {0}")]
     PositionNotFound(PositionId),
     #[error("invalid take-profit: {0}")]
@@ -143,6 +140,10 @@ pub struct PortfolioSnapshot {
     pub mark_value: f64,
     /// Signed exit value of open positions (size impact + venue fee).
     pub realizable_value: f64,
+    /// Dispatch costs debited past available cash (AUD-010): zero when
+    /// the book is solvent; positive means cash over its means and
+    /// `equity` carries the shortfall (`cash` itself reads negative).
+    pub overdraft_usd: f64,
     pub open_count: usize,
     pub closed_count: usize,
 }
@@ -214,7 +215,11 @@ impl PaperPortfolio {
     /// Set venue fee for one mint.
     pub fn set_venue_fee_for_mint(&mut self, mint: &str, fee_bps_per_side: f64) {
         if mint.is_empty() || !fee_bps_per_side.is_finite() || fee_bps_per_side < 0.0 {
-            warn!(mint, fee = fee_bps_per_side, "ignoring invalid venue fee tier");
+            warn!(
+                mint,
+                fee = fee_bps_per_side,
+                "ignoring invalid venue fee tier"
+            );
             return;
         }
         self.venue_fees.insert(mint.to_string(), fee_bps_per_side);
@@ -247,13 +252,18 @@ impl PaperPortfolio {
         self.cash
     }
 
-    /// Debit dispatch cost. Bleeds `cash` (floored at zero) and records
-    /// the cumulative bleed so headline PnL can net it (see
-    /// [`Self::realized_net_pnl`]). Non-finite/non-positive costs ignored.
+    /// Debit dispatch cost. Bleeds `cash`, allowed to go negative
+    /// (AUD-010): a cost past available cash writes a visible
+    /// overdraft (`PortfolioSnapshot.overdraft_usd > 0`) instead of
+    /// being silently absorbed by a zero floor — equity then reflects
+    /// the shortfall, and a negative cash fails any new Long open
+    /// (fail-closed). Records the cumulative bleed so headline PnL can
+    /// net it (see [`Self::realized_net_pnl`]).
+    /// Non-finite/non-positive costs ignored.
     pub fn debit_dispatch_cost(&mut self, cost_usd: f64) {
         if cost_usd.is_finite() && cost_usd > 0.0 {
             self.total_dispatch_usd += cost_usd;
-            self.cash = (self.cash - cost_usd).max(0.0);
+            self.cash -= cost_usd;
         }
     }
 
@@ -480,12 +490,7 @@ impl PaperPortfolio {
                 .positions
                 .remove(&id)
                 .ok_or(PortfolioError::PositionNotFound(id))?;
-            let trade = self.book(
-                &CloseSlice::whole(&position),
-                mark,
-                reason,
-                now_secs,
-            )?;
+            let trade = self.book(&CloseSlice::whole(&position), mark, reason, now_secs)?;
             self.record(trade.clone());
             return Ok(trade);
         }
@@ -568,8 +573,7 @@ impl PaperPortfolio {
             0.0
         };
         // Paper-only bleed, pro-rata (live debits actuals instead).
-        let dispatch =
-            finite_or_zero(self.paper_dispatch_legs.1 * slice.fraction).max(0.0);
+        let dispatch = finite_or_zero(self.paper_dispatch_legs.1 * slice.fraction).max(0.0);
         self.debit_dispatch_cost(dispatch);
 
         match slice.side {
@@ -671,6 +675,7 @@ impl PaperPortfolio {
             cash: self.cash,
             locked,
             equity: self.cash + locked + unrealized,
+            overdraft_usd: (-self.cash).max(0.0),
             realized_pnl: self.realized_pnl(),
             unrealized_pnl: unrealized,
             mark_value,
@@ -747,8 +752,13 @@ mod tests {
                 now_secs: 1001,
             })
             .expect("open2");
-        pf.close_position(id2, &Mark::new(2.0, 1_000_000.0), ExitReason::TakeProfit, 1002)
-            .expect("full close");
+        pf.close_position(
+            id2,
+            &Mark::new(2.0, 1_000_000.0),
+            ExitReason::TakeProfit,
+            1002,
+        )
+        .expect("full close");
         assert!(pf.position(id2).is_none());
     }
 
@@ -833,7 +843,7 @@ mod tests {
         let trade = pf
             .close_position(id, &Mark::new(1.0, 1e9), ExitReason::Manual, 1)
             .expect("close");
-        assert!((trade.gross_pnl).abs() < 1e-9, "gross={}", trade.gross_pnl);
+        assert!(trade.gross_pnl.abs() < 1e-9, "gross={}", trade.gross_pnl);
         assert!((trade.fees - 1.0).abs() < 1e-9, "fees={}", trade.fees);
         assert!((trade.net_pnl + 1.0).abs() < 1e-9, "net={}", trade.net_pnl);
         assert!((pf.cash() - 99.0).abs() < 1e-9, "cash={}", pf.cash());
@@ -1012,8 +1022,7 @@ mod tests {
         // `entry_notional`, the size this portfolio was built with), not
         // the nominal ticket: integer sizing leaves up to one token unspent.
         // Read before the close removes the position.
-        let entry_fee =
-            pf.position(id).expect("p").entry_notional * 100.0 / 10_000.0;
+        let entry_fee = pf.position(id).expect("p").entry_notional * 100.0 / 10_000.0;
         let trade = pf
             .close_position(id, &Mark::new(1.5, 5_000.0), ExitReason::Manual, 1)
             .expect("close");
@@ -1329,7 +1338,10 @@ mod tests {
         let std_px = pf.position(std_id).expect("std").entry_price;
         let cus_px = pf.position(cus_id).expect("cus").entry_price;
         assert!(cus_px > std_px, "custom {cus_px} vs std {std_px}");
-        assert!((cus_px - std_px - 0.022).abs() < 1e-9, "cus={cus_px} std={std_px}");
+        assert!(
+            (cus_px - std_px - 0.022).abs() < 1e-9,
+            "cus={cus_px} std={std_px}"
+        );
         pf.clear_venue_fee_for_mint("CUSTOM");
         assert!((pf.venue_fee_for("CUSTOM") - 125.0).abs() < 1e-9);
         pf.set_venue_fee_for_mint("", 999.0);
@@ -1494,14 +1506,22 @@ mod tests {
         pf.set_paper_dispatch_legs(0.30, 0.05);
         let id = open_40_at_1(&mut pf);
         // Open leg bled from cash.
-        assert!((pf.cash() - (60.0 - 0.30)).abs() < 1e-9, "cash={}", pf.cash());
+        assert!(
+            (pf.cash() - (60.0 - 0.30)).abs() < 1e-9,
+            "cash={}",
+            pf.cash()
+        );
         let trade = pf
             .close_position(id, &Mark::new(2.0, 1e9), ExitReason::Manual, 1100)
             .expect("close");
         // Close leg pro-rata on the trade; edge untouched.
         assert!((trade.dispatch_usd - 0.05).abs() < 1e-9);
         assert_eq!(trade.net_pnl, 40.0);
-        assert!((pf.cash() - (140.0 - 0.35)).abs() < 1e-9, "cash={}", pf.cash());
+        assert!(
+            (pf.cash() - (140.0 - 0.35)).abs() < 1e-9,
+            "cash={}",
+            pf.cash()
+        );
         assert!((pf.total_dispatch_usd() - 0.35).abs() < 1e-9);
         assert!((pf.realized_net_pnl() - (40.0 - 0.35)).abs() < 1e-9);
     }
@@ -1531,21 +1551,35 @@ mod tests {
     }
 
     #[test]
-    fn debit_dispatch_cost_bleeds_cash_and_floors_at_zero() {
+    fn debit_dispatch_cost_bleeds_cash_to_a_visible_overdraft() {
+        // AUD-010: an overspend is never absorbed at a zero floor —
+        // cash goes negative, the snapshot surfaces the overdraft, and
+        // equity carries the shortfall.
         let mut pf = PaperPortfolio::new(10.0, 0.0);
         pf.debit_dispatch_cost(2.5);
         assert!((pf.cash() - 7.5).abs() < 1e-9);
         assert!((pf.total_dispatch_usd() - 2.5).abs() < 1e-9);
         assert!((pf.realized_net_pnl() + 2.5).abs() < 1e-9);
         pf.debit_dispatch_cost(100.0);
-        assert_eq!(pf.cash(), 0.0);
+        assert!((pf.cash() + 92.5).abs() < 1e-9, "cash={}", pf.cash());
         assert!((pf.total_dispatch_usd() - 102.5).abs() < 1e-9);
+        // Bad values are still ignored entirely.
         let mut pf2 = PaperPortfolio::new(10.0, 0.0);
         for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
             pf2.debit_dispatch_cost(bad);
             assert_eq!(pf2.cash(), 10.0, "bad={bad}");
         }
         assert_eq!(pf2.total_dispatch_usd(), 0.0);
+        // No positions: equity == cash == -92.5 — the shortfall rides
+        // the equity and the snapshot names the overdraft.
+        let snap = pf.snapshot(&HashMap::new());
+        assert!((snap.overdraft_usd - 92.5).abs() < 1e-9);
+        assert!(snap.cash < 0.0);
+        assert!((snap.equity + 92.5).abs() < 1e-9);
+        // A solvent book reports none.
+        let snap2 = pf2.snapshot(&HashMap::new());
+        assert_eq!(snap2.overdraft_usd, 0.0);
+        assert_eq!(snap2.equity, 10.0);
     }
 
     #[test]

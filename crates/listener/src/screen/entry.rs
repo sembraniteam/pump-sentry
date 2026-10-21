@@ -80,7 +80,9 @@ impl EntryGate {
                     entry.devs.insert(0, dev);
                     entry.devs.truncate(MAX_COHORT_WALLETS);
                 }
-                let cap = entry.created_secs.saturating_add(self.window_secs.saturating_mul(3));
+                let cap = entry
+                    .created_secs
+                    .saturating_add(self.window_secs.saturating_mul(3));
                 entry.deadline_secs = deadline_secs.min(cap);
             }
             None => {
@@ -208,7 +210,9 @@ impl EntryGate {
 }
 
 /// Dev history policy.
-/// Age covers the full window. Launches sample the newest `sample_txs`.
+/// Age covers the walk. Launches count across the whole walked
+/// history (AUD-010); `sample_txs` no longer truncates the count.
+/// `sig_limit` sizes one signature page of the backward walk.
 #[derive(Debug, Clone)]
 pub struct DevScreenConfig {
     /// Min wallet age in seconds.
@@ -216,6 +220,11 @@ pub struct DevScreenConfig {
     /// Max past launches allowed.
     pub max_prior_launches: usize,
     /// Txs sampled for the launch count.
+    ///
+    /// Obsolete for the count (AUD-010 removed the slice: a truncated
+    /// history fails closed, so the count walks the whole history);
+    /// kept parsed for config compatibility. `sig_limit` now bounds
+    /// one page of the walk and is kept at or above this value.
     pub sample_txs: usize,
     /// Signature window fetched per wallet.
     pub sig_limit: usize,
@@ -241,6 +250,10 @@ pub struct DevVerdict {
     pub age_secs: Option<u64>,
     /// Launches seen in the sampled window.
     pub prior_launches: usize,
+    /// The launch count is a LOWER BOUND: the walk stopped at the
+    /// page budget with older history unread (AUD-010). Truncated
+    /// verdicts never pass — this is evidence for the operator log.
+    pub history_truncated: bool,
     /// Human-readable cause for logs.
     pub reason: String,
 }
@@ -256,6 +269,7 @@ pub fn judge_developer(
             pass: false,
             age_secs: None,
             prior_launches,
+            history_truncated: false,
             reason: "no on-chain history (fresh wallet)".to_string(),
         };
     };
@@ -264,6 +278,7 @@ pub fn judge_developer(
             pass: false,
             age_secs: Some(age),
             prior_launches,
+            history_truncated: false,
             reason: format!("wallet age {age}s below minimum {}", cfg.min_age_secs),
         };
     }
@@ -272,6 +287,7 @@ pub fn judge_developer(
             pass: false,
             age_secs: Some(age),
             prior_launches,
+            history_truncated: false,
             reason: format!(
                 "serial launcher: {prior_launches} prior launches (max {})",
                 cfg.max_prior_launches
@@ -282,6 +298,7 @@ pub fn judge_developer(
         pass: true,
         age_secs: Some(age),
         prior_launches,
+        history_truncated: false,
         reason: "history acceptable".to_string(),
     }
 }

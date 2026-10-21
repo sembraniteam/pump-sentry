@@ -22,11 +22,7 @@ use crate::pipeline::{AlertSink, Auditor, CurveRead, LiveSink, Pipeline, Reserve
 use crate::settings::now_secs;
 
 /// One curve read: `(mint, signal, full-or-truncated swaps or error)`.
-type Observation = (
-    String,
-    PendingSignal,
-    Result<CurveRead, ScreenError>,
-);
+type Observation = (String, PendingSignal, Result<CurveRead, ScreenError>);
 
 /// Max concurrent RPC per gate phase (slow rounds halve it).
 const GATE_FANOUT: usize = 16;
@@ -34,7 +30,6 @@ const GATE_FANOUT: usize = 16;
 const GATE_FANOUT_MIN: usize = 1;
 /// Slow round in secs halves fanout.
 const SLOW_GATE_ROUND_SECS: u64 = 10;
-
 
 /// Dev history to 0.0–1.0 trust. Scores below the 0.40 fallback
 /// cutoff PASS there: the floor must not mask the prior-launch
@@ -104,16 +99,26 @@ pub fn resolve_entry_with_flag(
 /// already-doubled round-trip figure.
 pub(crate) fn fee_aware_sl_floor(sl_percent: f64, per_side_total_bps: f64) -> f64 {
     debug_assert!(sl_percent.is_finite(), "sl_percent must be finite");
-    debug_assert!(per_side_total_bps.is_finite(), "per-side bps must be finite");
+    debug_assert!(
+        per_side_total_bps.is_finite(),
+        "per-side bps must be finite"
+    );
     if !per_side_total_bps.is_finite() {
-        warn!(sl = sl_percent, bps = per_side_total_bps,
-            "non-finite fee tier; holding the requested stop");
+        warn!(
+            sl = sl_percent,
+            bps = per_side_total_bps,
+            "non-finite fee tier; holding the requested stop"
+        );
         return sl_percent;
     }
     let floored = sl_percent.min(-(2.0 * per_side_total_bps / 100.0 + 4.0));
     let clamped = floored.clamp(-100.0, 0.0);
     if clamped != floored {
-        warn!(sl = sl_percent, bps = per_side_total_bps, "absurd fee tier clamped the stop; check the schedule");
+        warn!(
+            sl = sl_percent,
+            bps = per_side_total_bps,
+            "absurd fee tier clamped the stop; check the schedule"
+        );
     }
     clamped
 }
@@ -186,7 +191,8 @@ struct TrackedOpen<'a> {
     /// Venue tier with the tick. `None` is standard; synthetic forces `None`.
     venue_fee_bps: Option<f64>,
     /// SOL/USD stamped at confirm. Rechecked at use; stale fails closed.
-    sol: Option<(f64, u64)>,    trail_percent: f64,
+    sol: Option<(f64, u64)>,
+    trail_percent: f64,
     /// Exact curve reserves off the confirm tick: the paper fill and the
     /// live sizing quote the chain's own math. `None` on synthetic
     /// (override-priced) opens and mocks.
@@ -272,7 +278,11 @@ pub struct DailyBreaker {
 impl DailyBreaker {
     /// Fresh breaker (today, flat).
     pub fn new(now_secs: u64) -> Self {
-        Self { day: now_secs / 86_400, day_net: 0.0, halt_alerted_day: 0 }
+        Self {
+            day: now_secs / 86_400,
+            day_net: 0.0,
+            halt_alerted_day: 0,
+        }
     }
 
     /// Fold one closed trade in (rolls the day first).
@@ -367,7 +377,6 @@ fn confirm_metrics(
 }
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
-
     /// Watchlisted mint count.
     pub async fn pending_count(&self) -> usize {
         self.gate_state.lock().await.gate.pending_count()
@@ -411,11 +420,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 return;
             }
             Err(e) if e.is_retryable() => {
-                warn!(%mint, error = %e, "audit unresolved (indexing/transport); watchlisting for retry within gate window");
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "audit unresolved (indexing/transport); watchlisting for retry within gate window");
                 (None, now)
             }
             Err(e) => {
-                warn!(%mint, error = %e, "audit error; skipping (fail-closed)");
+                warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "audit error; skipping (fail-closed)");
                 return;
             }
         };
@@ -423,14 +432,17 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // 2. Dev history, fail closed. Admission only: the score is
         // NOT stored — confirm re-screens both wallets fresh (worst
         // wins there), so nothing here can go stale across the wait.
-        if self.screen_wallet(mint, dev, "dev").await.is_none() {
+        if self.screen_wallet(mint, dev, "dev", false).await.is_none() {
             return;
         }
 
         // 2b. v2 creator: screened too, worst wins at confirm.
         let distinct_creator = req.creator.filter(|c| *c != dev);
         if let Some(creator) = distinct_creator
-            && self.screen_wallet(mint, creator, "creator").await.is_none()
+            && self
+                .screen_wallet(mint, creator, "creator", false)
+                .await
+                .is_none()
         {
             return;
         }
@@ -477,13 +489,27 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         );
         match audit_score {
             Some(score) => info!(%mint, score, "watchlisted; awaiting buyer quorum"),
-            None => info!(%mint, "watchlisted without audit score; awaiting buyer quorum + audit retry"),
+            None => {
+                info!(%mint, "watchlisted without audit score; awaiting buyer quorum + audit retry")
+            }
         }
     }
 
     /// Screen one insider to a trust score. `None` skips (fail-closed).
-    async fn screen_wallet(&self, mint: &str, wallet: &str, role: &str) -> Option<f64> {
-        match self.screener.screen_dev(wallet).await {
+    /// `fresh` bypasses any dev-verdict cache (confirm-time re-screen).
+    async fn screen_wallet(
+        &self,
+        mint: &str,
+        wallet: &str,
+        role: &str,
+        fresh: bool,
+    ) -> Option<f64> {
+        let verdict = if fresh {
+            self.screener.screen_dev_fresh(wallet).await
+        } else {
+            self.screener.screen_dev(wallet).await
+        };
+        match verdict {
             Ok(verdict) if verdict.pass => {
                 info!(%mint, %role, age = ?verdict.age_secs, priors = verdict.prior_launches, "insider screen pass");
                 Some(dev_reputation_score(
@@ -519,7 +545,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // intake (`WATCHLIST_HARD_CAP`); entries otherwise die by
         // deadline. Ops tunes RPC headroom here; fanout stays capped.
         if mints.len() > WATCHLIST_WARN_SIZE {
-            warn!(watchlist = mints.len(), "watchlist above watermark; RPC burn follows launch rate");
+            warn!(
+                watchlist = mints.len(),
+                "watchlist above watermark; RPC burn follows launch rate"
+            );
         }
         // Phase 1: concurrent reads.
         use futures_util::stream::{self, StreamExt};
@@ -576,12 +605,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             audit_changed = true;
                         }
                         Err(e) if e.is_retryable() => {
-                            debug!(%mint, error = %e, "audit still unresolved; keeping watch");
+                            debug!(%mint, error = %ids::strip_error_url(&e.to_string()), "audit still unresolved; keeping watch");
                             signal.last_audit_secs = now;
                             audit_changed = true;
                         }
                         Err(e) => {
-                            warn!(%mint, error = %e, "audit resolved non-retryable; dropping watch");
+                            warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "audit resolved non-retryable; dropping watch");
                             let mut state = self.gate_state.lock().await;
                             state.gate.remove(&mint);
                             state.meta.remove(&mint);
@@ -658,7 +687,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                                     tape,
                                     signal: Box::new(signal.clone()),
                                     micro,
-                                }                            }
+                                }
+                            }
                             GateOutcome::Abort { reason } => {
                                 state.meta.remove(&mint);
                                 GateStep::Aborted(reason)
@@ -718,7 +748,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             if round_start.elapsed().as_secs() >= SLOW_GATE_ROUND_SECS {
                 let cut = (state.fanout / 2).max(GATE_FANOUT_MIN);
                 if cut != state.fanout {
-                    warn!(from = state.fanout, to = cut, "slow gate round; halving fanout");
+                    warn!(
+                        from = state.fanout,
+                        to = cut,
+                        "slow gate round; halving fanout"
+                    );
                     state.fanout = cut;
                 }
             } else if state.fanout < GATE_FANOUT {
@@ -753,14 +787,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let signal = req.signal;
         let buyers = req.buyers;
         // Price and tier from one chain state.
-        let (tick_result, venue_fee) = match self
-            .reserves
-            .fetch_tick_with_fee(mint, &signal.curve)
-            .await
-        {
-            Ok((tick, fee)) => (Ok(tick), fee),
-            Err(e) => (Err(e), None),
-        };
+        let (tick_result, venue_fee) =
+            match self.reserves.fetch_tick_with_fee(mint, &signal.curve).await {
+                Ok((tick, fee)) => (Ok(tick), fee),
+                Err(e) => (Err(e), None),
+            };
         // Exact reserves off the same read (copied out before the tick
         // is consumed): paper fills and live sizing both quote them.
         // The complete flag rides along separately: the choke refuses
@@ -779,9 +810,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
         // Live ticks must carry positive liquidity: zero liquidity
         // prices fee-only (synthetic-grade). Fail closed.
-        if !priced_via_override
-            && (!liquidity_usd.is_finite() || liquidity_usd <= 0.0)
-        {
+        if !priced_via_override && (!liquidity_usd.is_finite() || liquidity_usd <= 0.0) {
             warn!(%mint, liq = liquidity_usd, "non-positive curve liquidity; dropping signal (fail-closed)");
             return;
         }
@@ -836,8 +865,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Confirm-time insider re-screen: dev history goes stale
         // between watchlist intake and quorum (serial launchers, fresh
         // rugs). Reuses nothing from intake — worst trust wins again —
-        // and fails closed on any screen failure.
-        let dev_trust = match self.screen_wallet(mint, &signal.dev, "dev").await {
+        // and fails closed on any screen failure. Worst trust also
+        // means fresh history: confirm screens bypass the dev-verdict
+        // cache (AUD-004), so a launch this wallet made after intake
+        // cannot ride a stale pass.
+        let dev_trust = match self.screen_wallet(mint, &signal.dev, "dev", true).await {
             Some(trust) => trust,
             None => {
                 warn!(%mint, "confirm-time dev re-screen failed; dropping (fail-closed)");
@@ -848,7 +880,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         if let Some(creator) = signal.creator.as_deref()
             && creator != signal.dev.as_str()
         {
-            match self.screen_wallet(mint, creator, "creator").await {
+            match self.screen_wallet(mint, creator, "creator", true).await {
                 Some(creator_trust) => trust = trust.min(creator_trust),
                 None => {
                     warn!(%mint, "confirm-time creator re-screen failed; dropping (fail-closed)");
@@ -862,13 +894,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // younger than one gate window skip the extra round-trip.
         // Serial path only (a speculative overlap was deleted as YAGNI:
         // unproven latency gain, abort races, wasted inference spend).
-        let stale_snapshot = now_secs().saturating_sub(signal.last_audit_secs)
-            > self.settings.gate_window_secs;
+        let stale_snapshot =
+            now_secs().saturating_sub(signal.last_audit_secs) > self.settings.gate_window_secs;
         let score = if stale_snapshot {
             match self.auditor.evaluate_token(mint).await {
                 Ok(report) => report.score,
                 Err(e) => {
-                    warn!(%mint, error = %e, "confirm-time re-audit failed; dropping (fail-closed)");
+                    warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "confirm-time re-audit failed; dropping (fail-closed)");
                     return;
                 }
             }
@@ -1139,8 +1171,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // the heartbeat carries the halted state after that.
         let (tripped, fire, day_net) = {
             let mut daily = self.daily.lock().await;
-            let (tripped, fire) =
-                daily.halt_state(self.settings.max_daily_loss_usd, now_secs());
+            let (tripped, fire) = daily.halt_state(self.settings.max_daily_loss_usd, now_secs());
             (tripped, fire, daily.day_net())
         };
         if tripped {
@@ -1196,6 +1227,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     paper_locked += p.entry_notional;
                 }
             }
+            // Heat stays mint-based (`held_base_mints`): positions are
+            // counted per mint, so a duplicate bag must not consume
+            // slots. `live_unpaired_bag_count` is for the exposure
+            // dollar cap only (AUD-014).
             let live_extra = self
                 .exec
                 .held_base_mints()
@@ -1203,19 +1238,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 .into_iter()
                 .filter(|m| !paper_mints.contains(m))
                 .count();
-            if portfolio.position_ids().len() + live_extra
-                >= self.settings.max_open_positions
-            {
+            if portfolio.position_ids().len() + live_extra >= self.settings.max_open_positions {
                 info!(%mint, max = self.settings.max_open_positions, live_extra, "heat limit (incl. live-held mints): skipping");
                 return;
             }
             // Total exposure in USD counts the same two sides: paper
-            // cost basis, plus one ticket per unpaired live bag (a bag
-            // carries no stored USD basis; one ticket is the estimate
-            // heat already uses). The prospective ticket is included.
+            // cost basis, plus one ticket per unpaired live bag (each
+            // bag is its own ticket; paired bags ride the paper basis).
+            // The prospective ticket is included.
+            let live_bags = self.exec.live_unpaired_bag_count(&paper_mints).await;
             let cap = self.settings.max_exposure_usd;
             if cap.is_finite() && cap > 0.0 {
-                let deployed = paper_locked + live_extra as f64 * self.settings.notional_usd;
+                let deployed = paper_locked + live_bags as f64 * self.settings.notional_usd;
                 let prospective = deployed + self.settings.notional_usd;
                 if prospective > cap {
                     info!(%mint, deployed, cap, ticket = self.settings.notional_usd,
@@ -1267,7 +1301,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // round-trip internally.
         let mut profile = *profile;
         if let Some(bps) = req.venue_fee_bps {
-            let per_side_total_bps = bps + self.settings.fee_bps;
+            // AUD-007: the typed fee guard only — an invalid raw
+            // `fee_bps` (>=100%, negative, NaN) contributes NO widening.
+            // It already fails closed in paper settlement; an unguarded
+            // raw value here could clamp every live stop to the -100%
+            // floor, silently removing real stop-losses.
+            let typed_fee_bps = self.settings.fee().map(|f| f.get() as f64).unwrap_or(0.0);
+            let per_side_total_bps = bps + typed_fee_bps;
             let widened = fee_aware_sl_floor(profile.sl_percent, per_side_total_bps);
             if widened < profile.sl_percent {
                 info!(%mint, sl = profile.sl_percent, widened, bps,
@@ -1435,12 +1475,37 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     warn!(%mint, error = %ids::redact_urls_in_text(&e.to_string()), "ticker watch failed; paper-only, live mirror skipped");
                     if allow_live {
                         self.exec
-                            .mark_diverged(mint, "live buy skipped: ticker watch failed".to_string())
+                            .mark_diverged(
+                                mint,
+                                "live buy skipped: ticker watch failed".to_string(),
+                            )
                             .await;
-                        self.emit(format!("ticker watch failed on {mint}; paper open WITHOUT live cover"));
+                        self.emit(format!(
+                            "ticker watch failed on {mint}; paper open WITHOUT live cover"
+                        ));
+                    } else {
+                        // AUD-002: paper-only open with no live leg at
+                        // all (bundle suspect / override pricing):
+                        // never let its simulated PnL reach the live
+                        // breaker; clear any stale coverage stamp.
+                        self.exec
+                            .mark_diverged(
+                                mint,
+                                "paper-only open: live dispatch skipped (bundle suspect or override pricing)".to_string(),
+                            )
+                            .await;
                     }
                 } else if allow_live {
                     self.live_buy(mint, curve, assoc_curve, mark, sol, creator)
+                        .await;
+                } else {
+                    // AUD-002: same as the failed-watch arm — the
+                    // paper open has no live leg by design.
+                    self.exec
+                        .mark_diverged(
+                            mint,
+                            "paper-only open: live dispatch skipped (bundle suspect or override pricing)".to_string(),
+                        )
                         .await;
                 }
             }
@@ -1519,7 +1584,8 @@ mod tests {
     }
 
     #[test]
-    fn hard_cap_sheds_the_oldest_intake() {        let signal = |intake_secs: u64| PendingSignal {
+    fn hard_cap_sheds_the_oldest_intake() {
+        let signal = |intake_secs: u64| PendingSignal {
             curve: "C".to_string(),
             creator: None,
             assoc_curve: "A".to_string(),

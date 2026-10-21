@@ -37,8 +37,7 @@ pub fn quote_base_in(
     if eff_in == 0 {
         return None;
     }
-    let out =
-        eff_in * out_reserve as u128 / (in_reserve as u128 + eff_in);
+    let out = eff_in * out_reserve as u128 / (in_reserve as u128 + eff_in);
     u64::try_from(out).ok().filter(|o| *o > 0)
 }
 
@@ -122,7 +121,10 @@ mod tests {
         .expect("nonzero amount builds");
         assert_eq!(ix.program_id, ids::RAYDIUM_V4_PROGRAM_ID);
         assert_eq!(ix.accounts.len(), 8);
-        assert_eq!(ix.accounts[0], AccountMeta::new_readonly(ids::TOKEN_PROGRAM_ID, false));
+        assert_eq!(
+            ix.accounts[0],
+            AccountMeta::new_readonly(ids::TOKEN_PROGRAM_ID, false)
+        );
         assert_eq!(ix.accounts[1], AccountMeta::new(key(1), false));
         assert_eq!(ix.accounts[2], AccountMeta::new_readonly(key(2), false));
         assert_eq!(ix.accounts[7], AccountMeta::new_readonly(key(7), true));
@@ -153,14 +155,16 @@ mod tests {
     #[test]
     fn quote_takes_fee_and_rejects_degenerate() {
         // 1M in, 100M/100M, 25bps → 987_648 (rounded down).
-        assert_eq!(quote_base_in_std(1_000_000, 100_000_000, 100_000_000), Some(987_648));
+        assert_eq!(
+            quote_base_in_std(1_000_000, 100_000_000, 100_000_000),
+            Some(987_648)
+        );
         // Zero fee quotes higher (pure xy=k).
-        assert_eq!(quote_base_in(1_000_000, 100_000_000, 100_000_000, 0), Some(990_099));
-        for bad in [
-            (0, 100, 100),
-            (100, 0, 100),
-            (100, 100, 0),
-        ] {
+        assert_eq!(
+            quote_base_in(1_000_000, 100_000_000, 100_000_000, 0),
+            Some(990_099)
+        );
+        for bad in [(0, 100, 100), (100, 0, 100), (100, 100, 0)] {
             assert_eq!(quote_base_in(bad.0, bad.1, bad.2, 25), None);
         }
         // Zero-amount swaps never build (doomed ix, fails on-chain).

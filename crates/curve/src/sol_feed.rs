@@ -82,12 +82,15 @@ impl PriceUsd {
     }
 }
 
-/// First USDC-quoted SOL price from a DexScreener tokens response.
-/// Pure (unit-tested against the live shape): `None` on missing,
-/// unpriced, or unparseable legs — the caller fails closed.
+/// First USDC-quoted SOL price from a DexScreener tokens response,
+/// else USDT-quoted. Pure (unit-tested against the live shape):
+/// `None` on missing, unpriced, unparseable, or unknown-quote legs —
+/// the caller fails closed. Only deep stablecoin quotes (USDC, USDT)
+/// are trusted: a thin/unknown-quote leg must never set the global
+/// price used for USD sizing, guards, and paper valuation.
 fn parse_dexscreener_sol_usd(body: &str) -> Option<f64> {
     let tokens: DexScreenerTokens = serde_json::from_str(body).ok()?;
-    let mut fallback = None;
+    let mut usdt = None;
     for pair in tokens.pairs?.iter() {
         let DexScreenerPair::Pair {
             quote_token,
@@ -110,9 +113,13 @@ fn parse_dexscreener_sol_usd(body: &str) -> Option<f64> {
         if symbol == "USDC" {
             return Some(price);
         }
-        fallback = fallback.or(Some(price));
+        if symbol == "USDT" {
+            usdt = usdt.or(Some(price));
+        }
+        // Any other quote (SOL, XYZ, ...): untrusted for the global
+        // price — skipped, never a fallback.
     }
-    fallback
+    usdt
 }
 
 struct Inner {
@@ -167,7 +174,9 @@ impl SolUsdFeed {
     pub fn new_for_test(price: f64) -> Arc<Self> {
         let feed = Self::new(&DEFAULT_DEX_URL, DEFAULT_STALE_SECS, DEFAULT_REFRESH);
         if price.is_finite() && price > 0.0 {
-            feed.inner.price_bits.store(price.to_bits(), Ordering::Relaxed);
+            feed.inner
+                .price_bits
+                .store(price.to_bits(), Ordering::Relaxed);
             feed.inner.updated_at.store(now_secs(), Ordering::Relaxed);
         }
         feed
@@ -229,14 +238,17 @@ impl SolUsdFeed {
     /// Force-set price. Updates timestamp to now.
     pub fn set_price(&self, price: f64) {
         if price.is_finite() && price > 0.0 {
-            self.inner.price_bits.store(price.to_bits(), Ordering::Relaxed);
+            self.inner
+                .price_bits
+                .store(price.to_bits(), Ordering::Relaxed);
             self.inner.updated_at.store(now_secs(), Ordering::Relaxed);
         }
     }
 
-    /// One HTTP fetch. Parses the first USDC-quoted SOL price.
-    /// Shape: `{pairs: [{quoteToken: {symbol}, priceUsd: "..."}]}`.
-    /// USDC-first (deepest SOL spot); any priced pair if none is USDC.
+    /// One HTTP fetch. Parses the USDC-quoted (else USDT-quoted) SOL
+    /// price. Shape: `{pairs: [{quoteToken: {symbol}, priceUsd: "..."}]}`.
+    /// Stablecoin quotes only (deepest SOL spot); unknown quotes fail
+    /// closed instead of setting the global price.
     pub async fn fetch_once(&self) -> Result<f64, String> {
         let resp = self
             .client
@@ -252,7 +264,7 @@ impl SolUsdFeed {
             .await
             .map_err(|e| format!("dex body failed: {e}"))?;
         let usd = parse_dexscreener_sol_usd(&body)
-            .ok_or_else(|| "dex missing USDC-quoted SOL price".to_string())?;
+            .ok_or_else(|| "dex missing stablecoin-quoted SOL price".to_string())?;
         if !usd.is_finite() || usd <= 0.0 {
             return Err(format!("dex bad price {usd}"));
         }
@@ -371,13 +383,27 @@ mod tests {
     }
 
     #[test]
-    fn dex_parser_falls_back_to_any_priced_leg() {
+    fn dex_parser_falls_back_to_usdt_only() {
+        // USDT is a trusted stablecoin fallback for USDC.
         assert_eq!(
             parse_dexscreener_sol_usd(
-                r#"{"pairs":[{"quoteToken":{"symbol":"XYZ"},"priceUsd":"99.5"}]}"#
+                r#"{"pairs":[{"quoteToken":{"symbol":"USDT"},"priceUsd":"99.5"}]}"#
             ),
             Some(99.5)
         );
+        // Unknown quotes never set the global price — fail closed even
+        // when they are the only priced leg (one thin pair must not
+        // move every USD size, guard, and paper valuation).
+        for raw in [
+            r#"{"pairs":[{"quoteToken":{"symbol":"XYZ"},"priceUsd":"99.5"}]}"#,
+            r#"{"pairs":[{"quoteToken":{"symbol":"SOL"},"priceUsd":"106.2"}]}"#,
+            r#"{"pairs":[
+                {"quoteToken":{"symbol":"XYZ"},"priceUsd":"99.5"},
+                {"quoteToken":{"symbol":"SOL"},"priceUsd":"106.2"}
+            ]}"#,
+        ] {
+            assert_eq!(parse_dexscreener_sol_usd(raw), None, "{raw}");
+        }
         // Bare numbers parse too (schema drift must not fail closed).
         assert_eq!(
             parse_dexscreener_sol_usd(

@@ -172,10 +172,7 @@ impl RugCheckClient {
                             }
                         }
                         Ok(None) => break,
-                        Err(e)
-                            if is_transient_network_error(&e)
-                                && attempt < self.max_retries =>
-                        {
+                        Err(e) if is_transient_network_error(&e) && attempt < self.max_retries => {
                             warn!(mint, attempt, error = %e, "rugcheck body stalled; retrying");
                             sleep_backoff(attempt).await;
                             attempt += 1;
@@ -272,7 +269,9 @@ mod tests {
             Err(RugCheckError::BadUrl(_))
         ));
         assert!(matches!(
-            RugCheckClient::builder().base_url("ftp://example.com").build(),
+            RugCheckClient::builder()
+                .base_url("ftp://example.com")
+                .build(),
             Err(RugCheckError::BadUrl(_))
         ));
         assert!(matches!(

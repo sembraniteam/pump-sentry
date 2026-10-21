@@ -68,15 +68,12 @@ async fn mainnet_bundle_acceptance() {
     assert_eq!(payload["params"][1]["encoding"], "base64");
 
     // 5. Fire at the real engine; acceptance = UUID result.
-    let jito = JitoClient::new("https://mainnet.block-engine.jito.wtf")
-        .expect("engine URL must parse");
-    let uuid = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        jito.send_bundle(bundle),
-    )
-    .await
-    .expect("engine call timed out")
-    .expect("engine rejected the bundle (see error: -32602 = decode failure)");
+    let jito =
+        JitoClient::new("https://mainnet.block-engine.jito.wtf").expect("engine URL must parse");
+    let uuid = tokio::time::timeout(std::time::Duration::from_secs(60), jito.send_bundle(bundle))
+        .await
+        .expect("engine call timed out")
+        .expect("engine rejected the bundle (see error: -32602 = decode failure)");
     assert!(!uuid.is_empty(), "empty bundle id");
     println!("ACCEPTED bundle_id={uuid}");
 }

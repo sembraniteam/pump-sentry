@@ -63,6 +63,42 @@ pub enum BundleStatus {
     Unknown,
 }
 
+/// Transport class of a `sendBundle` failure (AUD-002). A bundle can
+/// only be "unknown custody" when the failure is a transport-level
+/// ambiguity — the request may have reached the engine and the answer
+/// may have been lost. Every other failure is a deterministic
+/// rejection the engine produced (or we produced before sending): the
+/// bundle provably never landed, so no custody claim may be created
+/// from it and the retry budget applies normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleRejection {
+    /// The POST may have been signed and sent (transport timeout, or a
+    /// 2xx response whose body could not be decoded): treat as unknown
+    /// custody, never resend blindly.
+    AmbiguousTransport,
+    /// The engine (or the local encoder) refused the bundle before it
+    /// could be accepted: rate limit (HTTP 429), a JSON-RPC error, an
+    /// empty bundle id, or an encode/URL failure. No claim, normal
+    /// retry policy.
+    Deterministic,
+}
+
+/// Pure classifier for a `sendBundle` failure. `Network` covers both a
+/// request that never completed and a response that could not be
+/// decoded after a 2xx — either way the engine's answer is unknown and
+/// the bundle may still land. `RateLimited` (explicit HTTP 429) and
+/// `Rpc` (a JSON-RPC error, no bundle id) are deterministic refusals:
+/// the engine answered and did not accept.
+pub fn classify_send_failure(e: &JitoError) -> BundleRejection {
+    match e {
+        JitoError::Network(_) => BundleRejection::AmbiguousTransport,
+        JitoError::RateLimited
+        | JitoError::Rpc(_)
+        | JitoError::Encode(_)
+        | JitoError::BadUrl(_) => BundleRejection::Deterministic,
+    }
+}
+
 /// Regional block-engine bundle client.
 #[derive(Clone)]
 pub struct JitoClient {
@@ -130,7 +166,11 @@ impl JitoClient {
             base,
             tips: std::sync::Arc::new(std::sync::Mutex::new((
                 JITO_TIP_ACCOUNTS.iter().map(|s| s.to_string()).collect(),
-                0,
+                // Seeded fresh (AUD-011): the initial dispatch reads the
+                // official list from cache. No tip fetch ever sits on
+                // the dispatch path; a background refresher keeps the
+                // cache current.
+                unix_secs(),
             ))),
             floor: std::sync::Arc::new(std::sync::Mutex::new((0, 0))),
         })
@@ -163,10 +203,10 @@ impl JitoClient {
     pub async fn send_bundle(&self, bundle_b64: Vec<String>) -> Result<String, JitoError> {
         let payload = bundle_payload(bundle_b64);
         let url = self.bundles_url();
-        debug!(endpoint = %url, txs = payload.params.0.len(), "submitting bundle");
+        debug!(endpoint = %ids::redact_endpoint(&url), txs = payload.params.0.len(), "submitting bundle");
         let res = self.client.post(&url).json(&payload).send().await?;
         if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            warn!(endpoint = %url, "bundle send rate-limited (1 req/s/IP/region)");
+            warn!(endpoint = %ids::redact_endpoint(&url), "bundle send rate-limited (1 req/s/IP/region)");
             return Err(JitoError::RateLimited);
         }
         let body: SendBundleResponse = res.json().await?;
@@ -189,7 +229,10 @@ impl JitoClient {
         };
         let res = match tokio::time::timeout(
             Duration::from_millis(2000),
-            self.client.post(self.inflight_status_url()).json(&payload).send(),
+            self.client
+                .post(self.inflight_status_url())
+                .json(&payload)
+                .send(),
         )
         .await
         {
@@ -203,38 +246,44 @@ impl JitoClient {
         parse_inflight_status(&body, bundle_id)
     }
 
-    /// Landed-tip floor in lamports. 0 when the oracle is unreachable:
-    /// callers fall back to the configured tip.
+    /// Landed-tip floor in lamports: LIVE-cache read only (AUD-006) —
+    /// no network I/O on the dispatch path. A stalled oracle leaves the
+    /// last cached floor in place (0 before the first refresh, meaning
+    /// the configured base tip rules unmodified). Freshness is owned by
+    /// [`Self::refresh_tip_floor`] driven from a background task.
     pub async fn tip_floor_lamports(&self) -> u64 {
-        let now = unix_secs();
-        let stale = self.tip_floor_stale_at(now);
-        if stale {
-            let fresh = self.fetch_tip_floor().await.unwrap_or(0);
-            if fresh == 0 {
-                // Rare path (oracle down): one warn per TTL window —
-                // fetches only happen when stale, so this cannot spam.
-                // Floor 0 means the base tip rules unmodified.
-                tracing::warn!("jito tip-floor oracle unreachable; using configured tip (underland risk under congestion)");
-            }
-            if let Ok(mut guard) = self.floor.lock() {
-                if fresh > 0 {
-                    guard.0 = fresh;
-                }
-                guard.1 = now;
-            }
-        }
-        self.floor.lock().map(|g| g.0).unwrap_or(0)
+        self.floor.lock().unwrap_or_else(|e| e.into_inner()).0
     }
 
-    /// True when the cached floor is past [`TIP_FLOOR_TTL_SECS`]
-    /// (or never fetched): the next `tip_floor_lamports` refetches.
-    /// `TipEscalator` (this module) drives every refetch, so this is
-    /// the only caller of the timestamp comparison.
-    fn tip_floor_stale_at(&self, now: u64) -> bool {
-        self.floor
-            .lock()
-            .map(|g| now.saturating_sub(g.1) >= TIP_FLOOR_TTL_SECS)
-            .unwrap_or(true)
+    /// Refresh the floor oracle (background task entry point): always
+    /// fetch and stamp, regardless of staleness. A failed/blank fetch
+    /// keeps the previous value (0 means the configured tip rules).
+    pub async fn refresh_tip_floor(&self) {
+        let now = unix_secs();
+        let fresh = self.fetch_tip_floor().await.unwrap_or_else(|| {
+            // Background path: one warn per refresh is fine (the
+            // task cadence is the TTL window). Floor 0 means the
+            // base tip rules unmodified.
+            warn!(
+                    "jito tip-floor oracle unreachable; using configured tip (underland risk under congestion)"
+                );
+            0
+        });
+        if let Ok(mut guard) = self.floor.lock() {
+            if fresh > 0 {
+                guard.0 = fresh;
+            }
+            guard.1 = now;
+        }
+    }
+
+    /// Test-only floor-cache seed (AUD-006): `TIP_FLOOR_URL` is a
+    /// hardcoded upstream oracle, so tests can never inject a floor
+    /// through [`Self::refresh_tip_floor`]; dispatch reads are proven
+    /// cache-only against this seeded cache instead.
+    #[cfg(test)]
+    pub fn test_seed_floor(&self, lamports: u64) {
+        *self.floor.lock().expect("floor") = (lamports, unix_secs());
     }
 
     /// GET the floor oracle. `None` on any trouble.
@@ -273,7 +322,7 @@ fn parse_tip_floor_lamports(body: &str) -> u64 {
         .unwrap_or(0.0);
     if !sol.is_finite() || sol <= 0.0 {
         TIP_FLOOR_PARSE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tracing::warn!("jito tip-floor schema unparsable; treating floor as 0 (unknown)");
+        warn!("jito tip-floor schema unparsable; treating floor as 0 (unknown)");
         return 0;
     }
     (sol * LAMPORTS_PER_SOL_F) as u64
@@ -285,7 +334,7 @@ fn parse_tip_floor_lamports(body: &str) -> u64 {
 pub fn apply_tip_floor(base_tip_lamports: u64, floor_lamports: u64) -> u64 {
     if floor_lamports == 0 {
         if base_tip_lamports > 0 {
-            tracing::warn!(
+            warn!(
                 base = base_tip_lamports,
                 "tip floor 0 with positive base tip; congestion underland risk unmeasured"
             );
@@ -368,9 +417,11 @@ pub fn select_tip_account(seed: u64) -> Pubkey {
 }
 
 impl JitoClient {
-    /// Tip account for this dispatch: live set when fresh, else constants.
+    /// Tip account for this dispatch: LIVE-cache read only (AUD-011) —
+    /// no network I/O between the decision and bundle submission. An
+    /// empty cache falls back to the official constants. Freshness is
+    /// owned by [`Self::refresh_tips`] driven from a background task.
     pub async fn tip_account(&self, seed: u64) -> Pubkey {
-        self.maybe_refresh_tips().await;
         let guard = self.tips.lock().unwrap_or_else(|e| e.into_inner());
         let list = &guard.0;
         if list.is_empty() {
@@ -383,20 +434,14 @@ impl JitoClient {
             .unwrap_or_else(|_| select_tip_account(seed))
     }
 
-    /// Refresh the tip set when stale. Any failure keeps the old list.
-    async fn maybe_refresh_tips(&self) {
+    /// Refresh the tip set (background task entry point): always fetch
+    /// and stamp, regardless of staleness. Any failure keeps the old
+    /// list.
+    pub async fn refresh_tips(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let stale = self
-            .tips
-            .lock()
-            .map(|g| now.saturating_sub(g.1) > TIP_ACCOUNTS_TTL_SECS)
-            .unwrap_or(true);
-        if !stale {
-            return;
-        }
         if let Some(fresh) = self.fetch_tip_accounts().await
             && let Ok(mut guard) = self.tips.lock()
         {
@@ -422,18 +467,18 @@ impl JitoClient {
         {
             Ok(Ok(res)) => res,
             _ => {
-                warn!(endpoint = %url, "tip refresh request failed; keeping cached list");
+                warn!(endpoint = %ids::redact_endpoint(&url), "tip refresh request failed; keeping cached list");
                 return None;
             }
         };
         if !res.status().is_success() {
-            warn!(endpoint = %url, status = ?res.status(), "tip refresh non-2xx; keeping cached list");
+            warn!(endpoint = %ids::redact_endpoint(&url), status = ?res.status(), "tip refresh non-2xx; keeping cached list");
             return None;
         }
         let body: TipAccountsResponse = match res.json().await {
             Ok(body) => body,
             Err(e) => {
-                warn!(endpoint = %url, error = %e, "tip refresh decode failed; keeping cached list");
+                warn!(endpoint = %ids::redact_endpoint(&url), error = %ids::strip_error_url(&e.to_string()), "tip refresh decode failed; keeping cached list");
                 return None;
             }
         };
@@ -690,11 +735,14 @@ mod tests {
             JitoClient::new("wss://example.com"),
             Err(JitoError::BadUrl(_))
         ));
-        let client =
-            JitoClient::new("https://mainnet.block-engine.jito.wtf").expect("ok");
+        let client = JitoClient::new("https://mainnet.block-engine.jito.wtf").expect("ok");
         // One base, one documented path per method.
         assert!(client.bundles_url().ends_with("/api/v1/bundles"));
-        assert!(client.tip_accounts_url().ends_with("/api/v1/getTipAccounts"));
+        assert!(
+            client
+                .tip_accounts_url()
+                .ends_with("/api/v1/getTipAccounts")
+        );
         assert!(
             client
                 .inflight_status_url()
@@ -704,15 +752,9 @@ mod tests {
 
     #[test]
     fn encode_bundle_rejects_empty_and_oversize() {
-        assert!(matches!(
-            encode_bundle(&[]),
-            Err(JitoError::Encode(_))
-        ));
+        assert!(matches!(encode_bundle(&[]), Err(JitoError::Encode(_))));
         let six = vec![Transaction::default(); 6];
-        assert!(matches!(
-            encode_bundle(&six),
-            Err(JitoError::Encode(_))
-        ));
+        assert!(matches!(encode_bundle(&six), Err(JitoError::Encode(_))));
         let one = vec![Transaction::default(); 1];
         assert_eq!(encode_bundle(&one).expect("one tx").len(), 1);
     }
@@ -788,6 +830,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classify_send_failure_separates_transport_ambiguity_from_rejections() {
+        // AUD-002: only an ambiguous transport failure may claim "may
+        // still land". A 429, a JSON-RPC error, an encode/URL failure
+        // are deterministic rejections: the bundle provably never
+        // landed, so no custody claim may ever be created from them.
+        use crate::jito::{BundleRejection, classify_send_failure};
+        // Real Network error: the engine port is closed, so the POST
+        // never completed — the request may or may not have been
+        // received, which is exactly the ambiguity class.
+        let closed = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        let client = JitoClient::new(&format!("http://127.0.0.1:{port}")).expect("client");
+        let network_err = client
+            .send_bundle(vec!["eA==".to_string()])
+            .await
+            .expect_err("closed port must fail");
+        assert!(
+            matches!(network_err, JitoError::Network(_)),
+            "{network_err}"
+        );
+        assert_eq!(
+            classify_send_failure(&network_err),
+            BundleRejection::AmbiguousTransport,
+            "transport ambiguity stays unknown custody"
+        );
+        for (err, why) in [
+            (JitoError::RateLimited, "429 is an explicit server refusal"),
+            (
+                JitoError::Rpc("code -32602".to_string()),
+                "a JSON-RPC error never accepted the bundle",
+            ),
+            (
+                JitoError::Encode("bincode".to_string()),
+                "local encode failure: nothing was sent",
+            ),
+            (
+                JitoError::BadUrl("notaurl".to_string()),
+                "local URL failure: nothing was sent",
+            ),
+        ] {
+            assert_eq!(
+                classify_send_failure(&err),
+                BundleRejection::Deterministic,
+                "{why}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn send_bundle_maps_429_to_rate_limited() {
         let paths = Arc::new(Mutex::new(Vec::new()));
         let base = serve_scripted(Arc::clone(&paths), vec![(429, "slow down")]).await;
@@ -803,6 +895,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tip_account_never_fetches_on_the_dispatch_path() {
+        // AUD-011: a fresh-boot dispatch reads the seeded official list.
+        // A live tip-accounts server stays unreached (no request).
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let base = serve_scripted(Arc::clone(&paths), Vec::new()).await;
+        let client = JitoClient::new(&base).expect("client");
+        let picked = client.tip_account(nanos_seed()).await.to_string();
+        assert!(
+            JITO_TIP_ACCOUNTS.contains(&picked.as_str()),
+            "picked from the seeded constants, got {picked}"
+        );
+        assert_eq!(
+            paths.lock().expect("paths").len(),
+            0,
+            "no tip fetch may sit on the dispatch path"
+        );
+    }
+
+    #[tokio::test]
+    async fn tip_refresh_is_explicit_and_replaces_the_cache() {
+        // The explicit refresher (background-task entry point) fetches
+        // and stamps; after it, dispatch reads the refreshed list.
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let result = format!(
+            r#"{{"jsonrpc":"2.0","result":["{}","{}"],"id":1}}"#,
+            JITO_TIP_ACCOUNTS[0], JITO_TIP_ACCOUNTS[1]
+        );
+        let base = serve_scripted(
+            Arc::clone(&paths),
+            vec![(200, Box::leak(result.into_boxed_str()))],
+        )
+        .await;
+        let client = JitoClient::new("https://mainnet.block-engine.jito.wtf").expect("client");
+        // Cache seeded fresh: dispatch-free read works from constants.
+        let seeded = client.tip_account(0).await.to_string();
+        assert_eq!(seeded, JITO_TIP_ACCOUNTS[0]);
+        // Explicit refresh fires against `base` — swap the endpoint by
+        // building a fresh client (the client owns its URL); then the
+        // cache read reflects the refreshed list.
+        let refreshed = JitoClient::new(&base).expect("client");
+        refreshed.refresh_tips().await;
+        let picked = refreshed.tip_account(0).await.to_string();
+        assert_eq!(picked, JITO_TIP_ACCOUNTS[0], "refreshed list ordered first");
+        let paths = paths.lock().expect("paths");
+        assert!(paths[0].contains("POST /api/v1/getTipAccounts "));
+    }
+
+    #[tokio::test]
     async fn tip_refresh_posts_to_own_path_and_heals() {
         let paths = Arc::new(Mutex::new(Vec::new()));
         let body = format!(
@@ -815,7 +955,9 @@ mod tests {
         )
         .await;
         let client = JitoClient::new(&base).expect("client");
-        // Fresh client cache is stale (fetched=0): refresh fires.
+        // AUD-011: dispatch reads never fetch; the explicit refresher
+        // does. Refresh first, then dispatch (live list drives picks).
+        client.refresh_tips().await;
         let picked = client.tip_account(1).await.to_string();
         assert!(
             picked == JITO_TIP_ACCOUNTS[0] || picked == JITO_TIP_ACCOUNTS[1],
@@ -823,6 +965,34 @@ mod tests {
         );
         let paths = paths.lock().expect("paths");
         assert_eq!(paths.len(), 1);
-        assert!(paths[0].contains("POST /api/v1/getTipAccounts "), "{}", paths[0]);
+        assert!(
+            paths[0].contains("POST /api/v1/getTipAccounts "),
+            "{}",
+            paths[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn tip_floor_dispatch_reads_cache_only() {
+        // AUD-006: the dispatch-path floor read never touches the
+        // oracle. A stalled/never-answering oracle is simulated by a
+        // server that answers no request; the seeded cache value comes
+        // straight back and no request was made.
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let base = serve_scripted(Arc::clone(&paths), Vec::new()).await;
+        let client = JitoClient::new(&base).expect("client");
+        assert_eq!(client.tip_floor_lamports().await, 0, "unseeded reads 0");
+        client.test_seed_floor(12_345);
+        let started = std::time::Instant::now();
+        assert_eq!(client.tip_floor_lamports().await, 12_345);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "cache read returned quickly (no 2s oracle timeout stalled dispatch)"
+        );
+        assert_eq!(
+            paths.lock().expect("paths").len(),
+            0,
+            "no tip-floor fetch may sit on the dispatch path"
+        );
     }
 }

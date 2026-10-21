@@ -134,8 +134,8 @@ pub fn resolve_strategy(profile: &RiskProfile, cfg: &StrategyConfig) -> RiskProf
             timeout_seconds: profile.timeout_seconds,
             // `clamp` on NaN stays NaN. Clean first.
             moonbag_percent: {
-                let moonbag = finite_or(cfg.runner_moonbag_percent, RUNNER_MOONBAG_DEFAULT)
-                    .clamp(0.0, 100.0);
+                let moonbag =
+                    finite_or(cfg.runner_moonbag_percent, RUNNER_MOONBAG_DEFAULT).clamp(0.0, 100.0);
                 // 100% moonbag sells nothing. Use full exit.
                 if moonbag >= 100.0 { 0.0 } else { moonbag }
             },
@@ -376,7 +376,6 @@ mod tests {
 
     #[test]
     fn runner_forces_moonbag_and_trailing() {
-
         let cfg = StrategyConfig {
             mode: StrategyMode::Runner,
             runner_moonbag_percent: 20.0,

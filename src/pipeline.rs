@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alert::{Alerter, CardCtx};
 use auditor::{RugCheckClient, RugCheckError, RugCheckReport};
@@ -17,23 +17,26 @@ use simulator::{ExitReason, Mark, PaperPortfolio};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::live::{BuyFill, LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck, PumpSwapSellParams, RaydiumSellParams};
-#[cfg(test)]
-use crate::live::escalated_tip;
-use crate::live_mirror::{LiveExecution, breaker_headline, live_base_mint};
+use crate::day_state::DayBook;
 use crate::follow::FollowState;
-pub use crate::gate::GateState;
 #[cfg(test)]
 pub use crate::gate::DailyBreaker;
-use crate::day_state::DayBook;
+pub use crate::gate::GateState;
 #[cfg(test)]
 pub use crate::gate::LaunchRequest;
 #[cfg(test)]
 pub(crate) use crate::gate::{dev_reputation_score, fee_aware_sl_floor, resolve_entry_with_flag};
 use crate::journal::{JournalLine, JournalSink};
 #[cfg(test)]
-pub(crate) use listener::BundleVerdict;
+use crate::live::escalated_tip;
+use crate::live::{
+    BuyFill, LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck,
+    PumpSwapSellParams, RaydiumSellParams,
+};
+use crate::live_mirror::{LiveExecution, breaker_headline, live_base_mint};
 use crate::settings::{Settings, now_secs};
+#[cfg(test)]
+pub(crate) use listener::BundleVerdict;
 
 /// Audit source.
 pub trait Auditor {
@@ -100,7 +103,10 @@ impl ReserveFeed for CurveTicker {
 /// Live buy dispatch. Only used with `--live`.
 pub trait BuySink {
     /// Buy per params. Returns position plus bundle.
-    async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String, Option<BuyFill>), LiveError>;
+    async fn buy(
+        &self,
+        req: &LiveBuyParams,
+    ) -> Result<(LivePosition, String, Option<BuyFill>), LiveError>;
 }
 
 /// Live sell dispatch: curve plus both pool venues. One trait (not
@@ -195,7 +201,10 @@ impl<T: BuySink + SellSink + PendingStore + CostLedger + WalSink> LiveSink for T
 // renamed away.
 
 impl BuySink for LiveTrader {
-    async fn buy(&self, req: &LiveBuyParams) -> Result<(LivePosition, String, Option<BuyFill>), LiveError> {
+    async fn buy(
+        &self,
+        req: &LiveBuyParams,
+    ) -> Result<(LivePosition, String, Option<BuyFill>), LiveError> {
         LiveTrader::buy(self, req).await
     }
 }
@@ -304,6 +313,14 @@ pub enum CurveRead {
 pub trait Screener {
     /// Dev verdict; `Err` skips fail-closed.
     async fn screen_dev(&self, dev: &str) -> Result<DevVerdict, ScreenError>;
+    /// Dev verdict that must not ride a cached pass. Confirm-time
+    /// re-screening uses this: fresh history between intake and quorum
+    /// must be observed, not the intake-time verdict (AUD-004).
+    /// Default defers to `screen_dev` so screens with no cache (or no
+    /// history-walk) keep one path.
+    async fn screen_dev_fresh(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
+        self.screen_dev(dev).await
+    }
     /// Swaps since `since_sig`, plus watermark. A truncated view must
     /// never confirm — a variant, not a flag, so new consumers cannot
     /// miss it.
@@ -337,6 +354,11 @@ impl Screener for RpcScreener {
         self.dev_verdict(&dev, now_secs()).await
     }
 
+    async fn screen_dev_fresh(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
+        let dev = listener::parse_address(dev)?;
+        self.dev_verdict_fresh(&dev, now_secs()).await
+    }
+
     async fn observe_curve(
         &self,
         _mint: &str,
@@ -361,6 +383,11 @@ impl Screener for RpcScreener {
         self.bundle_verdict(&curve, creation_slot).await
     }
 
+    async fn top_holder_pct(&self, mint: &str) -> Result<f64, ScreenError> {
+        let mint = listener::parse_address(mint)?;
+        RpcScreener::top_holder_pct(self, &mint).await
+    }
+
     async fn detect_migration(
         &self,
         curve: &str,
@@ -372,11 +399,6 @@ impl Screener for RpcScreener {
             .hunt_migration(&curve, &mint)
             .await?
             .map(|detected| detected.report()))
-    }
-
-    async fn top_holder_pct(&self, mint: &str) -> Result<f64, ScreenError> {
-        let mint = listener::parse_address(mint)?;
-        RpcScreener::top_holder_pct(self, &mint).await
     }
 }
 
@@ -444,13 +466,8 @@ pub struct Pipeline<
     journal: OnceLock<Arc<JournalSink>>,
 }
 
-
 /// Stale curve ticks are ignored.
 pub const CURVE_TICK_STALE_SECS: u64 = 120;
-
-
-
-
 
 impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
     /// Build shared state. `day_state` is the day-loss tally file
@@ -500,7 +517,6 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         })
     }
 
-
     /// Attach the (analytics-only) decision journal to a built
     /// pipeline; the first sink wins, later calls no-op.
     pub fn with_journal(&self, sink: Arc<JournalSink>) {
@@ -518,7 +534,7 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         mint: &str,
         trade: &simulator::ClosedTrade,
         fraction: f64,
-        mark: &simulator::Mark,
+        mark: &Mark,
         tick_observed_at: u64,
     ) {
         if let Some(j) = self.journal() {
@@ -539,6 +555,14 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         let portfolio = self.portfolio.lock().await;
         let snap = portfolio.snapshot(&marks);
         (snap.cash, snap.equity)
+    }
+
+    /// Paper ledger overdraft (AUD-010): dispatch costs debited past
+    /// available cash. Reporting only — the book itself refuses new
+    /// opens while cash is negative (fail-closed).
+    pub async fn paper_overdraft_usd(&self) -> f64 {
+        let portfolio = self.portfolio.lock().await;
+        (-portfolio.cash()).max(0.0)
     }
 
     /// Fresh marks (stale evicted, never leaks).
@@ -621,7 +645,9 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
     pub fn set_entries_paused(&self, paused: bool) {
         let was = self.entries_paused.swap(paused, Ordering::Relaxed);
         if paused && !was {
-            warn!("KILL SWITCH: entries paused — no new position opens; open-position management (exits, runner/moonbag scale-outs, `sell <mint>`) keeps running");
+            warn!(
+                "KILL SWITCH: entries paused — no new position opens; open-position management (exits, runner/moonbag scale-outs, `sell <mint>`) keeps running"
+            );
         } else if !paused && was {
             info!("kill switch cleared: entries resume");
         }
@@ -648,17 +674,6 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
 }
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
-
-
-
-
-
-
-
-
-
-
-
     /// Fire a card when enabled.
     pub(crate) fn emit(&self, message: String) {
         if let Some(alerts) = &self.alerts {
@@ -684,8 +699,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// clear, then unwatch. Both the tick path and manual sell run it
     /// after the live leg settles; unsettled paths return before it.
     pub(crate) async fn settle_close_tail(&self, tick: &PriceTick) {
-        // Recheck before unwatch.
-        self.recheck_live_pending().await;
+        // Pending-buy rechecks run on the dedicated supervisor task
+        // (AUD-013) — never here on the tick path.
         if self
             .portfolio
             .lock()
@@ -698,10 +713,24 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Settle deferred PnL only when no live exposure remains.
             // Manual check is base-wide: a suffixed parked dup is still
             // held funds, even though only the exact key resurrects.
-            let live_held = self.exec.is_tracked(&tick.mint).await
+            // An unresolved pending buy is the same unsettled exposure
+            // (AUD-008): the paper PnL stays deferred until the pending
+            // recheck resolves it.
+            let pending_buy = self
+                .exec
+                .live
+                .as_ref()
+                .is_some_and(|t| t.has_pending_for(&tick.mint));
+            let live_held = pending_buy
+                || self.exec.is_tracked(&tick.mint).await
                 || self.exec.manual_holds_base(&tick.mint).await;
             if !live_held {
                 self.flush_deferred_pnl(&tick.mint).await;
+                // With no exposure left, no unsettled leg can owe the
+                // breaker anything more. Coverage is stamped at buy
+                // and kept through the settle so a late-flushed stash
+                // stays eligible (it belongs to that same trade).
+                self.exec.clear_live_covered(&tick.mint).await;
             }
         }
         // Shared tail under fresh locks.
@@ -722,7 +751,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
 
     /// Per-mint tick mutex.
     pub(crate) async fn mint_serial(&self, mint: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        Self::lock_for(&self.tick_locks, mint).await.lock_owned().await
+        Self::lock_for(&self.tick_locks, mint)
+            .await
+            .lock_owned()
+            .await
     }
 
     /// Drop a mint's locks (terminal paths with no tick).
@@ -780,7 +812,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // survives while any parked manual bag remains (exact or dup):
         // its eventual manual exit is the settle this note waits for.
         // Post-migration eviction must not orphan it.
-        self.portfolio.lock().await.clear_venue_fee_for_mint(&tick.mint);
+        self.portfolio
+            .lock()
+            .await
+            .clear_venue_fee_for_mint(&tick.mint);
         if !self.exec.manual_holds_base(&tick.mint).await {
             self.exec.clear_gap(&tick.mint).await;
         }
@@ -823,6 +858,25 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let unpriceable = !tick.complete && unpriceable_liquidity(tick.liquidity_usd);
         // Per-mint lock.
         let _serial = self.mint_serial(&tick.mint).await;
+        // AUD-002/AUD-001: a complete tick for a mint with custody
+        // must resolve the migration BEFORE the first sell attempt.
+        // `maybe_unwatch` used to be the only hunt caller, but it
+        // returns early while a bag is tracked — so the pool leg was
+        // registered only after retries had already parked the exit.
+        // Hunt here (deduped, None/Err retry on later ticks), then the
+        // same tick's close routes through the fresh pool leg. Without
+        // a resolvable pool the fail-closed curve refusal stands.
+        if tick.complete
+            && (!self
+                .portfolio
+                .lock()
+                .await
+                .positions_for_mint(&tick.mint)
+                .is_empty()
+                || self.exec.is_tracked(&tick.mint).await)
+        {
+            self.report_migration_once(&tick.mint, &tick.curve).await;
+        }
         // Clone marks before the book guard (never nest locks).
         let card_marks = self.fresh_marks(now_secs()).await;
         let mut portfolio = self.portfolio.lock().await;
@@ -857,7 +911,6 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.live_sell(&tick.mint, &mark, 1.0).await;
                 }
             }
-            self.recheck_live_pending().await;
             self.maybe_unwatch(tick).await;
             return;
         } else {
@@ -865,7 +918,6 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             if !tick.complete && self.sol_feed.price().is_none() {
                 drop(portfolio);
                 warn!(mint = %tick.mint, "stale SOL/USD — paper exits deferred (no static fallback)");
-                self.recheck_live_pending().await;
                 self.maybe_unwatch(tick).await;
                 return;
             }
@@ -878,7 +930,6 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             if unpriceable {
                 drop(portfolio);
                 self.report_drained(&tick.mint, tick.liquidity_usd, was_drained, "paper exits");
-                self.recheck_live_pending().await;
                 self.maybe_unwatch(tick).await;
                 return;
             }
@@ -993,7 +1044,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         for (reason, pnl, pct, equity, moonbag) in closed_cards {
             self.emit(Alerter::format_exit(
                 &self.card_ctx(),
-                &tick.mint, &reason, pnl, pct, equity, moonbag,
+                &tick.mint,
+                &reason,
+                pnl,
+                pct,
+                equity,
+                moonbag,
             ));
         }
         // One note per tick per mint (qty-weighted avg): the live leg
@@ -1020,23 +1076,15 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             true
         };
         if live_settled {
-            // Synthetic never feeds the gate.
-            if self.exec.is_synthetic(&tick.mint).await {
-                warn!(mint = %tick.mint, n = closed_pnls.len(), "synthetic paper PnL excluded from day-loss breaker (override price, no market)");
-            } else {
-                for pnl in closed_pnls {
-                    self.daily.lock().await.record(pnl, now);
-                }
-            }
+            // Synthetic exclusion and uncovered-paper exclusion live in
+            // the shared recorder (AUD-002).
+            self.record_breaker_pnls(&tick.mint, closed_pnls, now).await;
         } else {
             warn!(mint = %tick.mint, "paper closed but live still holds; breaker PnL deferred until live settles");
             self.exec.stash_deferred_pnl(&tick.mint, closed_pnls).await;
         }
         self.settle_close_tail(tick).await;
     }
-
-
-
 }
 
 #[cfg(test)]

@@ -233,7 +233,10 @@ mod tests {
         let saved_file = env::var("SOLANA_PRIVATE_KEY_FILE").ok();
         unsafe { env::remove_var("SOLANA_PRIVATE_KEY") };
         unsafe { env::remove_var("SOLANA_PRIVATE_KEY_FILE") };
-        let err = WalletGuard::load_from_env().err().expect("must fail");
+        let err = match WalletGuard::load_from_env() {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
         assert!(matches!(err, WalletGuardError::MissingKeyEnv));
         if let Some(v) = saved {
             unsafe { env::set_var("SOLANA_PRIVATE_KEY", v) };
@@ -279,7 +282,7 @@ mod tests {
         let saved = env::var("SOLANA_PRIVATE_KEY").ok();
         let saved_file = env::var("SOLANA_PRIVATE_KEY_FILE").ok();
         unsafe { env::remove_var("SOLANA_PRIVATE_KEY") };
-        let dir = std::env::temp_dir().join(format!(
+        let dir = env::temp_dir().join(format!(
             "wallet-file-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -341,7 +344,7 @@ mod tests {
         let saved = env::var("SOLANA_PRIVATE_KEY").ok();
         let saved_file = env::var("SOLANA_PRIVATE_KEY_FILE").ok();
         unsafe { env::remove_var("SOLANA_PRIVATE_KEY") };
-        let dir = std::env::temp_dir().join(format!(
+        let dir = env::temp_dir().join(format!(
             "wallet-perms-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -355,13 +358,16 @@ mod tests {
         assert!(check_key_file_permissions(&path).is_ok());
         // Group/world bits: refused before a byte of key material is read.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
-        let err = check_key_file_permissions(&path).err().expect("refused");
+        let err = check_key_file_permissions(&path).expect_err("refused");
         assert!(
             matches!(err, WalletGuardError::InsecureKeyFile { mode: 0o644, .. }),
             "{err}"
         );
         unsafe { env::set_var("SOLANA_PRIVATE_KEY_FILE", &path) };
-        let err = WalletGuard::load_from_env().err().expect("refused");
+        let err = match WalletGuard::load_from_env() {
+            Err(e) => e,
+            Ok(_) => panic!("refused"),
+        };
         assert!(
             matches!(err, WalletGuardError::InsecureKeyFile { .. }),
             "{err}"
@@ -391,8 +397,7 @@ mod tests {
         assert!(armed.check_hot_wallet_cap(1).is_ok());
         let err = armed
             .check_hot_wallet_cap(2_000_000_001)
-            .err()
-            .expect("over cap");
+            .expect_err("over cap");
         assert!(
             matches!(
                 err,

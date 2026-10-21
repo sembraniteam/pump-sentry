@@ -43,7 +43,9 @@ pub async fn cmd_replay(file: Option<String>) -> ! {
         // The journal is the record of record for analytics: unreadable
         // means the replay can prove nothing — fail closed, never
         // "nothing recorded" (which would be a fabricated PASS).
-        println!("journal unreadable: {error} — replay cannot verify anything; fixing the file is an operator action");
+        println!(
+            "journal unreadable: {error} — replay cannot verify anything; fixing the file is an operator action"
+        );
         std::process::exit(1);
     }
     if lines.is_empty() {
@@ -786,11 +788,7 @@ pub(crate) fn concentration_bin(pct: f64) -> &'static str {
     }
 }
 
-fn print_micro_table(
-    title: &str,
-    rows: &[MicroRow],
-    key: impl Fn(&MicroRow) -> Option<String>,
-) {
+fn print_micro_table(title: &str, rows: &[MicroRow], key: impl Fn(&MicroRow) -> Option<String>) {
     let mut keyed: Vec<(String, u64, f64)> = rows
         .iter()
         .filter_map(|r| key(r).map(|k| (k, r.ts, r.net_pnl)))
@@ -803,7 +801,9 @@ fn print_micro_table(
     // label → (n, total, first-half n/total, second-half n/total).
     let mut bins: HashMap<String, (usize, f64, usize, f64, usize, f64)> = HashMap::new();
     for (i, (label, _, net)) in keyed.iter().enumerate() {
-        let e = bins.entry(label.clone()).or_insert((0, 0.0, 0, 0.0, 0, 0.0));
+        let e = bins
+            .entry(label.clone())
+            .or_insert((0, 0.0, 0, 0.0, 0, 0.0));
         e.0 += 1;
         e.1 += net;
         if i < half {
@@ -848,7 +848,9 @@ fn print_micro_tables(rows: &[MicroRow], paper_trades: usize) {
     if rows.is_empty() {
         return;
     }
-    println!("-- microstructure expectancy (paper exits joined to entry signals; halves = chronological stability check) --");
+    println!(
+        "-- microstructure expectancy (paper exits joined to entry signals; halves = chronological stability check) --"
+    );
     print_micro_table("buy pressure", rows, |r| {
         r.micro.buy_ratio.map(|b| ratio_bin(b).to_string())
     });
@@ -870,15 +872,13 @@ fn print_micro_tables(rows: &[MicroRow], paper_trades: usize) {
         )
     });
     print_micro_table("tape velocity", rows, |r| {
-        r.micro
-            .velocity_delta
-            .map(|v| {
-                if v < 0.0 {
-                    "fading".to_string()
-                } else {
-                    "accelerating".to_string()
-                }
-            })
+        r.micro.velocity_delta.map(|v| {
+            if v < 0.0 {
+                "fading".to_string()
+            } else {
+                "accelerating".to_string()
+            }
+        })
     });
     // Regime expectancy: what actually ran (LLM pick or forced
     // baseline) — the table the operator judges selection against the
@@ -904,12 +904,7 @@ fn print_micro_tables(rows: &[MicroRow], paper_trades: usize) {
     // spans boots, so this is the cross-run performance read;
     // pre-upgrade lines without a recorded name land "not recorded".
     print_micro_table("risk model", rows, |r| {
-        Some(
-            r.model
-                .as_deref()
-                .unwrap_or("not recorded")
-                .to_string(),
-        )
+        Some(r.model.as_deref().unwrap_or("not recorded").to_string())
     });
     let excluded = paper_trades.saturating_sub(rows.len());
     if excluded > 0 {
@@ -1582,7 +1577,10 @@ mod tests {
                 "model",
                 None,
             ),
-            JournalLine::Boot { ts: 2_000, settings },
+            JournalLine::Boot {
+                ts: 2_000,
+                settings,
+            },
             micro_exit(1, 2_100, 5.0),
         ];
         let m = metrics(&lines);
@@ -1601,7 +1599,8 @@ mod tests {
     }
 
     #[test]
-    fn replay_fails_on_tampered_reason() {        let (mut lines, _) = lifecycle();
+    fn replay_fails_on_tampered_reason() {
+        let (mut lines, _) = lifecycle();
         if let Some(JournalLine::Exit { trade, .. }) = lines.last_mut() {
             trade.reason = ExitReason::StopLoss;
         }

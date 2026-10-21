@@ -32,32 +32,36 @@ pub struct DayState {
 /// must not adopt (they refuse newer numbers, never guess).
 pub const DAY_STATE_SCHEMA: u32 = 1;
 
-/// Load the tally. `None` (fresh day) when missing, corrupt, or
-/// non-finite; only real damage warns — a first boot is silent.
-pub fn load(path: &Path) -> Option<DayState> {
+/// Load outcome. `Missing` (first boot) is the only fresh-day path.
+/// `Damaged` carries the reason and must fail the breaker closed —
+/// a corrupt tally must never read as "no losses today" (see
+/// `DayBook`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DayStateLoad {
+    Missing,
+    Loaded(DayState),
+    Damaged(String),
+}
+
+/// Load the tally. `Missing` only when the file was never written;
+/// every other failure (unreadable, corrupt, non-finite, newer
+/// schema) is `Damaged` — the caller fails closed, never fresh.
+pub fn load(path: &Path) -> DayStateLoad {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DayStateLoad::Missing,
         Err(e) => {
-            tracing::warn!(file = %path.display(), error = %e, "day-state unreadable; day-loss tally starts fresh (restart would reset it)");
-            return None;
+            return DayStateLoad::Damaged(format!("unreadable: {e}"));
         }
     };
     match serde_json::from_str::<DayState>(&raw) {
-        Ok(state) if state.schema > DAY_STATE_SCHEMA => {
-            tracing::warn!(file = %path.display(), schema = state.schema, ours = DAY_STATE_SCHEMA,
-                "day-state written by a NEWER version; refusing to adopt its numbers — day-loss tally starts fresh (upgrade the binary or delete the file)");
-            None
-        }
-        Ok(state) if state.day_net.is_finite() => Some(state),
-        Ok(state) => {
-            tracing::warn!(file = %path.display(), day_net = state.day_net, "day-state carries a non-finite tally; day-loss starts fresh");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(file = %path.display(), error = %e, "day-state corrupt; day-loss tally starts fresh");
-            None
-        }
+        Ok(state) if state.schema > DAY_STATE_SCHEMA => DayStateLoad::Damaged(format!(
+            "written by a NEWER schema ({} > ours {DAY_STATE_SCHEMA}); refusing its numbers",
+            state.schema
+        )),
+        Ok(state) if state.day_net.is_finite() => DayStateLoad::Loaded(state),
+        Ok(state) => DayStateLoad::Damaged(format!("non-finite tally (day_net {})", state.day_net)),
+        Err(e) => DayStateLoad::Damaged(format!("corrupt: {e}")),
     }
 }
 
@@ -73,58 +77,189 @@ pub fn save(path: &Path, state: &DayState) -> std::io::Result<()> {
     crate::cli::atomic_write_private(path, &json)
 }
 
+/// Live-boot writability probe for the day-state path (AUD-006): a
+/// state dir that cannot take a write today is the exact hazard the
+/// restart-persistent tally exists for, so live refuses to fund
+/// against a tally it cannot record. Probe = short write + delete of
+/// a dedicated file next to the tally; the probe file is never the
+/// tally itself.
+pub fn ensure_writable(path: &Path) -> Result<(), String> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    // A parent that already exists but is not a directory (e.g. the
+    // bare log path's dir slot taken by a stray file) is the same
+    // hazard: refuse with the same fail-closed wording as an
+    // unwritable dir (create_dir_all would say "cannot be created",
+    // but the operator-facing problem is identical).
+    if dir.exists() && !dir.is_dir() {
+        return Err(format!(
+            "day-state dir {} is not writable: the path exists but is not a directory (the loss tally must persist; fix permissions/disk before running live)",
+            dir.display()
+        ));
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(format!(
+            "day-state dir {} cannot be created: {e} (the loss tally must persist; fix permissions/disk before running live)",
+            dir.display()
+        ));
+    }
+    let probe = dir.join(format!("{}.probe", DAY_STATE_FILE));
+    let payload = b"probe";
+    let write = std::fs::write(&probe, payload).and_then(|()| {
+        std::fs::read(&probe).and_then(|got| {
+            if got == payload {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("probe readback mismatch"))
+            }
+        })
+    });
+    let _ = std::fs::remove_file(&probe);
+    write.map_err(|e| {
+        format!(
+            "day-state dir {} is not writable: {e} (the loss tally must persist; fix permissions/disk before running live)",
+            dir.display()
+        )
+    })
+}
+
 /// Day-loss breaker with its home on disk: `record` persists (the
-/// tally must never be reset by a restart), reads stay pure.
+/// tally must never be reset by a restart), reads stay pure. A
+/// damaged state file poisons the book: entries halt for the rest of
+/// the UTC day (loud card on first check), instead of restarting the
+/// tally fresh and blowing past the loss cap. The poison is
+/// in-memory only (never persisted: a -inf tally is not JSON) and
+/// clears on the next UTC day or when the operator deletes the file.
+///
+/// A failed persist latches `persist_failed` the same way (AUD-006):
+/// the in-memory tally stays correct for the run, but the file no
+/// longer backs it, so a restart would silently read a missing or
+/// older tally as a fresh day and loosen the live breaker. While the
+/// latch holds, the book is halted (entries off; exits unaffected)
+/// until a successful write or an explicit operator reset of the
+/// state dir. The one case this cannot catch is the file being lost
+/// while the process is fine and every write since has succeeded —
+/// an externally deleted file is indistinguishable from a first
+/// boot without a second durable marker, so an operator reset (not a
+/// silent "fresh day") is the documented remedy there. Live boot
+/// additionally probes state-dir writability before funding (`crate::day_state::ensure_writable`).
 #[derive(Debug)]
 pub struct DayBook {
     breaker: DailyBreaker,
     path: Option<PathBuf>,
+    poisoned: bool,
+    /// UTC day the poison was taken (open time). Rollover past this
+    /// day clears the poison; `breaker.day` alone cannot tell (open
+    /// stamps it to today).
+    poisoned_day: u64,
+    /// A `save` failed this run (AUD-006): the file may be missing or
+    /// stale, so a restart must not read this tally as trustworthy —
+    /// the book halts until a successful write lands.
+    persist_failed: bool,
 }
 
 impl DayBook {
     /// Load the persisted tally when it belongs to the same UTC day,
     /// then arm persistence. `None` = in-memory only (tests, or a run
     /// with no state dir). A stale bucket is a fresh day by definition.
+    /// A damaged file poisons the book (entries halt today).
     pub fn open(path: Option<PathBuf>, now_secs: u64) -> Self {
         let mut book = Self {
             breaker: DailyBreaker::new(now_secs),
             path,
+            poisoned: false,
+            poisoned_day: 0,
+            persist_failed: false,
         };
-        if let Some(path) = book.path.as_deref()
-            && let Some(state) = load(path)
-        {
-            if state.day == now_secs / 86_400 {
-                book.breaker.day_net = state.day_net;
-                book.breaker.halt_alerted_day = state.halt_alerted_day;
-                tracing::info!(file = %path.display(), day_net = state.day_net, "day-loss tally resumed from disk");
-            } else {
-                tracing::debug!(file = %path.display(), saved_day = state.day, "day-state from an older day; fresh tally");
+        let Some(path) = book.path.as_deref() else {
+            return book;
+        };
+        match load(path) {
+            DayStateLoad::Missing => {}
+            DayStateLoad::Loaded(state) => {
+                if state.day == now_secs / 86_400 {
+                    book.breaker.day_net = state.day_net;
+                    book.breaker.halt_alerted_day = state.halt_alerted_day;
+                    tracing::info!(file = %path.display(), day_net = state.day_net, "day-loss tally resumed from disk");
+                } else {
+                    tracing::debug!(file = %path.display(), saved_day = state.day, "day-state from an older day; fresh tally");
+                }
+            }
+            DayStateLoad::Damaged(reason) => {
+                book.poisoned = true;
+                book.poisoned_day = now_secs / 86_400;
+                book.breaker.day_net = f64::NEG_INFINITY;
+                tracing::error!(file = %path.display(), reason = %reason, "day-state DAMAGED; entries halted for today (fail-closed: delete the file to resume; a running book clears on UTC rollover)");
             }
         }
         book
     }
 
-    /// Fold one closed trade in and persist it. A failed write warns:
-    /// the in-memory tally stays authoritative for this run.
+    /// Clear a same-run poison once the UTC day rolls over.
+    fn maybe_unpoison(&mut self, now_secs: u64) {
+        if self.poisoned && now_secs / 86_400 != self.poisoned_day {
+            self.poisoned = false;
+            self.poisoned_day = 0;
+            self.breaker.day_net = 0.0;
+        }
+    }
+
+    /// True while persistence is broken (corrupt file poison or a
+    /// failed write latch, AUD-006).
+    fn halted_for_persistence(&self) -> bool {
+        self.poisoned || self.persist_failed
+    }
+
+    /// Fold one closed trade in and persist it. A failed write latches
+    /// halt (AUD-006): the in-memory tally stays authoritative for the
+    /// run, but the file no longer backs it, so the breaker must not
+    /// keep allowing entries it could not survive a restart with.
     pub fn record(&mut self, net_pnl: f64, now_secs: u64) {
+        self.maybe_unpoison(now_secs);
         self.breaker.record(net_pnl, now_secs);
         self.persist();
     }
 
     /// Same contract as `DailyBreaker::tripped`; a day rollover
-    /// persists (today's zero replaces yesterday's tally).
+    /// persists (today's zero replaces yesterday's tally). Poisoned =
+    /// halted (a corrupt tally must never read as "no losses"); a
+    /// failed persist halts the same way until a write succeeds.
     pub fn tripped(&mut self, cap_usd: f64, now_secs: u64) -> bool {
+        self.maybe_unpoison(now_secs);
+        if self.halted_for_persistence() {
+            return true;
+        }
         let rolled = now_secs / 86_400 != self.breaker.day;
         let tripped = self.breaker.tripped(cap_usd, now_secs);
         if rolled {
             self.persist();
+            if self.persist_failed {
+                return true;
+            }
         }
         tripped
     }
 
     /// Same contract as `DailyBreaker::halt_state`; the one-shot card
     /// marker persists so a restart cannot re-fire the day's card.
+    /// Poisoned = halted with a firing card (loud, once per day). A
+    /// failed persist halts the same way and fires the card once per
+    /// run-day until the next write succeeds.
     pub fn halt_state(&mut self, cap_usd: f64, now_secs: u64) -> (bool, bool) {
+        self.maybe_unpoison(now_secs);
+        if self.halted_for_persistence() {
+            // Loud once per run-day (per-UTC-day one-shot): stamp the
+            // card day so the (true, true) edge re-fires exactly once
+            // per day even in a long-lived run.
+            self.breaker.day = now_secs / 86_400;
+            if self.breaker.halt_alerted_day == self.breaker.day {
+                return (true, false);
+            }
+            self.breaker.halt_alerted_day = self.breaker.day;
+            return (true, true);
+        }
         let before = self.breaker.halt_alerted_day;
         let out = self.breaker.halt_state(cap_usd, now_secs);
         if self.breaker.halt_alerted_day != before {
@@ -138,8 +273,16 @@ impl DayBook {
         self.breaker.day_net
     }
 
-    /// Best-effort write of the current scalars.
-    fn persist(&self) {
+    /// Best-effort write of the current scalars. Skipped while
+    /// poisoned (a -inf tally is not JSON-serializable; the poison is
+    /// in-memory only and clears on UTC rollover). A write failure
+    /// latches `persist_failed` (AUD-006): the book halts until a
+    /// later write succeeds — a recovered write clears the latch and
+    /// the next persistence keeps the breaker honest across restarts.
+    fn persist(&mut self) {
+        if self.poisoned {
+            return;
+        }
         let Some(path) = self.path.as_deref() else {
             return;
         };
@@ -149,8 +292,22 @@ impl DayBook {
             day_net: self.breaker.day_net,
             halt_alerted_day: self.breaker.halt_alerted_day,
         };
-        if let Err(e) = save(path, &state) {
-            tracing::warn!(file = %path.display(), error = %e, "day-state write failed; tally is in memory only this run (a restart would lose it)");
+        match save(path, &state) {
+            Ok(()) => {
+                if self.persist_failed {
+                    self.persist_failed = false;
+                    tracing::info!(file = %path.display(), "day-state write recovered; persistence latch cleared");
+                }
+            }
+            Err(e) => {
+                if !self.persist_failed {
+                    tracing::error!(
+                        file = %path.display(), error = %e,
+                        "day-state WRITE FAILED: the tally cannot persist, so a restart would read it as lost — entries halt until a write succeeds (exits keep running; fix the state dir)"
+                    );
+                }
+                self.persist_failed = true;
+            }
         }
     }
 }
@@ -169,6 +326,13 @@ mod tests {
         dir
     }
 
+    fn loaded(path: &Path) -> DayState {
+        match load(path) {
+            DayStateLoad::Loaded(state) => state,
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+    }
+
     #[test]
     fn save_load_roundtrips() {
         let path = scratch("roundtrip").join(DAY_STATE_FILE);
@@ -179,13 +343,13 @@ mod tests {
             halt_alerted_day: 20_000,
         };
         save(&path, &state).expect("save");
-        assert_eq!(load(&path), Some(state));
+        assert_eq!(load(&path), DayStateLoad::Loaded(state));
     }
 
     #[test]
     fn newer_schema_refuses_to_adopt_numbers() {
-        // A future writer's file is not ours to interpret: fresh day,
-        // loudly — never a guessed tally.
+        // A future writer's file is not ours to interpret: damaged
+        // (fail closed), never a guessed tally.
         let dir = scratch("future");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join(DAY_STATE_FILE);
@@ -198,28 +362,110 @@ mod tests {
             ),
         )
         .expect("write");
-        assert_eq!(load(&path), None, "newer schema degrades to fresh day");
+        assert!(
+            matches!(load(&path), DayStateLoad::Damaged(_)),
+            "newer schema is damaged, never fresh"
+        );
     }
 
     #[test]
-    fn missing_corrupt_and_stale_degrade_to_fresh() {
+    fn missing_is_fresh_but_corrupt_is_damaged() {
         let dir = scratch("degrade");
         let path = dir.join(DAY_STATE_FILE);
-        assert_eq!(load(&path), None, "missing file is a fresh day");
+        assert_eq!(
+            load(&path),
+            DayStateLoad::Missing,
+            "missing file is a fresh day"
+        );
         std::fs::create_dir_all(&dir).expect("mkdir");
+        // Unreadable (a directory in the file's place) is damaged, not
+        // fresh: a broken path must never look like "no losses".
+        let blocked = dir.join("blocked");
+        std::fs::create_dir(&blocked).expect("mkdir");
+        assert!(
+            matches!(load(&blocked), DayStateLoad::Damaged(_)),
+            "unreadable path is damaged"
+        );
         std::fs::write(&path, "{not json").expect("write");
-        assert_eq!(load(&path), None, "corrupt file is a fresh day");
+        assert!(
+            matches!(load(&path), DayStateLoad::Damaged(_)),
+            "corrupt file is damaged, never fresh"
+        );
         std::fs::write(&path, "{\"day\":1,\"day_net\":-3.0}").expect("write");
         // Older files predate the card marker AND the schema field.
         assert_eq!(
             load(&path),
-            Some(DayState {
+            DayStateLoad::Loaded(DayState {
                 schema: 0,
                 day: 1,
                 day_net: -3.0,
                 halt_alerted_day: 0
             })
         );
+    }
+
+    #[test]
+    fn damaged_file_poisons_the_book_until_rollover() {
+        // A corrupt tally halts entries for the day (fail closed) with
+        // one loud card — a restart cannot silently reset the loss.
+        let day = 20_000u64;
+        let now = day * 86_400 + 10;
+        let dir = scratch("poison");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(DAY_STATE_FILE);
+        std::fs::write(&path, "{not json").expect("write");
+        let mut book = DayBook::open(Some(path.clone()), now);
+        assert!(book.poisoned, "damaged file poisons the book");
+        assert!(
+            book.tripped(1_000_000.0, now),
+            "poisoned book halts entries"
+        );
+        assert_eq!(
+            book.halt_state(1_000_000.0, now),
+            (true, true),
+            "first card fires"
+        );
+        assert_eq!(
+            book.halt_state(1_000_000.0, now + 30),
+            (true, false),
+            "no card spam after the first"
+        );
+        // A restart with the same damaged file stays halted.
+        let mut restarted = DayBook::open(Some(path.clone()), now + 60);
+        assert!(restarted.poisoned);
+        assert!(restarted.tripped(1_000_000.0, now + 60));
+        // Next UTC day, same damaged file: still halted — a restart
+        // cannot prove today's tally is zero (an earlier process may
+        // have traded and crashed). Fail closed until the operator
+        // clears the file.
+        let next = (day + 1) * 86_400 + 10;
+        let mut rolled = DayBook::open(Some(path.clone()), next);
+        assert!(rolled.poisoned);
+        assert!(
+            rolled.tripped(1_000_000.0, next),
+            "damaged file still halts after restart"
+        );
+        // Operator clears the file: fresh day resumes.
+        std::fs::remove_file(&path).expect("operator clears the file");
+        let mut cleared = DayBook::open(Some(path.clone()), next + 60);
+        assert!(!cleared.poisoned);
+        assert!(!cleared.tripped(1_000_000.0, next + 60));
+        cleared.record(-1.0, next + 60);
+        assert_eq!(
+            loaded(&path).day_net,
+            -1.0,
+            "recovery persists a clean tally"
+        );
+        // A running (long-lived) book crossing midnight with damage:
+        // yesterday's unknown tally is moot, so the poison clears and
+        // the clean tally persists over the damaged file.
+        std::fs::write(&path, "{not json").expect("re-damage");
+        book.tripped(1_000_000.0, next + 120);
+        assert!(!book.poisoned, "UTC rollover clears a running poison");
+        assert!(!book.tripped(1_000_000.0, next + 120));
+        book.record(-2.0, next + 120);
+        let state = loaded(&path);
+        assert_eq!((state.day, state.day_net), (day + 1, -2.0));
     }
 
     #[test]
@@ -231,7 +477,7 @@ mod tests {
         book.record(-7.0, now);
         book.record(2.0, now);
         assert_eq!(book.day_net(), -5.0);
-        let state = load(&path).expect("persisted");
+        let state = loaded(&path);
         assert_eq!((state.day, state.day_net), (day, -5.0));
 
         // Restart: same day resumes, the tally must not reset.
@@ -239,7 +485,7 @@ mod tests {
         assert_eq!(restarted.day_net(), -5.0);
         assert!(restarted.tripped(3.0, now + 60), "resumed loss still trips");
         restarted.record(-1.0, now + 120);
-        assert_eq!(load(&path).expect("persisted").day_net, -6.0);
+        assert_eq!(loaded(&path).day_net, -6.0);
 
         // Next UTC day: fresh, and the rollover is persisted.
         let next = (day + 1) * 86_400 + 10;
@@ -247,7 +493,7 @@ mod tests {
         assert_eq!(rolled.day_net(), 0.0);
         assert!(!rolled.tripped(3.0, next));
         rolled.record(-1.0, next);
-        let state = load(&path).expect("persisted");
+        let state = loaded(&path);
         assert_eq!((state.day, state.day_net), (day + 1, -1.0));
     }
 
@@ -274,5 +520,129 @@ mod tests {
         book.record(-4.0, now);
         assert_eq!(book.day_net(), -4.0);
         assert!(book.tripped(1.0, now));
+    }
+
+    #[test]
+    fn failed_persist_latches_halt_until_a_write_succeeds() {
+        // AUD-006: a disk-full/read-only/permission write failure
+        // after a correct boot cannot loosen the live breaker. The
+        // tally is in memory for this run, but a restart would read a
+        // missing/older file as a fresh day, so the book halts until a
+        // write lands. Scenario: the day-state file is missing (a
+        // fresh-day load at open) and the directory is read-only, so
+        // the first `save` fails: exactly the "unbacked but halted"
+        // case. (A path under a regular file is a different failure —
+        // `load` is damaged, which poisons the book at open; covered
+        // by `damaged_file_poisons_the_book_until_rollover`.)
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let day = 20_000u64;
+        let now = day * 86_400 + 10;
+        let dir = scratch("latch");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(DAY_STATE_FILE);
+        assert!(
+            matches!(load(&path), DayStateLoad::Missing),
+            "fresh-day load"
+        );
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("make dir read-only");
+        let mut book = DayBook::open(Some(path.clone()), now);
+        book.record(-2.0, now);
+        assert!(book.persist_failed, "failed write latches");
+        assert!(
+            book.tripped(1_000_000.0, now),
+            "a failed persist halts entries (fail-closed)"
+        );
+        assert_eq!(
+            book.halt_state(1_000_000.0, now),
+            (true, true),
+            "loud card fires"
+        );
+        assert_eq!(
+            book.halt_state(1_000_000.0, now + 30),
+            (true, false),
+            "no card spam"
+        );
+        // Still-losing in-memory tally must not be readable as a win:
+        // the file never got the number, but the run knows.
+        assert!(book.tripped(1.9, now + 60), "in-memory loss still trips");
+        // A later `record` retries the write (the latch is a state,
+        // not a skip-list): it must not loosen the breaker even while
+        // still failing.
+        book.record(-1.0, now + 80);
+        assert!(
+            book.tripped(2.9, now + 80),
+            "still failing writes keep the halt"
+        );
+        // Recovery: make the dir writable and record again — the
+        // successful write clears the latch (items resume).
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore dir");
+        book.record(-0.1, now + 90);
+        assert!(!book.persist_failed, "a successful write clears the latch");
+        assert!(
+            !book.tripped(1_000_000.0, now + 90),
+            "entries resume after recovery (cap far above the tally)"
+        );
+        assert_eq!(loaded(&path).day_net, -3.1, "recovered tally persisted");
+    }
+
+    #[test]
+    fn live_boot_refuses_an_unwritable_day_state_path() {
+        // AUD-006: live cannot boot against a tally it cannot write.
+        let dir = scratch("probe");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let tally = dir.join(DAY_STATE_FILE);
+        assert!(ensure_writable(&tally).is_ok());
+        // The probe leaves nothing behind.
+        assert!(!dir.join(format!("{DAY_STATE_FILE}.probe")).exists());
+        // A probe file left behind by a crashed boot never blocks: the
+        // probe overwrites it, and the real tally path is untouched.
+        std::fs::write(dir.join(format!("{DAY_STATE_FILE}.probe")), b"stale")
+            .expect("write stale probe");
+        assert!(
+            ensure_writable(&tally).is_ok(),
+            "stale probe does not block"
+        );
+        assert!(!tally.exists(), "the probe never touches the tally itself");
+        // A parent that is a regular file (state dir slot taken by a
+        // stray file) refuses with the not-writable wording.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"").expect("file");
+        let err =
+            ensure_writable(&blocked.join(DAY_STATE_FILE)).expect_err("blocked path must refuse");
+        assert!(err.contains("not writable"), "{err}");
+        // A read-only directory refuses the write probe directly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ro = dir.join("read-only");
+            std::fs::create_dir_all(&ro).expect("mkdir");
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+            let err =
+                ensure_writable(&ro.join(DAY_STATE_FILE)).expect_err("read-only dir must refuse");
+            assert!(err.contains("not writable"), "{err}");
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755))
+                .expect("restore for cleanup");
+        }
+    }
+
+    #[test]
+    fn day_rollover_persists_zero_and_survives_write_failures() {
+        // The latch never masks a fresh day: a normal rollover still
+        // persists zero when the dir is writable and unpoisons cleanly.
+        let day = 20_000u64;
+        let now = day * 86_400 + 10;
+        let path = scratch("rollover-latch").join(DAY_STATE_FILE);
+        let mut book = DayBook::open(Some(path.clone()), now);
+        book.record(-8.0, now);
+        let next = (day + 1) * 86_400 + 10;
+        assert!(!book.tripped(1.0, next), "fresh day is not halted");
+        assert_eq!(loaded(&path).day_net, 0.0, "rollover persisted zero");
+        assert!(!book.persist_failed);
     }
 }

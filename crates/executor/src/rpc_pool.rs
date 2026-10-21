@@ -50,9 +50,14 @@ pub const POOL_PROBE_SECS: u64 = 10;
 /// Heavy calls (blocks, transactions, signature pages) get their own
 /// budget via [`attempt_timeout`].
 pub const POOL_READ_TIMEOUT: Duration = Duration::from_secs(6);
-/// Per-attempt deadline for heavy calls (proof: backfill scans blocks
-/// that a 6s budget would spuriously fail over).
-pub const POOL_HEAVY_TIMEOUT: Duration = Duration::from_secs(25);
+/// Per-attempt deadline for heavy calls (blocks, transactions,
+/// signature pages, sims). This MUST sit under the tightest caller
+/// outer (executor wraps reads at 10s, screen at 15s, backfill blocks
+/// at 20s): a hung primary must fail over with room left for the
+/// fallback attempt. A spurious failover is only an extra attempt on
+/// the next endpoint — never a failure — so this favors availability
+/// over waiting out a hung primary.
+pub const POOL_HEAVY_TIMEOUT: Duration = Duration::from_secs(7);
 /// Endpoint cooldown after a failed attempt; a successful sampler
 /// probe clears it earlier.
 const EP_COOLDOWN_MS: u64 = 30_000;
@@ -132,7 +137,9 @@ struct PoolCounters {
 
 /// Per-attempt deadline by method weight (pure, pinned by tests).
 /// Light reads fail over fast (under the callers' 10s outers);
-/// block-weight reads get room instead of spurious failover.
+/// block-weight reads get slightly more room (backfill blocks are
+/// large) but still sit under the tightest 10s caller outer so a hung
+/// primary actually fails over instead of burning the whole budget.
 fn attempt_timeout(request: RpcRequest) -> Duration {
     match request {
         RpcRequest::GetBlock
@@ -279,7 +286,7 @@ impl RpcPool {
                 }
                 Err(e) => {
                     if node.record_err(self.start) {
-                        warn!(url = %ids::redact_endpoint(&node.url), error = %e, "rpc endpoint probe failed; cooling down (reads failover)");
+                        warn!(url = %ids::redact_endpoint(&node.url), error = %ids::strip_error_url(&e.to_string()), "rpc endpoint probe failed; cooling down (reads failover)");
                     }
                 }
             }
@@ -434,7 +441,7 @@ impl RpcSender for FailoverSender {
                 ))),
             };
             if node.record_err(self.pool.start) {
-                warn!(url = %ids::redact_endpoint(&node.url), error = %attempted, "rpc read failed; endpoint cooling down (next attempt serves)");
+                warn!(url = %ids::redact_endpoint(&node.url), error = %ids::strip_error_url(&attempted.to_string()), "rpc read failed; endpoint cooling down (next attempt serves)");
             }
             last_err = Some(attempted);
         }
@@ -652,8 +659,14 @@ mod tests {
             POOL_HEAVY_TIMEOUT
         );
         // The light budget must sit under the callers' 10s outers, or a
-        // hung primary would never fail over in time.
+        // hung primary would never fail over in time. The heavy budget
+        // must too: screen wraps heavy reads at 15s, backfill blocks at
+        // 20s, and executor sims at 10s — a 25s attempt used to burn
+        // every one of those budgets before failover could start.
         assert!(POOL_READ_TIMEOUT.as_secs() < 10);
+        assert!(POOL_HEAVY_TIMEOUT.as_secs() < 10);
+        // Two heavy attempts still fit inside the 15s screen outer.
+        assert!(POOL_HEAVY_TIMEOUT.as_secs() * 2 <= 15);
     }
 
     #[tokio::test]

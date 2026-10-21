@@ -2,7 +2,7 @@
 
 use risk_engine::{ExitRegime, StrategyMode};
 use std::collections::HashMap;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Default Jito block-engine base URL (override via `JITO_ENDPOINT`).
 /// Global endpoint stays the default (anycast reachability over shaving
@@ -187,7 +187,10 @@ impl std::fmt::Debug for Settings {
                     .map(|u| ids::redact_endpoint(u))
                     .collect::<Vec<_>>(),
             )
-            .field("yellowstone_endpoint", &ids::redact_endpoint(&self.yellowstone_endpoint))
+            .field(
+                "yellowstone_endpoint",
+                &ids::redact_endpoint(&self.yellowstone_endpoint),
+            )
             .field("commitment", &self.commitment)
             .field("start_balance", &self.start_balance)
             .field("fee_bps", &self.fee_bps)
@@ -232,13 +235,19 @@ impl std::fmt::Debug for Settings {
             .field("inference_headers", &self.inference_header_names())
             .field("slippage_bps", &self.slippage_bps)
             .field("slippage_vol_window_secs", &self.slippage_vol_window_secs)
-            .field("slippage_vol_extra_cap_bps", &self.slippage_vol_extra_cap_bps)
+            .field(
+                "slippage_vol_extra_cap_bps",
+                &self.slippage_vol_extra_cap_bps,
+            )
             .field("strategy_mode", &self.strategy_mode)
             .field("inference_fallback", &self.inference_fallback)
             .field("inference_defer_max_n", &self.inference_defer_max_n)
             .field("force_exit_regime", &self.force_exit_regime)
             .field("runner_moonbag_percent", &self.runner_moonbag_percent)
-            .field("priority_fee_micro_lamports", &self.priority_fee_micro_lamports)
+            .field(
+                "priority_fee_micro_lamports",
+                &self.priority_fee_micro_lamports,
+            )
             .field("compute_unit_limit", &self.compute_unit_limit)
             .field("tip_lamports", &self.tip_lamports)
             .field("jito_endpoint", &ids::redact_endpoint(&self.jito_endpoint))
@@ -276,6 +285,12 @@ impl Settings {
             merged.insert("INFERENCE_API_KEY".to_string(), key);
         }
         let mut settings = Self::from_map(&merged);
+        // The merged map held the bearer as a plain `String`; the
+        // parsed settings own it as `Zeroizing` now — scrub the
+        // intermediate copy instead of letting it linger to drop.
+        if let Some(copy) = merged.get_mut("INFERENCE_API_KEY") {
+            copy.zeroize();
+        }
         // File notes first: they name the source of a value.
         file_notes.append(&mut settings.parse_notes);
         settings.parse_notes = file_notes;
@@ -329,7 +344,9 @@ impl Settings {
             inference_endpoint: get_string(vars, "INFERENCE_ENDPOINT", DEFAULT_INFERENCE_ENDPOINT),
             inference_model: get_string(vars, "INFERENCE_MODEL", "llama3.2:1b"),
             inference_timeout_ms: get_int(vars, "INFERENCE_TIMEOUT_MS", 300, &mut notes),
-            inference_api_key: vars.get("INFERENCE_API_KEY").map(|s| Zeroizing::new(s.clone())),
+            inference_api_key: vars
+                .get("INFERENCE_API_KEY")
+                .map(|s| Zeroizing::new(s.clone())),
             inference_headers: parse_inference_headers(vars, &mut notes),
             slippage_bps: get_int(vars, "SLIPPAGE_BPS", 200, &mut notes),
             slippage_vol_window_secs: get_int(vars, "SLIPPAGE_VOL_WINDOW_SECS", 0, &mut notes),
@@ -339,7 +356,12 @@ impl Settings {
             inference_defer_max_n: get_int(vars, "INFERENCE_DEFER_MAX_N", 1, &mut notes),
             force_exit_regime: get_string(vars, "FORCE_EXIT_REGIME", ""),
             runner_moonbag_percent: get_float(vars, "RUNNER_MOONBAG_PERCENT", 20.0, &mut notes),
-            priority_fee_micro_lamports: get_int(vars, "PRIORITY_FEE_MICRO_LAMPORTS", 0, &mut notes),
+            priority_fee_micro_lamports: get_int(
+                vars,
+                "PRIORITY_FEE_MICRO_LAMPORTS",
+                0,
+                &mut notes,
+            ),
             compute_unit_limit: get_int(vars, "COMPUTE_UNIT_LIMIT", 0, &mut notes),
             tip_lamports: get_int(vars, "JITO_TIP_LAMPORTS", 100_000, &mut notes),
             jito_endpoint: get_string(vars, "JITO_ENDPOINT", DEFAULT_JITO_ENDPOINT),
@@ -350,7 +372,12 @@ impl Settings {
                 .filter(|v| !v.is_empty()),
             sim_strict: get_bool(vars, "SIM_STRICT", false, &mut notes),
             alert_diverged_warn_n: get_int(vars, "ALERT_DIVERGED_WARN_N", 3, &mut notes),
-            alert_risk_fallback_warn_pct: get_int(vars, "ALERT_RISK_FALLBACK_WARN_PCT", 50, &mut notes),
+            alert_risk_fallback_warn_pct: get_int(
+                vars,
+                "ALERT_RISK_FALLBACK_WARN_PCT",
+                50,
+                &mut notes,
+            ),
             alert_giveup_burst_n: get_int(vars, "ALERT_GIVEUP_BURST_N", 3, &mut notes),
             alert_giveup_window_secs: get_int(vars, "ALERT_GIVEUP_WINDOW_SECS", 3600, &mut notes),
             parse_notes: notes,
@@ -358,6 +385,103 @@ impl Settings {
     }
 
     /// Warnings for bad values. Empty when sane.
+    /// Endpoint-trust findings (AUD-016): `(fatals, warns)`. Fatals
+    /// refuse a live boot; warns surface in every mode. Remote
+    /// plain-http endpoints (RPC, fallbacks, Jito, geyser) carry
+    /// traffic/credentials in cleartext, and a wrong-cluster fallback
+    /// would silently change the read source; localhost http is
+    /// explicitly allowed. `allow_fallback_cluster_mismatch` is the
+    /// explicit operator override (`ALLOW_FALLBACK_CLUSTER_MISMATCH`),
+    /// which downgrades a flagged fallback to a logged warning but
+    /// never clears renames of the underlying risk.
+    pub fn endpoint_trust(
+        &self,
+        allow_fallback_cluster_mismatch: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut fatals = Vec::new();
+        let mut warns = Vec::new();
+        // One reference cluster: the primary read RPC (the existing
+        // split-brain check pins dispatch to the same cluster).
+        let primary = endpoint_cluster(&self.http_url);
+
+        let mut endpoints: Vec<(String, &str)> = vec![
+            ("MAINNET_RPC_URL".to_string(), self.http_url.as_str()),
+            ("JITO_ENDPOINT".to_string(), self.jito_endpoint.as_str()),
+        ];
+        if !self.yellowstone_endpoint.is_empty() {
+            endpoints.push((
+                "YELLOWSTONE_ENDPOINT".to_string(),
+                self.yellowstone_endpoint.as_str(),
+            ));
+        }
+        for (i, url) in self.fallback_rpc_urls.iter().enumerate() {
+            endpoints.push((format!("MAINNET_RPC_URLS_FALLBACK[{i}]"), url));
+        }
+
+        for (label, url) in endpoints {
+            // Localhost http is explicitly allowed (local dev/test
+            // proxies); remote plain-http is not.
+            if is_plain_http_remote(url) {
+                let redacted = ids::redact_endpoint(url);
+                fatals.push(format!(
+                    "{label} serves a remote plain-http endpoint ({redacted}): reads/credentials move in cleartext; use https or a localhost endpoint"
+                ));
+                continue;
+            }
+            // Unusable URL (malformed / non-http scheme): the pool and
+            // geyser dialers would degrade to silent failed reads.
+            if !is_http_url(url) {
+                fatals.push(format!(
+                    "{label} is not a usable http(s) URL ({redacted}); fix the config (an unset endpoint means unset)",
+                    redacted = ids::redact_endpoint(url)
+                ));
+                continue;
+            }
+            // Cluster agreement, fallback endpoints only (the
+            // RPC-vs-Jito split-brain check below covers dispatch).
+            if !label.starts_with("MAINNET_RPC_URLS_FALLBACK") {
+                continue;
+            }
+            let cluster = endpoint_cluster(url);
+            match (primary, cluster) {
+                (Some(p), Some(c)) if c != p => {
+                    if allow_fallback_cluster_mismatch {
+                        warns.push(format!(
+                            "{label} identifies cluster '{c}' but the primary RPC is '{p}' — OVERRIDDEN by ALLOW_FALLBACK_CLUSTER_MISMATCH (operator acknowledged cross-cluster reads)",
+                        ));
+                    } else {
+                        fatals.push(format!(
+                            "{label} identifies cluster '{c}' but the primary RPC is '{p}': a read failover would silently switch data sources (cross-cluster state breaks pricing/decisions)"
+                        ));
+                    }
+                }
+                (None, Some(c)) => {
+                    warns.push(format!(
+                        "{label} identifies cluster '{c}' while MAINNET_RPC_URL is unidentifiable; verify it serves the same cluster as the primary",
+                    ));
+                }
+                _ => {} // same cluster, or neither end identifies (warned below)
+            }
+        }
+
+        // Split-brain clusters can never land. Enforced when both identify.
+        match (primary, endpoint_cluster(&self.jito_endpoint)) {
+            (Some(rpc), Some(jito)) if rpc != jito => {
+                fatals.push(format!(
+                    "split-brain clusters: RPC is {rpc}, Jito is {jito} (tips would never land)"
+                ));
+            }
+            (None, _) | (_, None) => {
+                warns.push(
+                    "config: RPC/Jito cluster unidentifiable from URLs; ensure both serve the same cluster".to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        (fatals, warns)
+    }
+
     pub fn warnings(&self) -> Vec<String> {
         let mut out = self.parse_notes.clone();
         if self.slippage().is_none() {
@@ -411,6 +535,11 @@ impl Settings {
                 "INFERENCE_API_KEY is set with a non-local plain-http INFERENCE_ENDPOINT: the bearer token travels in cleartext — use https or keep inference on localhost".to_string(),
             );
         }
+        // AUD-016: endpoint trust — paper keeps warnings (the live gate
+        // refuses the fatal items).
+        let (endpoint_fatals, endpoint_warns) = self.endpoint_trust(false);
+        out.extend(endpoint_warns);
+        out.extend(endpoint_fatals);
         if self.runner_moonbag().is_none() {
             out.push(format!(
                 "RUNNER_MOONBAG_PERCENT={} outside 0–100; clamped at resolve time",
@@ -572,6 +701,13 @@ impl Settings {
         out
     }
 
+    /// Live boot gate (AUD-005): true when the primary RPC is the
+    /// shipped public default, documented as unfit for live reads
+    /// (drops candidates, truncates quorum, rate limits).
+    pub fn on_public_rpc_default(&self) -> bool {
+        self.http_url == listener::types::DEFAULT_HTTP_RPC_URL
+    }
+
     /// Typed slippage guard (`None` when >=100% or unrepresentable).
     /// Prefer this over raw `slippage_bps` in new code.
     pub fn slippage(&self) -> Option<crate::money::Bps> {
@@ -658,7 +794,8 @@ impl Settings {
         }
         if self.fetch_concurrency == 0 {
             return Err(
-                "FETCH_CONCURRENCY=0 blinds ingestion (zero fetch permits drop every candidate)".to_string(),
+                "FETCH_CONCURRENCY=0 blinds ingestion (zero fetch permits drop every candidate)"
+                    .to_string(),
             );
         }
         Ok(())
@@ -733,16 +870,18 @@ fn get_bool(
 fn parse_wss_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> String {
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
     if vars.contains_key("MAINNET_WSS_RPC_URL")
-        && vars.get("MAINNET_WSS_RPC_URL").is_some_and(|v| clean(v).is_empty())
+        && vars
+            .get("MAINNET_WSS_RPC_URL")
+            .is_some_and(|v| clean(v).is_empty())
     {
         notes.push(
             "MAINNET_WSS_RPC_URL is blank; using the public endpoint (check for typos)".to_string(),
         );
     }
-    match vars.get("MAINNET_WSS_RPC_URL").map(clean).filter(|v| !v.is_empty()) {
-        Some(url) => url,
-        None => listener::types::DEFAULT_WS_RPC_URL.to_string(),
-    }
+    vars.get("MAINNET_WSS_RPC_URL")
+        .map(clean)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| listener::types::DEFAULT_WS_RPC_URL.to_string())
 }
 
 /// Canonical HTTP RPC URL (`MAINNET_RPC_URL`; empty = public default).
@@ -750,16 +889,18 @@ fn parse_rpc_url(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> Str
     let clean = |v: &String| v.replace('\\', "").trim().to_string();
     // Blank set var is a typo, not unset.
     if vars.contains_key("MAINNET_RPC_URL")
-        && vars.get("MAINNET_RPC_URL").is_some_and(|v| clean(v).is_empty())
+        && vars
+            .get("MAINNET_RPC_URL")
+            .is_some_and(|v| clean(v).is_empty())
     {
         notes.push(
             "MAINNET_RPC_URL is blank; using the public endpoint (check for typos)".to_string(),
         );
     }
-    match vars.get("MAINNET_RPC_URL").map(clean).filter(|v| !v.is_empty()) {
-        Some(url) => url,
-        None => listener::types::DEFAULT_HTTP_RPC_URL.to_string(),
-    }
+    vars.get("MAINNET_RPC_URL")
+        .map(clean)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| listener::types::DEFAULT_HTTP_RPC_URL.to_string())
 }
 
 /// Comma-separated read-failover endpoints (`MAINNET_RPC_URLS_FALLBACK`
@@ -817,27 +958,29 @@ fn parse_yellowstone_url(vars: &HashMap<String, String>, notes: &mut Vec<String>
 /// RFC 7230 token: the name side of a header.
 fn is_header_name(s: &str) -> bool {
     !s.is_empty()
-        && s.bytes().all(|b| matches!(
-            b,
-            b'0'..=b'9'
-                | b'A'..=b'Z'
-                | b'a'..=b'z'
-                | b'!'
-                | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        ))
+        && s.bytes().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
 }
 
 /// Header value: non-empty, no controls or DEL (obs-text allowed).
@@ -948,6 +1091,30 @@ pub(crate) fn is_plain_http_remote(endpoint: &str) -> bool {
         || host == "::1")
 }
 
+/// Cluster identity of a Solana endpoint URL (AUD-016): the first
+/// recognizable cluster marker. `None` = unidentifiable (a warning,
+/// never a refusal on its own — many providers use opaque domains).
+/// Whole-URL match keeps the existing split-brain check's semantics.
+/// Pure: the boot gate, config warnings, and tests share one predicate.
+pub(crate) fn endpoint_cluster(url: &str) -> Option<&'static str> {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("devnet") {
+        Some("devnet")
+    } else if lower.contains("testnet") {
+        Some("testnet")
+    } else if lower.contains("mainnet") {
+        Some("mainnet")
+    } else {
+        None
+    }
+}
+
+/// True when `url` parses and speaks http/https (geyser dials gRPC off
+/// the scheme; RPC/Jito need HTTP(S) too).
+pub(crate) fn is_http_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| u.scheme() == "http" || u.scheme() == "https")
+}
+
 /// Unix seconds; `0` when the clock fails (never panics).
 pub fn now_secs() -> u64 {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1005,6 +1172,143 @@ mod tests {
         assert!(s.fallback_rpc_urls.is_empty());
     }
 
+    /// Live-boot endpoint-trust predicate (AUD-016).
+    #[test]
+    fn endpoint_trust_refuses_remote_plain_http_endpoints() {
+        // Remote plain-http RPC is a fatal (keyed reads in cleartext).
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "http://rpc.example.com"),
+            ("JITO_ENDPOINT", "https://mainnet.block-engine.jito.wtf"),
+        ]));
+        let (fatals, warns) = s.endpoint_trust(false);
+        assert!(
+            fatals
+                .iter()
+                .any(|f| f.contains("MAINNET_RPC_URL") && f.contains("plain-http")),
+            "expected a cleartext refusal, got fatals={fatals:?} warns={warns:?}"
+        );
+        // Localhost http passes: same port/socket trust boundary.
+        let s = Settings::from_map(&vars(&[("MAINNET_RPC_URL", "http://localhost:8899")]));
+        assert!(
+            s.endpoint_trust(false).0.is_empty(),
+            "localhost http must not be refused: {:?}",
+            s.endpoint_trust(false)
+        );
+        // Jito follows the same transport rule.
+        let s = Settings::from_map(&vars(&[("JITO_ENDPOINT", "http://jito.example.com")]));
+        let (fatals, _) = s.endpoint_trust(false);
+        assert!(fatals.iter().any(|f| f.contains("JITO_ENDPOINT")));
+        // Geyser (x-token auth) follows it too.
+        let s = Settings::from_map(&vars(&[(
+            "YELLOWSTONE_ENDPOINT",
+            "http://geyser.example.com",
+        )]));
+        let (fatals, _) = s.endpoint_trust(false);
+        assert!(fatals.iter().any(|f| f.contains("YELLOWSTONE_ENDPOINT")));
+    }
+
+    #[test]
+    fn endpoint_trust_refuses_a_cross_cluster_fallback() {
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            ("MAINNET_RPC_URLS_FALLBACK", "https://api.devnet.solana.com"),
+        ]));
+        let (fatals, _) = s.endpoint_trust(false);
+        assert!(
+            fatals
+                .iter()
+                .any(|f| f.contains("devnet") && f.contains("mainnet")),
+            "a devnet fallback must refuse live: {fatals:?}"
+        );
+        // Testnet is the same refusal.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            (
+                "MAINNET_RPC_URLS_FALLBACK",
+                "https://api.testnet.solana.com",
+            ),
+        ]));
+        assert!(
+            s.endpoint_trust(false)
+                .0
+                .iter()
+                .any(|f| f.contains("testnet"))
+        );
+        // An unidentifiable fallback is not a refusal (opaque domains are
+        // legitimate), it is a warning at most.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            ("MAINNET_RPC_URLS_FALLBACK", "https://reads.example.com"),
+        ]));
+        let (fatals, _) = s.endpoint_trust(false);
+        assert!(fatals.is_empty(), "{fatals:?}");
+    }
+
+    #[test]
+    fn fallback_cluster_mismatch_override_is_explicit_and_logged() {
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            ("MAINNET_RPC_URLS_FALLBACK", "https://api.devnet.solana.com"),
+        ]));
+        // With the override the refusal downgrades to a logged warning
+        // naming both the risk and the override.
+        let (fatals, warns) = s.endpoint_trust(true);
+        assert!(fatals.is_empty(), "{fatals:?}");
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("OVERRIDDEN by ALLOW_FALLBACK_CLUSTER_MISMATCH")),
+            "the override must be logged: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_trust_warns_paper_but_runs_on_fatals() {
+        // Paper mode: the fatal findings surface in config warnings
+        // (boot continues) — "paper warns but runs".
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "http://rpc.example.com"),
+            (
+                "MAINNET_RPC_URLS_FALLBACK",
+                "https://api.devnet.solana.com,notaurl",
+            ),
+        ]));
+        let w = s.warnings().join("\n");
+        assert!(w.contains("plain-http"), "{w}");
+        assert!(w.contains("devnet"), "{w}");
+        assert!(
+            w.contains("notaurl") || w.contains("MAINNET_RPC_URLS_FALLBACK[1]"),
+            "malformed fallback is warned: {w}"
+        );
+        // And the live predicate still refuses the same configuration:
+        // the cleartext primary and the malformed fallback.
+        let (fatals, warns) = s.endpoint_trust(false);
+        assert_eq!(fatals.len(), 2, "{fatals:?}");
+        assert!(fatals[0].contains("plain-http"));
+        assert!(
+            warns.iter().any(|w| w.contains("devnet")),
+            "cross-cluster-or-unproven fallback is warned: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn split_brain_clusters_are_a_live_gate_fatal() {
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            ("JITO_ENDPOINT", "https://api.devnet.solana.com"),
+        ]));
+        let (fatals, _) = s.endpoint_trust(false);
+        assert!(
+            fatals.iter().any(|f| f.contains("split-brain")),
+            "{fatals:?}"
+        );
+        // The unidentifiable case stays a warning, never a refusal.
+        let s = Settings::from_map(&vars(&[("MAINNET_RPC_URL", "https://reads.example.com")]));
+        let (fatals, warns) = s.endpoint_trust(false);
+        assert!(fatals.is_empty(), "{fatals:?}");
+        assert!(warns.iter().any(|w| w.contains("unidentifiable")));
+    }
+
     #[test]
     fn defaults_are_sane() {
         let s = Settings::from_map(&HashMap::new());
@@ -1052,6 +1356,28 @@ mod tests {
         // Canonical WSS wins.
         let s = Settings::from_map(&vars(&[("MAINNET_WSS_RPC_URL", "wss://helius/abc")]));
         assert_eq!(s.ws_url, "wss://helius/abc");
+    }
+
+    #[test]
+    fn public_rpc_boot_gate_predicate() {
+        // AUD-005: live boots refuse the shipped public default unless
+        // the operator opts in; the predicate identifies the default
+        // exactly (blank/unset count, real endpoints don't).
+        let s = Settings::from_map(&HashMap::new());
+        assert!(
+            s.on_public_rpc_default(),
+            "unset MAINNET_RPC_URL is the public default"
+        );
+        let s = Settings::from_map(&vars(&[("MAINNET_RPC_URL", "")]));
+        assert!(
+            s.on_public_rpc_default(),
+            "blank MAINNET_RPC_URL falls back to the public default"
+        );
+        let s = Settings::from_map(&vars(&[("MAINNET_RPC_URL", "https://helius/abc")]));
+        assert!(
+            !s.on_public_rpc_default(),
+            "a real endpoint is not the public default"
+        );
     }
 
     #[test]
@@ -1231,15 +1557,22 @@ mod tests {
         let s = Settings::from_map(&vars(&[("INFERENCE_FALLBACK", "pass")]));
         assert_eq!(s.inference_fallback, "pass");
         assert!(
-            !s.warnings().iter().any(|w| w.contains("INFERENCE_FALLBACK")),
+            !s.warnings()
+                .iter()
+                .any(|w| w.contains("INFERENCE_FALLBACK")),
             "{:?}",
             s.warnings()
         );
         let s = Settings::from_map(&vars(&[("INFERENCE_FALLBACK", "defer")]));
         assert_eq!(s.inference_fallback, "defer");
-        assert!(s.inference_defer_max_n > 0, "bare defer defaults to one retry");
         assert!(
-            !s.warnings().iter().any(|w| w.contains("INFERENCE_FALLBACK")),
+            s.inference_defer_max_n > 0,
+            "bare defer defaults to one retry"
+        );
+        assert!(
+            !s.warnings()
+                .iter()
+                .any(|w| w.contains("INFERENCE_FALLBACK")),
             "{:?}",
             s.warnings()
         );
@@ -1268,17 +1601,22 @@ mod tests {
         // silent sugar misread as a huge budget).
         let s = Settings::from_map(&vars(&[("INFERENCE_DEFER_MAX_N", "soon")]));
         assert_eq!(s.inference_defer_max_n, 1);
-        assert!(s.warnings().iter().any(|w| w.contains("INFERENCE_DEFER_MAX_N='soon' is not an integer")));
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("INFERENCE_DEFER_MAX_N='soon' is not an integer"))
+        );
         // An extreme (runaway) budget warns only with defer armed —
         // the fresh-window re-arm makes this count the only stop.
         let s = Settings::from_map(&vars(&[
             ("INFERENCE_FALLBACK", "defer"),
             ("INFERENCE_DEFER_MAX_N", "1000"),
         ]));
-        assert!(s
-            .warnings()
-            .iter()
-            .any(|w| w.contains("INFERENCE_DEFER_MAX_N=1000 looks larger than sane")));
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("INFERENCE_DEFER_MAX_N=1000 looks larger than sane"))
+        );
         // Same number with disarm'd policy: no warning (the count is
         // dead configuration then, its cost none).
         let s = Settings::from_map(&vars(&[("INFERENCE_DEFER_MAX_N", "1000")]));
@@ -1305,7 +1643,6 @@ mod tests {
 
     #[test]
     fn overrides_apply() {
-
         let s = Settings::from_map(&vars(&[
             ("START_BALANCE", "250.5"),
             ("GATE_MIN_BUYERS", "5"),
@@ -1439,9 +1776,21 @@ mod tests {
         assert!(!s.warnings().iter().any(|w| w.contains("SLIPPAGE_VOL")));
         // Cap without a window (and vice versa) warns loudly.
         let s = Settings::from_map(&vars(&[("SLIPPAGE_VOL_EXTRA_CAP_BPS", "150")]));
-        assert!(s.warnings().iter().any(|w| w.contains("SLIPPAGE_VOL_EXTRA_CAP_BPS>0")), "{:?}", s.warnings());
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("SLIPPAGE_VOL_EXTRA_CAP_BPS>0")),
+            "{:?}",
+            s.warnings()
+        );
         let s = Settings::from_map(&vars(&[("SLIPPAGE_VOL_WINDOW_SECS", "60")]));
-        assert!(s.warnings().iter().any(|w| w.contains("SLIPPAGE_VOL_WINDOW_SECS>0")), "{:?}", s.warnings());
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("SLIPPAGE_VOL_WINDOW_SECS>0")),
+            "{:?}",
+            s.warnings()
+        );
         // Fully armed: parses, no warning.
         let s = Settings::from_map(&vars(&[
             ("SLIPPAGE_VOL_WINDOW_SECS", "60"),
@@ -1474,7 +1823,10 @@ mod tests {
         ] {
             let mut ep = s.clone();
             ep.inference_endpoint = local.to_string();
-            assert!(!ep.warnings().iter().any(|w| w.contains("cleartext")), "{local}");
+            assert!(
+                !ep.warnings().iter().any(|w| w.contains("cleartext")),
+                "{local}"
+            );
         }
     }
 
@@ -1485,7 +1837,13 @@ mod tests {
             .expect("test toml");
         let s = Settings::from_file(Some(&file));
         assert_eq!(s.notional_usd, 42.0);
-        assert!(s.warnings().iter().any(|w| w.contains("[gate].gate_window_sec unknown")), "{:?}", s.warnings());
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("[gate].gate_window_sec unknown")),
+            "{:?}",
+            s.warnings()
+        );
         // No file: pure defaults.
         let s = Settings::from_file(None);
         assert_eq!(s.notional_usd, 10.0);
@@ -1510,7 +1868,9 @@ mod tests {
         }
         // ... and the file cannot provide it (no such key exists).
         assert!(
-            !crate::config::KEYMAP.iter().any(|(_, _, flat)| *flat == "INFERENCE_API_KEY"),
+            !crate::config::KEYMAP
+                .iter()
+                .any(|(_, _, flat)| *flat == "INFERENCE_API_KEY"),
             "inference key must never gain a file mapping"
         );
     }
@@ -1602,7 +1962,11 @@ mod tests {
         // Warnings still fire alongside (soft copy for logs).
         let s = Settings::from_map(&vars(&[("SLIPPAGE_BPS", "20000")]));
         assert!(s.validate().is_err());
-        assert!(s.warnings().iter().any(|w| w.contains("SLIPPAGE_BPS=20000")));
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|w| w.contains("SLIPPAGE_BPS=20000"))
+        );
     }
 
     #[test]
@@ -1613,7 +1977,11 @@ mod tests {
         let w = s.warnings().join("\n");
         assert!(w.contains("COMMITMENT='bogus' unknown"), "{w}");
         let s = Settings::from_map(&HashMap::new());
-        assert!(!s.warnings().iter().any(|x| x.contains("unknown; startup refuses")));
+        assert!(
+            !s.warnings()
+                .iter()
+                .any(|x| x.contains("unknown; startup refuses"))
+        );
     }
 
     #[test]
@@ -1642,8 +2010,14 @@ mod tests {
         // Helius-style URLs carry ?api-key=: Debug must keep the host
         // (debuggable) and drop the query (secret).
         let s = Settings::from_map(&vars(&[
-            ("MAINNET_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=K1"),
-            ("MAINNET_WSS_RPC_URL", "wss://mainnet.helius-rpc.com/?api-key=K2"),
+            (
+                "MAINNET_RPC_URL",
+                "https://mainnet.helius-rpc.com/?api-key=K1",
+            ),
+            (
+                "MAINNET_WSS_RPC_URL",
+                "wss://mainnet.helius-rpc.com/?api-key=K2",
+            ),
             ("JITO_ENDPOINT", "https://jito.example/?key=K3"),
         ]));
         let dbg = format!("{s:?}");
@@ -1705,7 +2079,10 @@ mod tests {
 
     #[test]
     fn inference_headers_dedupe_last_wins() {
-        let s = Settings::from_map(&vars(&[("INFERENCE_HEADERS", "x-sess: first, X-Sess: second")]));
+        let s = Settings::from_map(&vars(&[(
+            "INFERENCE_HEADERS",
+            "x-sess: first, X-Sess: second",
+        )]));
         assert_eq!(s.inference_headers.len(), 1);
         assert_eq!(s.inference_headers[0].1, "second");
     }

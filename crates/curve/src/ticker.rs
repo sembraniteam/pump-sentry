@@ -183,7 +183,6 @@ impl CurveTicker {
         self.subs.read().await.len()
     }
 
-
     /// One-shot reserve read (one retry, with deadline).
     pub async fn fetch_tick(&self, mint: &str, curve: &str) -> Result<PriceTick, CurveError> {
         Pubkey::from_str(mint).map_err(|_| CurveError::BadMintKey(mint.to_string()))?;
@@ -192,7 +191,14 @@ impl CurveTicker {
         let sol_usd = self.sol_feed.price().ok_or(CurveError::StaleSolUsd)?;
         let account = read_with_retry(&self.rpc, &key).await?;
         let decimals = self.token_decimals(mint).await?;
-        tick_from_account(mint, curve, &account.data, &account.owner, sol_usd, decimals)
+        tick_from_account(
+            mint,
+            curve,
+            &account.data,
+            &account.owner,
+            sol_usd,
+            decimals,
+        )
     }
 
     /// Mint decimals (cached). Fail-closed.
@@ -243,8 +249,14 @@ impl CurveTicker {
         let sol_usd = self.sol_feed.price().ok_or(CurveError::StaleSolUsd)?;
         let account = read_with_retry(&self.rpc, &key).await?;
         let decimals = self.token_decimals(mint).await?;
-        let tick =
-            tick_from_account(mint, curve, &account.data, &account.owner, sol_usd, decimals)?;
+        let tick = tick_from_account(
+            mint,
+            curve,
+            &account.data,
+            &account.owner,
+            sol_usd,
+            decimals,
+        )?;
         let fee = crate::fee::venue_fee_for_data(
             &self.rpc,
             &self.fee_inputs,
@@ -284,29 +296,31 @@ impl CurveTicker {
                 continue;
             };
             let keys: Vec<Pubkey> = watched.iter().map(|w| w.curve).collect();
-            let accounts =
-                match tokio::time::timeout(ROUND_OVERALL_TIMEOUT, poll_round(&self.rpc, &keys))
-                    .await
-                {
-                    Ok(Ok(accounts)) => {
-                        self.backoff.success();
-                        accounts
+            let accounts = match tokio::time::timeout(
+                ROUND_OVERALL_TIMEOUT,
+                poll_round(&self.rpc, &keys),
+            )
+            .await
+            {
+                Ok(Ok(accounts)) => {
+                    self.backoff.success();
+                    accounts
+                }
+                Ok(Err(e)) => {
+                    if warn_throttled(&TICK_WARN_AT) {
+                        warn!(error = %ids::strip_error_url(&e.to_string()), n = keys.len(), "round failed; backing off");
                     }
-                    Ok(Err(e)) => {
-                        if warn_throttled(&TICK_WARN_AT) {
-                            warn!(error = %ids::strip_error_url(&e.to_string()), n = keys.len(), "round failed; backing off");
-                        }
-                        tokio::time::sleep(self.backoff.fail_sleep()).await;
-                        continue;
+                    tokio::time::sleep(self.backoff.fail_sleep()).await;
+                    continue;
+                }
+                Err(_) => {
+                    if warn_throttled(&TICK_WARN_AT) {
+                        warn!(n = keys.len(), "round timed out; backing off");
                     }
-                    Err(_) => {
-                        if warn_throttled(&TICK_WARN_AT) {
-                            warn!(n = keys.len(), "round timed out; backing off");
-                        }
-                        tokio::time::sleep(self.backoff.fail_sleep()).await;
-                        continue;
-                    }
-                };
+                    tokio::time::sleep(self.backoff.fail_sleep()).await;
+                    continue;
+                }
+            };
             if accounts.len() != watched.len() {
                 warn!(
                     expected = watched.len(),
@@ -343,7 +357,8 @@ impl CurveTicker {
                     Ok(tick) => match tx.try_send(tick) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.dropped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             debug!("tick queue full; dropping tick");
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -540,13 +555,13 @@ mod tests {
             data.extend_from_slice(&v.to_le_bytes());
         }
         data.push(0);
-        let tick =
-            tick_from_account("MINT", "CURVE", &data, &ids::PUMP_PROGRAM_ID, 150.0, 6).expect("tick");
+        let tick = tick_from_account("MINT", "CURVE", &data, &ids::PUMP_PROGRAM_ID, 150.0, 6)
+            .expect("tick");
         assert!((tick.price_usd - 2.7959e-8 * 150.0).abs() < 1e-12);
         assert!((tick.liquidity_usd - 4500.0).abs() < 1e-9);
         assert!(!tick.complete);
-        let tick9 =
-            tick_from_account("MINT", "CURVE", &data, &ids::PUMP_PROGRAM_ID, 150.0, 9).expect("tick");
+        let tick9 = tick_from_account("MINT", "CURVE", &data, &ids::PUMP_PROGRAM_ID, 150.0, 9)
+            .expect("tick");
         assert!((tick9.price_usd - tick.price_usd * 1000.0).abs() < 1e-9);
     }
 
@@ -598,7 +613,8 @@ mod tests {
     async fn rejects_bad_mint_key() {
         let t = ticker();
         assert!(matches!(
-            t.watch("not-a-pubkey", "11111111111111111111111111111111").await,
+            t.watch("not-a-pubkey", "11111111111111111111111111111111")
+                .await,
             Err(CurveError::BadMintKey(_))
         ));
     }

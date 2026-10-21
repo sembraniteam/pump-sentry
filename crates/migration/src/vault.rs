@@ -38,7 +38,7 @@ pub enum VaultError {
     /// Address is not a valid pubkey: {0}
     #[error("invalid address: {0}")]
     BadAddress(String),
-/// Vault decimals must be plausible (SPL caps at 18).
+    /// Vault decimals must be plausible (SPL caps at 18).
     #[error("invalid vault decimals: base={0} quote={1}")]
     BadConfig(u8, u8),
     /// SOL/USD feed has no fresh price.
@@ -83,7 +83,7 @@ pub struct VaultTicker {
     interval: Duration,
     sol_feed: Arc<SolUsdFeed>,
     /// Ticks dropped on a full queue.
-    dropped: Arc<std::sync::atomic::AtomicU64>,
+    dropped: Arc<AtomicU64>,
     /// Consecutive-failure backoff (sick node, not sick data).
     backoff: Arc<RoundBackoff>,
 }
@@ -117,7 +117,7 @@ impl VaultTicker {
             subs: Arc::new(RwLock::new(HashMap::new())),
             interval,
             sol_feed,
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
             backoff: Arc::new(RoundBackoff::new()),
         }
     }
@@ -195,8 +195,8 @@ impl VaultTicker {
         if base_decimals > 18 || quote_decimals > 18 {
             return Err(VaultError::BadConfig(base_decimals, quote_decimals));
         }
-        let nonstandard = base_decimals != WSOL_DECIMALS_DEFAULT
-            || quote_decimals != PUMP_TOKEN_DECIMALS_DEFAULT;
+        let nonstandard =
+            base_decimals != WSOL_DECIMALS_DEFAULT || quote_decimals != PUMP_TOKEN_DECIMALS_DEFAULT;
         if nonstandard && !allow_nonstandard {
             warn!(
                 mint = %mint, base_decimals, quote_decimals,
@@ -281,8 +281,8 @@ impl VaultTicker {
     /// Max pools per batched round.
     pub const VAULT_BATCH_CHUNK_PAIRS: usize = 50;
 
-/// Poll loop: one batched read per round, one tick per pool.
-/// Ends when the receiver drops. Drop-on-full with counter.
+    /// Poll loop: one batched read per round, one tick per pool.
+    /// Ends when the receiver drops. Drop-on-full with counter.
     pub async fn run(self, tx: mpsc::Sender<PoolTick>) {
         let mut timer = tokio::time::interval(self.interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -388,11 +388,12 @@ impl VaultTicker {
                 };
                 match tx.try_send(tick) {
                     Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.dropped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         debug!("pool tick queue full; dropping tick");
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
                         debug!("pool tick receiver closed; ticker stopping");
                         return;
                     }
@@ -427,7 +428,10 @@ impl VaultTicker {
                     break;
                 }
                 Err(_) => {
-                    warn!(pools = watched.len(), "pool vault batch timed out; backing off");
+                    warn!(
+                        pools = watched.len(),
+                        "pool vault batch timed out; backing off"
+                    );
                     break;
                 }
             }
@@ -488,7 +492,7 @@ fn price_tick(
         return None;
     }
     let base_raw = token_amount(base_data)?;
-    let base_eff = (i128::from(base_raw)).checked_add(wsol_adj_lamports)?;
+    let base_eff = i128::from(base_raw).checked_add(wsol_adj_lamports)?;
     if base_eff <= 0 {
         return None;
     }
@@ -565,7 +569,11 @@ mod tests {
         )
     }
 
-    fn tick_adj(base_sol_lamports: u64, quote_token_units: u64, wsol_adj: i128) -> Option<PoolTick> {
+    fn tick_adj(
+        base_sol_lamports: u64,
+        quote_token_units: u64,
+        wsol_adj: i128,
+    ) -> Option<PoolTick> {
         price_tick(
             &pool(),
             &vault_bytes(&ids::WSOL_MINT, base_sol_lamports),
@@ -694,13 +702,29 @@ mod tests {
         // real (30 SOL -> $4500): virtual reserves reprice but are
         // not withdrawable, so they must not inflate depth.
         let tick = tick_adj(30_000_000_000, 1_000_000_000_000, 15_000_000_000).expect("tick");
-        assert!((tick.price_usd - 0.00675).abs() < 1e-9, "price={}", tick.price_usd);
-        assert!((tick.liquidity_usd - 4500.0).abs() < 1e-9, "liq={}", tick.liquidity_usd);
+        assert!(
+            (tick.price_usd - 0.00675).abs() < 1e-9,
+            "price={}",
+            tick.price_usd
+        );
+        assert!(
+            (tick.liquidity_usd - 4500.0).abs() < 1e-9,
+            "liq={}",
+            tick.liquidity_usd
+        );
         // Negative virtual within the vault still prices (20 SOL
         // effective -> $0.003) while liquidity stays real ($4500).
         let tick = tick_adj(30_000_000_000, 1_000_000_000_000, -10_000_000_000).expect("tick");
-        assert!((tick.price_usd - 0.003).abs() < 1e-12, "price={}", tick.price_usd);
-        assert!((tick.liquidity_usd - 4500.0).abs() < 1e-9, "liq={}", tick.liquidity_usd);
+        assert!(
+            (tick.price_usd - 0.003).abs() < 1e-12,
+            "price={}",
+            tick.price_usd
+        );
+        assert!(
+            (tick.liquidity_usd - 4500.0).abs() < 1e-9,
+            "liq={}",
+            tick.liquidity_usd
+        );
         // Virtual at or past the vault empties effective reserves: no tick.
         assert!(tick_adj(30_000_000_000, 1_000_000_000_000, -30_000_000_000).is_none());
         assert!(tick_adj(30_000_000_000, 1_000_000_000_000, -31_000_000_000).is_none());
@@ -712,7 +736,7 @@ mod tests {
         assert!(
             VaultTicker::new(
                 "notaurl",
-                solana_commitment_config::CommitmentConfig::confirmed(),
+                CommitmentConfig::confirmed(),
                 Duration::from_millis(500),
                 SolUsdFeed::new_for_test(150.0),
             )
@@ -725,7 +749,7 @@ mod tests {
         use curve::SolUsdFeed;
         let ticker = VaultTicker::new(
             "https://api.mainnet-beta.solana.com",
-            solana_commitment_config::CommitmentConfig::confirmed(),
+            CommitmentConfig::confirmed(),
             Duration::from_millis(500),
             SolUsdFeed::new_for_test(150.0),
         )
@@ -760,7 +784,7 @@ mod tests {
         use curve::SolUsdFeed;
         let ticker = VaultTicker::new(
             "https://api.mainnet-beta.solana.com",
-            solana_commitment_config::CommitmentConfig::confirmed(),
+            CommitmentConfig::confirmed(),
             Duration::from_millis(500),
             SolUsdFeed::new_for_test(150.0),
         )

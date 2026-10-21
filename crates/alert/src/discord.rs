@@ -154,9 +154,7 @@ impl Alerter {
     /// Route to a Hermes Discord channel. Bad input keeps default.
     pub fn with_channel(mut self, channel: &str) -> Self {
         let channel = channel.trim();
-        if !channel.is_empty()
-            && channel.len() <= 32
-            && channel.bytes().all(|b| b.is_ascii_digit())
+        if !channel.is_empty() && channel.len() <= 32 && channel.bytes().all(|b| b.is_ascii_digit())
         {
             self.channel = Some(channel.to_string());
         }
@@ -169,7 +167,12 @@ impl Alerter {
             Some(id) => format!("discord:{id}"),
             None => "discord".to_string(),
         };
-        vec!["send".to_string(), "--to".to_string(), target, message.to_string()]
+        vec![
+            "send".to_string(),
+            "--to".to_string(),
+            target,
+            message.to_string(),
+        ]
     }
 
     /// Send `message` as a detached task. Never blocks the caller.
@@ -184,7 +187,10 @@ impl Alerter {
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                let dropped = self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let dropped = self
+                    .dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
                 warn!(target: "alerting", dropped, "alert storm; dropping message");
                 return;
             }
@@ -265,8 +271,20 @@ impl Alerter {
             .filter(|c| {
                 !matches!(
                     c,
-                    '`' | '*' | '_' | '~' | '|' | '>' | '@' | '#' | ':' | '/' | '\\' | '['
-                        | ']' | '(' | ')'
+                    '`' | '*'
+                        | '_'
+                        | '~'
+                        | '|'
+                        | '>'
+                        | '@'
+                        | '#'
+                        | ':'
+                        | '/'
+                        | '\\'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
                 ) && !c.is_control()
                     && !is_format_char(*c)
             })
@@ -350,9 +368,15 @@ impl Alerter {
         let mint = Self::sanitize(mint);
         let destination = Self::sanitize(destination);
         let signature = Self::sanitize(signature);
-        let amm = amm_id.map(Self::sanitize).unwrap_or_else(|| "unknown".to_string());
-        let base = base_mint.map(Self::sanitize).unwrap_or_else(|| "unknown".to_string());
-        let quote = quote_mint.map(Self::sanitize).unwrap_or_else(|| "unknown".to_string());
+        let amm = amm_id
+            .map(Self::sanitize)
+            .unwrap_or_else(|| "unknown".to_string());
+        let base = base_mint
+            .map(Self::sanitize)
+            .unwrap_or_else(|| "unknown".to_string());
+        let quote = quote_mint
+            .map(Self::sanitize)
+            .unwrap_or_else(|| "unknown".to_string());
         format!(
             "🌉 **[MIGRATION DETECTED]**\n\
              {}\n\
@@ -471,8 +495,14 @@ fn is_format_char(c: char) -> bool {
 mod tests {
     use super::*;
 
-    const PAPER: CardCtx = CardCtx { mode: "paper", strategy: "adaptive" };
-    const LIVE: CardCtx = CardCtx { mode: "live", strategy: "scalp" };
+    const PAPER: CardCtx = CardCtx {
+        mode: "paper",
+        strategy: "adaptive",
+    };
+    const LIVE: CardCtx = CardCtx {
+        mode: "live",
+        strategy: "scalp",
+    };
 
     /// Base heartbeat fixture; tests override individual fields.
     #[cfg(test)]
@@ -593,8 +623,15 @@ mod tests {
 
     #[test]
     fn migration_card_marks_pool() {
-        let card =
-            Alerter::format_migration(&LIVE, "M", "RaydiumV4", "sig", Some("AMM"), Some("BASE"), None);
+        let card = Alerter::format_migration(
+            &LIVE,
+            "M",
+            "RaydiumV4",
+            "sig",
+            Some("AMM"),
+            Some("BASE"),
+            None,
+        );
         assert!(card.contains("[MIGRATION DETECTED]"));
         assert!(card.contains("RaydiumV4"));
         assert!(card.contains("`AMM`"));
@@ -606,7 +643,8 @@ mod tests {
     #[test]
     fn interpolated_fields_are_sanitized() {
         // Attacker-shaped inputs must not survive as mentions, fences, or links.
-        let card = Alerter::format_exit(&PAPER, "@everyone `x`", "TakeProfit", 1.0, 1.0, 1.0, false);
+        let card =
+            Alerter::format_exit(&PAPER, "@everyone `x`", "TakeProfit", 1.0, 1.0, 1.0, false);
         assert!(!card.contains("@everyone"));
         assert!(!card.contains("`x`"));
         let mig = Alerter::format_migration(
@@ -627,7 +665,15 @@ mod tests {
 
     #[test]
     fn sanitize_blocks_links_and_bidi() {
-        let card = Alerter::format_exit(&PAPER, "[click](https://evil.example)", "TakeProfit", 1.0, 1.0, 1.0, false);
+        let card = Alerter::format_exit(
+            &PAPER,
+            "[click](https://evil.example)",
+            "TakeProfit",
+            1.0,
+            1.0,
+            1.0,
+            false,
+        );
         assert!(!card.contains("https://evil.example"));
         assert!(!card.contains("[click]"));
         // Zero-width and bidi-override characters are stripped.

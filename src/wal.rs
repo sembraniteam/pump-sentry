@@ -295,6 +295,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 assoc,
                 amount,
                 creator,
+                bundle,
                 ..
             } => {
                 let Some(pos) = position_from(&mint, &curve, &assoc, amount, creator.as_deref())
@@ -302,6 +303,17 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     skipped += 1;
                     continue;
                 };
+                // A confirmed-fill `Position` retires its pending line
+                // (AUD-009): the writer only emits `Position` after the
+                // chain confirmed, so a crash between the `Position`
+                // append and the `Settled` tombstone must not resurrect
+                // a phantom custody claim at boot. Legacy/compacted
+                // positions without a bundle cannot be attributed (the
+                // bundle is preserved going forward by compaction; for
+                // old files the pending simply replays as before).
+                if let Some(bundle) = bundle {
+                    pending.remove(&bundle);
+                }
                 add(&mut positions, pos);
             }
             WalLine::Sell {
@@ -501,8 +513,8 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
     {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = crate::cli::write_private_file(path, out.as_bytes()) {
-        tracing::warn!(file = %path.display(), error = %e, "live WAL compaction failed; file keeps growing (non-fatal)");
+    if let Err(e) = crate::cli::atomic_write_private(path, out.as_bytes()) {
+        tracing::warn!(file = %path.display(), error = %e, "live WAL compaction failed; original untouched, file keeps growing (non-fatal)");
     }
 }
 
@@ -547,6 +559,33 @@ mod tests {
         format!(
             r#"{{"t":"manual","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":{amount},"creator":null,"note":"{note}","ts":2}}"#
         )
+    }
+
+    #[test]
+    fn confirmed_fill_position_retires_its_pending_without_a_tombstone() {
+        // AUD-009: the writer appends `Pending` then later `Position`
+        // then `Settled`. A crash between the `Position` append and the
+        // `Settled` tombstone must not resurrect a phantom custody
+        // claim at boot: the confirmed fill is the retirement proof.
+        let pending = format!(
+            r#"{{"t":"pending","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}}"#
+        );
+        let crash_window = [pending.clone(), position_line(TMINT, 1000, "B1")];
+        let replay = replay_lines(crash_window.iter().map(String::as_str));
+        assert!(
+            replay.pending.is_empty(),
+            "a confirmed fill is not a pending"
+        );
+        assert_eq!(replay.positions.len(), 1);
+        assert_eq!(replay.positions[0].amount_tokens, 1000);
+        // The normal order is unchanged: `Settled` also removes.
+        let settled_window = [
+            position_line(TMINT, 1000, "B1"),
+            r#"{"t":"settled","bundle":"B1","ts":3}"#.to_string(),
+        ];
+        let replay = replay_lines(settled_window.iter().map(String::as_str));
+        assert!(replay.pending.is_empty());
+        assert_eq!(replay.positions.len(), 1);
     }
 
     #[test]
@@ -681,6 +720,27 @@ mod tests {
     }
 
     #[test]
+    fn compaction_failure_leaves_original_untouched() {
+        // Crash-mid-compaction model: when the staged write fails, the
+        // original file must keep its exact bytes. A truncate-in-place
+        // rewrite could not promise this (open-then-die = torn WAL).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("wal.jsonl");
+        let original = format!("{}\n", position_line(TMINT, 1000, "B1"));
+        std::fs::write(&path, &original).expect("write WAL");
+        // Sabotage staging: the temp beside the target is a directory,
+        // so the atomic write must fail before the target is touched.
+        std::fs::create_dir(path.with_extension("part")).expect("staging blocker");
+        let replay = replay_file(&path).expect("readable");
+        compact_file(&path, &replay);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            original,
+            "failed compaction never truncates the target"
+        );
+    }
+
+    #[test]
     fn duplicate_sell_lines_subtract_once() {
         // The same fill recorded twice (two writers pre-fix, or a
         // retried append): replay must not double-subtract.
@@ -783,9 +843,8 @@ mod tests {
         let old_pending = format!(
             "{{\"t\":\"pending\",\"mint\":\"{TMINT}\",\"curve\":\"{TCURVE}\",\"assoc\":\"{TASSOC}\",\"amount\":1000,\"creator\":null,\"sig\":\"S1\",\"bundle\":\"B2\",\"ts\":1}}"
         );
-        let old_sell = format!(
-            r#"{{"t":"sell_pending","mint":"{TMINT}","bundle":"B8","ts":1000}}"#
-        );
+        let old_sell =
+            format!(r#"{{"t":"sell_pending","mint":"{TMINT}","bundle":"B8","ts":1000}}"#);
         let replay = replay_lines([old_pending.as_str(), old_sell.as_str()].iter().copied());
         assert_eq!(replay.skipped, 0);
         assert_eq!(replay.pending[0].blockhash, None);
@@ -804,8 +863,7 @@ mod tests {
         let replay = replay_lines([park.as_str(), take.as_str()].iter().copied());
         assert!(replay.manual.is_empty());
         // Partial take leaves the remainder parked.
-        let take_part =
-            format!(r#"{{"t":"take_manual","mint":"{TMINT}","amount":600,"ts":2}}"#);
+        let take_part = format!(r#"{{"t":"take_manual","mint":"{TMINT}","amount":600,"ts":2}}"#);
         let replay = replay_lines([park.as_str(), take_part.as_str()].iter().copied());
         assert_eq!(replay.manual.len(), 1);
         assert_eq!(replay.manual[0].position.amount_tokens, 400);

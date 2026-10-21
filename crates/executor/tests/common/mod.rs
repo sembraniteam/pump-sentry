@@ -12,9 +12,7 @@
 //! re-create the duplication this module deletes.
 #![allow(dead_code)]
 
-use solana_client::{
-    nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig,
-};
+use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
@@ -200,10 +198,10 @@ fn decode_tx_meta(tx_meta: &EncodedTransactionWithStatusMeta) -> Option<ScannedT
     if tx_meta.meta.as_ref().is_some_and(|m| m.err.is_some()) {
         return None;
     }
-    let solana_transaction_status::EncodedTransaction::Json(ui_tx) = &tx_meta.transaction else {
+    let EncodedTransaction::Json(ui_tx) = &tx_meta.transaction else {
         return None;
     };
-    let solana_transaction_status::UiMessage::Raw(raw) = &ui_tx.message else {
+    let UiMessage::Raw(raw) = &ui_tx.message else {
         return None;
     };
     let mut keys: Vec<Pubkey> = raw
@@ -294,7 +292,10 @@ pub async fn holder_atas(
                 break;
             }
             _ if attempt < 2 => {
-                eprintln!("largest-accounts unreadable for {mint} (attempt {}/3; backing off)", attempt + 1);
+                eprintln!(
+                    "largest-accounts unreadable for {mint} (attempt {}/3; backing off)",
+                    attempt + 1
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(2 * (attempt as u64 + 1))).await;
             }
             _ => {
@@ -305,7 +306,9 @@ pub async fn holder_atas(
     let mut out = Vec::new();
     let mut aux = 0u64;
     for h in holders.unwrap_or_default().iter().take(10) {
-        let Ok(hata) = Pubkey::from_str(&h.address) else { continue };
+        let Ok(hata) = Pubkey::from_str(&h.address) else {
+            continue;
+        };
         let (owner, _, base) = match token_account(rpc, &hata).await {
             Some(v) => v,
             None => continue,

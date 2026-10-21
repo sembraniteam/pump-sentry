@@ -7,14 +7,14 @@ use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::str::FromStr;
-use zeroize::Zeroizing;use std::sync::{
-    Arc,
-    Mutex,
+use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 /// Inference deadline before fallback (300ms).
 pub const FALLBACK_TIMEOUT: Duration = Duration::from_millis(300);
@@ -545,7 +545,7 @@ impl RiskEngine {
         let response = match req.send().await {
             Ok(response) => response,
             Err(e) => {
-                warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, error = %e, "inference request failed; using heuristic fallback");
+                warn!(endpoint = %log_endpoint(&self.endpoint), model = %self.model, error = %ids::strip_error_url(&e.to_string()), "inference request failed; using heuristic fallback");
                 return None;
             }
         };

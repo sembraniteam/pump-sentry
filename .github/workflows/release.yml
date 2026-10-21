@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
       - name: Install Clippy component
         run: rustup component add clippy
 
@@ -40,8 +43,8 @@ jobs:
             ~/.cargo/git
             target
 
-      - name: Clippy all targets, warnings deny
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy workspace all targets, warnings deny
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test workspace

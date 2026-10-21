@@ -19,14 +19,13 @@ use std::str::FromStr;
 pub use ids::{
     ASSOCIATED_TOKEN_PROGRAM_ID, BUYBACK_FEE_RECIPIENTS, COMPUTE_BUDGET_PROGRAM_ID,
     CURVE_CASHBACK_FLAG_OFFSET, CURVE_COIN_CREATOR_FEE_END, CURVE_COMPLETE_OFFSET,
-    CURVE_CREATOR_END, CURVE_CREATOR_OFFSET,
-    CURVE_MAYHEM_FLAG_OFFSET, CURVE_QUOTE_MINT_END, CURVE_QUOTE_MINT_OFFSET,
-    DEFAULT_BUYBACK_FEE_RECIPIENT, EVENT_AUTHORITY, FEE_CONFIG_ACCOUNT, FEE_CONFIG_PROGRAM,
-    FEE_RECIPIENT, GLOBAL_ACCOUNT, PUMP_AMM_EVENT_AUTHORITY_SEED, PUMP_AMM_FEE_CONFIG,
-    PUMP_AMM_GLOBAL_CONFIG, PUMP_AMM_PROGRAM_ID, PUMP_AMM_SELL_V2_DISCRIMINATOR,
-    PUMP_BUY_V3_DISCRIMINATOR, PUMP_PROGRAM_ID,
-    PUMP_SELL_V3_DISCRIMINATOR, RENT_SYSVAR_ID, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
-    TOKEN_2022_PROGRAM_ID, USDC_MINT, USER_VOLUME_ACCUMULATOR_SEED, WSOL_MINT,
+    CURVE_CREATOR_END, CURVE_CREATOR_OFFSET, CURVE_MAYHEM_FLAG_OFFSET, CURVE_QUOTE_MINT_END,
+    CURVE_QUOTE_MINT_OFFSET, DEFAULT_BUYBACK_FEE_RECIPIENT, EVENT_AUTHORITY, FEE_CONFIG_ACCOUNT,
+    FEE_CONFIG_PROGRAM, FEE_RECIPIENT, GLOBAL_ACCOUNT, PUMP_AMM_EVENT_AUTHORITY_SEED,
+    PUMP_AMM_FEE_CONFIG, PUMP_AMM_GLOBAL_CONFIG, PUMP_AMM_PROGRAM_ID,
+    PUMP_AMM_SELL_V2_DISCRIMINATOR, PUMP_BUY_V3_DISCRIMINATOR, PUMP_PROGRAM_ID,
+    PUMP_SELL_V3_DISCRIMINATOR, RENT_SYSVAR_ID, SYSTEM_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+    TOKEN_PROGRAM_ID, USDC_MINT, USER_VOLUME_ACCUMULATOR_SEED, WSOL_MINT,
 };
 
 /// v3 buy args. 24-byte payload with no `partial_fill` tail.
@@ -95,12 +94,23 @@ impl PumpSwapBuilder {
     ) -> Instruction {
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&PUMP_BUY_V3_DISCRIMINATOR);
-        PumpBuyV3Args { amount, max_sol_cost }
-            .serialize(&mut data)
-            .expect("in-memory Borsh encode cannot fail");
-        Self::build_v3_ix(data, accts.payer, accts.mint, accts.quote_mint, accts.bonding_curve,
-            accts.associated_bonding_curve, accts.base_token_program, accts.quote_token_program,
-            accts.buyback_recipient)
+        PumpBuyV3Args {
+            amount,
+            max_sol_cost,
+        }
+        .serialize(&mut data)
+        .expect("in-memory Borsh encode cannot fail");
+        Self::build_v3_ix(
+            data,
+            accts.payer,
+            accts.mint,
+            accts.quote_mint,
+            accts.bonding_curve,
+            accts.associated_bonding_curve,
+            accts.base_token_program,
+            accts.quote_token_program,
+            accts.buyback_recipient,
+        )
     }
 
     /// v3 sell ix: same 17 accounts, drain direction.
@@ -111,12 +121,23 @@ impl PumpSwapBuilder {
     ) -> Instruction {
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&PUMP_SELL_V3_DISCRIMINATOR);
-        PumpSellV3Args { amount, min_sol_output }
-            .serialize(&mut data)
-            .expect("in-memory Borsh encode cannot fail");
-        Self::build_v3_ix(data, accts.payer, accts.mint, accts.quote_mint, accts.bonding_curve,
-            accts.associated_bonding_curve, accts.base_token_program, accts.quote_token_program,
-            accts.buyback_recipient)
+        PumpSellV3Args {
+            amount,
+            min_sol_output,
+        }
+        .serialize(&mut data)
+        .expect("in-memory Borsh encode cannot fail");
+        Self::build_v3_ix(
+            data,
+            accts.payer,
+            accts.mint,
+            accts.quote_mint,
+            accts.bonding_curve,
+            accts.associated_bonding_curve,
+            accts.base_token_program,
+            accts.quote_token_program,
+            accts.buyback_recipient,
+        )
     }
 
     /// Shared 17-account v3 body: `data` picks the side.
@@ -134,30 +155,34 @@ impl PumpSwapBuilder {
     ) -> Instruction {
         let user_vol = user_volume_accumulator_pda(payer);
         let base_ata = || user_ata_with_program(payer, mint, base_token_program);
-        let quote_ata = |owner: &Pubkey| user_ata_with_program(owner, quote_mint, quote_token_program);
+        let quote_ata =
+            |owner: &Pubkey| user_ata_with_program(owner, quote_mint, quote_token_program);
         let accounts = vec![
-            AccountMeta::new_readonly(GLOBAL_ACCOUNT, false),                    // [0]
-            AccountMeta::new_readonly(*mint, false),                             // [1]
-            AccountMeta::new_readonly(*quote_mint, false),                       // [2]
-            AccountMeta::new_readonly(*base_token_program, false),               // [3]
-            AccountMeta::new_readonly(*quote_token_program, false),              // [4]
-            AccountMeta::new(*bonding_curve, false),                             // [5]
-            AccountMeta::new(*associated_bonding_curve, false),                  // [6]
-            AccountMeta::new(quote_ata(bonding_curve), false),                   // [7]
-            AccountMeta::new(*payer, true),                                      // [8]
-            AccountMeta::new(base_ata(), false),                                 // [9]
-            AccountMeta::new(quote_ata(payer), false),                           // [10]
-            AccountMeta::new(user_vol, false),                                   // [11]
-            AccountMeta::new_readonly(FEE_CONFIG_ACCOUNT, false),                // [12]
-            AccountMeta::new(*buyback_recipient, false),                         // [13]
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),                 // [14]
-            AccountMeta::new_readonly(EVENT_AUTHORITY, false),                   // [15]
-            AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),                   // [16]
+            AccountMeta::new_readonly(GLOBAL_ACCOUNT, false), // [0]
+            AccountMeta::new_readonly(*mint, false),          // [1]
+            AccountMeta::new_readonly(*quote_mint, false),    // [2]
+            AccountMeta::new_readonly(*base_token_program, false), // [3]
+            AccountMeta::new_readonly(*quote_token_program, false), // [4]
+            AccountMeta::new(*bonding_curve, false),          // [5]
+            AccountMeta::new(*associated_bonding_curve, false), // [6]
+            AccountMeta::new(quote_ata(bonding_curve), false), // [7]
+            AccountMeta::new(*payer, true),                   // [8]
+            AccountMeta::new(base_ata(), false),              // [9]
+            AccountMeta::new(quote_ata(payer), false),        // [10]
+            AccountMeta::new(user_vol, false),                // [11]
+            AccountMeta::new_readonly(FEE_CONFIG_ACCOUNT, false), // [12]
+            AccountMeta::new(*buyback_recipient, false),      // [13]
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // [14]
+            AccountMeta::new_readonly(EVENT_AUTHORITY, false), // [15]
+            AccountMeta::new_readonly(PUMP_PROGRAM_ID, false), // [16]
         ];
         debug_assert_eq!(accounts.len(), 17);
-        Instruction { program_id: PUMP_PROGRAM_ID, accounts, data }
+        Instruction {
+            program_id: PUMP_PROGRAM_ID,
+            accounts,
+            data,
+        }
     }
-
 }
 
 /// PumpSwap `sell_v2` args: 24-byte payload.
@@ -207,10 +232,8 @@ pub fn amm_user_volume_accumulator_pda(user: &Pubkey) -> Pubkey {
 
 /// PumpSwap event-authority PDA.
 pub fn amm_event_authority_pda() -> Pubkey {
-    let (pda, _) = Pubkey::find_program_address(
-        &[PUMP_AMM_EVENT_AUTHORITY_SEED],
-        &PUMP_AMM_PROGRAM_ID,
-    );
+    let (pda, _) =
+        Pubkey::find_program_address(&[PUMP_AMM_EVENT_AUTHORITY_SEED], &PUMP_AMM_PROGRAM_ID);
     pda
 }
 
@@ -224,30 +247,37 @@ impl PumpSwapBuilder {
     ) -> Instruction {
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&PUMP_AMM_SELL_V2_DISCRIMINATOR);
-        PumpAmmSellV2Args { base_amount_in, min_quote_amount_out }
-            .serialize(&mut data)
-            .expect("in-memory Borsh encode cannot fail");
+        PumpAmmSellV2Args {
+            base_amount_in,
+            min_quote_amount_out,
+        }
+        .serialize(&mut data)
+        .expect("in-memory Borsh encode cannot fail");
         let accounts = vec![
-            AccountMeta::new(*accts.pool, false),                          // [0]
-            AccountMeta::new(*accts.user, true),                           // [1]
-            AccountMeta::new_readonly(PUMP_AMM_GLOBAL_CONFIG, false),      // [2]
-            AccountMeta::new_readonly(*accts.base_mint, false),            // [3]
-            AccountMeta::new_readonly(*accts.quote_mint, false),           // [4]
-            AccountMeta::new(*accts.user_base_token_account, false),       // [5]
-            AccountMeta::new(*accts.user_quote_token_account, false),      // [6]
-            AccountMeta::new(*accts.pool_base_token_account, false),       // [7]
-            AccountMeta::new(*accts.pool_quote_token_account, false),      // [8]
-            AccountMeta::new_readonly(*accts.base_token_program, false),   // [9]
-            AccountMeta::new_readonly(*accts.quote_token_program, false),  // [10]
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),           // [11]
+            AccountMeta::new(*accts.pool, false),                     // [0]
+            AccountMeta::new(*accts.user, true),                      // [1]
+            AccountMeta::new_readonly(PUMP_AMM_GLOBAL_CONFIG, false), // [2]
+            AccountMeta::new_readonly(*accts.base_mint, false),       // [3]
+            AccountMeta::new_readonly(*accts.quote_mint, false),      // [4]
+            AccountMeta::new(*accts.user_base_token_account, false),  // [5]
+            AccountMeta::new(*accts.user_quote_token_account, false), // [6]
+            AccountMeta::new(*accts.pool_base_token_account, false),  // [7]
+            AccountMeta::new(*accts.pool_quote_token_account, false), // [8]
+            AccountMeta::new_readonly(*accts.base_token_program, false), // [9]
+            AccountMeta::new_readonly(*accts.quote_token_program, false), // [10]
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),      // [11]
             AccountMeta::new(amm_user_volume_accumulator_pda(accts.user), false), // [12]
-            AccountMeta::new_readonly(PUMP_AMM_FEE_CONFIG, false),         // [13]
-            AccountMeta::new(*accts.buyback_fee_recipient, false),         // [14]
-            AccountMeta::new_readonly(amm_event_authority_pda(), false),   // [15]
-            AccountMeta::new_readonly(PUMP_AMM_PROGRAM_ID, false),         // [16]
+            AccountMeta::new_readonly(PUMP_AMM_FEE_CONFIG, false),    // [13]
+            AccountMeta::new(*accts.buyback_fee_recipient, false),    // [14]
+            AccountMeta::new_readonly(amm_event_authority_pda(), false), // [15]
+            AccountMeta::new_readonly(PUMP_AMM_PROGRAM_ID, false),    // [16]
         ];
         debug_assert_eq!(accounts.len(), 17);
-        Instruction { program_id: PUMP_AMM_PROGRAM_ID, accounts, data }
+        Instruction {
+            program_id: PUMP_AMM_PROGRAM_ID,
+            accounts,
+            data,
+        }
     }
 }
 
@@ -453,13 +483,25 @@ mod tests {
             900_000
         );
         assert_eq!(built.data.len(), 24);
-        let writable: HashSet<usize> =
-            [0, 1, 5, 6, 7, 8, 12, 14].into_iter().collect();
+        let writable: HashSet<usize> = [0, 1, 5, 6, 7, 8, 12, 14].into_iter().collect();
         let expect_keys = [
-            PUMP_AMM_PROGRAM_ID, key(1), PUMP_AMM_GLOBAL_CONFIG, key(3), WSOL_MINT, key(5),
-            key(6), key(7), key(8), TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID,
-            amm_user_volume_accumulator_pda(&key(1)), PUMP_AMM_FEE_CONFIG, key(14),
-            amm_event_authority_pda(), PUMP_AMM_PROGRAM_ID,
+            PUMP_AMM_PROGRAM_ID,
+            key(1),
+            PUMP_AMM_GLOBAL_CONFIG,
+            key(3),
+            WSOL_MINT,
+            key(5),
+            key(6),
+            key(7),
+            key(8),
+            TOKEN_PROGRAM_ID,
+            TOKEN_PROGRAM_ID,
+            SYSTEM_PROGRAM_ID,
+            amm_user_volume_accumulator_pda(&key(1)),
+            PUMP_AMM_FEE_CONFIG,
+            key(14),
+            amm_event_authority_pda(),
+            PUMP_AMM_PROGRAM_ID,
         ];
         for (i, meta) in built.accounts.iter().enumerate() {
             assert_eq!(meta.pubkey, expect_keys[i], "position {i}");
@@ -610,7 +652,8 @@ mod tests {
         let owner = Pubkey::new_from_array([7; 32]);
         let mint = Pubkey::new_from_array([8; 32]);
         let classic = user_ata_with_program(&owner, &mint, &TOKEN_PROGRAM_ID);
-        let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").expect("t22");
+        let token_2022 =
+            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").expect("t22");
         let modern22 = user_ata_with_program(&owner, &mint, &token_2022);
         assert_ne!(modern22, classic, "2022 derivation must differ");
         // Sanity: distinct owners still get distinct addresses.

@@ -119,8 +119,7 @@ impl BondingCurveReserves {
         }
         let scale = 10u128.checked_pow(u32::from(decimals))?;
         let numer = u128::from(self.virtual_sol_reserves).checked_mul(scale)?;
-        let denom =
-            u128::from(self.virtual_token_reserves).checked_mul(LAMPORTS_PER_SOL_U128)?;
+        let denom = u128::from(self.virtual_token_reserves).checked_mul(LAMPORTS_PER_SOL_U128)?;
         if denom == 0 {
             return None;
         }
@@ -197,7 +196,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_short_and_foreign_data() {        assert_eq!(
+    fn rejects_short_and_foreign_data() {
+        assert_eq!(
             BondingCurveReserves::parse(&[0u8; 10]),
             Err(CurveParseError::DataTooShort(10))
         );

@@ -251,12 +251,7 @@ pub async fn cmd_research(file: Option<String>) -> ! {
     print_loss_clusters(
         "by risk model",
         &loss_clusters(rows, |r| {
-            Some(
-                r.model
-                    .as_deref()
-                    .unwrap_or("not recorded")
-                    .to_string(),
-            )
+            Some(r.model.as_deref().unwrap_or("not recorded").to_string())
         }),
     );
     print_loss_clusters(
@@ -268,7 +263,9 @@ pub async fn cmd_research(file: Option<String>) -> ! {
     print_loss_clusters(
         "by round concentration",
         &loss_clusters(rows, |r| {
-            r.micro.top_wallet_share_pct.map(|p| concentration_bin(p).to_string())
+            r.micro
+                .top_wallet_share_pct
+                .map(|p| concentration_bin(p).to_string())
         }),
     );
     print_proposals(rows);
@@ -326,8 +323,9 @@ mod tests {
 
     #[test]
     fn loss_clusters_rank_by_total_loss() {
-        let clusters =
-            loss_clusters(&fixture_rows(), |r| Some(regime_label(r.regime.as_deref()).to_string()));
+        let clusters = loss_clusters(&fixture_rows(), |r| {
+            Some(regime_label(r.regime.as_deref()).to_string())
+        });
         assert_eq!(clusters.len(), 2);
         assert_eq!(clusters[0].label, "regime momentum");
         assert!((clusters[0].total_loss - 6.0).abs() < 1e-9);
