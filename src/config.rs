@@ -142,7 +142,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# pump-sentry config — auto-created o
 [network]
 # Dedicated RPC recommended; empty falls back to the public endpoint.
 mainnet_rpc_url = ""        # dedicated RPC recommended; empty = public endpoint
-mainnet_rpc_urls_fallback = [] # read-path failover endpoints (comma list via MAINNET_RPC_URLS_FALLBACK); READS ONLY — dispatch never fans out; same-cluster https required live (override: ALLOW_FALLBACK_CLUSTER_MISMATCH=1, logged)
+mainnet_rpc_urls_fallback = "" # read-path failover endpoints (comma-separated string, e.g. "https://a,https://b"; empty = primary only); READS ONLY — dispatch never fans out; same-cluster https required live (override: ALLOW_FALLBACK_CLUSTER_MISMATCH=1, logged)
 mainnet_wss_rpc_url = ""    # empty = public endpoint
 yellowstone_endpoint = ""   # Yellowstone gRPC (https URL); non-empty REPLACES ws ingestion (x-token via YELLOWSTONE_TOKEN env, never here)
 commitment = "confirmed"    # (confirmed|finalized; processed is refused live)
