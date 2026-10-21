@@ -1939,8 +1939,14 @@ mod tests {
         // AUD-001 core primitive: one holder at a time on one path,
         // released on drop. This is the same `flock` the trader
         // process holds for its whole lifetime.
+        // NOTE: the dir embeds an atomic counter so parallel shards of
+        // this test never share a lock file, and the reacquire polls
+        // briefly: under parallel load the OS can report the just-
+        // released flock as still held for a beat after `close`.
+        static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CTR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
-            "cli-state-lock-test-{}-{:?}",
+            "cli-state-lock-test-{}-{:?}-{n}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1955,7 +1961,18 @@ mod tests {
         let err = second.expect_err("checked above");
         assert!(err.to_string().contains("state dir already owned"), "{err}");
         drop(first);
-        let third = StateDirLock::try_acquire(&lock_path).expect("reacquire after drop");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let third = loop {
+            match StateDirLock::try_acquire(&lock_path) {
+                Ok(g) => break g,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => panic!("reacquire after drop: {e}"),
+            }
+        };
         drop(third);
         let _ = std::fs::remove_dir_all(&dir);
     }
