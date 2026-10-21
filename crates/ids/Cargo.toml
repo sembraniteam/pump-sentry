@@ -1,6 +1,6 @@
 [package]
 name = "ids"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.99.0"
 description = "Single source of truth for Solana program IDs and instruction discriminators"
