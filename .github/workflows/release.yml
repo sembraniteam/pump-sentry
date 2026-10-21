@@ -20,17 +20,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Install Clippy component
-        run: rustup component add clippy
+      - name: Install Clippy & Rustfmt component
+        run: |
+          rustup component add clippy
+          rustup component add rustfmt
 
       - name: Show Rust toolchain
         run: |
           rustc --version
           cargo --version
           cargo clippy --version
+          cargo fmt --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v6
