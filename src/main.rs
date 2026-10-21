@@ -105,6 +105,7 @@ struct Boot {
     settings: Settings,
     wallet: Option<WalletGuard>,
     yellowstone_token: Option<String>,
+    discord_token: Option<String>,
     /// Held for the whole process lifetime: one writer per state dir.
     _state_lock: cli::StateDirLock,
 }
@@ -112,7 +113,7 @@ struct Boot {
 /// Secret-bearing environment variables scrubbed in the sync boot
 /// phase (AUD-015) once Settings/captured values own the data: RPC
 /// URLs carry `?api-key=`/path keys. Nothing re-reads them after boot;
-/// later children (alert Hermes, upgrade checks) inherit a clean env.
+/// later children (upgrade checks) inherit a clean env.
 /// `_FILE` variants are NOT here (paths, not secrets);
 /// `SOLANA_PRIVATE_KEY` is scrubbed by its own loader
 /// (`WalletGuard::load_from_env`).
@@ -121,6 +122,7 @@ const SECRET_ENV_VARS: &[&str] = &[
     "MAINNET_RPC_URL",
     "MAINNET_WSS_RPC_URL",
     "MAINNET_RPC_URLS_FALLBACK",
+    alert::DISCORD_BOT_TOKEN_ENV,
     listener::YELLOWSTONE_TOKEN_ENV,
 ];
 
@@ -141,7 +143,7 @@ fn live_mode_from(live_arg: bool, is_live: Option<&str>) -> bool {
 
 /// Paper-ledger commission from the typed fee (AUD-025): an invalid
 /// raw value contributes 0 bps, never an impossible 100%/side fee.
-fn paper_fee_bps(settings: &settings::Settings) -> f64 {
+fn paper_fee_bps(settings: &Settings) -> f64 {
     settings.fee().map_or(0.0, |bps| f64::from(bps.get()))
 }
 
@@ -243,6 +245,11 @@ fn run_binary(live_arg: bool) {
         })
         .filter(|s| !s.is_empty());
 
+    // Capture the Discord bot token (if any) BEFORE scrubbing: delivery
+    // is a direct HTTPS POST with `Authorization: Bot …`, and the token
+    // crosses into the alerter as owned data, never re-read from env.
+    let discord_token = alert::capture_bot_token();
+
     // Scrub endpoint secrets from the process environment now that
     // Settings owns copies: the RPC URLs carry `?api-key=` / path keys,
     // and nothing re-reads them after boot (same rule as the bearer
@@ -275,6 +282,7 @@ fn run_binary(live_arg: bool) {
         settings,
         wallet,
         yellowstone_token,
+        discord_token,
         _state_lock: state_lock,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -327,7 +335,7 @@ async fn replay_live_wal(
         // Fresh WAL: stamp the writer even with nothing to replay, so
         // versioning evidence exists from the first session onward.
         if let Some(trader) = pipeline.exec.live.as_ref() {
-            trader.wal_write_meta(crate::settings::now_secs());
+            trader.wal_write_meta(settings::now_secs());
         }
         return;
     }
@@ -343,9 +351,9 @@ async fn replay_live_wal(
     if let Some(trader) = pipeline.exec.live.as_ref() {
         // Compaction rewrote the file; the stamp goes in after it so
         // the fresh session's schema/writer provenance survives.
-        trader.wal_write_meta(crate::settings::now_secs());
+        trader.wal_write_meta(settings::now_secs());
         // Seed before the pending move below (borrow discipline).
-        let recent = replay.recent_sell_pending(crate::settings::now_secs());
+        let recent = replay.recent_sell_pending(settings::now_secs());
         // AUD-009: import what the rechecker can own; a second pending
         // for the same mint is held out for a visible parked claim —
         // either bundle may have landed, so silent loss is not an
@@ -700,6 +708,7 @@ async fn run_pipeline(boot: Boot) {
         settings,
         mut wallet,
         yellowstone_token,
+        discord_token,
         // Held until this function returns: this process owns the
         // state dir for its whole lifetime (AUD-001).
         _state_lock,
@@ -760,7 +769,7 @@ async fn run_pipeline(boot: Boot) {
         // Ctrl-C inside the window exits before boot.
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(5)) => {},
-            _ = crate::cli::shutdown_signal() => {
+            _ = cli::shutdown_signal() => {
                 warn!("aborted during live startup window; exiting before boot");
                 std::process::exit(0);
             }
@@ -825,7 +834,7 @@ async fn run_pipeline(boot: Boot) {
             std::process::exit(1);
         }
         if settings.inference_api_key.is_some()
-            && crate::settings::is_plaintext_remote(&settings.inference_endpoint)
+            && settings::is_plaintext_remote(&settings.inference_endpoint)
         {
             eprintln!(
                 "live mode refuses INFERENCE_API_KEY over plain-http remote INFERENCE_ENDPOINT (bearer travels in cleartext); use https or localhost"
@@ -1039,7 +1048,7 @@ async fn run_pipeline(boot: Boot) {
         // the 15-minute TTL.
         let tip_refresher = jito.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            let mut ticker = tokio::time::interval(Duration::from_secs(
                 executor::jito::TIP_ACCOUNTS_TTL_SECS / 2,
             ));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1055,9 +1064,8 @@ async fn run_pipeline(boot: Boot) {
         // dispatch latency. Half-TTL (30s) cadence.
         let floor_refresher = jito.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-                executor::jito::TIP_FLOOR_TTL_SECS / 2,
-            ));
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(executor::jito::TIP_FLOOR_TTL_SECS / 2));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await; // first tick fires immediately: refresh once at boot
             loop {
@@ -1172,15 +1180,23 @@ async fn run_pipeline(boot: Boot) {
         std::process::exit(1);
     }
 
-    let alerts = settings
-        .discord_alerts
-        .then(|| match &settings.discord_channel {
+    let alerts = settings.discord_alerts.then(|| {
+        let mut alerter = Alerter::new();
+        match &settings.discord_channel {
             Some(channel) => {
                 info!(%channel, "discord alerts routed to channel");
-                Alerter::new().with_channel(channel)
+                alerter = alerter.with_channel(channel);
             }
-            None => Alerter::new(),
-        });
+            None => info!("discord alerts lack a channel id; sends stay disabled"),
+        }
+        match discord_token {
+            Some(token) => alerter.with_token(&token),
+            None => {
+                info!("discord alerts lack a bot token; sends stay disabled");
+                alerter
+            }
+        }
+    });
     if alerts.is_none() {
         info!("discord alerts disabled (DISCORD_ALERTS=false)");
     }
@@ -1206,7 +1222,7 @@ async fn run_pipeline(boot: Boot) {
     if let Some(ref j) = jrn {
         // Snapshot BEFORE the settings move into the pipeline.
         j.boot(
-            crate::settings::now_secs(),
+            settings::now_secs(),
             &settings,
             if live_mode { "live" } else { "paper" },
         );
@@ -1229,7 +1245,7 @@ async fn run_pipeline(boot: Boot) {
         Some(day_state_path()),
     );
     if let Some(j) = jrn {
-        pipeline.with_journal(std::sync::Arc::new(j));
+        pipeline.with_journal(Arc::new(j));
     }
 
     // Kill switch: the marker file halts entries without a restart.
@@ -1537,7 +1553,7 @@ async fn run_pipeline(boot: Boot) {
                         warn!("decision journal is degraded (stopped recording after an IO failure); decisions since then are unplayable — restart the bot to clear (trading unaffected)");
                     } else {
                         j.append(&journal::JournalLine::Equity {
-                            ts: crate::settings::now_secs(),
+                            ts: settings::now_secs(),
                             cash,
                             equity,
                             open_count: open,
@@ -1634,7 +1650,7 @@ async fn run_pipeline(boot: Boot) {
                     let hours = pipeline.exec.entry_hour_stats().await;
                     let mut worst: Option<(usize, usize, f64, f64)> = None;
                     for (h, (n, avg, total)) in hours.iter().enumerate() {
-                        if *n >= crate::live_mirror::MIN_GAP_SAMPLES
+                        if *n >= live_mirror::MIN_GAP_SAMPLES
                             && worst.is_none_or(|(_, _, wavg, _)| *avg < wavg)
                         {
                             worst = Some((h, *n, *avg, *total));
@@ -2045,6 +2061,7 @@ mod tests {
             "MAINNET_RPC_URL",
             "MAINNET_WSS_RPC_URL",
             "MAINNET_RPC_URLS_FALLBACK",
+            alert::DISCORD_BOT_TOKEN_ENV,
             listener::YELLOWSTONE_TOKEN_ENV,
         ] {
             assert!(
@@ -2058,8 +2075,7 @@ mod tests {
     }
 
     /// AUD-015 acceptance: after the boot scrub, child processes
-    /// (the alert Hermes spawn path, which inherits the process env)
-    /// see no secret variables/values.
+    /// (which inherit the process env) see no secret variables/values.
     #[test]
     #[cfg(unix)]
     fn children_inherited_env_carries_no_secrets() {
@@ -2075,7 +2091,8 @@ mod tests {
                 "https://test.example/?api-key=test-victim-3",
             ),
             (listener::YELLOWSTONE_TOKEN_ENV, "test-token-fixture-4"),
-            ("SOLANA_PRIVATE_KEY", "test-mint-fixture-5"),
+            (alert::DISCORD_BOT_TOKEN_ENV, "test-token-fixture-5"),
+            ("SOLANA_PRIVATE_KEY", "test-mint-fixture-6"),
         ];
         // Restored on drop even while unwinding (AUD-022 guard).
         let _guard = {
@@ -2087,8 +2104,8 @@ mod tests {
         // live boot the wallet loader scrubs it after `load_from_env`).
         super::scrub_secret_env();
         unsafe { std::env::remove_var("SOLANA_PRIVATE_KEY") };
-        // A child spawned after boot (the alert path shape: any
-        // `process::Command`) inherits the scrubbed environment.
+        // A child spawned after boot (any `process::Command`, e.g. the
+        // upgrade check) inherits the scrubbed environment.
         let out = std::process::Command::new("env")
             .output()
             .expect("spawn env");

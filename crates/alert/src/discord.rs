@@ -1,19 +1,26 @@
-//! Hermes dispatch plus Discord card formatters.
+//! Direct Discord delivery (bot token HTTPS) plus card formatters.
+//!
+//! The Hermes subprocess dispatch is gone: [`Alerter::send`] POSTs the
+//! card to `POST /channels/{id}/messages` with `Authorization: Bot …`.
+//! The token is owned data captured at boot (env-only, scrubbed after
+//! capture like the other bearer secrets) and never logged.
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
+/// Env var (or `{var}_FILE`) carrying the Discord bot token. Secret:
+/// env-only, never the config file, scrubbed after boot capture.
+pub const DISCORD_BOT_TOKEN_ENV: &str = "DISCORD_BOT_TOKEN";
+/// Discord API root for channel sends.
+pub const DISCORD_API: &str = "https://discord.com/api/v10";
 /// Per-message dispatch deadline.
 pub const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Hermes binary invoked for delivery.
-pub const HERMES_BIN: &str = "hermes";
-/// Env override for the Hermes binary path.
-pub const HERMES_BIN_ENV: &str = "HERMES_BIN";
-/// Max Hermes children. Excess drops with a counter.
+/// Max in-flight sends. Excess drops with a counter.
 pub const MAX_INFLIGHT_ALERTS: usize = 4;
+/// Discord `content` length cap: longer cards are truncated, never split.
+pub const MAX_CONTENT_LEN: usize = 2000;
 
 /// Explorer deep-link roots (single source; cards reference these).
 pub const EXPLORER_ADDRESS: &str = "https://explorer.solana.com/address";
@@ -22,11 +29,12 @@ pub const EXPLORER_TX: &str = "https://explorer.solana.com/tx";
 /// Fire-and-forget alerter. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Alerter {
-    binary: String,
-    enabled: bool,
+    /// Bot token (`Authorization: Bot …`). `None` disables sends.
+    token: Option<String>,
+    api_base: String,
     timeout: Duration,
-    /// Optional channel target. `None` uses the default.
-    /// Non-numeric ids stay on default.
+    /// Channel id target. `None` disables sends.
+    /// Non-numeric ids are rejected at the builder.
     channel: Option<String>,
     /// Permits shared across clones.
     permits: Arc<Semaphore>,
@@ -99,26 +107,64 @@ pub struct HeartbeatReport<'a> {
     pub giveups_window: u64,
 }
 
-/// Resolve the Hermes binary: override, env, then PATH.
-fn resolve_binary() -> String {
-    match std::env::var(HERMES_BIN_ENV) {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => HERMES_BIN.to_string(),
-    }
-}
-
 impl Default for Alerter {
     fn default() -> Self {
         Self::new()
     }
 }
 
+/// Capture the bot token from the environment (or `{var}_FILE`, the
+/// 0600-file form that avoids exporting the secret). Pure helper for
+/// the sync boot phase: capture, then scrub the env.
+pub fn capture_bot_token() -> Option<String> {
+    std::env::var(DISCORD_BOT_TOKEN_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var(format!("{DISCORD_BOT_TOKEN_ENV}_FILE"))
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Channel-send URL for a numeric channel id (pure).
+fn send_url(api_base: &str, channel: &str) -> String {
+    format!(
+        "{}/channels/{channel}/messages",
+        api_base.trim_end_matches('/')
+    )
+}
+
+/// Truncate a card to Discord's `content` cap (pure). Truncation keeps
+/// char boundaries and marks the cut; formatters sanitize fields
+/// already, so the marker text is safe to append.
+fn truncate_content(message: &str) -> String {
+    if message.len() <= MAX_CONTENT_LEN {
+        return message.to_string();
+    }
+    let mut end = MAX_CONTENT_LEN;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &message[..end])
+}
+
 impl Alerter {
-    /// Enabled alerter using Hermes.
+    /// Alerter shell: sends only once a token and a channel are set
+    /// (both builders below). Until then [`Alerter::send`] no-ops.
     pub fn new() -> Self {
+        Self::with_api_base(DISCORD_API)
+    }
+
+    /// Same shell against another API root (tests point at loopback).
+    fn with_api_base(api_base: &str) -> Self {
         Self {
-            binary: resolve_binary(),
-            enabled: true,
+            token: None,
+            api_base: api_base.to_string(),
             timeout: DISPATCH_TIMEOUT,
             channel: None,
             permits: Arc::new(Semaphore::new(MAX_INFLIGHT_ALERTS)),
@@ -128,14 +174,7 @@ impl Alerter {
 
     /// No-op alerter: [`Alerter::send`] returns immediately.
     pub fn disabled() -> Self {
-        Self {
-            binary: resolve_binary(),
-            enabled: false,
-            timeout: DISPATCH_TIMEOUT,
-            channel: None,
-            permits: Arc::new(Semaphore::new(MAX_INFLIGHT_ALERTS)),
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        }
+        Self::new()
     }
 
     /// Messages dropped for lack of a permit. Test-only: production
@@ -145,13 +184,17 @@ impl Alerter {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Override the binary (tests use `echo`/`false`).
-    pub fn with_binary(mut self, binary: &str) -> Self {
-        self.binary = binary.to_string();
+    /// Set the bot token (never logged). Empty input is ignored.
+    pub fn with_token(mut self, token: &str) -> Self {
+        let token = token.trim();
+        if !token.is_empty() {
+            self.token = Some(token.to_string());
+        }
         self
     }
 
-    /// Route to a Hermes Discord channel. Bad input keeps default.
+    /// Route to a Discord channel id. Bad input keeps the unset state
+    /// (sends stay disabled).
     pub fn with_channel(mut self, channel: &str) -> Self {
         let channel = channel.trim();
         if !channel.is_empty() && channel.len() <= 32 && channel.bytes().all(|b| b.is_ascii_digit())
@@ -161,29 +204,13 @@ impl Alerter {
         self
     }
 
-    /// argv for one dispatch (pure). Target built here, not via `sanitize`.
-    fn argv(&self, message: &str) -> Vec<String> {
-        let target = match &self.channel {
-            Some(id) => format!("discord:{id}"),
-            None => "discord".to_string(),
-        };
-        vec![
-            "send".to_string(),
-            "--to".to_string(),
-            target,
-            message.to_string(),
-        ]
-    }
-
     /// Send `message` as a detached task. Never blocks the caller.
+    /// No token or no channel means no-op (boot logs the reason).
     /// Excess load drops with a counter.
-    ///
-    /// Pass formatter output. Message goes as argv, so a leading `-`
-    /// could parse as a flag. Formatters sanitize fields already.
     pub fn send(&self, message: String) {
-        if !self.enabled {
+        let (Some(token), Some(channel)) = (self.token.clone(), self.channel.clone()) else {
             return;
-        }
+        };
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -195,22 +222,23 @@ impl Alerter {
                 return;
             }
         };
-        let binary = self.binary.clone();
+        let url = send_url(&self.api_base, &channel);
         let timeout = self.timeout;
-        let args = self.argv(&message);
+        let body = truncate_content(&message);
         tokio::spawn(async move {
             let _permit = permit;
-            let mut cmd = Command::new(&binary);
-            // Timed-out future drops here. Kill the child.
-            cmd.kill_on_drop(true);
-            let run = cmd.args(&args).output();
+            let client = reqwest::Client::new();
+            let run = client
+                .post(&url)
+                .header("Authorization", format!("Bot {token}"))
+                .json(&serde_json::json!({ "content": body }))
+                .timeout(timeout)
+                .send();
             match tokio::time::timeout(timeout, run).await {
-                Err(_) => warn!(target: "alerting", "Hermes alert timed out"),
-                Ok(Err(e)) => warn!(target: "alerting", "Failed to spawn Hermes alert: {e}"),
-                Ok(Ok(output)) if !output.status.success() => {
-                    let err = String::from_utf8_lossy(&output.stderr);
-                    let err: String = err.chars().take(1024).collect();
-                    warn!(target: "alerting", "Hermes Discord delivery failed: {err}");
+                Err(_) => warn!(target: "alerting", "Discord alert timed out"),
+                Ok(Err(e)) => warn!(target: "alerting", "Discord delivery failed: {e}"),
+                Ok(Ok(resp)) if !resp.status().is_success() => {
+                    warn!(target: "alerting", status = %resp.status(), "Discord delivery rejected");
                 }
                 Ok(Ok(_)) => {}
             }
@@ -684,8 +712,10 @@ mod tests {
 
     #[test]
     fn storm_drops_behind_permits() {
-        // Exhaust the permit pool; the next send drops instead of forking.
-        let alert = Alerter::new().with_binary("/bin/echo");
+        // Exhaust the permit pool; the next send drops instead of posting.
+        let alert = Alerter::new()
+            .with_token("test-token-fixture")
+            .with_channel("123456789");
         let mut held = Vec::new();
         for _ in 0..MAX_INFLIGHT_ALERTS {
             held.push(alert.permits.clone().try_acquire_owned().expect("permit"));
@@ -696,55 +726,67 @@ mod tests {
     }
 
     #[test]
-    fn channel_rejects_overlong_input() {
+    fn channel_rejects_bad_input() {
+        // Overlong, blank, or non-numeric input keeps sends disabled
+        // (no channel set).
+        assert!(
+            Alerter::new()
+                .with_channel(&"1".repeat(64))
+                .channel
+                .is_none()
+        );
+        assert!(Alerter::new().with_channel("  ").channel.is_none());
+        assert!(
+            Alerter::new()
+                .with_channel("trades;rm -rf")
+                .channel
+                .is_none()
+        );
         assert_eq!(
-            Alerter::new().with_channel(&"1".repeat(64)).argv("hi"),
-            vec!["send", "--to", "discord", "hi"]
+            Alerter::new().with_channel("123456789").channel.as_deref(),
+            Some("123456789")
         );
     }
 
     #[test]
-    fn argv_defaults_to_skill_shape() {
+    fn send_url_shape() {
         assert_eq!(
-            Alerter::new().argv("hi"),
-            vec!["send", "--to", "discord", "hi"]
-        );
-        // Numeric channel id: folded into the --to target.
-        assert_eq!(
-            Alerter::new().with_channel("123456789").argv("hi"),
-            vec!["send", "--to", "discord:123456789", "hi"]
-        );
-        // Blank or non-numeric input is rejected (default target kept).
-        assert_eq!(
-            Alerter::new().with_channel("  ").argv("hi"),
-            vec!["send", "--to", "discord", "hi"]
-        );
-        assert_eq!(
-            Alerter::new().with_channel("trades;rm -rf").argv("hi"),
-            vec!["send", "--to", "discord", "hi"]
+            send_url("https://discord.com/api/v10", "123456789"),
+            "https://discord.com/api/v10/channels/123456789/messages"
         );
     }
 
+    #[test]
+    fn truncate_content_marks_the_cut() {
+        assert_eq!(truncate_content("hi"), "hi");
+        let long = "a".repeat(MAX_CONTENT_LEN + 10);
+        let cut = truncate_content(&long);
+        assert!(cut.ends_with("[truncated]"));
+        assert!(cut.len() <= MAX_CONTENT_LEN + "…[truncated]".len());
+        // Multibyte boundary: never splits a char.
+        let emoji = "é".repeat(MAX_CONTENT_LEN);
+        let cut = truncate_content(&format!("{emoji}x"));
+        assert!(cut.ends_with("[truncated]"));
+    }
+
     #[tokio::test]
-    async fn disabled_never_spawns() {
-        // A bad binary proves the early return (never spawned).
-        Alerter::disabled()
-            .with_binary("/nonexistent-binary-xyz")
+    async fn disabled_never_sends() {
+        // No token/channel: early return, nothing spawned.
+        Alerter::disabled().send("hi".to_string());
+        Alerter::new().send("hi".to_string());
+        Alerter::new()
+            .with_token("test-token-fixture")
             .send("hi".to_string());
     }
 
     #[tokio::test]
     async fn delivery_paths_do_not_panic() {
-        // Exit-code and spawn-failure paths only log.
-        Alerter::new()
-            .with_binary("/bin/false")
-            .send("hi".to_string());
-        Alerter::new()
-            .with_binary("/nonexistent-binary-xyz")
-            .send("hi".to_string());
-        Alerter::new()
-            .with_binary("/bin/echo")
-            .send("hi".to_string());
+        // Connection-refused loopback: the error path only logs.
+        // (No external network: nothing listens on port 9.)
+        let alert = Alerter::with_api_base("http://127.0.0.1:9")
+            .with_token("test-token-fixture")
+            .with_channel("123456789");
+        alert.send("hi".to_string());
         // Let detached tasks run; assertions are "no panic, returns fast".
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
