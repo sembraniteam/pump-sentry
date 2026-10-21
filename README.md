@@ -15,7 +15,7 @@ Pipeline: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum →
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/sembraniteam/pump-sentry/main/install.sh | bash
-   # VERSION=vX.Y.Z bash install.sh | bash install.sh --from-source | bash uninstall.sh [--purge]
+   # pin a release: VERSION=vX.Y.Z bash install.sh · build from source: bash install.sh --from-source · uninstall.sh [--purge]
    ```
 
 2. **Create the config.** `pump-sentry init-config` writes `~/.pump-sentry/config.toml` (also auto-created on first start). At minimum, set your `mainnet_rpc_url`.
@@ -41,7 +41,7 @@ Pipeline: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum →
 | `pump-sentry replay [file]` | re-derive recorded decisions offline from `journal.jsonl`; exit 1 on any mismatch/unverifiable step |
 | `pump-sentry research [file]` | offline loss-pattern analysis over the journal: loss clusters plus ranked filter proposals with avoided-vs-foregone math and halves; read-only by construction |
 
-State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, sell requests, WAL, day-state, kill-switch marker, snapshots); `LOG_FILE`/`PID_FILE` override it. Long runs need `ops/logrotate/pump-sentry`.
+State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, `bot.lock`, sell requests, WAL, day-state, kill-switch marker, snapshots); `LOG_FILE`/`PID_FILE` override it, and the exclusive `bot.lock` (flock) refuses a second process on the same state dir before it reads config or custody. Long runs need `ops/logrotate/pump-sentry`.
 
 Live funding: SOL-pair v3 buys pay **native SOL** — fund native for trade + fees + tips + 0.05 reserve. A **WSOL** float is only needed for token-paired quotes.
 
@@ -117,9 +117,9 @@ outcomes, paper-vs-live gap averages worse than `max_avg_exit_gap_usd` /
 or a ledger balance short of the claims. Thin windows never trip;
 recovery is always a passing re-check, never elapsed time.
 
-Stream gaps are counted, not hidden: geyser backfill sheds windows past
-its slot cap (`slot_gaps_shed`); WS backfill pages up to 3 signature
-pages and counts capped remainders (`backfill_pages_capped`).
+Stream gaps are counted, not hidden: geyser backfill sheds windows past its slot cap or its
+30s reconnect budget (`slot_gaps_shed`, failed/pruned blocks included); WS backfill pages up
+to 3 signature pages and counts capped remainders (`backfill_pages_capped`).
 
 Custody is re-verified, not just replayed: the live WAL stamps a schema
 line per boot (provenance only — old binaries skip it) and compaction
@@ -131,8 +131,10 @@ mismatches page the operator, nothing auto-corrects. A short ledger
 (balance below claims) additionally latches the entry pause until a later
 recheck passes. The heartbeat card
 carries the health view: RPC `n/m ok · failovers`, data state, oldest
-open age, stream gaps shed, and windowed GiveUps; a position overdue past
-its own timeout warns log-only (runner lifts respected).
+open age, stream gaps shed, and windowed GiveUps; a paper-ledger
+overdraft (dispatch costs past cash) warns on the same beat, and a
+position overdue past its own timeout warns log-only (runner lifts
+respected).
 
 ## Uninstall
 
@@ -161,6 +163,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 | `alerts`    | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs`                                                                                                                                                                                           | `true` / host default / `3` / `50` / `3` / `3600`                                                                                                      |
 
 - `quote_usd` is test-only.
+- `dev_screen_sample_txs` is a floor for the signature budget (`dev_sig_limit`, clamped to 1000); it does not truncate the dev-history count — the screen walks up to 3 pages and fails closed when that budget cuts the history short.
 - `fee_bps` (extra commission per side, on top of the venue fee already inside fills), `trail_percent` and `runner_trail_percent` are validated through typed units: negative/non-finite values warn, `fee_bps >= 100%` fails closed in paper settlement, and trail values must be in `(0, 100]`. In paper mode these are advisory warnings, never a boot refusal; live mode refuses an invalid `fee_bps` outright (an out-of-range commission can neither widen real stop-losses nor corrupt bookkeeping), and the gate's fee-aware stop widening only consumes the typed value — an invalid raw value contributes no widening.
 - `yellowstone_endpoint`: non-empty selects Yellowstone gRPC ingestion instead of WS (x-token via `YELLOWSTONE_TOKEN` env, never the file).
 
@@ -186,6 +189,8 @@ Settings that live **outside** the file (env-only, never in `config.toml`):
 | `YELLOWSTONE_TOKEN_FILE`                                                              | preferred: 0600 token file, avoids exporting the token         |
 | `CONFIG_FILE` / `PID_FILE` / `LOG_FILE`                                               | path overrides                                                 |
 | `BOT_DAEMON` / `BOT_INVOCATION` / `BOT_FIRST_RUN`                                     | daemon markers                                                 |
+| `ALLOW_PUBLIC_RPC_LIVE`                                                               | explicit live override for the public RPC default              |
+| `ALLOW_FALLBACK_CLUSTER_MISMATCH`                                                     | explicit override for cross-cluster read fallbacks             |
 | `HERMES_BIN`                                                                          | alert binary override                                          |
 | `JITO_ACCEPTANCE`, `MAINNET_LAYOUT`, `RAYDIUM_ACCEPTANCE`                             | live-probe gates, ignored by default                           |
 | `PUMP_ACCEPTANCE_POOL`, `PUMP_ACCEPTANCE_HOLDER`, `MAINNET_RPC_URL`                   | live probes only (executor tests): creatorless-fee target, RPC override; the bot never reads these |
@@ -294,8 +299,8 @@ floor, non-6-decimal and Token-2022 fail-closeds, `max_daily_loss_usd > 0`,
 "confirmed"`, `QUOTE_USD` unset.
 
 Live env (all env-only): `SOLANA_PRIVATE_KEY` on a **dedicated** wallet,
-`YELLOWSTONE_TOKEN`, optional `INFERENCE_API_KEY`. Fund native SOL per
-`ops/RUNBOOK.md` §2 (trade + fees + tips + 0.05 reserve), verify Discord
+`YELLOWSTONE_TOKEN`, optional `INFERENCE_API_KEY`. Fund native SOL for
+trade + fees + tips + the 0.05 reserve, verify Discord
 cards actually arrive (Hermes timeouts observed), and keep `notional_usd`
 small until the execution gap line says otherwise. Prefer
 `SOLANA_PRIVATE_KEY_FILE` (the bot **refuses** a key file that is
@@ -307,7 +312,7 @@ sits above what you are willing to lose.
 **Golden rules (everyone):**
 
 - Paper-only without `--live`/`IS_LIVE=true`. Live needs a dedicated wallet, small `notional_usd`, `max_daily_loss_usd>0`, `sim_strict=true`.
-- Exits never block: TP/SL/trailing/timeout + manual `sell`; the day-loss breaker halts entries only.
+- Exits never block: TP/SL/trailing/timeout + manual `sell`; exit ticks and manual sells draw from a reserved dispatch lane so a launch flood cannot starve them, and the day-loss breaker halts entries only.
 - `pump-sentry pause` is the emergency kill switch: no new entry opens (the marker is polled every gate round, no restart needed), while exits, runner/moonbag scale-outs, and `sell <mint>` keep managing open positions. `pump-sentry resume` re-arms entries. The marker survives restarts.
 
 **What it refuses (fail-closed, no funds move):**
@@ -330,4 +335,4 @@ crates/executor/   # live swaps via Jito (only with --live)
 crates/curve|auditor|risk-engine|simulator|ids|alert|migration/
 ```
 
-Each crate has its own README. Tests: `cargo test --workspace` (live probes ignored) · `cargo clippy --all-targets` (zero warnings).
+Each crate has its own README. Tests: `cargo test --workspace` (live probes ignored) · `cargo fmt --all -- --check` · `cargo clippy --workspace --all-targets` (zero warnings).

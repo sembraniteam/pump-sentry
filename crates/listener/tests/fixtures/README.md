@@ -32,6 +32,9 @@ operator with RPC access can close them.
   to resolve per-tx versions; freeze the first v1 past the old slot.
 
 ## Gap 2: PumpSwap WSOL-quoted executable pool — CLOSED 2026-10-16
+
+Both pool blobs live in `crates/migration/tests/fixtures/`, not in this directory.
+
 - Have (fail-closed pin, keep): `pumpswap_pool_mainnet.json` (`GeWJCT...`) is a depth-2
   pump-coin quote — deliberately non-executable, the trust gate refuses
   it (`is_wsol_quoted() == false` is asserted in

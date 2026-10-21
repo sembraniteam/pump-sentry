@@ -15,12 +15,12 @@ wallet attribution + exact base-unit amounts):
 - `sell_v2_mainnet.json`, `sell_v2_second_mainnet.json` — two `sell_v2` samples.
 - `buy_v3_mainnet.json`, `sell_v3_mainnet.json`,
   `buy_exact_quote_in_v3_mainnet.json` — v3 fills (17-account layout).
-- `buy_18_mainnet.json` — fee-routed 18-account buy (slot 458795810,
+- `legacy_buy_18_mainnet.json` — fee-routed 18-account buy (slot 458795810,
   outer): creator/mayhem flow, NOT canonical v3 (fee program +
   buyback wallet + mayhem-linked accounts; trader at index 6, amount =
   first u64). Pinned across 3 samples with the `TradeEvent` user
   cross-checked on each; amount equals the buyer balance delta to the
-  unit (`replay_buy_18_amount_matches_balance_delta`).
+  unit (`replay_legacy_buy_18_amount_matches_balance_delta`).
 - `sell_v2_pumpswap_mainnet.json` — PumpSwap `sell_v2` fill (17
   accounts, slot 457835709; Token-2022 base mint, WSOL quote):
   byte-pinned by `sell_pumpswap_v2_matches_frozen_fill`.

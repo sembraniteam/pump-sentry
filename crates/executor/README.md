@@ -5,7 +5,10 @@ Guarded wallet, exact instruction builders, Jito bundles. Not wired into paper p
 - SOL-pair buys pay **native SOL**; token-paired quotes debit the quote ATA.
 - 17-account `buy_v3`/`sell_v3` from derived addresses + listed buyback; order ceiling is the spend guard; sim preflight gates every dispatch (`SIM_STRICT=true` for live).
 - Legacy/18/v2 shapes deleted; cashback/complete/creatorless curves fail closed.
-- Wallet: env-only secret (zeroized), 0.05 SOL floor; tips refresh ≤15min.
+- Wallet: env-only secret (zeroized), 0.05 SOL floor.
+- Tips: the account list (15min TTL) and the landed-tip floor (60s TTL) are refreshed by
+  background tasks; dispatch reads the cache only, so a stalled oracle costs freshness,
+  never send latency.
 
 ## Read-path redundancy (`rpc_pool`)
 
@@ -21,8 +24,10 @@ read-level fail-closed, not a pause).
 No dispatch fan-out, ever: the pool hardens READS (balances, confirms,
 blockhashes, quotes) only. Order execution stays single-path Jito;
 executed-once semantics belong to the send/confirm guards, not to
-redundancy. Configure fallbacks via `mainnet_rpc_urls_fallback`
-(`MAINNET_RPC_URLS_FALLBACK`); empty keeps primary-only.
+redundancy. Configure fallbacks via `mainnet_rpc_urls_fallback` (config file only — the
+environment is not read for tunables); empty keeps primary-only. Boot trust-checks every
+endpoint: malformed/non-http URLs, remote plain http, and cross-cluster fallbacks refuse a
+live start.
 
 ```sh
 cargo test -p executor

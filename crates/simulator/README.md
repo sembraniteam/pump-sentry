@@ -16,6 +16,9 @@ Virtual cash, positions, and exits. Proves profitability before real funds move.
   live pays escalated tips under congestion.
 - Exits, in order: timeout → TP → SL → trailing; moonbag scale-outs ratchet to breakeven with a 24h backstop.
 - No leverage (`notional + fee ≤ cash`); equity marks exits at modeled proceeds minus fees.
+- Dispatch costs can outrun cash: the ledger carries the negative cash instead of flooring
+  it, `PortfolioSnapshot::overdraft_usd` names the shortfall (the heartbeat warns), and new
+  Long opens refuse while cash is negative.
 
 ```sh
 cargo test -p simulator

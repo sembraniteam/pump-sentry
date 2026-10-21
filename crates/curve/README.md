@@ -3,7 +3,7 @@
 Turns on-chain virtual reserves into live USD spot: no static prices anywhere (`QUOTE_USD` is paper-tests only).
 
 - Parser pinned to the Pump.fun IDL shape; prices with real mint decimals; confirm gate drops non-6 mints.
-- DexScreener SOL/USD feed (Jupiter Lite retired), 120s stale-gated: stale reads fail closed, never print old USD. The feed records whether it ever priced (`has_ever_priced`) so the supervisor tells a boot that never had a price (grace window) from a lost price (pause at once).
+- DexScreener SOL/USD feed (Jupiter Lite retired), 120s stale-gated: stale reads fail closed, never print old USD. Only deep stablecoin legs may set the global price — USDC first, then USDT; any other quote token is skipped, never a fallback. The feed records whether it ever priced (`has_ever_priced`) so the supervisor tells a boot that never had a price (grace window) from a lost price (pause at once).
 - Ticker: dynamic watch set, chunked `getMultipleAccounts` (≤100), 15s per chunk under a 60s round budget; missed rounds log and continue.
 
 ```sh
