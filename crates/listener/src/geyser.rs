@@ -329,7 +329,7 @@ impl GeyserSubscriber {
                 }
             }
             let seen_before = self.stats.logs_seen();
-            let session_start = std::time::Instant::now();
+            let session_start = Instant::now();
             let mut rate_limited = false;
             match self.run_once(&tx, from_slot).await {
                 Ok(last_slot) => {

@@ -1170,7 +1170,7 @@ mod tests {
     #[test]
     fn truncate200_caps_long_output() {
         let long = "x".repeat(500);
-        assert_eq!(super::truncate200(&long).chars().count(), 201);
-        assert_eq!(super::truncate200("short"), "short");
+        assert_eq!(truncate200(&long).chars().count(), 201);
+        assert_eq!(truncate200("short"), "short");
     }
 }

@@ -156,9 +156,9 @@ pub struct Settings {
     pub tip_lamports: u64,
     /// Jito block-engine URL.
     pub jito_endpoint: String,
-    /// Discord alerts via Hermes CLI.
+    /// Discord alerts via direct HTTPS (bot token).
     pub discord_alerts: bool,
-    /// Hermes channel id. Empty uses host config.
+    /// Numeric Discord channel id for card delivery. Empty disables sends.
     pub discord_channel: Option<String>,
     /// Strict preflight: sim failures reject. Use for live.
     pub sim_strict: bool,

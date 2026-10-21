@@ -598,7 +598,7 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
     async fn rpc_retry<F, Fut, T>(label: &str, mut f: F) -> T
     where
         F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<T, solana_client::client_error::ClientError>>,
+        Fut: Future<Output = Result<T, solana_client::client_error::ClientError>>,
     {
         let mut attempt = 0u32;
         loop {
@@ -928,7 +928,7 @@ async fn fresh_mayhem_buy_simulates_end_to_end_v2() {
                 .expect("curve readable")
                 .data;
             if data.len() >= 115 {
-                let raw = solana_pubkey::Pubkey::new_from_array(data[83..115].try_into().unwrap());
+                let raw = Pubkey::new_from_array(data[83..115].try_into().unwrap());
                 executor::executor::resolve_quote_mint(&raw)
             } else {
                 executor::instructions::WSOL_MINT

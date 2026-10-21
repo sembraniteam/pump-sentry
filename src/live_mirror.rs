@@ -744,8 +744,8 @@ impl<L> LiveExecution<L> {
     where
         L: LiveSink,
     {
-        let mut bags: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let bump = |m: &str, bags: &mut std::collections::HashMap<String, usize>| {
+        let mut bags: HashMap<String, usize> = HashMap::new();
+        let bump = |m: &str, bags: &mut HashMap<String, usize>| {
             *bags.entry(m.to_string()).or_insert(0) += 1;
         };
         for key in self.live_positions.lock().await.keys() {
@@ -945,7 +945,7 @@ impl<L> LiveExecution<L> {
             qty_tokens,
             venue,
             liquidity_usd,
-            crate::settings::now_secs(),
+            now_secs(),
         );
         if let Some(ref gap) = gap {
             info!(mint = %gap.mint, paper = gap.paper_price_usd, fill = gap.fill_price_usd,

@@ -615,7 +615,7 @@ pub struct LiveTrader {
     /// broken until an operator restart. Shared (clones agree).
     wal_degraded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Unconfirmed buys, re-polled until settled or out of tries.
-    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+    pending: std::sync::Arc<std::sync::Mutex<HashMap<String, PendingBuy>>>,
     /// Recent mark prices per mint for volatility-adaptive slippage.
     /// Fed from live dispatch prints (entry/exit); tick-level feed is
     /// future work, so thin histories simply yield the base slippage.
@@ -629,8 +629,7 @@ pub struct LiveTrader {
     /// [`LiveTrader::prior_sell_state`] before every release; only the
     /// [`SELL_GUARD_TTL_SECS`] bound releases without proof, so a lying
     /// status API cannot hold resends forever.
-    last_sell_bundle:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, SellGuard>>>,
+    last_sell_bundle: std::sync::Arc<std::sync::Mutex<HashMap<String, SellGuard>>>,
     /// One recheck round at a time.
     recheck_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -716,10 +715,8 @@ impl LiveTrader {
             marks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             vol_window_secs: 0,
             vol_extra_cap_bps: 0,
-            pending: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            last_sell_bundle: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            pending: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            last_sell_bundle: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             recheck_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -848,7 +845,7 @@ impl LiveTrader {
         &self,
         op: &'static str,
         fallback: R,
-        f: impl FnOnce(&mut std::collections::HashMap<String, PendingBuy>) -> R,
+        f: impl FnOnce(&mut HashMap<String, PendingBuy>) -> R,
     ) -> R {
         match self.pending.lock() {
             Ok(mut guard) => f(&mut guard),
@@ -1379,7 +1376,7 @@ impl LiveTrader {
 
     /// Record an unconfirmed buy. First receipt wins per mint.
     fn track_pending(
-        pending: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+        pending: &std::sync::Arc<std::sync::Mutex<HashMap<String, PendingBuy>>>,
         mint: &str,
         position: LivePosition,
         receipt: &JitoReceipt,
@@ -1406,7 +1403,7 @@ impl LiveTrader {
 
     /// Remove a settled entry. Timeouts stay for recheck.
     fn untrack_pending(
-        pending: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingBuy>>>,
+        pending: &std::sync::Arc<std::sync::Mutex<HashMap<String, PendingBuy>>>,
         mint: &str,
     ) {
         match pending.lock() {

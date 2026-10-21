@@ -410,7 +410,7 @@ impl PumpFunListener {
             let outcome = self.run_once(&tx, &rpc, &semaphore).await;
             // Long healthy sessions reset backoff.
             let healthy = self.stats.logs_seen().saturating_sub(seen_before) > 1000
-                || session_start.elapsed() > std::time::Duration::from_secs(30);
+                || session_start.elapsed() > Duration::from_secs(30);
             match outcome {
                 Ok(()) => {
                     // Clean subscription end (server closed stream): reconnect.
@@ -613,14 +613,14 @@ async fn fetch_tx_permit_bound(
     match first {
         Ok(v) => Some(v),
         Err(e) if is_transient_fetch_error(&e) => {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
             let _permit = acquire("retry")?;
             match rpc.get_transaction_with_config(signature, tx_config).await {
                 Ok(v) => Some(v),
                 // `429` gets one longer retry: 250ms often lands in-window.
                 Err(e) if is_rate_limited(&e) => {
                     let jitter = jitter_ms(500);
-                    tokio::time::sleep(std::time::Duration::from_millis(1000 + jitter)).await;
+                    tokio::time::sleep(Duration::from_millis(1000 + jitter)).await;
                     let _permit = acquire("rate-limit retry")?;
                     match rpc.get_transaction_with_config(signature, tx_config).await {
                         Ok(v) => Some(v),
@@ -715,7 +715,7 @@ async fn fetch_and_emit(
 
     // Hung RPCs can't hold permits forever.
     let fetched = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        Duration::from_secs(10),
         fetch_tx_permit_bound(rpc, &signature, tx_config, sem, stats, sig_str),
     )
     .await

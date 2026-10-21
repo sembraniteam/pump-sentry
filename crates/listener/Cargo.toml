@@ -52,3 +52,6 @@ solana-transaction = "4.3"
 [[example]]
 name = "watch"
 path = "examples/watch.rs"
+
+[lints]
+workspace = true

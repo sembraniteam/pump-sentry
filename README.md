@@ -164,7 +164,7 @@ Secrets (`SOLANA_PRIVATE_KEY`, `INFERENCE_API_KEY`) stay in env, never in the fi
 | `gate`      | `gate_window_secs`, `gate_min_buyers`, `gate_poll_ms`, `dev_min_age_secs`, `dev_max_prior_launches`, `dev_screen_sample_txs`, `dev_sig_limit`                                                                                                                                                                                              | `10` / `5` / `2000` / `3600` / `1` / `20` / `100`                                                                                                      |
 | `risk`      | `strategy_mode`, `runner_moonbag_percent`, `inference_endpoint`, `inference_model`, `inference_timeout_ms`, `inference_fallback`, `inference_defer_max_n`, `inference_headers`, `force_exit_regime`                                                                                                                                        | `adaptive` / `20` / local / `llama3.2:1b` / `300` / `heuristic` / `1` / unset / `""`                                                                   |
 | `execution` | `slippage_bps`, `slippage_vol_window_secs`, `slippage_vol_extra_cap_bps`, `priority_fee_micro_lamports`, `compute_unit_limit`, `jito_tip_lamports`, `jito_endpoint`, `sim_strict`                                                                                                                                                          | `200` / `0` / `0` / `0` / `0` / `100000` / global / `false`                                                                                            |
-| `alerts`    | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs`                                                                                                                                                                                           | `true` / host default / `3` / `50` / `3` / `3600`                                                                                                      |
+| `alerts`    | `discord_alerts`, `discord_channel`, `alert_diverged_warn_n`, `alert_risk_fallback_warn_pct`, `alert_giveup_burst_n`, `alert_giveup_window_secs`                                                                                                                                                                                           | `true` / unset (sends disabled) / `3` / `50` / `3` / `3600`                                                                                            |
 
 - `quote_usd` is test-only.
 - `dev_screen_sample_txs` is a floor for the signature budget (`dev_sig_limit`, clamped to 1000); it does not truncate the dev-history count — the screen walks up to 3 pages and fails closed when that budget cuts the history short.
@@ -195,7 +195,8 @@ Settings that live **outside** the file (env-only, never in `config.toml`):
 | `BOT_DAEMON` / `BOT_INVOCATION` / `BOT_FIRST_RUN`                                     | daemon markers                                                 |
 | `ALLOW_PUBLIC_RPC_LIVE`                                                               | explicit live override for the public RPC default              |
 | `ALLOW_FALLBACK_CLUSTER_MISMATCH`                                                     | explicit override for cross-cluster read fallbacks             |
-| `HERMES_BIN`                                                                          | alert binary override                                          |
+| `DISCORD_BOT_TOKEN`                                                                 | Discord bot token, scrubbed after boot                         |
+| `DISCORD_BOT_TOKEN_FILE`                                                            | preferred: 0600 token file, avoids exporting the token        |
 | `JITO_ACCEPTANCE`, `MAINNET_LAYOUT`, `RAYDIUM_ACCEPTANCE`                             | live-probe gates, ignored by default                           |
 | `PUMP_ACCEPTANCE_POOL`, `PUMP_ACCEPTANCE_HOLDER`, `MAINNET_RPC_URL`                   | live probes only (executor tests): creatorless-fee target, RPC override; the bot never reads these |
 
@@ -306,7 +307,7 @@ floor, non-6-decimal and Token-2022 fail-closeds, `max_daily_loss_usd > 0`,
 Live env (all env-only): `SOLANA_PRIVATE_KEY` on a **dedicated** wallet,
 `YELLOWSTONE_TOKEN`, optional `INFERENCE_API_KEY`. Fund native SOL for
 trade + fees + tips + the 0.05 reserve, verify Discord
-cards actually arrive (Hermes timeouts observed), and keep `notional_usd`
+cards actually arrive (verify on paper first), and keep `notional_usd`
 small until the execution gap line says otherwise. Prefer
 `SOLANA_PRIVATE_KEY_FILE` (the bot **refuses** a key file that is
 group/world readable) and set `hot_wallet_max_sol` so the wallet never

@@ -231,7 +231,7 @@ pub const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// One deadline-bound RPC read. `None` on timeout or failure.
 async fn rpc_timeout<T>(
     timeout: Duration,
-    fut: impl std::future::Future<Output = Result<T, ClientError>>,
+    fut: impl Future<Output = Result<T, ClientError>>,
 ) -> Option<T> {
     match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(v)) => Some(v),
@@ -678,8 +678,7 @@ impl SwapExecutor {
                 "mint account unreadable; token program unknown".to_string(),
             ));
         };
-        let ata =
-            crate::instructions::user_ata_with_program(&self.wallet.pubkey(), mint, &token_program);
+        let ata = user_ata_with_program(&self.wallet.pubkey(), mint, &token_program);
         match tokio::time::timeout(RPC_READ_TIMEOUT, self.rpc.get_account(&ata)).await {
             Ok(Ok(account)) => token_account_amount(&account.data)
                 .map(Some)
@@ -858,7 +857,7 @@ impl SwapExecutor {
         let pre_sol = meta.pre_balances.get(buyer_idx)?;
         let post_sol = meta.post_balances.get(buyer_idx)?;
         let buyer_sol_spent = pre_sol.checked_sub(*post_sol)?;
-        let pre_by_account: std::collections::HashMap<u8, u64> = match &meta.pre_token_balances {
+        let pre_by_account: HashMap<u8, u64> = match &meta.pre_token_balances {
             OptionSerializer::Some(list) => list
                 .iter()
                 .filter_map(|b| {
@@ -1155,8 +1154,7 @@ impl SwapExecutor {
                 "Token-2022 mint unroutable via Raydium V4; refusing (fail-closed)".to_string(),
             ));
         }
-        let source_ata =
-            crate::instructions::user_ata_with_program(&payer, &order.mint, &token_program);
+        let source_ata = user_ata_with_program(&payer, &order.mint, &token_program);
         match tokio::time::timeout(
             Duration::from_secs(10),
             self.rpc.get_token_account_balance(&source_ata),
@@ -1237,7 +1235,7 @@ impl SwapExecutor {
                 ExecutorError::BadOrder("raydium floor unguardable (dust); refusing".to_string())
             })?;
         // WSOL dest [6] must exist; prefix is idempotent.
-        let user_destination = crate::instructions::user_ata_with_program(
+        let user_destination = user_ata_with_program(
             &payer,
             &crate::instructions::WSOL_MINT,
             &crate::instructions::TOKEN_PROGRAM_ID,
@@ -1542,25 +1540,23 @@ impl SwapExecutor {
                 ));
             }
         }
-        ixs.push(
-            crate::instructions::PumpSwapBuilder::build_sell_pumpswap_v2_ix(
-                order.amount_tokens,
-                floor,
-                &crate::instructions::PumpAmmSellV2Accounts {
-                    pool: &order.pool,
-                    user: &payer,
-                    base_mint: &order.mint,
-                    quote_mint: &WSOL_MINT,
-                    user_base_token_account: &source_ata,
-                    user_quote_token_account: &user_quote,
-                    pool_base_token_account: &order.base_vault,
-                    pool_quote_token_account: &order.quote_vault,
-                    base_token_program: &token_program,
-                    quote_token_program: quote_program,
-                    buyback_fee_recipient: &buyback,
-                },
-            ),
-        );
+        ixs.push(PumpSwapBuilder::build_sell_pumpswap_v2_ix(
+            order.amount_tokens,
+            floor,
+            &crate::instructions::PumpAmmSellV2Accounts {
+                pool: &order.pool,
+                user: &payer,
+                base_mint: &order.mint,
+                quote_mint: &WSOL_MINT,
+                user_base_token_account: &source_ata,
+                user_quote_token_account: &user_quote,
+                pool_base_token_account: &order.base_vault,
+                pool_quote_token_account: &order.quote_vault,
+                base_token_program: &token_program,
+                quote_token_program: quote_program,
+                buyback_fee_recipient: &buyback,
+            },
+        ));
         Ok(ixs)
     }
 
@@ -2589,7 +2585,7 @@ mod tests {
         })
         .expect("mock response serializes")
     }
-    fn mock_ui_account(owner: &solana_pubkey::Pubkey, data: &[u8]) -> serde_json::Value {
+    fn mock_ui_account(owner: &Pubkey, data: &[u8]) -> serde_json::Value {
         use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
         mock_resp(MockUiAcct {
             data: (BASE64_STANDARD.encode(data), "base64".to_string()),
@@ -2607,14 +2603,10 @@ mod tests {
             "preflight-scope",
             mocks,
         );
-        let rpc = std::sync::Arc::new(
-            solana_client::nonblocking::rpc_client::RpcClient::new_sender(
-                sender,
-                RpcClientConfig::with_commitment(
-                    solana_commitment_config::CommitmentConfig::confirmed(),
-                ),
-            ),
-        );
+        let rpc = Arc::new(RpcClient::new_sender(
+            sender,
+            RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+        ));
         let keypair = Keypair::new();
         let wallet = WalletGuard::from_base58(&bs58::encode(keypair.to_bytes()).into_string())
             .expect("wallet");
@@ -2622,12 +2614,7 @@ mod tests {
     }
     /// Synthetic curve blob (own layout, already pinned) with a chosen
     /// quote mint, creator, and flags.
-    fn mock_curve(
-        creator: &solana_pubkey::Pubkey,
-        quote_mint: &solana_pubkey::Pubkey,
-        complete: bool,
-        mayhem: bool,
-    ) -> Vec<u8> {
+    fn mock_curve(creator: &Pubkey, quote_mint: &Pubkey, complete: bool, mayhem: bool) -> Vec<u8> {
         let mut data = vec![0u8; 166];
         data[..8].copy_from_slice(&ids::BONDING_CURVE_DISCRIMINATOR);
         data[crate::instructions::CURVE_CREATOR_OFFSET..crate::instructions::CURVE_CREATOR_END]

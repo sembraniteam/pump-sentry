@@ -206,8 +206,8 @@ jito_endpoint = "https://mainnet.block-engine.jito.wtf"  #
 sim_strict = false          # (unproven sims refuse; required live)
 
 [alerts]
-discord_alerts = true       # (trade cards via Hermes CLI)
-discord_channel = ""        # (empty = host default)
+discord_alerts = true       # (trade cards via direct HTTPS; needs DISCORD_BOT_TOKEN + channel)
+discord_channel = ""        # (numeric channel id; empty disables sends)
 alert_diverged_warn_n = 3   # (0 = off; warn at >= 3 paper-without-cover mints; log-only, never cards)
 alert_risk_fallback_warn_pct = 50  # (0 = off; warn at >= 50% heuristic decisions; log-only, never cards)
 alert_giveup_burst_n = 3    # (0 = off; warn at >= 3 GiveUps per window; log-only, never cards)

@@ -18,3 +18,6 @@ solana-pubkey = "4"
 sha2 = "0.11.1"
 spl-token = { version = "9", default-features = false, features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "8", default-features = false, features = ["no-entrypoint"] }
+
+[lints]
+workspace = true

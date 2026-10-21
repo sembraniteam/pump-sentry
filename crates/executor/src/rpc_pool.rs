@@ -365,7 +365,7 @@ pub struct RpcPoolSnapshot {
 }
 
 /// Cheap sampler probe: slot + latency, bypassing eligibility.
-async fn probe_slot(node: &Endpoint) -> std::result::Result<(u64, Duration), String> {
+async fn probe_slot(node: &Endpoint) -> Result<(u64, Duration), String> {
     let started = Instant::now();
     let params: serde_json::Value = serde_json::to_value(
         &[CommitmentParam {
@@ -406,7 +406,7 @@ impl RpcSender for FailoverSender {
         &self,
         request: RpcRequest,
         params: serde_json::Value,
-    ) -> std::result::Result<serde_json::Value, ClientError> {
+    ) -> Result<serde_json::Value, ClientError> {
         // Eligible endpoints first (stable order keeps the primary
         // preferred among equals); ineligible ones still get tried
         // behind them rather than failing an available read outright.
@@ -525,7 +525,7 @@ mod tests {
             &self,
             _request: RpcRequest,
             _params: serde_json::Value,
-        ) -> std::result::Result<serde_json::Value, ClientError> {
+        ) -> Result<serde_json::Value, ClientError> {
             self.count.calls.fetch_add(1, Ordering::Relaxed);
             let probe = matches!(_request, RpcRequest::GetSlot);
             let fails = if probe {

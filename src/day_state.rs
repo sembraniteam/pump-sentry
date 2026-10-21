@@ -86,7 +86,7 @@ pub fn save(path: &Path, state: &DayState) -> std::io::Result<()> {
 pub fn ensure_writable(path: &Path) -> Result<(), String> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => std::path::PathBuf::from("."),
+        _ => PathBuf::from("."),
     };
     // A parent that already exists but is not a directory (e.g. the
     // bare log path's dir slot taken by a stray file) is the same

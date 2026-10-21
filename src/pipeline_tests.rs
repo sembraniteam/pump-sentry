@@ -91,18 +91,18 @@ struct StubLiveInner {
     /// landed-and-errored burn). 0 = books nothing, so the paper-only
     /// accounting assertions keep holding.
     dispatch_lamports: StdMutex<u64>,
-    fail_buys: std::sync::atomic::AtomicBool,
+    fail_buys: AtomicBool,
     /// Simulated dead-buy verdict (dispatch proven dead before landing).
     dead_buys: StdMutex<Option<DeadReason>>,
-    fail_sells: std::sync::atomic::AtomicBool,
+    fail_sells: AtomicBool,
     /// Transient sell failures (consume retry budget, unlike `BadOrder`).
-    fail_sells_transient: std::sync::atomic::AtomicBool,
+    fail_sells_transient: AtomicBool,
     /// Unknown sell dispatch (timeout with no receipt): unknown custody,
     /// parks for manual review with no resend.
-    fail_sells_unknown: std::sync::atomic::AtomicBool,
+    fail_sells_unknown: AtomicBool,
     /// Deterministic Jito rejection (HTTP 429 rate limit): retryable,
     /// never unknown custody (AUD-002).
-    fail_sells_rate_limited: std::sync::atomic::AtomicBool,
+    fail_sells_rate_limited: AtomicBool,
     /// Overlap-test hook: sells of `block_mint` wait on `unblock`.
     block_mint: StdMutex<Option<String>>,
     started: StdMutex<Vec<String>>,
@@ -112,14 +112,14 @@ struct StubLiveInner {
     /// Deterministic recheck hang: `std::future::pending` forever —
     /// any code path that awaits a recheck must not be on the tick
     /// path (AUD-013 regression guard).
-    hang_recheck: std::sync::atomic::AtomicBool,
+    hang_recheck: AtomicBool,
     /// Pending entries resolve as `Confirmed` on the next recheck.
-    recheck_confirms: std::sync::atomic::AtomicBool,
+    recheck_confirms: AtomicBool,
     /// Pending entries resolve as provably `Dead` on the next recheck
     /// (AUD-003: divergence marking on the recheck path).
-    recheck_dies: std::sync::atomic::AtomicBool,
+    recheck_dies: AtomicBool,
     /// Simulated WAL write failure (entries must halt).
-    wal_degraded: std::sync::atomic::AtomicBool,
+    wal_degraded: AtomicBool,
 }
 
 impl StubLive {
@@ -133,20 +133,20 @@ impl StubLive {
                 sell_tips: StdMutex::new(vec![]),
                 tip_lamports: 100_000,
                 dispatch_lamports: StdMutex::new(0),
-                fail_buys: std::sync::atomic::AtomicBool::new(false),
+                fail_buys: AtomicBool::new(false),
                 dead_buys: StdMutex::new(None),
-                fail_sells: std::sync::atomic::AtomicBool::new(false),
-                fail_sells_transient: std::sync::atomic::AtomicBool::new(false),
-                fail_sells_unknown: std::sync::atomic::AtomicBool::new(false),
-                fail_sells_rate_limited: std::sync::atomic::AtomicBool::new(false),
+                fail_sells: AtomicBool::new(false),
+                fail_sells_transient: AtomicBool::new(false),
+                fail_sells_unknown: AtomicBool::new(false),
+                fail_sells_rate_limited: AtomicBool::new(false),
                 block_mint: StdMutex::new(None),
                 started: StdMutex::new(vec![]),
                 unblock: tokio::sync::Notify::new(),
                 pending: StdMutex::new(vec![]),
-                hang_recheck: std::sync::atomic::AtomicBool::new(false),
-                recheck_confirms: std::sync::atomic::AtomicBool::new(false),
-                recheck_dies: std::sync::atomic::AtomicBool::new(false),
-                wal_degraded: std::sync::atomic::AtomicBool::new(false),
+                hang_recheck: AtomicBool::new(false),
+                recheck_confirms: AtomicBool::new(false),
+                recheck_dies: AtomicBool::new(false),
+                wal_degraded: AtomicBool::new(false),
             }),
         }
     }
@@ -186,11 +186,7 @@ impl BuySink for StubLive {
         let curve = req.curve;
         let assoc_curve = req.assoc_curve;
         let notional_usd = req.notional_usd;
-        if self
-            .inner
-            .fail_buys
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_buys.load(Ordering::Relaxed) {
             return Err(LiveError::BadOrder("stubbed failure".to_string()));
         }
         if let Some(reason) = *self.inner.dead_buys.lock().expect("lock") {
@@ -224,27 +220,15 @@ impl BuySink for StubLive {
 impl SellSink for StubLive {
     async fn sell(&self, req: &LiveSellParams<'_>) -> Result<String, LiveError> {
         let position = req.position;
-        if self
-            .inner
-            .fail_sells
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells.load(Ordering::Relaxed) {
             return Err(LiveError::BadOrder("stubbed sell failure".to_string()));
         }
-        if self
-            .inner
-            .fail_sells_transient
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells_transient.load(Ordering::Relaxed) {
             return Err(LiveError::Unconfirmed(
                 "stubbed transient sell failure".to_string(),
             ));
         }
-        if self
-            .inner
-            .fail_sells_unknown
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells_unknown.load(Ordering::Relaxed) {
             self.inner
                 .started
                 .lock()
@@ -255,11 +239,7 @@ impl SellSink for StubLive {
                 reason: "stubbed unknown sell dispatch".to_string(),
             });
         }
-        if self
-            .inner
-            .fail_sells_rate_limited
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells_rate_limited.load(Ordering::Relaxed) {
             // Deterministic Jito refusal (429): the engine answered
             // without accepting, so this is a retryable failure and
             // never unknown custody (AUD-002).
@@ -294,29 +274,17 @@ impl SellSink for StubLive {
         let position = req.position;
         let pool = req.pool;
         // Same failure hooks as the curve leg.
-        if self
-            .inner
-            .fail_sells
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells.load(Ordering::Relaxed) {
             return Err(LiveError::BadOrder(
                 "stubbed raydium sell failure".to_string(),
             ));
         }
-        if self
-            .inner
-            .fail_sells_transient
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells_transient.load(Ordering::Relaxed) {
             return Err(LiveError::Unconfirmed(
                 "stubbed transient raydium sell failure".to_string(),
             ));
         }
-        if self
-            .inner
-            .fail_sells_unknown
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells_unknown.load(Ordering::Relaxed) {
             return Err(LiveError::UnknownDispatch {
                 position: Box::new(position.clone()),
                 reason: "stubbed unknown raydium sell dispatch".to_string(),
@@ -339,29 +307,17 @@ impl SellSink for StubLive {
         let position = req.position;
         let pool = req.pool;
         // Same failure hooks as the curve leg.
-        if self
-            .inner
-            .fail_sells
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells.load(Ordering::Relaxed) {
             return Err(LiveError::BadOrder(
                 "stubbed pumpswap sell failure".to_string(),
             ));
         }
-        if self
-            .inner
-            .fail_sells_transient
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells_transient.load(Ordering::Relaxed) {
             return Err(LiveError::Unconfirmed(
                 "stubbed transient pumpswap sell failure".to_string(),
             ));
         }
-        if self
-            .inner
-            .fail_sells_unknown
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fail_sells_unknown.load(Ordering::Relaxed) {
             return Err(LiveError::UnknownDispatch {
                 position: Box::new(position.clone()),
                 reason: "stubbed unknown pumpswap sell dispatch".to_string(),
@@ -406,22 +362,14 @@ impl PendingStore for StubLive {
     }
 
     async fn recheck_pending(&self) -> Vec<PendingRecheck> {
-        if self
-            .inner
-            .hang_recheck
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.hang_recheck.load(Ordering::Relaxed) {
             // Hang forever: deterministic stale-forever future. Used
             // by the AUD-013 guard test (a tick must never wait behind
             // a recheck round).
             std::future::pending::<()>().await;
             return Vec::new();
         }
-        if self
-            .inner
-            .recheck_confirms
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.recheck_confirms.load(Ordering::Relaxed) {
             return self
                 .inner
                 .pending
@@ -446,11 +394,7 @@ impl PendingStore for StubLive {
                 })
                 .collect();
         }
-        if self
-            .inner
-            .recheck_dies
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.recheck_dies.load(Ordering::Relaxed) {
             return self
                 .inner
                 .pending
@@ -514,9 +458,7 @@ impl WalSink for StubLive {
     fn unrecord_manual(&self, _position: &LivePosition) {}
 
     fn wal_degraded(&self) -> bool {
-        self.inner
-            .wal_degraded
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.inner.wal_degraded.load(Ordering::Relaxed)
     }
 }
 
@@ -679,10 +621,10 @@ struct StubScreenerInner {
     swaps: StdMutex<HashMap<String, Vec<SwapRecord>>>,
     bundle: StdMutex<BundleOutcome>,
     migration: StdMutex<Option<MigrationReport>>,
-    truncated: std::sync::atomic::AtomicBool,
+    truncated: AtomicBool,
     /// Confirm-time fresh screens reject (serial-launcher detected
     /// between intake and quorum; AUD-004 wiring proof).
-    fresh_rejects: std::sync::atomic::AtomicBool,
+    fresh_rejects: AtomicBool,
     /// Canned top-10 holder share (`None` = RPC failure).
     top_holders: StdMutex<Option<f64>>,
     /// Migration-hunt invocations (AUD-027: paper closes must not hunt).
@@ -706,8 +648,8 @@ impl StubScreener {
                 swaps: StdMutex::new(HashMap::new()),
                 bundle: StdMutex::new(BundleOutcome::Safe),
                 migration: StdMutex::new(None),
-                truncated: std::sync::atomic::AtomicBool::new(false),
-                fresh_rejects: std::sync::atomic::AtomicBool::new(false),
+                truncated: AtomicBool::new(false),
+                fresh_rejects: AtomicBool::new(false),
                 top_holders: StdMutex::new(None),
                 migration_hunts: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -786,11 +728,7 @@ impl Screener for StubScreener {
     }
 
     async fn screen_dev_fresh(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
-        if self
-            .inner
-            .fresh_rejects
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inner.fresh_rejects.load(Ordering::Relaxed) {
             return Ok(DevVerdict {
                 pass: false,
                 age_secs: Some(7200),
@@ -817,10 +755,7 @@ impl Screener for StubScreener {
             .get(mint)
             .cloned()
             .unwrap_or_default();
-        let truncated = self
-            .inner
-            .truncated
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let truncated = self.inner.truncated.load(Ordering::Relaxed);
         Ok(if truncated {
             CurveRead::Truncated
         } else {
@@ -867,9 +802,7 @@ impl Screener for StubScreener {
         _curve: &str,
         _mint: &str,
     ) -> Result<Option<MigrationReport>, ScreenError> {
-        self.inner
-            .migration_hunts
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.migration_hunts.fetch_add(1, Ordering::Relaxed);
         let found = self.inner.migration.lock().expect("lock").clone();
         Ok(found)
     }
@@ -903,7 +836,7 @@ fn pipeline_engined(
     screener: StubScreener,
     live: Option<StubLive>,
     alerts: Option<StubAlerts>,
-    engine: Option<risk_engine::RiskEngine>,
+    engine: Option<RiskEngine>,
 ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
     let vaults = VaultTicker::new(
         listener::types::DEFAULT_HTTP_RPC_URL,
@@ -929,8 +862,8 @@ fn pipeline_engined(
 
 /// Unreachable model endpoint: refuses fast, always heuristic. This is
 /// the production-default shape (engine present, Ollama absent).
-fn dead_engine() -> Option<risk_engine::RiskEngine> {
-    risk_engine::RiskEngine::builder()
+fn dead_engine() -> Option<RiskEngine> {
+    RiskEngine::builder()
         .endpoint("http://127.0.0.1:9")
         .timeout(std::time::Duration::from_millis(100))
         .build()
@@ -1289,7 +1222,7 @@ async fn shutdown_snapshot_lists_open_and_live_state() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            mark: simulator::Mark::new(2.0, 1e9),
+            mark: Mark::new(2.0, 1e9),
             notional_usd: 10.0,
             tp_percent: 75.0,
             sl_percent: -8.0,
@@ -1338,7 +1271,7 @@ async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            mark: simulator::Mark::new(2.0, 1e9),
+            mark: Mark::new(2.0, 1e9),
             notional_usd: 10.0,
             tp_percent: 75.0,
             sl_percent: -8.0,
@@ -1373,7 +1306,7 @@ async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
     );
     let snap = pipe.portfolio.lock().await.snapshot(&HashMap::from([(
         MINT.to_string(),
-        simulator::Mark::new(2.0, 30_000.0),
+        Mark::new(2.0, 30_000.0),
     )]));
     let (cash, equity) = pipe.paper_cash_equity().await;
     assert_eq!(cash, snap.cash);
@@ -1420,7 +1353,7 @@ async fn daily_breaker_blocks_opens_but_not_exits() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            mark: simulator::Mark::new(2.0, 1e9),
+            mark: Mark::new(2.0, 1e9),
             notional_usd: 10.0,
             tp_percent: 75.0,
             sl_percent: -8.0,
@@ -1513,7 +1446,7 @@ async fn entry_bleed_cap_blocks_only_proven_bleeders() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            mark: simulator::Mark::new(2.0, 1e9),
+            mark: Mark::new(2.0, 1e9),
             notional_usd: 10.0,
             tp_percent: 75.0,
             sl_percent: -8.0,
@@ -2216,13 +2149,8 @@ async fn recovered_bag_without_a_curve_tick_resolves_its_pool_feed() {
     }
     // The exit now routes through the pool, exactly like a live tick.
     assert!(
-        pipe.live_sell(
-            MINT,
-            &simulator::Mark::new(3.0, 30_000.0),
-            1.0,
-            crate::live_mirror::SellCover::LiveOnly,
-        )
-        .await
+        pipe.live_sell(MINT, &Mark::new(3.0, 30_000.0), 1.0, SellCover::LiveOnly,)
+            .await
     );
     assert_eq!(
         live.pumpswap_sells(),
@@ -2234,16 +2162,10 @@ async fn recovered_bag_without_a_curve_tick_resolves_its_pool_feed() {
 fn paper_closes_skip_the_pre_close_migration_hunt() {
     // AUD-027: the hunt is only useful when a live leg can route the
     // exit; a paper close must not spend an exit-lane permit on it.
-    assert!(!crate::pipeline::should_hunt_before_close(
-        false, true, true
-    ));
-    assert!(!crate::pipeline::should_hunt_before_close(
-        true, false, true
-    ));
-    assert!(!crate::pipeline::should_hunt_before_close(
-        true, true, false
-    ));
-    assert!(crate::pipeline::should_hunt_before_close(true, true, true));
+    assert!(!should_hunt_before_close(false, true, true));
+    assert!(!should_hunt_before_close(true, false, true));
+    assert!(!should_hunt_before_close(true, true, false));
+    assert!(should_hunt_before_close(true, true, true));
 }
 
 #[tokio::test]
@@ -2277,9 +2199,7 @@ async fn complete_tick_with_hunt_none_preserves_fail_closed_refusal() {
     pipe.poll_gates().await;
     // Force the curve refusal the real executor deterministically
     // raises on a complete curve (executor preflight refusal).
-    live.inner
-        .fail_sells
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    live.inner.fail_sells.store(true, Ordering::Relaxed);
     let mut done = tick(MINT, 2.0);
     done.complete = true;
     pipe.on_tick(&done).await;
@@ -2348,10 +2268,7 @@ async fn confirm_rescreen_bypasses_dev_verdict_cache() {
     // a confirm-time re-screen with FRESH history — the cached intake
     // pass must not admit the open.
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
-    screener
-        .inner
-        .fresh_rejects
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    screener.inner.fresh_rejects.store(true, Ordering::Relaxed);
     let pipe = pipeline_screened(
         Settings::from_map(&HashMap::new()),
         AuditOutcome::Allow(100),
@@ -2409,9 +2326,7 @@ async fn recheck_dead_marks_paper_diverged() {
     pipe.poll_gates().await;
     assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
     // Pending without a tracked bag; the recheck proves it dead.
-    live.inner
-        .recheck_dies
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    live.inner.recheck_dies.store(true, Ordering::Relaxed);
     live.inner
         .pending
         .lock()
@@ -2452,9 +2367,7 @@ async fn wal_degraded_halts_entries_but_not_exits() {
         slot: 5000,
     };
     let set_degraded = |on: bool| {
-        live.inner
-            .wal_degraded
-            .store(on, std::sync::atomic::Ordering::Relaxed);
+        live.inner.wal_degraded.store(on, Ordering::Relaxed);
     };
     set_degraded(true);
     pipe.on_launch(&launch).await;
@@ -2498,7 +2411,7 @@ async fn exposure_cap_bounds_total_tickets() {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: MINT_A,
                 side: Side::Long,
-                mark: simulator::Mark::new(2.0, 1e9),
+                mark: Mark::new(2.0, 1e9),
                 notional_usd: 10.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
@@ -2723,10 +2636,7 @@ async fn truncated_round_never_confirms() {
     // Quorum swaps on a truncated round: no confirm, no watermark
     // advance — the entry stays watchlisted for the next round.
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
-    screener
-        .inner
-        .truncated
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    screener.inner.truncated.store(true, Ordering::Relaxed);
     let reserves = StubReserves::with_tick(tick(MINT, 2.0));
     let pipe = pipeline_screened(
         Settings::from_map(&HashMap::new()),
@@ -2944,9 +2854,7 @@ async fn diverged_close_never_feeds_live_day_loss_breaker() {
     // not feed its simulated PnL into `max_daily_loss_usd` — a phantom
     // paper win must not loosen (or offset into) a live circuit breaker.
     let live = StubLive::working();
-    live.inner
-        .fail_buys
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    live.inner.fail_buys.store(true, Ordering::Relaxed);
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
     let pipe = pipeline_screened(
         Settings::from_map(&HashMap::new()),
@@ -3757,9 +3665,7 @@ async fn tick_never_waits_behind_a_slow_pending_recheck() {
     // recheck future hangs forever; if any tick path still awaits it,
     // this tick times out.
     let live = StubLive::working();
-    live.inner
-        .hang_recheck
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    live.inner.hang_recheck.store(true, Ordering::Relaxed);
     live.inner
         .pending
         .lock()
@@ -3827,9 +3733,7 @@ async fn recheck_resolves_confirmed_buys_without_a_tick() {
     })
     .await;
     // Pending without any tracked position: resolves as Confirmed.
-    live.inner
-        .recheck_confirms
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    live.inner.recheck_confirms.store(true, Ordering::Relaxed);
     live.inner
         .pending
         .lock()
@@ -3915,7 +3819,7 @@ async fn tick_closes_other_mints_only() {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: MINT_B,
                 side: Side::Long,
-                mark: simulator::Mark::new(2.0, 30_000.0),
+                mark: Mark::new(2.0, 30_000.0),
                 notional_usd: 10.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
@@ -3947,7 +3851,7 @@ async fn tick_timeout_closes_stale_position() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            mark: simulator::Mark::new(2.0, 30_000.0),
+            mark: Mark::new(2.0, 30_000.0),
             notional_usd: 10.0,
             tp_percent: 75.0,
             sl_percent: -8.0,
@@ -4047,9 +3951,7 @@ async fn live_buy_fires_with_paper_open() {
 #[tokio::test]
 async fn live_buy_failure_keeps_paper_position() {
     let live = StubLive::working();
-    live.inner
-        .fail_buys
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    live.inner.fail_buys.store(true, Ordering::Relaxed);
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
     let reserves = StubReserves::with_tick(tick(MINT, 2.0));
     let pipe = pipeline_screened(
@@ -4218,7 +4120,7 @@ async fn exposure_counts_each_unpaired_live_bag() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            mark: simulator::Mark::new(2.0, 1e9),
+            mark: Mark::new(2.0, 1e9),
             notional_usd: 10.0,
             tp_percent: 75.0,
             sl_percent: -8.0,
@@ -4247,7 +4149,7 @@ async fn exposure_cap_counts_duplicate_bags_before_opening() {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: MINT_A,
                 side: Side::Long,
-                mark: simulator::Mark::new(2.0, 1e9),
+                mark: Mark::new(2.0, 1e9),
                 notional_usd: 10.0,
                 tp_percent: 75.0,
                 sl_percent: -8.0,
@@ -4503,7 +4405,7 @@ async fn manual_sell_closes_both_legs() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: sys,
             side: Side::Long,
-            mark: simulator::Mark::new(2.0, 1e9),
+            mark: Mark::new(2.0, 1e9),
             notional_usd: 10.0,
             tp_percent: 75.0,
             sl_percent: -8.0,
@@ -4560,9 +4462,7 @@ async fn manual_sell_waits_while_a_live_buy_is_pending() {
     );
     // The pending buy confirms through the recheck path: the bag is
     // tracked and the retained request sells it on the next drain.
-    live.inner
-        .recheck_confirms
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    live.inner.recheck_confirms.store(true, Ordering::Relaxed);
     pipe.recheck_live_pending().await;
     assert!(!pipe.exec.live_positions.lock().await.is_empty());
     assert!(pipe.manual_sell(sys).await);
@@ -4626,9 +4526,7 @@ async fn giveup_parked_manual_exit_records_paper_headline_once() {
     // the live day-loss breaker instead of being dropped as
     // "uncovered".
     let live = StubLive::working();
-    live.inner
-        .fail_buys
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    live.inner.fail_buys.store(true, Ordering::Relaxed);
     let pipe = pipeline_screened(
         Settings::from_map(&HashMap::new()),
         AuditOutcome::Allow(100),
@@ -4708,12 +4606,7 @@ async fn live_only_exit_books_realized_pnl_from_persisted_basis() {
         },
     );
     let settled = pipe
-        .live_sell(
-            sys,
-            &simulator::Mark::new(3.0, 30_000.0),
-            1.0,
-            crate::live_mirror::SellCover::LiveOnly,
-        )
+        .live_sell(sys, &Mark::new(3.0, 30_000.0), 1.0, SellCover::LiveOnly)
         .await;
     assert!(settled, "stub sell settles");
     let day = pipe.daily.lock().await.day_net();
@@ -4751,13 +4644,8 @@ async fn live_only_exit_without_basis_is_counted_and_alerted() {
         },
     );
     assert!(
-        pipe.live_sell(
-            sys,
-            &simulator::Mark::new(3.0, 30_000.0),
-            1.0,
-            crate::live_mirror::SellCover::LiveOnly,
-        )
-        .await
+        pipe.live_sell(sys, &Mark::new(3.0, 30_000.0), 1.0, SellCover::LiveOnly,)
+            .await
     );
     assert_eq!(
         pipe.exec.unaccounted_realized_count().await,
@@ -4799,12 +4687,7 @@ async fn paper_leg_exit_never_books_realized_on_top_of_the_headline() {
         },
     );
     let settled = pipe
-        .live_sell(
-            sys,
-            &simulator::Mark::new(3.0, 30_000.0),
-            1.0,
-            crate::live_mirror::SellCover::PaperLeg,
-        )
+        .live_sell(sys, &Mark::new(3.0, 30_000.0), 1.0, SellCover::PaperLeg)
         .await;
     assert!(settled);
     // Dispatch costs may book; the realized fallback may not.
@@ -5191,7 +5074,7 @@ async fn heat_cap_blocks_extra_positions() {
             .open_position_params(&simulator::OpenPositionParams {
                 mint: "OTHER",
                 side: Side::Long,
-                mark: simulator::Mark::new(2.0, 30_000.0),
+                mark: Mark::new(2.0, 30_000.0),
                 notional_usd: 10.0,
                 tp_percent: 35.0,
                 sl_percent: -8.0,
@@ -5235,7 +5118,7 @@ async fn cooldown_blocks_immediate_reentry() {
         .open_position_params(&simulator::OpenPositionParams {
             mint: MINT,
             side: Side::Long,
-            mark: simulator::Mark::new(2.0, 30_000.0),
+            mark: Mark::new(2.0, 30_000.0),
             notional_usd: 10.0,
             tp_percent: 35.0,
             sl_percent: -8.0,
@@ -5250,7 +5133,7 @@ async fn cooldown_blocks_immediate_reentry() {
     portfolio
         .close_position(
             id,
-            &simulator::Mark::new(2.0, 30_000.0),
+            &Mark::new(2.0, 30_000.0),
             ExitReason::Manual,
             now_secs(),
         )
@@ -5645,12 +5528,7 @@ async fn live_sells_for_different_mints_overlap() {
             async {
                 tokio::time::timeout(
                     secs(5),
-                    pipe.live_sell(
-                        MINT_A,
-                        &simulator::Mark::new(3.0, 30_000.0),
-                        1.0,
-                        crate::live_mirror::SellCover::PaperLeg,
-                    ),
+                    pipe.live_sell(MINT_A, &Mark::new(3.0, 30_000.0), 1.0, SellCover::PaperLeg),
                 )
                 .await
                 .expect("A finishes after release");
@@ -5677,12 +5555,7 @@ async fn live_sells_for_different_mints_overlap() {
                 .expect("A starts");
                 tokio::time::timeout(
                     secs(5),
-                    pipe.live_sell(
-                        MINT_B,
-                        &simulator::Mark::new(3.0, 30_000.0),
-                        1.0,
-                        crate::live_mirror::SellCover::PaperLeg,
-                    ),
+                    pipe.live_sell(MINT_B, &Mark::new(3.0, 30_000.0), 1.0, SellCover::PaperLeg),
                 )
                 .await
                 .expect("B proceeds while A is blocked");

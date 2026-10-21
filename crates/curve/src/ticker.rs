@@ -88,7 +88,7 @@ pub struct CurveTicker {
     subs: Arc<RwLock<HashMap<String, Watched>>>,
     interval: Duration,
     sol_feed: Arc<SolUsdFeed>,
-    dropped: Arc<std::sync::atomic::AtomicU64>,
+    dropped: Arc<AtomicU64>,
     /// Mint decimals cache: (decimals, first-seen). Immutable on-chain;
     /// eviction past the cap drops the oldest first-seen entry (not a
     /// random key) so hot mints are not evicted by insertion luck.
@@ -144,7 +144,7 @@ impl CurveTicker {
             subs: Arc::new(RwLock::new(HashMap::new())),
             interval,
             sol_feed,
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
             decimals: Arc::new(Mutex::new(HashMap::new())),
             fee_inputs: Arc::new(Mutex::new(None)),
             supply: Arc::new(Mutex::new(HashMap::new())),
@@ -356,12 +356,12 @@ impl CurveTicker {
                 ) {
                     Ok(tick) => match tx.try_send(tick) {
                         Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        Err(mpsc::error::TrySendError::Full(_)) => {
                             self.dropped
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             debug!("tick queue full; dropping tick");
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
                             debug!("tick receiver closed; ticker stopping");
                             return;
                         }
@@ -580,9 +580,7 @@ mod tests {
         let stranger = Pubkey::new_from_array([9; 32]);
         assert!(matches!(
             tick_from_account("M", "C", &data, &stranger, 150.0, 6),
-            Err(CurveError::Parse(
-                crate::layout::CurveParseError::WrongOwner(_)
-            ))
+            Err(CurveError::Parse(CurveParseError::WrongOwner(_)))
         ));
     }
 
@@ -592,13 +590,13 @@ mod tests {
         let stale = SolUsdFeed::new(
             &crate::sol_feed::DEFAULT_DEX_URL,
             120,
-            std::time::Duration::from_secs(30),
+            Duration::from_secs(30),
         );
         stale.set_price(150.0);
         let empty = SolUsdFeed::new(
             &crate::sol_feed::DEFAULT_DEX_URL,
             120,
-            std::time::Duration::from_secs(30),
+            Duration::from_secs(30),
         );
         let _ = SystemTime::now()
             .duration_since(UNIX_EPOCH)

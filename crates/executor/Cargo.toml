@@ -50,3 +50,6 @@ solana-message = "4"
 solana-instruction-error = "2"
 solana-transaction-error = "3.4"
 tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true
