@@ -33,7 +33,7 @@ use crate::live::{
     BuyFill, LiveBuyParams, LiveError, LivePosition, LiveSellParams, LiveTrader, PendingRecheck,
     PumpSwapSellParams, RaydiumSellParams,
 };
-use crate::live_mirror::{LiveExecution, breaker_headline, live_base_mint};
+use crate::live_mirror::{LiveExecution, SellCover, breaker_headline, live_base_mint};
 use crate::settings::{Settings, now_secs};
 #[cfg(test)]
 pub(crate) use listener::BundleVerdict;
@@ -408,6 +408,18 @@ impl Screener for RpcScreener {
 /// missing read: exits defer instead of booking a fee-only fiction.
 fn unpriceable_liquidity(liquidity_usd: f64) -> bool {
     !liquidity_usd.is_finite() || liquidity_usd <= 0.0
+}
+
+/// AUD-027: hunt the migration before a complete tick's close only when
+/// a live leg exists to route the exit through the pool. Paper closes
+/// cannot use the pool and must not burn an exit-lane permit on the
+/// bounded RPC hunt; their hunt still runs post-close in `maybe_unwatch`.
+pub(crate) fn should_hunt_before_close(
+    live_present: bool,
+    complete: bool,
+    has_custody: bool,
+) -> bool {
+    live_present && complete && has_custody
 }
 
 /// Shared state for event, gate, and ticker tasks. Generics allow stubs.
@@ -866,15 +878,18 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Hunt here (deduped, None/Err retry on later ticks), then the
         // same tick's close routes through the fresh pool leg. Without
         // a resolvable pool the fail-closed curve refusal stands.
-        if tick.complete
-            && (!self
-                .portfolio
-                .lock()
-                .await
-                .positions_for_mint(&tick.mint)
-                .is_empty()
-                || self.exec.is_tracked(&tick.mint).await)
-        {
+        // AUD-027: only a live leg can route the exit through the pool,
+        // so paper-only closes must not spend an exit-lane permit on a
+        // 15s RPC hunt. Paper mode still hunts after the close in
+        // `maybe_unwatch` (already deduped).
+        let has_custody = !self
+            .portfolio
+            .lock()
+            .await
+            .positions_for_mint(&tick.mint)
+            .is_empty()
+            || self.exec.is_tracked(&tick.mint).await;
+        if should_hunt_before_close(self.exec.live.is_some(), tick.complete, has_custody) {
             self.report_migration_once(&tick.mint, &tick.curve).await;
         }
         // Clone marks before the book guard (never nest locks).
@@ -908,7 +923,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 if unpriceable {
                     self.report_drained(&tick.mint, tick.liquidity_usd, was_drained, "live exit");
                 } else {
-                    self.live_sell(&tick.mint, &mark, 1.0).await;
+                    self.live_sell(&tick.mint, &mark, 1.0, SellCover::LiveOnly)
+                        .await;
                 }
             }
             self.maybe_unwatch(tick).await;
@@ -1071,7 +1087,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         // Live first, breaker second: unsettled live defers the feed.
         let live_settled = if closed_fraction > 0.0 {
-            self.live_sell(&tick.mint, &mark, closed_fraction).await
+            self.live_sell(&tick.mint, &mark, closed_fraction, SellCover::PaperLeg)
+                .await
         } else {
             true
         };

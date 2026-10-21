@@ -166,6 +166,53 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         info!(%mint, amm = %amm, "following migrated pool");
     }
 
+    /// AUD-021: live custody (tracked or parked) that still rides a
+    /// curve with no registered pool leg. After a restart the paper book
+    /// is empty and a graduated curve may stop ticking (zero reserves),
+    /// so these bags have no guaranteed automated exit feed. Deduped by
+    /// mint, sorted for stable logs/tests.
+    pub async fn bags_without_pool_leg(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let guard = self.exec.live_positions.lock().await;
+            for pos in guard.values() {
+                let mint = pos.mint.to_string();
+                if seen.insert(mint.clone()) {
+                    out.push((mint, pos.curve.to_string()));
+                }
+            }
+        }
+        {
+            let guard = self.exec.live_manual.lock().await;
+            for pos in guard.values() {
+                let mint = pos.mint.to_string();
+                if seen.insert(mint.clone()) {
+                    out.push((mint, pos.curve.to_string()));
+                }
+            }
+        }
+        {
+            let followed = self.followed.lock().await;
+            out.retain(|(mint, _)| !followed.get(mint).is_some_and(|state| state.pool.is_some()));
+        }
+        out.sort();
+        out
+    }
+
+    /// Hunt the migration for every bag without a pool leg and register
+    /// whatever resolves (bounded per bag by the existing hunt
+    /// deadline). Returns how many bags still lack an exit feed after
+    /// the pass; the caller alerts when non-zero and retries on the
+    /// supervision recheck.
+    pub async fn refresh_recovered_bag_feeds(&self) -> usize {
+        let bags = self.bags_without_pool_leg().await;
+        for (mint, curve) in &bags {
+            self.report_migration_once(mint, curve).await;
+        }
+        self.bags_without_pool_leg().await.len()
+    }
+
     /// Sweep idle follows even when no pool ticks arrive (call from the
     /// poll loop on a timer). `on_pool_tick` also sweeps, but a fully
     /// idle ticker would otherwise leak `followed` + vault subs to restart.

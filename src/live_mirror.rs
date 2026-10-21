@@ -542,6 +542,19 @@ pub(crate) fn breaker_headline(net_pnl: f64, dispatch_usd: f64) -> f64 {
 }
 
 /// Live state, split from [`Pipeline`]. Owns the live generic (`L`).
+/// Whether the exit being settled has a paper leg (AUD-020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SellCover {
+    /// A paper position for this mint closed in the same exit; its
+    /// headline is fed to the breaker, so no realized live PnL is
+    /// booked here (that would double-count the same trade).
+    PaperLeg,
+    /// No paper leg exists (live-only custody: a bag recovered from the
+    /// WAL or a duplicate parked bag). Book realized PnL from the
+    /// persisted entry basis instead.
+    LiveOnly,
+}
+
 pub struct LiveExecution<L = LiveTrader> {
     /// Dispatcher; `None` is paper-only.
     pub live: Option<L>,
@@ -570,6 +583,11 @@ pub struct LiveExecution<L = LiveTrader> {
     /// (AUD-002): a diverged or bundle-suspect paper open must not
     /// simulate a loss/win that trips or loosens a live circuit breaker.
     pub paper_covered: Mutex<std::collections::HashSet<String>>,
+    /// Settled live exits whose entry cost basis was unknown (legacy
+    /// WAL, AUD-020). Their realized PnL could not be booked; the
+    /// heartbeat surfaces the count so the tally is never silently
+    /// under-counted.
+    pub unaccounted_realized: Mutex<u64>,
 }
 
 impl<L> LiveExecution<L> {
@@ -588,6 +606,7 @@ impl<L> LiveExecution<L> {
             gaps: Mutex::new(FillGapTracker::new()),
             outcomes: Mutex::new(FillOutcomeTracker::new()),
             paper_covered: Mutex::new(std::collections::HashSet::new()),
+            unaccounted_realized: Mutex::new(0),
         }
     }
 
@@ -793,6 +812,13 @@ impl<L> LiveExecution<L> {
         self.live_diverged.lock().await.keys().cloned().collect()
     }
 
+    /// True when paper PnL is stashed for this mint while live settles.
+    /// A stash proves a paper leg existed for the exit, so the settle
+    /// path must not book realized live PnL on top of it (AUD-020).
+    pub async fn has_deferred(&self, mint: &str) -> bool {
+        self.deferred_pnl.lock().await.contains_key(mint)
+    }
+
     /// `(mints, total)` stashed while live holds: paper PnL kept out
     /// of the breaker. Invisible stashes hide real exposure, so the
     /// heartbeat carries both numbers.
@@ -805,6 +831,20 @@ impl<L> LiveExecution<L> {
     /// Override-priced mints excluded from the breaker.
     pub async fn synthetic_count(&self) -> usize {
         self.synthetic_mints.lock().await.len()
+    }
+
+    /// Settled live exits whose realized PnL could not be booked
+    /// because the entry cost basis was unknown (AUD-020).
+    pub async fn unaccounted_realized_count(&self) -> u64 {
+        *self.unaccounted_realized.lock().await
+    }
+
+    /// Count one unaccounted realized exit and return the running
+    /// total (the first one also raises an operator alert).
+    async fn note_unaccounted_realized(&self) -> u64 {
+        let mut count = self.unaccounted_realized.lock().await;
+        *count += 1;
+        *count
     }
 
     /// Stamp a GiveUp (buy-unconfirmed or sell-budget-exhausted) for
@@ -1592,6 +1632,50 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
     }
 
+    /// Book realized PnL for a settled live exit with no paper leg
+    /// (AUD-020). The basis is the persisted per-display-token entry
+    /// cost; proceeds are marked at this tick's USD price, the same
+    /// proxy the paper book settles with, so both routes price one
+    /// trade alike. Exactly one call per settled bundle; dispatch
+    /// debits stay separate.
+    async fn record_live_realized(
+        &self,
+        mint: &str,
+        probe: &LivePosition,
+        price_usd: f64,
+        decimals: u8,
+    ) {
+        if self.exec.is_synthetic(mint).await {
+            warn!(mint = %mint, "synthetic paper mint settled live without a paper leg; realized PnL not booked");
+            return;
+        }
+        let basis = probe.entry_usd_per_token;
+        let display = probe.amount_tokens as f64 / 10f64.powi(i32::from(decimals));
+        if !basis.is_finite()
+            || basis <= 0.0
+            || !price_usd.is_finite()
+            || price_usd <= 0.0
+            || !display.is_finite()
+            || display <= 0.0
+        {
+            let n = self.exec.note_unaccounted_realized().await;
+            warn!(
+                mint = %mint, tokens = probe.amount_tokens, basis, price_usd, n,
+                "realized live PnL unaccounted: no persisted entry cost basis (legacy WAL); the day-loss tally under-counts this exit"
+            );
+            if n == 1 {
+                self.emit(format!(
+                    "REALIZED PnL UNACCOUNTED on {mint} (legacy WAL carries no entry cost); the day-loss tally under-counts this exit — review manually"
+                ));
+            }
+            return;
+        }
+        let pnl = display * (price_usd - basis);
+        if pnl.is_finite() {
+            self.daily.lock().await.record(pnl, now_secs());
+        }
+    }
+
     /// Give up automation, park the tracked bag for manual exit.
     /// Always returns false: parked manual is still held, so the
     /// caller must NOT treat this as settled (paper PnL routes through
@@ -1623,6 +1707,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         mint: &str,
         mark: &simulator::Mark,
         fraction_closed: f64,
+        cover: SellCover,
     ) -> bool {
         let Some(trader) = &self.exec.live else {
             return true;
@@ -1709,6 +1794,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 assoc_curve: tracked.assoc_curve,
                 amount_tokens: sell_amount,
                 creator: tracked.creator,
+                entry_usd_per_token: tracked.entry_usd_per_token,
             }
         };
         // Validated pool leg means curve is gone: route Raydium.
@@ -1801,6 +1887,24 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 let emptied = self.exec.subtract_fill(mint, probe.amount_tokens).await;
                 // Success resets the budget.
                 self.exec.reset_retry(mint).await;
+                // AUD-020: a settled real sell proves the custody was
+                // real. Stamp coverage here — the single settle point —
+                // so a bag whose buy outcome was unknown (parked after
+                // GiveUp/UnknownDispatch, later resurrected by `sell`)
+                // cannot keep its paper headline out of the breaker.
+                // Covered trades keep the stamp until the paper close;
+                // `settle_close_tail` releases it once exposure is gone.
+                self.exec.mark_live_covered(mint).await;
+                // No paper leg means the paper headline route cannot
+                // see this exit at all (restart-recovered custody,
+                // drained duplicates). Book its realized PnL once. A
+                // deferred stash proves a paper leg existed for this
+                // exit (the paper close was stashed on an earlier
+                // unsettled attempt), so never book both.
+                if cover == SellCover::LiveOnly && !self.exec.has_deferred(mint).await {
+                    self.record_live_realized(mint, &probe, price_usd, decimals)
+                        .await;
+                }
                 // Feed stashed paper PnL only when live holds nothing
                 // anymore: a tracked remainder or a parked manual bag
                 // (exact or suffixed dup) is still exposure. The tail
@@ -2083,6 +2187,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // position per mint). Paper PnL feeds the breaker only after
         // everything settles; tracked custody is never replaced.
         if self.exec.live.is_some() {
+            // AUD-020: the first settled bag of this request owns the
+            // paper headline (the book holds at most one position per
+            // mint); duplicates drained after it are live-only.
+            let mut paper_headline_pending = !closed_pnls.is_empty();
             loop {
                 if !self.exec.is_tracked(&tick.mint).await {
                     let Some(dup_key) = self
@@ -2102,7 +2210,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                     self.exec.insert_tracked(held).await;
                 }
-                if !self.live_sell(&tick.mint, &mark, 1.0).await {
+                let cover = if std::mem::take(&mut paper_headline_pending) {
+                    SellCover::PaperLeg
+                } else {
+                    SellCover::LiveOnly
+                };
+                if !self.live_sell(&tick.mint, &mark, 1.0, cover).await {
                     warn!(mint = %tick.mint, "manual sell: live still holds; breaker PnL deferred, request kept");
                     self.exec.stash_deferred_pnl(&tick.mint, closed_pnls).await;
                     return false;
@@ -2147,6 +2260,7 @@ mod tests {
             assoc_curve: assoc_key,
             amount_tokens: amount,
             creator: None,
+            entry_usd_per_token: 0.0,
         }
     }
 

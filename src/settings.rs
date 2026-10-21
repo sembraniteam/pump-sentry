@@ -404,36 +404,72 @@ impl Settings {
         // split-brain check pins dispatch to the same cluster).
         let primary = endpoint_cluster(&self.http_url);
 
-        let mut endpoints: Vec<(String, &str)> = vec![
-            ("MAINNET_RPC_URL".to_string(), self.http_url.as_str()),
-            ("JITO_ENDPOINT".to_string(), self.jito_endpoint.as_str()),
+        let mut endpoints: Vec<(String, &str, EndpointScheme)> = vec![
+            (
+                "MAINNET_RPC_URL".to_string(),
+                self.http_url.as_str(),
+                EndpointScheme::Http,
+            ),
+            (
+                "MAINNET_WSS_RPC_URL".to_string(),
+                self.ws_url.as_str(),
+                EndpointScheme::Ws,
+            ),
+            (
+                "JITO_ENDPOINT".to_string(),
+                self.jito_endpoint.as_str(),
+                EndpointScheme::Http,
+            ),
         ];
         if !self.yellowstone_endpoint.is_empty() {
             endpoints.push((
                 "YELLOWSTONE_ENDPOINT".to_string(),
                 self.yellowstone_endpoint.as_str(),
+                EndpointScheme::Http,
             ));
         }
         for (i, url) in self.fallback_rpc_urls.iter().enumerate() {
-            endpoints.push((format!("MAINNET_RPC_URLS_FALLBACK[{i}]"), url));
+            endpoints.push((
+                format!("MAINNET_RPC_URLS_FALLBACK[{i}]"),
+                url,
+                EndpointScheme::Http,
+            ));
         }
 
-        for (label, url) in endpoints {
-            // Localhost http is explicitly allowed (local dev/test
-            // proxies); remote plain-http is not.
-            if is_plain_http_remote(url) {
+        for (label, url, scheme) in endpoints {
+            // Localhost http/ws is explicitly allowed (local dev/test
+            // proxies); remote plaintext is not.
+            if is_plaintext_remote(url) {
                 let redacted = ids::redact_endpoint(url);
                 fatals.push(format!(
-                    "{label} serves a remote plain-http endpoint ({redacted}): reads/credentials move in cleartext; use https or a localhost endpoint"
+                    "{label} serves a remote plaintext endpoint ({redacted}): reads/credentials move in cleartext; use {scheme} or a localhost endpoint"
                 ));
                 continue;
             }
-            // Unusable URL (malformed / non-http scheme): the pool and
-            // geyser dialers would degrade to silent failed reads.
-            if !is_http_url(url) {
+            // Unusable URL (malformed / wrong scheme): the pool, WS
+            // client, and geyser dialers would degrade to silent failed
+            // reads.
+            let usable = match scheme {
+                EndpointScheme::Http => is_http_url(url),
+                EndpointScheme::Ws => is_ws_url(url),
+            };
+            if !usable {
                 fatals.push(format!(
-                    "{label} is not a usable http(s) URL ({redacted}); fix the config (an unset endpoint means unset)",
+                    "{label} is not a usable endpoint URL (expected {scheme}) ({redacted}); fix the config (an unset endpoint means unset)",
                     redacted = ids::redact_endpoint(url)
+                ));
+                continue;
+            }
+            // WS ingestion must agree with the read RPC: a cross-cluster
+            // socket feeds launches/prices from another network with no
+            // other signal. Never overridable (the operator override is
+            // scoped to read fallbacks).
+            if scheme == EndpointScheme::Ws
+                && let (Some(p), Some(c)) = (primary, endpoint_cluster(url))
+                && c != p
+            {
+                fatals.push(format!(
+                    "{label} identifies cluster '{c}' but the primary RPC is '{p}': ingestion would watch another cluster while reads/exits use this one"
                 ));
                 continue;
             }
@@ -530,7 +566,7 @@ impl Settings {
                 self.force_exit_regime
             ));
         }
-        if self.inference_api_key.is_some() && is_plain_http_remote(&self.inference_endpoint) {
+        if self.inference_api_key.is_some() && is_plaintext_remote(&self.inference_endpoint) {
             out.push(
                 "INFERENCE_API_KEY is set with a non-local plain-http INFERENCE_ENDPOINT: the bearer token travels in cleartext — use https or keep inference on localhost".to_string(),
             );
@@ -705,7 +741,7 @@ impl Settings {
     /// shipped public default, documented as unfit for live reads
     /// (drops candidates, truncates quorum, rate limits).
     pub fn on_public_rpc_default(&self) -> bool {
-        self.http_url == listener::types::DEFAULT_HTTP_RPC_URL
+        same_endpoint(&self.http_url, listener::types::DEFAULT_HTTP_RPC_URL)
     }
 
     /// Typed slippage guard (`None` when >=100% or unrepresentable).
@@ -1072,18 +1108,24 @@ fn parse_quote_usd(vars: &HashMap<String, String>, notes: &mut Vec<String>) -> O
 /// True for plain-http endpoints outside localhost: bearer tokens
 /// sent there travel in cleartext. Local servers are exempt.
 /// Shared with the live boot gate (refuses there, warns elsewhere).
-pub(crate) fn is_plain_http_remote(endpoint: &str) -> bool {
-    let rest = match endpoint.trim().strip_prefix("http://") {
-        Some(r) => r,
-        None => return false,
+/// True when `url` is a plaintext remote endpoint (`http://` or
+/// `ws://`) that is not localhost: traffic and any provider key would
+/// move in cleartext. `https`/`wss` are transport-secure; localhost is
+/// exempt (local dev/test proxies).
+pub(crate) fn is_plaintext_remote(endpoint: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(endpoint.trim()) else {
+        return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Strip a port (`127.0.0.1:11434`); bracketed IPv6 keeps its
-    // colons (`[::1]:11434`).
-    let host = match authority.strip_prefix('[') {
-        Some(rest) => rest.split(']').next().unwrap_or(""),
-        None => authority.split(':').next().unwrap_or(""),
+    if !matches!(parsed.scheme(), "http" | "ws") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return true;
     };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     let host = host.strip_suffix('.').unwrap_or(host);
     !(host.is_empty()
         || host.eq_ignore_ascii_case("localhost")
@@ -1115,6 +1157,47 @@ pub(crate) fn is_http_url(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|u| u.scheme() == "http" || u.scheme() == "https")
 }
 
+/// True when `url` parses and speaks ws/wss (the subscription client).
+pub(crate) fn is_ws_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| u.scheme() == "ws" || u.scheme() == "wss")
+}
+
+/// Endpoint equality that ignores spelling: scheme (http/https/ws/wss
+/// and case), explicit-vs-default ports, and a trailing slash. Used by
+/// the public-RPC live gate so `https://HOST/`, `HTTP://HOST`, and
+/// `https://HOST:443` all match the shipped default (AUD-024).
+fn same_endpoint(a: &str, b: &str) -> bool {
+    fn normalized(raw: &str) -> Option<(String, String)> {
+        let parsed = url::Url::parse(raw.trim()).ok()?;
+        let host = parsed
+            .host_str()?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        Some((
+            host.strip_suffix('.').unwrap_or(&host).to_string(),
+            parsed.path().trim_end_matches('/').to_string(),
+        ))
+    }
+    normalized(a) == normalized(b) && normalized(a).is_some()
+}
+
+/// Transport a boot endpoint is expected to speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointScheme {
+    Http,
+    Ws,
+}
+
+impl std::fmt::Display for EndpointScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Http => "https",
+            Self::Ws => "wss",
+        })
+    }
+}
+
 /// Unix seconds; `0` when the clock fails (never panics).
 pub fn now_secs() -> u64 {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1134,14 +1217,7 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    /// Serializes env-mutating tests (process-global env shared by
-    /// parallel test threads).
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::test_env::lock;
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -1184,7 +1260,7 @@ mod tests {
         assert!(
             fatals
                 .iter()
-                .any(|f| f.contains("MAINNET_RPC_URL") && f.contains("plain-http")),
+                .any(|f| f.contains("MAINNET_RPC_URL") && f.contains("plaintext")),
             "expected a cleartext refusal, got fatals={fatals:?} warns={warns:?}"
         );
         // Localhost http passes: same port/socket trust boundary.
@@ -1205,6 +1281,52 @@ mod tests {
         )]));
         let (fatals, _) = s.endpoint_trust(false);
         assert!(fatals.iter().any(|f| f.contains("YELLOWSTONE_ENDPOINT")));
+    }
+
+    /// AUD-023: the WS ingestion URL is secret-bearing and feeds every
+    /// decision, so it follows the same transport/cluster trust as the
+    /// HTTP endpoints.
+    #[test]
+    fn endpoint_trust_covers_the_ws_ingest_url() {
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            ("MAINNET_WSS_RPC_URL", "ws://rpc.example.com"),
+        ]));
+        let (fatals, _) = s.endpoint_trust(false);
+        assert!(
+            fatals
+                .iter()
+                .any(|f| f.contains("MAINNET_WSS_RPC_URL") && f.contains("plaintext")),
+            "remote plaintext WS must refuse live: {fatals:?}"
+        );
+        // Localhost ws is exempt (local proxy).
+        let s = Settings::from_map(&vars(&[("MAINNET_WSS_RPC_URL", "ws://localhost:8900")]));
+        assert!(
+            s.endpoint_trust(false).0.is_empty(),
+            "localhost ws must not be refused: {:?}",
+            s.endpoint_trust(false)
+        );
+        // A cross-cluster socket silently ingests another network.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            ("MAINNET_WSS_RPC_URL", "wss://api.devnet.solana.com"),
+        ]));
+        let (fatals, _) = s.endpoint_trust(false);
+        assert!(
+            fatals
+                .iter()
+                .any(|f| f.contains("MAINNET_WSS_RPC_URL") && f.contains("devnet")),
+            "a cross-cluster WS must refuse live: {fatals:?}"
+        );
+        // Wrong scheme is unusable for the WS dialer.
+        let s = Settings::from_map(&vars(&[("MAINNET_WSS_RPC_URL", "https://rpc.example.com")]));
+        let (fatals, _) = s.endpoint_trust(false);
+        assert!(
+            fatals
+                .iter()
+                .any(|f| f.contains("MAINNET_WSS_RPC_URL") && f.contains("wss")),
+            "an https URL is not a usable WS endpoint: {fatals:?}"
+        );
     }
 
     #[test]
@@ -1274,7 +1396,7 @@ mod tests {
             ),
         ]));
         let w = s.warnings().join("\n");
-        assert!(w.contains("plain-http"), "{w}");
+        assert!(w.contains("plaintext"), "{w}");
         assert!(w.contains("devnet"), "{w}");
         assert!(
             w.contains("notaurl") || w.contains("MAINNET_RPC_URLS_FALLBACK[1]"),
@@ -1284,7 +1406,7 @@ mod tests {
         // the cleartext primary and the malformed fallback.
         let (fatals, warns) = s.endpoint_trust(false);
         assert_eq!(fatals.len(), 2, "{fatals:?}");
-        assert!(fatals[0].contains("plain-http"));
+        assert!(fatals[0].contains("plaintext"));
         assert!(
             warns.iter().any(|w| w.contains("devnet")),
             "cross-cluster-or-unproven fallback is warned: {warns:?}"
@@ -1378,6 +1500,20 @@ mod tests {
             !s.on_public_rpc_default(),
             "a real endpoint is not the public default"
         );
+        // AUD-024: spelling must not bypass the gate.
+        for spelling in [
+            "https://api.mainnet-beta.solana.com/",
+            "http://api.mainnet-beta.solana.com",
+            "HTTPS://API.MAINNET-BETA.SOLANA.COM",
+            "https://api.mainnet-beta.solana.com:443",
+            "https://api.mainnet-beta.solana.com/?x=1",
+        ] {
+            let s = Settings::from_map(&vars(&[("MAINNET_RPC_URL", spelling)]));
+            assert!(
+                s.on_public_rpc_default(),
+                "{spelling} must be recognized as the public default"
+            );
+        }
     }
 
     #[test]
@@ -1853,7 +1989,7 @@ mod tests {
     fn inference_key_stays_env_only() {
         // The single sanctioned env exception: a bearer token must
         // never sit in the config file.
-        let _lock = env_lock().lock().expect("lock");
+        let _lock = lock();
         let file: toml::Table = "[risk]\n".parse().expect("test toml");
         let saved = std::env::var("INFERENCE_API_KEY").ok();
         unsafe { std::env::set_var("INFERENCE_API_KEY", "test-secret") };
@@ -1879,7 +2015,7 @@ mod tests {
     fn inference_key_file_fallback_avoids_export() {
         // Preferred path: bearer from a file so it never enters the
         // environment (`ps e`, shell history stay clean).
-        let _lock = env_lock().lock().expect("lock");
+        let _lock = lock();
         let file: toml::Table = "[risk]\n".parse().expect("test toml");
         let saved = std::env::var("INFERENCE_API_KEY").ok();
         let saved_file = std::env::var("INFERENCE_API_KEY_FILE").ok();

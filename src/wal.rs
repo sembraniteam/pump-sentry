@@ -101,6 +101,11 @@ pub enum WalLine {
         blockhash: Option<String>,
         #[serde(default)]
         ts: Option<u64>,
+        /// AUD-020 planned entry cost basis (USD per display token).
+        /// `None` on legacy lines: replay carries 0.0 (unknown) and the
+        /// settle point counts such exits as unaccounted.
+        #[serde(default)]
+        entry_usd: Option<f64>,
     },
     /// Dead bundle: retires its pending buy and sell traces.
     Settled {
@@ -130,6 +135,10 @@ pub enum WalLine {
         bundle: Option<String>,
         #[serde(default)]
         ts: Option<u64>,
+        /// AUD-020 planned entry cost basis (USD per display token).
+        /// `None` on legacy lines (unknown; counted at settle).
+        #[serde(default)]
+        entry_usd: Option<f64>,
     },
     /// Confirmed sell (partial or full).
     Sell {
@@ -152,6 +161,10 @@ pub enum WalLine {
         note: Option<String>,
         #[serde(default)]
         ts: Option<u64>,
+        /// AUD-020 planned entry cost basis (USD per display token).
+        /// `None` on legacy lines (unknown; counted at settle).
+        #[serde(default)]
+        entry_usd: Option<f64>,
     },
     /// Manual bag taken for exit.
     TakeManual {
@@ -178,17 +191,27 @@ pub enum WalLine {
 /// Current WAL schema version. Bump only for a wire-shape change that
 /// replay must distinguish (missing load-bearing fields stay behind
 /// `#[serde(default)]`, which needs no bump).
-pub const WAL_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (AUD-020): `entry_usd` on `pending`/`position`/`manual` lines.
+/// Old-schema lines replay with `entry_usd_per_token = 0.0` (unknown);
+/// the settle point counts their exits as unaccounted instead of
+/// silently excluding the realized PnL from the breaker.
+pub const WAL_SCHEMA_VERSION: u32 = 2;
 
 /// Position from WAL fields. Corrupt addresses skip the line (counted):
 /// the writer only emits canonical base58 or null, so unparseable means
 /// a damaged file — never half-adopted custody.
+///
+/// `entry_usd` is the AUD-020 per-token cost basis; absent (legacy
+/// lines) becomes `0.0` = unknown, and the settle point counts and
+/// alerts such exits instead of silently dropping their realized PnL.
 fn position_from(
     mint: &str,
     curve: &str,
     assoc: &str,
     amount: u64,
     creator: Option<&str>,
+    entry_usd: Option<f64>,
 ) -> Option<LivePosition> {
     let parse = |s: &str| executor::parse_pubkey(s).ok();
     Some(LivePosition {
@@ -200,7 +223,38 @@ fn position_from(
             None => None,
             Some(s) => Some(parse(s)?),
         },
+        entry_usd_per_token: entry_usd
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.0),
     })
+}
+
+/// WAL-writeable basis: known, finite, positive values serialize; the
+/// unknown `0.0` sentinel stays absent (legacy lines parse back as
+/// unknown either way).
+pub(crate) fn option_entry_usd(per_token: f64) -> Option<f64> {
+    (per_token.is_finite() && per_token > 0.0).then_some(per_token)
+}
+
+/// Weighted-average cost basis for merged same-mint bags (the amounts
+/// are summed; the per-token basis cannot simply sum).
+fn merge_entry_basis(a: &LivePosition, b: &LivePosition, merged_amount: u64) -> f64 {
+    // One unknown side marks the merged bag unknown (fail-closed):
+    // averaging a 0-sentinel with a real basis would dilute the basis
+    // and understate a later loss — never silent.
+    if a.entry_usd_per_token <= 0.0
+        || b.entry_usd_per_token <= 0.0
+        || !a.entry_usd_per_token.is_finite()
+        || !b.entry_usd_per_token.is_finite()
+    {
+        return 0.0;
+    }
+    let total = (a.amount_tokens as f64) * a.entry_usd_per_token
+        + (b.amount_tokens as f64) * b.entry_usd_per_token;
+    if merged_amount == 0 || !total.is_finite() {
+        return 0.0;
+    }
+    total / merged_amount as f64
 }
 
 /// Fold lines in order into boot state.
@@ -233,7 +287,9 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     tracing::warn!(mint = %e.mint, kept = %e.curve, dropped = %p.curve,
                         "WAL replay: same mint, different curve — keeping first, amounts still summed");
                 }
-                e.amount_tokens = e.amount_tokens.saturating_add(p.amount_tokens);
+                let merged = e.amount_tokens.saturating_add(p.amount_tokens);
+                e.entry_usd_per_token = merge_entry_basis(e, &p, merged);
+                e.amount_tokens = merged;
             })
             .or_insert(p);
     };
@@ -259,9 +315,11 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 sig,
                 bundle,
                 blockhash,
+                entry_usd,
                 ..
             } => {
-                let Some(pos) = position_from(&mint, &curve, &assoc, amount, creator.as_deref())
+                let Some(pos) =
+                    position_from(&mint, &curve, &assoc, amount, creator.as_deref(), entry_usd)
                 else {
                     skipped += 1;
                     continue;
@@ -296,9 +354,11 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 amount,
                 creator,
                 bundle,
+                entry_usd,
                 ..
             } => {
-                let Some(pos) = position_from(&mint, &curve, &assoc, amount, creator.as_deref())
+                let Some(pos) =
+                    position_from(&mint, &curve, &assoc, amount, creator.as_deref(), entry_usd)
                 else {
                     skipped += 1;
                     continue;
@@ -343,9 +403,11 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 amount,
                 creator,
                 note,
+                entry_usd,
                 ..
             } => {
-                let Some(pos) = position_from(&mint, &curve, &assoc, amount, creator.as_deref())
+                let Some(pos) =
+                    position_from(&mint, &curve, &assoc, amount, creator.as_deref(), entry_usd)
                 else {
                     skipped += 1;
                     continue;
@@ -355,8 +417,10 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                 manual
                     .entry(pos.mint.to_string())
                     .and_modify(|e: &mut WalManual| {
-                        e.position.amount_tokens =
-                            e.position.amount_tokens.saturating_add(pos.amount_tokens);
+                        let merged = e.position.amount_tokens.saturating_add(pos.amount_tokens);
+                        e.position.entry_usd_per_token =
+                            merge_entry_basis(&e.position, &pos, merged);
+                        e.position.amount_tokens = merged;
                     })
                     .or_insert(WalManual {
                         position: pos,
@@ -458,6 +522,7 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
                 bundle: p.bundle_id.clone(),
                 blockhash: p.blockhash.clone(),
                 ts: Some(now),
+                entry_usd: option_entry_usd(p.position.entry_usd_per_token),
             },
         );
     }
@@ -490,6 +555,7 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
                 creator: creator(p.creator.as_ref()),
                 bundle: None,
                 ts: Some(now),
+                entry_usd: option_entry_usd(p.entry_usd_per_token),
             },
         );
     }
@@ -505,6 +571,7 @@ pub fn compact_file(path: &std::path::Path, replay: &WalReplay) {
                 creator: creator(p.creator.as_ref()),
                 note: Some(m.note.clone()),
                 ts: Some(now),
+                entry_usd: option_entry_usd(p.entry_usd_per_token),
             },
         );
     }

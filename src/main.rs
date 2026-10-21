@@ -13,6 +13,10 @@ mod pipeline;
 mod replay;
 mod research;
 mod settings;
+
+#[cfg(test)]
+mod test_env;
+
 mod wal;
 
 use std::collections::BTreeMap;
@@ -129,6 +133,18 @@ fn scrub_secret_env() {
     }
 }
 
+/// Effective live mode: `--live` or the exact `IS_LIVE=true` value.
+/// Pure so the pid-record identity is testable (AUD-026).
+fn live_mode_from(live_arg: bool, is_live: Option<&str>) -> bool {
+    live_arg || is_live == Some("true")
+}
+
+/// Paper-ledger commission from the typed fee (AUD-025): an invalid
+/// raw value contributes 0 bps, never an impossible 100%/side fee.
+fn paper_fee_bps(settings: &settings::Settings) -> f64 {
+    settings.fee().map_or(0.0, |bps| f64::from(bps.get()))
+}
+
 /// Synchronous boot phase, then the async pipeline. Every environment
 /// read-and-scrub, the config load, and the wallet load happen here —
 /// before the Tokio runtime spawns worker threads (env is process-
@@ -165,21 +181,22 @@ fn run_binary(live_arg: bool) {
             std::process::exit(1);
         }
     };
+    // Paper unless explicitly live. Only exact `true` enables live;
+    // attribute the source (a lingering IS_LIVE=true in the shell is
+    // the sharpest mode footgun). Resolved BEFORE the pid record so
+    // `status` reports the mode the process actually runs (AUD-026).
+    let is_live_env = std::env::var("IS_LIVE").ok();
+    let live_mode = live_mode_from(live_arg, is_live_env.as_deref());
+    let live_via: &'static str = if live_arg { "--live" } else { "IS_LIVE=true" };
     // Foreground `run` registers itself so `status`/`sell`/`stop` find
     // it exactly like the daemon (the daemon child overwrites the same
     // record with its own pid, same values).
     {
         let (pid_file, _) = cli::resolve_paths();
-        cli::register_running(live_arg, &pid_file);
+        cli::register_running(live_mode, &pid_file);
     }
-
-    // Paper unless explicitly live. Only exact `true` enables live;
-    // attribute the source (a lingering IS_LIVE=true in the shell is
-    // the sharpest mode footgun).
-    let live_mode = live_arg || std::env::var("IS_LIVE").is_ok_and(|v| v == "true");
-    let live_via: &'static str = if live_arg { "--live" } else { "IS_LIVE=true" };
     if !live_mode
-        && let Ok(v) = std::env::var("IS_LIVE")
+        && let Some(v) = is_live_env.as_deref()
         && !v.is_empty()
         && v != "false"
         && v != "0"
@@ -421,6 +438,17 @@ async fn replay_live_wal(
         file = %path.display(),
         "WAL replay: recovered live custody from unclean shutdown; MANUAL REVIEW REQUIRED (delete the file to clear resolved bags)"
     );
+    // AUD-021: resolve the migration now for recovered bags. Their curve
+    // may already have graduated and stopped ticking, so waiting for a
+    // complete tick can strand the only automated exit. Bounded per bag;
+    // unresolved bags retry on the supervision recheck.
+    let unfed = pipeline.refresh_recovered_bag_feeds().await;
+    if unfed > 0 {
+        warn!(
+            bags = unfed,
+            "WAL replay: recovered live bag(s) have no pool exit feed yet; migration hunt retries on the supervision recheck (manual `sell <mint>` is always available)"
+        );
+    }
 }
 
 /// Replayed custody claims for one mint: the tracked copy plus every
@@ -797,7 +825,7 @@ async fn run_pipeline(boot: Boot) {
             std::process::exit(1);
         }
         if settings.inference_api_key.is_some()
-            && crate::settings::is_plain_http_remote(&settings.inference_endpoint)
+            && crate::settings::is_plaintext_remote(&settings.inference_endpoint)
         {
             eprintln!(
                 "live mode refuses INFERENCE_API_KEY over plain-http remote INFERENCE_ENDPOINT (bearer travels in cleartext); use https or localhost"
@@ -956,7 +984,11 @@ async fn run_pipeline(boot: Boot) {
     };
 
     let start_balance = settings.start_balance;
-    let fee_bps = settings.fee_bps;
+    // AUD-025: the paper ledger consumes the same typed commission as
+    // settlement and stop widening. An invalid `FEE_BPS` contributes
+    // no commission (the gate already refuses to widen stops with it),
+    // instead of booking an impossible 100%/side fee into the book.
+    let fee_bps = paper_fee_bps(&settings);
 
     // Live stack (fatal on misconfig).
     let live = if live_mode {
@@ -1396,6 +1428,18 @@ async fn run_pipeline(boot: Boot) {
                 {
                     last_custody_check = settings::now_secs();
                     ledger_shorts = custody_recheck(&pipeline).await;
+                    // AUD-021: recovered bags with no pool leg get their
+                    // migration hunt retried here (a graduated curve can
+                    // stop ticking, stranding the only automated exit).
+                    // Riding the 30-minute recheck bounds the RPC cost —
+                    // one hunt may take its full 15s deadline.
+                    let unfed = pipeline.refresh_recovered_bag_feeds().await;
+                    if unfed > 0 {
+                        warn!(
+                            bags = unfed,
+                            "live bag(s) still have no pool exit feed; curve ticks or manual `sell <mint>` are the only exits"
+                        );
+                    }
                 }
                 // Positions outliving their OWN timeouts read as stuck
                 // exits (drained pools, guard holds) — log-only warn
@@ -1510,9 +1554,19 @@ async fn run_pipeline(boot: Boot) {
                 {
                     let (deferred_n, deferred_total) = pipeline.exec.deferred_stats().await;
                     let synthetic_n = pipeline.exec.synthetic_count().await;
-                    if deferred_n > 0 || synthetic_n > 0 {
-                        info!("breaker bypass: deferred_pnl_n={deferred_n} deferred_total={deferred_total:+.2} synthetic_n={synthetic_n} (excluded from day-loss breaker)");
+                    let unaccounted_n = pipeline.exec.unaccounted_realized_count().await;
+                    if deferred_n > 0 || synthetic_n > 0 || unaccounted_n > 0 {
+                        info!("breaker bypass: deferred_pnl_n={deferred_n} deferred_total={deferred_total:+.2} synthetic_n={synthetic_n} unaccounted_realized_n={unaccounted_n} (excluded from day-loss breaker)");
                     }
+                    if unaccounted_n > 0 {
+                        warn!("{unaccounted_n} settled live exit(s) had no persisted entry cost (legacy WAL): realized PnL is UNACCOUNTED and the day-loss tally under-counts them");
+                    }
+                }
+                // AUD-021: custody with no pool leg has no guaranteed
+                // automated exit once its curve stops ticking.
+                let unfed = pipeline.bags_without_pool_leg().await.len();
+                if unfed > 0 {
+                    warn!("{unfed} live bag(s) have no pool exit feed (curve ticks or manual `sell <mint>` are the only exits)");
                 }
                 let tick_dropped = tick_drops.load(Ordering::Relaxed);
                 let pool_dropped = pool_drops.load(Ordering::Relaxed);
@@ -1919,8 +1973,41 @@ async fn run_pipeline(boot: Boot) {
 mod tests {
     use super::{
         CUSTODY_RECHECK_SECS, EXIT_LANE_PERMITS, HEARTBEAT_SECS, MAX_IN_FLIGHT, SECRET_ENV_VARS,
-        SUPERVISION_SECS, supervision_due,
+        SUPERVISION_SECS, live_mode_from, paper_fee_bps, supervision_due,
     };
+
+    /// AUD-026: the pid record must carry the effective mode. Only
+    /// `--live` or the exact `IS_LIVE=true` value is live.
+    #[test]
+    fn pid_record_follows_the_effective_live_mode() {
+        assert!(live_mode_from(false, Some("true")));
+        assert!(live_mode_from(true, None));
+        assert!(live_mode_from(true, Some("false")));
+        for env in [None, Some(""), Some("false"), Some("0"), Some("TRUE")] {
+            assert!(
+                !live_mode_from(false, env),
+                "IS_LIVE={env:?} must stay paper"
+            );
+        }
+    }
+
+    /// AUD-025: the paper ledger consumes the typed commission; an
+    /// invalid `FEE_BPS` contributes none (and does not widen stops).
+    #[test]
+    fn paper_ledger_ignores_an_invalid_fee() {
+        let invalid = crate::settings::Settings::from_map(
+            &[("FEE_BPS".to_string(), "10000".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(paper_fee_bps(&invalid), 0.0);
+        let valid = crate::settings::Settings::from_map(
+            &[("FEE_BPS".to_string(), "345".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(paper_fee_bps(&valid), 345.0);
+    }
 
     /// AUD-008: a launch flood that holds every launch-lane permit
     /// cannot consume the exits' reserve — the dispatch-lane split
@@ -1976,9 +2063,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn children_inherited_env_carries_no_secrets() {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock");
         // Fictitious secret fixtures (never real values).
         let secrets = [
             ("INFERENCE_API_KEY", "test-key-fixture-1"),
@@ -1993,21 +2077,12 @@ mod tests {
             (listener::YELLOWSTONE_TOKEN_ENV, "test-token-fixture-4"),
             ("SOLANA_PRIVATE_KEY", "test-mint-fixture-5"),
         ];
-        let saved: Vec<(&str, Option<String>)> = secrets
-            .iter()
-            .map(|(k, _)| (*k, std::env::var(k).ok()))
-            .collect();
-        let restore = || {
-            for (k, v) in &saved {
-                match v {
-                    Some(v) => unsafe { std::env::set_var(k, v) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
+        // Restored on drop even while unwinding (AUD-022 guard).
+        let _guard = {
+            let vars: Vec<(&str, Option<&str>)> =
+                secrets.iter().map(|(k, v)| (*k, Some(*v))).collect();
+            crate::test_env::scoped(&vars)
         };
-        for (k, v) in secrets {
-            unsafe { std::env::set_var(k, v) };
-        }
         // The exact sync-boot scrub (SOLANA_PRIVATE_KEY included: in
         // live boot the wallet loader scrubs it after `load_from_env`).
         super::scrub_secret_env();
@@ -2017,7 +2092,6 @@ mod tests {
         let out = std::process::Command::new("env")
             .output()
             .expect("spawn env");
-        restore();
         let stdout = String::from_utf8_lossy(&out.stdout);
         for (_, value) in secrets {
             assert!(

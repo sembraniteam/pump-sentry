@@ -2,6 +2,7 @@
 
 use crate::settings::now_secs;
 use crate::wal;
+use crate::wal::option_entry_usd;
 use executor::{
     BundleStatus, BuyOrder, DeadReason, DispatchVerdict, ExecutorError, JitoReceipt, SellOrder,
     SwapExecutor,
@@ -175,6 +176,19 @@ pub struct LivePosition {
     pub amount_tokens: u64,
     /// Creator. `None` fails v3 dispatch.
     pub creator: Option<Pubkey>,
+    /// Planned entry cost basis, USD per DISPLAY token (amount_tokens
+    /// are base units: 10^decimals per token), from the buy sizing
+    /// (`notional_usd / tokens`). Per-token so partial sells and WAL
+    /// replay stay exact. Feeds the day-loss breaker's realized-PnL
+    /// input for exits with no paper leg: for a bag with no paper leg
+    /// at all, `sold_display * (exit_price - entry_price)` books the
+    /// realized PnL that would otherwise be invisible (AUD-020).
+    ///
+    /// `0.0` = unknown: custody carried over from a legacy WAL line
+    /// written before this field existed (its paper leg never traveled
+    /// across a restart either — the paper book is in-memory). Such
+    /// bags are counted and alerted at settle, never silently dropped.
+    pub entry_usd_per_token: f64,
 }
 
 /// Buy request. All addresses validated (`Pubkey` is `Copy`, so no
@@ -1111,6 +1125,7 @@ impl LiveTrader {
         assoc_curve: Pubkey,
         amount_tokens: u64,
         creator: Option<Pubkey>,
+        entry_usd_per_token: f64,
         e: ExecutorError,
     ) -> LiveError {
         match e {
@@ -1125,6 +1140,7 @@ impl LiveTrader {
                     assoc_curve,
                     amount_tokens,
                     creator,
+                    entry_usd_per_token,
                 )),
                 reason: format!(
                     "buy bundle POST of {mint} failed after signing (sig {signature}, blockhash {blockhash}); may still land, MANUAL REVIEW REQUIRED"
@@ -1157,6 +1173,7 @@ impl LiveTrader {
         assoc_curve: Pubkey,
         amount_tokens: u64,
         creator: Option<Pubkey>,
+        entry_usd_per_token: f64,
     ) -> LivePosition {
         LivePosition {
             mint,
@@ -1164,6 +1181,7 @@ impl LiveTrader {
             assoc_curve,
             amount_tokens,
             creator,
+            entry_usd_per_token,
         }
     }
 
@@ -1234,6 +1252,16 @@ impl LiveTrader {
             &req.mark,
         )
         .ok_or_else(|| LiveError::BadOrder(format!("cannot size buy of {mint} at {price_usd}")))?;
+        // Planned entry cost basis (USD per display token): the same
+        // notional the paper book opens against, so a live-only exit's
+        // realized PnL and a covered trade's paper headline price the
+        // same trade on the same day-book (AUD-020).
+        let display_tokens = plan.amount_tokens as f64 / 10f64.powi(req.decimals as i32);
+        let entry_usd_per_token = if display_tokens.is_finite() && display_tokens > 0.0 {
+            notional_usd / display_tokens
+        } else {
+            0.0
+        };
         self.note_mark(&mint_str, price_usd, now_secs());
         // Bound once: the order and the gap math must agree on the tip
         // paid (a second oracle read could drift between the two).
@@ -1254,12 +1282,26 @@ impl LiveTrader {
         .await
         {
             Ok(dispatch) => dispatch.map_err(|e| {
-                Self::buy_dispatch_error(mint, curve, assoc_curve, plan.amount_tokens, creator, e)
+                Self::buy_dispatch_error(
+                    mint,
+                    curve,
+                    assoc_curve,
+                    plan.amount_tokens,
+                    creator,
+                    entry_usd_per_token,
+                    e,
+                )
             })?,
             Err(_) => {
                 // No signature: fill unknown, park for review.
-                let position =
-                    Self::pending_position(mint, curve, assoc_curve, plan.amount_tokens, creator);
+                let position = Self::pending_position(
+                    mint,
+                    curve,
+                    assoc_curve,
+                    plan.amount_tokens,
+                    creator,
+                    entry_usd_per_token,
+                );
                 return Err(LiveError::UnknownDispatch {
                     position: Box::new(position),
                     reason: format!(
@@ -1271,8 +1313,14 @@ impl LiveTrader {
         };
         tracing::info!(%mint, bundle = %receipt.bundle_id, amount = plan.amount_tokens, "LIVE buy dispatched");
         // Receipt exists from here; confirm removes it.
-        let intended =
-            Self::pending_position(mint, curve, assoc_curve, plan.amount_tokens, creator);
+        let intended = Self::pending_position(
+            mint,
+            curve,
+            assoc_curve,
+            plan.amount_tokens,
+            creator,
+            entry_usd_per_token,
+        );
         Self::track_pending(&self.pending, &mint_str, intended.clone(), &receipt);
         self.write_wal_pending(&intended, &receipt);
         let dispatch_blockhash = receipt.blockhash.to_string();
@@ -1298,7 +1346,14 @@ impl LiveTrader {
                     )
                     .await;
                 Ok((
-                    Self::pending_position(mint, curve, assoc_curve, plan.amount_tokens, creator),
+                    Self::pending_position(
+                        mint,
+                        curve,
+                        assoc_curve,
+                        plan.amount_tokens,
+                        creator,
+                        entry_usd_per_token,
+                    ),
                     receipt.bundle_id,
                     entry_fill,
                 ))
@@ -1459,6 +1514,7 @@ impl LiveTrader {
             bundle: receipt.bundle_id.clone(),
             blockhash: Some(receipt.blockhash.to_string()),
             ts: Some(now_secs()),
+            entry_usd: option_entry_usd(position.entry_usd_per_token),
         });
     }
 
@@ -1492,6 +1548,7 @@ impl LiveTrader {
             creator: position.creator.as_ref().map(|c| c.to_string()),
             bundle: Some(bundle_id.to_string()),
             ts: Some(now_secs()),
+            entry_usd: option_entry_usd(position.entry_usd_per_token),
         });
         self.write_wal_settled(bundle_id);
     }
@@ -1507,6 +1564,7 @@ impl LiveTrader {
             creator: position.creator.as_ref().map(|c| c.to_string()),
             note: Some(note.to_string()),
             ts: Some(now_secs()),
+            entry_usd: option_entry_usd(position.entry_usd_per_token),
         });
     }
 
@@ -1852,6 +1910,7 @@ mod tests {
             test_pubkey(3),
             1_000,
             None,
+            0.0,
             ExecutorError::SendUnknown {
                 signature: "sig123".to_string(),
                 blockhash: "bh456".to_string(),
@@ -1874,6 +1933,7 @@ mod tests {
             test_pubkey(3),
             1_000,
             None,
+            0.0,
             ExecutorError::Timeout("get_latest_blockhash"),
         );
         assert!(
@@ -1895,6 +1955,7 @@ mod tests {
             assoc_curve: test_pubkey(3),
             amount_tokens: 500,
             creator: None,
+            entry_usd_per_token: 0.0,
         };
         for label in ["curve", "raydium", "pumpswap"] {
             match LiveTrader::sell_dispatch_timeout(&position, label) {
@@ -2391,6 +2452,7 @@ mod tests {
                 assoc_curve: executor::parse_pubkey(TEST_ASSOC).expect("assoc"),
                 amount_tokens: amount,
                 creator: None,
+                entry_usd_per_token: 0.0,
             },
             signature: format!("sig-{bundle}"),
             bundle_id: bundle.to_string(),
@@ -2458,6 +2520,7 @@ mod tests {
                 assoc_curve: test_pubkey(9),
                 amount_tokens: 1_000,
                 creator: None,
+                entry_usd_per_token: 0.0,
             },
             "B1",
         );

@@ -1881,24 +1881,11 @@ mod tests {
 
     #[test]
     fn resolve_paths_defaults_and_overrides() {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock");
-        let saved = ["HOME", "PID_FILE", "LOG_FILE"]
-            .iter()
-            .map(|k| (*k, std::env::var(k).ok()))
-            .collect::<Vec<_>>();
-        let restore = || {
-            for (k, v) in &saved {
-                match v {
-                    Some(v) => unsafe { std::env::set_var(k, v) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
-        };
-        unsafe { std::env::set_var("HOME", "/tmp/fakehome") };
-        unsafe { std::env::remove_var("PID_FILE") };
-        unsafe { std::env::remove_var("LOG_FILE") };
+        let _guard = crate::test_env::scoped(&[
+            ("HOME", Some("/tmp/fakehome")),
+            ("PID_FILE", None),
+            ("LOG_FILE", None),
+        ]);
         let (pid, log) = resolve_paths();
         assert_eq!(pid, PathBuf::from("/tmp/fakehome/.pump-sentry/bot.pid"));
         assert_eq!(log, PathBuf::from("/tmp/fakehome/.pump-sentry/bot.log"));
@@ -1907,7 +1894,6 @@ mod tests {
         let (pid, log) = resolve_paths();
         assert_eq!(pid, PathBuf::from("/tmp/x.pid"));
         assert_eq!(log, PathBuf::from("/tmp/fakehome/custom/bot.log"));
-        restore();
     }
 
     #[test]
@@ -2045,13 +2031,8 @@ mod tests {
         // AUD-012: `LOG_FILE=bot.log` has parent Some(""), which used
         // to make the drain see no directory at all. Request path and
         // drain dir must agree on the CWD. Chdir is process-global:
-        // serialized like the env-mutating tests.
-        use std::sync::{Mutex, OnceLock};
-        static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = CWD_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("lock");
+        // serialized like the env-mutating tests (AUD-022 guard).
+        let _guard = crate::test_env::lock();
         assert_eq!(
             sell_request_path(Path::new("bot.log"), "MINT"),
             PathBuf::from("sell-MINT.json")
@@ -2064,12 +2045,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let log = dir.join("bot.log");
         std::fs::write(&log, "").expect("log");
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&dir).expect("chdir");
+        let mut cwd_guard = crate::test_env::chdir(&dir).expect("chdir");
         let request = sell_request_path(Path::new("bot.log"), "MINTA");
         write_private_file(&request, br#"{"mint":"MINTA","ts":1}"#).expect("queue");
         let found = pending_sell_requests(Path::new("bot.log"));
-        std::env::set_current_dir(cwd).expect("restore cwd");
+        cwd_guard.restore().expect("restore cwd");
         assert_eq!(found.len(), 1, "bare-path request must be delivered");
         assert_eq!(found[0].0, "MINTA");
         // Absolute paths still work.

@@ -212,6 +212,7 @@ impl BuySink for StubLive {
                 assoc_curve,
                 amount_tokens: 1_000,
                 creator: None,
+                entry_usd_per_token: 0.0,
             },
             "bundle-stub".to_string(),
             // Stubs never observe fills: no fill, no entry gap.
@@ -436,6 +437,7 @@ impl PendingStore for StubLive {
                             assoc_curve: pk(ASSOC),
                             amount_tokens: 1_000,
                             creator: None,
+                            entry_usd_per_token: 0.0,
                         },
                         bundle_id: format!("bundle-{mint}"),
                         signature: format!("sig-{mint}"),
@@ -464,6 +466,7 @@ impl PendingStore for StubLive {
                             assoc_curve: pk(ASSOC),
                             amount_tokens: 1_000,
                             creator: None,
+                            entry_usd_per_token: 0.0,
                         },
                         bundle_id: format!("bundle-{mint}"),
                         signature: format!("sig-{mint}"),
@@ -682,6 +685,8 @@ struct StubScreenerInner {
     fresh_rejects: std::sync::atomic::AtomicBool,
     /// Canned top-10 holder share (`None` = RPC failure).
     top_holders: StdMutex<Option<f64>>,
+    /// Migration-hunt invocations (AUD-027: paper closes must not hunt).
+    migration_hunts: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -704,6 +709,7 @@ impl StubScreener {
                 truncated: std::sync::atomic::AtomicBool::new(false),
                 fresh_rejects: std::sync::atomic::AtomicBool::new(false),
                 top_holders: StdMutex::new(None),
+                migration_hunts: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -861,6 +867,9 @@ impl Screener for StubScreener {
         _curve: &str,
         _mint: &str,
     ) -> Result<Option<MigrationReport>, ScreenError> {
+        self.inner
+            .migration_hunts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let found = self.inner.migration.lock().expect("lock").clone();
         Ok(found)
     }
@@ -1299,6 +1308,7 @@ async fn shutdown_snapshot_lists_open_and_live_state() {
             assoc_curve: pk(ASSOC),
             amount_tokens: 1_000,
             creator: None,
+            entry_usd_per_token: 0.0,
         },
     );
     assert_eq!(pipe.open_position_mints().await, vec![MINT.to_string()]);
@@ -1851,6 +1861,7 @@ async fn heat_counts_live_held_mints() {
             assoc_curve: pk(ASSOC),
             amount_tokens: 1_000,
             creator: None,
+            entry_usd_per_token: 0.0,
         },
     );
     pipe.on_launch(&LaunchRequest {
@@ -2148,6 +2159,94 @@ async fn complete_tick_resolves_migration_before_first_sell_attempt() {
 }
 
 #[tokio::test]
+async fn recovered_bag_without_a_curve_tick_resolves_its_pool_feed() {
+    // AUD-021: after a restart the paper book is empty and the recovered
+    // bag's curve may already be graduated (no more ticks). The boot
+    // hunt must register the pool leg without waiting for a tick.
+    use listener::MigrationDestination;
+    let live = StubLive::working();
+    let screener = StubScreener::passing();
+    *screener.inner.migration.lock().expect("lock") = Some(MigrationReport {
+        signature: "migsig".to_string(),
+        destination: MigrationDestination::PumpSwap,
+        amm_id: Some(fixture_wallet(20)),
+        base_mint: Some("WSOL".to_string()),
+        quote_mint: Some(MINT.to_string()),
+        base_vault: Some(fixture_wallet(21)),
+        quote_vault: Some(fixture_wallet(22)),
+    });
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        screener,
+        Some(live.clone()),
+    );
+    // Boot-replay shape: custody recovered, no paper leg, no tick yet.
+    pipe.exec.live_positions.lock().await.insert(
+        MINT.to_string(),
+        LivePosition {
+            mint: pk(MINT),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000,
+            creator: None,
+            entry_usd_per_token: 2.0,
+        },
+    );
+    assert_eq!(
+        pipe.bags_without_pool_leg().await,
+        vec![(MINT.to_string(), CURVE.to_string())]
+    );
+    assert_eq!(
+        pipe.refresh_recovered_bag_feeds().await,
+        0,
+        "the hunt resolves the migrated pool"
+    );
+    {
+        let followed = pipe.followed.lock().await;
+        assert!(
+            followed
+                .get(MINT)
+                .and_then(|state| state.pool.clone())
+                .is_some(),
+            "the pool leg is registered without a tick"
+        );
+    }
+    // The exit now routes through the pool, exactly like a live tick.
+    assert!(
+        pipe.live_sell(
+            MINT,
+            &simulator::Mark::new(3.0, 30_000.0),
+            1.0,
+            crate::live_mirror::SellCover::LiveOnly,
+        )
+        .await
+    );
+    assert_eq!(
+        live.pumpswap_sells(),
+        vec![(MINT.to_string(), fixture_wallet(20), 1_000)]
+    );
+}
+
+#[test]
+fn paper_closes_skip_the_pre_close_migration_hunt() {
+    // AUD-027: the hunt is only useful when a live leg can route the
+    // exit; a paper close must not spend an exit-lane permit on it.
+    assert!(!crate::pipeline::should_hunt_before_close(
+        false, true, true
+    ));
+    assert!(!crate::pipeline::should_hunt_before_close(
+        true, false, true
+    ));
+    assert!(!crate::pipeline::should_hunt_before_close(
+        true, true, false
+    ));
+    assert!(crate::pipeline::should_hunt_before_close(true, true, true));
+}
+
+#[tokio::test]
 async fn complete_tick_with_hunt_none_preserves_fail_closed_refusal() {
     // AUD-001 case (b): when the hunt finds no valid pool, the
     // fail-closed behavior is preserved — no phantom pool sell, the
@@ -2418,6 +2517,7 @@ async fn exposure_cap_bounds_total_tickets() {
                 assoc_curve: pk(ASSOC),
                 amount_tokens: 1_000,
                 creator: None,
+                entry_usd_per_token: 0.0,
             },
         );
     }
@@ -2599,6 +2699,7 @@ async fn follow_pool_stores_leg_and_sweep_keeps_held_bags() {
             assoc_curve: pk(ASSOC),
             amount_tokens: 1_000,
             creator: None,
+            entry_usd_per_token: 0.0,
         },
     );
     {
@@ -3585,6 +3686,7 @@ async fn zero_liquidity_tick_defers_the_live_exit() {
             assoc_curve: pk(ASSOC),
             amount_tokens: 1_000,
             creator: None,
+            entry_usd_per_token: 0.0,
         },
     );
     let mut drained = tick(MINT, 1.5);
@@ -4080,6 +4182,7 @@ async fn exposure_counts_each_unpaired_live_bag() {
         assoc_curve: pk(ASSOC),
         amount_tokens: 1_000,
         creator: None,
+        entry_usd_per_token: 0.0,
     };
     pipe.exec
         .live_positions
@@ -4161,6 +4264,7 @@ async fn exposure_cap_counts_duplicate_bags_before_opening() {
             assoc_curve: pk(ASSOC),
             amount_tokens: 1_000,
             creator: None,
+            entry_usd_per_token: 0.0,
         };
         pipe.exec
             .live_positions
@@ -4418,6 +4522,7 @@ async fn manual_sell_closes_both_legs() {
             assoc_curve: pk(ASSOC),
             amount_tokens: 1_000,
             creator: None,
+            entry_usd_per_token: 0.0,
         },
     );
     assert!(pipe.manual_sell(sys).await);
@@ -4504,12 +4609,211 @@ async fn manual_sell_exits_parked_manual_bag() {
             assoc_curve: pk(ASSOC),
             amount_tokens: 1_000,
             creator: None,
+            entry_usd_per_token: 0.0,
         },
     );
     assert!(pipe.manual_sell(sys).await);
     assert_eq!(live.sells(), vec![(sys.to_string(), 1_000)]);
     assert!(pipe.exec.live_manual.lock().await.is_empty());
     assert!(pipe.exec.live_positions.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn giveup_parked_manual_exit_records_paper_headline_once() {
+    // AUD-020 (a): an unknown-outcome buy parks a bag without a
+    // coverage stamp; `sell <mint>` later sells it for real SOL. The
+    // settle point must stamp coverage so the paper headline reaches
+    // the live day-loss breaker instead of being dropped as
+    // "uncovered".
+    let live = StubLive::working();
+    live.inner
+        .fail_buys
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15])),
+        Some(live.clone()),
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+    assert!(pipe.exec.live_positions.lock().await.is_empty());
+    // The buy never landed: paper is uncovered (the AUD-002 guard would
+    // drop its PnL).
+    assert!(!pipe.exec.breaker_eligible(MINT).await);
+    // Simulate the GiveUp park (the same shape the recheck leaves).
+    pipe.exec.live_manual.lock().await.insert(
+        MINT.to_string(),
+        LivePosition {
+            mint: pk(MINT),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000,
+            creator: None,
+            entry_usd_per_token: 0.0,
+        },
+    );
+    assert_eq!(pipe.daily.lock().await.day_net(), 0.0);
+    assert!(pipe.manual_sell(MINT).await);
+    // The paper headline (same-price close, so fees only) is booked.
+    assert!(
+        pipe.daily.lock().await.day_net() < 0.0,
+        "a settled manual exit of an unknown-outcome bag must feed its paper headline"
+    );
+    assert_eq!(
+        pipe.exec.unaccounted_realized_count().await,
+        0,
+        "the paper leg owns the PnL; no realized fallback may double-book"
+    );
+}
+
+#[tokio::test]
+async fn live_only_exit_books_realized_pnl_from_persisted_basis() {
+    // AUD-020 (b): after a restart the paper book is empty, so a
+    // WAL-recovered bag exits with no paper leg. Its realized PnL must
+    // come from the persisted entry basis, not vanish.
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 3.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    pipe.exec.live_positions.lock().await.insert(
+        sys.to_string(),
+        LivePosition {
+            mint: pk(sys),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            // 1e9 base units at 6 decimals = 1,000 display tokens.
+            amount_tokens: 1_000_000_000,
+            creator: None,
+            entry_usd_per_token: 2.0,
+        },
+    );
+    let settled = pipe
+        .live_sell(
+            sys,
+            &simulator::Mark::new(3.0, 30_000.0),
+            1.0,
+            crate::live_mirror::SellCover::LiveOnly,
+        )
+        .await;
+    assert!(settled, "stub sell settles");
+    let day = pipe.daily.lock().await.day_net();
+    assert!(
+        (day - 1_000.0).abs() < 0.02,
+        "realized = 1,000 tokens x ($3.00 - $2.00) basis minus the dispatch debit, got {day}"
+    );
+    assert!(pipe.exec.live_positions.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn live_only_exit_without_basis_is_counted_and_alerted() {
+    // AUD-020 residual: a legacy WAL line carries no entry cost. The
+    // exit cannot be booked, so it must be counted loudly — never
+    // silently dropped.
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 3.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    pipe.exec.live_positions.lock().await.insert(
+        sys.to_string(),
+        LivePosition {
+            mint: pk(sys),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000_000_000,
+            creator: None,
+            entry_usd_per_token: 0.0,
+        },
+    );
+    assert!(
+        pipe.live_sell(
+            sys,
+            &simulator::Mark::new(3.0, 30_000.0),
+            1.0,
+            crate::live_mirror::SellCover::LiveOnly,
+        )
+        .await
+    );
+    assert_eq!(
+        pipe.exec.unaccounted_realized_count().await,
+        1,
+        "unknown basis must be counted, not silently booked as zero"
+    );
+    // Only the dispatch debit may move the tally; no realized PnL was
+    // invented from a missing basis.
+    let day = pipe.daily.lock().await.day_net();
+    assert!(
+        (-0.02..=0.0).contains(&day),
+        "no realized PnL booked: {day}"
+    );
+}
+
+#[tokio::test]
+async fn paper_leg_exit_never_books_realized_on_top_of_the_headline() {
+    // AUD-020 (iii): a covered/paper-leg exit is booked through the
+    // paper headline, so the realized fallback must stay silent.
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 3.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    pipe.exec.live_positions.lock().await.insert(
+        sys.to_string(),
+        LivePosition {
+            mint: pk(sys),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000_000_000,
+            creator: None,
+            entry_usd_per_token: 2.0,
+        },
+    );
+    let settled = pipe
+        .live_sell(
+            sys,
+            &simulator::Mark::new(3.0, 30_000.0),
+            1.0,
+            crate::live_mirror::SellCover::PaperLeg,
+        )
+        .await;
+    assert!(settled);
+    // Dispatch costs may book; the realized fallback may not.
+    let day = pipe.daily.lock().await.day_net();
+    assert!(
+        (-0.02..=0.0).contains(&day),
+        "the paper headline owns this exit; realized must not double-book (got {day})"
+    );
+    assert_eq!(pipe.exec.unaccounted_realized_count().await, 0);
 }
 
 #[tokio::test]
@@ -4536,6 +4840,7 @@ async fn manual_sell_drains_suffixed_dup_bags() {
             assoc_curve: pk(ASSOC),
             amount_tokens: 1_000,
             creator: None,
+            entry_usd_per_token: 0.0,
         },
     );
     assert!(pipe.manual_sell(sys).await);
@@ -5330,6 +5635,7 @@ async fn live_sells_for_different_mints_overlap() {
                 assoc_curve: pk(ASSOC),
                 amount_tokens: 1_000,
                 creator: None,
+                entry_usd_per_token: 0.0,
             },
         );
     }
@@ -5339,7 +5645,12 @@ async fn live_sells_for_different_mints_overlap() {
             async {
                 tokio::time::timeout(
                     secs(5),
-                    pipe.live_sell(MINT_A, &simulator::Mark::new(3.0, 30_000.0), 1.0),
+                    pipe.live_sell(
+                        MINT_A,
+                        &simulator::Mark::new(3.0, 30_000.0),
+                        1.0,
+                        crate::live_mirror::SellCover::PaperLeg,
+                    ),
                 )
                 .await
                 .expect("A finishes after release");
@@ -5366,7 +5677,12 @@ async fn live_sells_for_different_mints_overlap() {
                 .expect("A starts");
                 tokio::time::timeout(
                     secs(5),
-                    pipe.live_sell(MINT_B, &simulator::Mark::new(3.0, 30_000.0), 1.0),
+                    pipe.live_sell(
+                        MINT_B,
+                        &simulator::Mark::new(3.0, 30_000.0),
+                        1.0,
+                        crate::live_mirror::SellCover::PaperLeg,
+                    ),
                 )
                 .await
                 .expect("B proceeds while A is blocked");

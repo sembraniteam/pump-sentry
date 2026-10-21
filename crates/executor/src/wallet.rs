@@ -215,7 +215,10 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
-    /// Serializes env-mutating tests (process-global env).
+    /// Serializes env-mutating tests (process-global env). This is a
+    /// separate test binary from the root crate, so a shared lock would
+    /// not help there; cross-binary isolation relies on `cargo test`
+    /// running test binaries sequentially (AUD-022).
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))

@@ -407,27 +407,13 @@ mod tests {
         // must never land in world-writable /tmp: a predictable shared
         // dir is a symlink risk for the template and everything read
         // from it.
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock");
-        let saved_home = std::env::var_os("HOME");
-        let saved_cfg = std::env::var_os(CONFIG_FILE_ENV);
-        unsafe { std::env::remove_var("HOME") };
-        unsafe { std::env::remove_var(CONFIG_FILE_ENV) };
+        let _guard = crate::test_env::scoped(&[("HOME", None), ("CONFIG_FILE", None)]);
         let path = resolve_config_path();
         assert!(
             !path.starts_with("/tmp"),
             "no /tmp fallback, got {}",
             path.display()
         );
-        match saved_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match saved_cfg {
-            Some(v) => unsafe { std::env::set_var(CONFIG_FILE_ENV, v) },
-            None => unsafe { std::env::remove_var(CONFIG_FILE_ENV) },
-        }
     }
 
     #[test]
