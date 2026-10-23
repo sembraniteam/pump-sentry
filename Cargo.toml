@@ -68,3 +68,7 @@ bs58 = "0.5"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "second_run_refuses_to_start_while_state_dir_is_owned"
+path = "tests/state_lock_single_owner.rs"
