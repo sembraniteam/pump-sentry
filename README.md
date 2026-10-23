@@ -353,3 +353,18 @@ crates/curve|auditor|risk-engine|simulator|ids|alert|migration/
 ```
 
 Each crate has its own README. Tests: `cargo test --workspace` (live probes ignored) · `cargo fmt --all -- --check` · `cargo clippy --workspace --all-targets` (zero warnings).
+
+## Development hooks
+
+The checked-in hooks are not active until Git is told where they live
+(this is a per-clone setting, not versioned):
+
+```bash
+chmod +x .githooks/pre-commit .githooks/commit-msg
+git config core.hooksPath .githooks
+```
+
+`pre-commit` refuses staged credential-shaped files and secrets (paths
+and line numbers only — values are never printed). `commit-msg` enforces
+Conventional Commits and the 75-character line limit; it also runs
+directly: `bash .githooks/commit-msg <message-file>`.

@@ -50,7 +50,7 @@ Only staged changes are candidates for this commit. Unstaged and untracked files
 Verify that both required scripts exist:
 
 - `.githooks/pre-commit`
-- `.githooks/commit-message`
+- `.githooks/commit-msg`
 
 If either is missing, report the missing file, provide the setup guidance below, and stop. Do not create or modify hooks
 automatically.
@@ -163,7 +163,7 @@ type to satisfy the limit.
 
 ### Validate Through the Repository Hook
 
-Do not reimplement mechanical validation in the command. Validate the drafted message using `.githooks/commit-message`:
+Do not reimplement mechanical validation in the command. Validate the drafted message using `.githooks/commit-msg`:
 
 ```bash
 tmp=$(mktemp) || exit 1
@@ -173,7 +173,7 @@ cat > "$tmp" <<'EOF'
 <drafted commit message>
 EOF
 
-bash .githooks/commit-message "$tmp"
+bash .githooks/commit-msg "$tmp"
 ```
 
 Replace the placeholder with the actual draft.
@@ -298,7 +298,7 @@ Confirm that no push was performed.
 For a repository whose hook scripts are already committed, the user can run:
 
 ```bash
-chmod +x .githooks/commit-message .githooks/pre-commit
+chmod +x .githooks/pre-commit .githooks/commit-msg
 git config core.hooksPath .githooks
 ```
 

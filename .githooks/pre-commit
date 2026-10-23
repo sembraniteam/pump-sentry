@@ -1,22 +1,50 @@
 #!/usr/bin/env bash
+#
+# pre-commit: fail-closed secret/credential scan for staged changes.
+#
+# Exit codes: 0 = clean, 1 = potential finding (paths/line numbers only,
+# values are never printed), 2 = scanner could not run (fail closed).
+#
+# SKIP_SECRET_CHECK=1 is honored only on an interactive terminal: an
+# inherited environment variable (CI, shell profile) must never silently
+# disable the gate.
 
-set -u
+set -uo pipefail
 
 if [ "${SKIP_SECRET_CHECK:-0}" = "1" ]; then
-  echo "pre-commit: secret check skipped (SKIP_SECRET_CHECK=1)" >&2
-  exit 0
+  # Only an operator sitting at a terminal may waive the gate.
+  if [ -t 0 ] && [ -t 2 ]; then
+    echo "pre-commit: SECRET CHECK SKIPPED (SKIP_SECRET_CHECK=1, interactive)" >&2
+    exit 0
+  fi
+  echo "pre-commit: refusing SKIP_SECRET_CHECK=1 from a non-interactive context" >&2
+  exit 2
 fi
 
-FILE_RE='(^|/)\.env$|\.env\.|credentials|secrets|\.pem$|\.key$|\.p12$|\.pfx$|id_rsa|id_dsa|id_ecdsa|\.password|api_key|token'
+# Credential-SHAPED file names only. Bare substrings ("token", "secrets")
+# flagged ordinary source files such as src/token.rs; keep this anchored
+# to real credential artifacts and their config extensions.
+FILE_RE='(^|/)\.env(\.|$)|(^|/)(secrets?|credentials?)(\.(json|ya?ml|toml|txt|env|cfg|ini))?$|(^|/)tokens?\.(json|ya?ml|toml|txt|env|cfg|ini|pem|key)$|\.(pem|key|p12|pfx)$|(^|/)id_(rsa|dsa|ecdsa)$'
 FILE_ALLOW_RE='\.(example|sample|template|dist)$'
-KEYWORD_RE='(password|secret|api_key|access_token|private_key|client_secret)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+/]{8,}'
-FORMAT_RE='AKIA[0-9A-Z]{16}|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{10,}'
+# Keys may be quoted (JSON/YAML) before the separator, and values may
+# contain URL/token punctuation.
+KEYWORD_RE='["'"'"']?(pass(word|wd|phrase)?|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|client[_-]?secret)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?([A-Za-z0-9+/_.~-]{8,})'
+# A sensitive name and a quoted literal on the same line, for typed
+# assignments the key=value shape misses (`const PASSWORD: &str = "..."`).
+SENSITIVE_NAME_RE='(pass(word|wd|phrase)?|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|client[_-]?secret|credential)'
+LITERAL_RE='["'"'"']([A-Za-z0-9+/_.~-]{8,})["'"'"']'
+# Known token shapes + URI userinfo + bearer/basic headers.
+FORMAT_RE='AKIA[0-9A-Z]{16}|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{10,}|[A-Za-z][A-Za-z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]@]{6,}@|([Bb]earer|[Bb]asic)[[:space:]]+[A-Za-z0-9._~+/-]{20,}={0,2}'
 
 findings=0
 out=""
 
-# Added/Copied/Modified/Renamed only: deleting a secret file must not be blocked
-files=$(git -c core.quotepath=off diff --cached --name-only --diff-filter=ACMR)
+# Fail closed when the index cannot be read: an empty list must never be
+# indistinguishable from "no findings".
+if ! files=$(git -c core.quotepath=off diff --cached --name-only --diff-filter=ACMR); then
+  echo "pre-commit: cannot read the staged index; refusing to pass (fail closed)" >&2
+  exit 2
+fi
 
 while IFS= read -r f; do
   [ -z "$f" ] && continue
@@ -29,18 +57,56 @@ while IFS= read -r f; do
   fi
 
   # 2. Secret-like content in added lines, emitted as "<line number>:<content>"
-  added=$(git -c core.quotepath=off diff --cached -U0 --no-color -- "$f" | awk '
+  if ! raw=$(git -c core.quotepath=off diff --cached -U0 --no-color -- "$f"); then
+    echo "pre-commit: cannot read the staged diff; refusing to pass (fail closed)" >&2
+    exit 2
+  fi
+  [ -z "$raw" ] && continue
+  # `|| true`: under pipefail, a diff whose every added line carries a
+  # `secret-scan:ignore` marker filters to an empty (exit 1) result —
+  # that is "nothing to report", never a scanner failure.
+  added=$(printf '%s\n' "$raw" | awk '
     /^@@/ { match($0, /\+[0-9]+/); n = substr($0, RSTART + 1, RLENGTH - 1) - 1; hunk = 1; next }
     !hunk { next }
     /^\+/ { n++; print n ":" substr($0, 2) }
-  ' | grep -v 'secret-scan:ignore')
+  ' | grep -v 'secret-scan:ignore' || true)
 
   [ -z "$added" ] && continue
 
+  # Keyword=value matches count only when the value looks secret-ish:
+  # >=8 chars and (>=2 character classes or >=16 chars). That keeps
+  # hardcoded credentials in source visible while harmless identifiers
+  # (an api_key constant bound to a dictionary word) and short
+  # placeholders stay quiet. Applies to every file type — there is no
+  # source-code exemption to hide behind.
   hits=$(
     {
-      printf '%s\n' "$added" | grep -Ei "$KEYWORD_RE"
       printf '%s\n' "$added" | grep -E "$FORMAT_RE"
+      printf '%s\n' "$added" | grep -Ei "$SENSITIVE_NAME_RE" | while IFS= read -r cand; do
+        [ -z "$cand" ] && continue
+        body=${cand#*:}
+        v=""
+        if [[ $body =~ $KEYWORD_RE ]]; then
+          v=${BASH_REMATCH[3]:-}
+        elif lbody=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]') \
+          && [[ $lbody =~ $SENSITIVE_NAME_RE ]] \
+          && [[ $body =~ $LITERAL_RE ]]; then
+          v=${BASH_REMATCH[1]:-}
+        else
+          continue
+        fi
+        [ "${#v}" -ge 8 ] || continue
+        # Explicit character sets, not ranges: `[A-Z]` in `[[ == ]]`
+        # follows locale collation and matches lowercase in UTF-8.
+        classes=0
+        [[ $v == *[abcdefghijklmnopqrstuvwxyz]* ]] && classes=$((classes + 1))
+        [[ $v == *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]* ]] && classes=$((classes + 1))
+        [[ $v == *[0123456789]* ]] && classes=$((classes + 1))
+        [[ $v == *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]* ]] && classes=$((classes + 1))
+        if [ "$classes" -ge 2 ] || [ "${#v}" -ge 16 ]; then
+          printf '%s\n' "$cand"
+        fi
+      done
     } | cut -d: -f1 | sort -un | head -10 | paste -sd, -
   )
 
