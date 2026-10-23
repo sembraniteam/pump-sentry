@@ -1,10 +1,17 @@
 //! Direct Discord delivery (bot token HTTPS) plus card formatters.
 //!
-//! The Hermes subprocess dispatch is gone: [`Alerter::send`] POSTs the
-//! card to `POST /channels/{id}/messages` with `Authorization: Bot …`.
-//! The token is owned data captured at boot (env-only, scrubbed after
-//! capture like the other bearer secrets) and never logged.
+//! The Hermes subprocess dispatch is gone: [`Alerter::send_card`] and
+//! [`Alerter::send_text`] POST to `POST /channels/{id}/messages` with
+//! `Authorization: Bot …`. The token is owned data captured at boot
+//! (env-only, scrubbed after capture like the other bearer secrets)
+//! and never logged.
+//!
+//! Cards are the unit of delivery (docs/discord-sidecar.md §5): the
+//! plain-text rendering always rides in `content` (fallback for
+//! clients that hide embeds), and structured cards add one embed that
+//! mirrors the same fields.
 
+use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -52,12 +59,16 @@ pub struct CardCtx<'a> {
     pub strategy: &'a str,
 }
 
-/// Heartbeat payload: counters plus cash.
-pub struct HeartbeatReport<'a> {
+/// Heartbeat payload: counters plus cash. Also the sidecar status
+/// payload (`status.json`, flattened) — plain operator-facing values.
+/// `mode`/`strategy` are owned (the writer passes literals; the
+/// sidecar deserializes the file), everything else are numbers.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct HeartbeatReport {
     /// `live` or `paper`.
-    pub mode: &'a str,
+    pub mode: String,
     /// Effective strategy (`adaptive` | `scalp` | `runner`).
-    pub strategy: &'a str,
+    pub strategy: String,
     /// Seconds since boot.
     pub uptime_secs: u64,
     /// Listener throughput counters.
@@ -107,6 +118,197 @@ pub struct HeartbeatReport<'a> {
     pub giveups_window: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Embed layer (docs/discord-sidecar.md §5): one text card → one embed.
+// ---------------------------------------------------------------------------
+
+/// Embed palette: green entry/fill/win, red halt/loss exit/give-up,
+/// yellow warn/attention, grey info/heartbeat.
+pub const COLOR_GREEN: u32 = 0x22_C55E;
+/// Red: halts, losing exits, live sell dispatch.
+pub const COLOR_RED: u32 = 0xEF_4444;
+/// Yellow: momentum/attention cards.
+pub const COLOR_YELLOW: u32 = 0xF5_9E0B;
+/// Grey: informational cards (migration, heartbeat).
+pub const COLOR_GREY: u32 = 0x94_A3B8;
+
+/// Discord embed limits (gateway API v10).
+pub const EMBED_TITLE_MAX: usize = 256;
+/// Discord embed field-name cap.
+pub const EMBED_FIELD_NAME_MAX: usize = 256;
+/// Discord embed field-value cap.
+pub const EMBED_FIELD_VALUE_MAX: usize = 1024;
+/// Discord fields-per-embed cap; extras are dropped, never an error.
+pub const MAX_EMBED_FIELDS: usize = 25;
+/// Approximate total chars per embed (title + footer + fields).
+pub const EMBED_TOTAL_MAX: usize = 6000;
+/// Field values up to this length render inline (aligned columns);
+/// longer values (URLs, annotated counters) take a full row.
+const INLINE_VALUE_MAX: usize = 48;
+
+/// One aligned embed column.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbedField {
+    pub name: String,
+    pub value: String,
+    pub inline: bool,
+}
+
+/// Bottom-right embed caption (the `live · adaptive` mode line).
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbedFooter {
+    pub text: String,
+}
+
+/// Structured embed for one card. Serialized straight into the
+/// message payload's `embeds` array (always a single element here);
+/// the sidecar re-renders it with serenity, hence public fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct Embed {
+    pub title: String,
+    pub color: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer: Option<EmbedFooter>,
+    pub fields: Vec<EmbedField>,
+}
+
+impl Embed {
+    /// Approximate rendered size against Discord's 6000-char total.
+    /// `false` means the card ships text-only — the `content` fallback
+    /// always delivers, the embed never breaks the send.
+    fn fits(&self) -> bool {
+        let fields: usize = self
+            .fields
+            .iter()
+            .map(|f| f.name.len() + f.value.len() + 20)
+            .sum();
+        let total = self.title.len() + self.footer.as_ref().map_or(0, |f| f.text.len()) + fields;
+        total <= EMBED_TOTAL_MAX
+    }
+}
+
+/// The alert payload: plain text alone, or text plus one embed
+/// rendering the same fields. Plain strings flow through `From` and
+/// keep the pre-embed behavior.
+#[derive(Debug, Clone)]
+pub struct Card {
+    /// Markdown text fallback (always sent, 2000-char capped).
+    pub content: String,
+    /// Structured embed. Dropped when the payload overflows limits.
+    pub embed: Option<Embed>,
+}
+
+impl From<String> for Card {
+    fn from(content: String) -> Self {
+        Card {
+            content,
+            embed: None,
+        }
+    }
+}
+
+/// Builder for the standard card shape: an `{icon} **[{TAG}]**` header
+/// plus `• **Name:** value` bullets, mirrored 1:1 into embed fields.
+/// Interpolated data must be sanitized by the caller — the card
+/// formatters own that.
+#[derive(Debug, Clone)]
+pub struct CardBuilder {
+    icon: &'static str,
+    tag: String,
+    title: String,
+    color: u32,
+    url: Option<String>,
+    footer: Option<String>,
+    fields: Vec<EmbedField>,
+}
+
+impl CardBuilder {
+    /// Header tag for the text fallback (e.g. `TRADE OPENED`), plus
+    /// the embed title (e.g. `Trade Opened — MINT`).
+    pub fn new(icon: &'static str, tag: &str, title: impl Into<String>, color: u32) -> Self {
+        Self {
+            icon,
+            tag: tag.to_string(),
+            title: clamp_chars(&title.into(), EMBED_TITLE_MAX),
+            color,
+            url: None,
+            footer: None,
+            fields: Vec::new(),
+        }
+    }
+
+    /// First field and embed footer: the `live · adaptive` mode line
+    /// (sanitized here; mode/strategy are operator config, never
+    /// secrets).
+    pub fn mode(mut self, ctx: &CardCtx<'_>) -> Self {
+        let mode = Alerter::sanitize(ctx.mode);
+        let strategy = Alerter::sanitize(ctx.strategy);
+        self.footer = Some(format!("{mode} · {strategy}"));
+        self.field("Mode", format!("`{mode} · {strategy}`"))
+    }
+
+    /// One bullet / one embed field. Beyond the 25-field cap, extras
+    /// are dropped (the text fallback loses them too — a card is
+    /// authored within the limits).
+    pub fn field(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        if self.fields.len() >= MAX_EMBED_FIELDS {
+            return self;
+        }
+        let value = value.into();
+        self.fields.push(EmbedField {
+            name: clamp_chars(&name.into(), EMBED_FIELD_NAME_MAX),
+            value: clamp_chars(&value, EMBED_FIELD_VALUE_MAX),
+            inline: value.chars().count() <= INLINE_VALUE_MAX,
+        });
+        self
+    }
+
+    /// Deep link (explorer address/tx). Rendered in `content` as well —
+    /// pair with a `field("Explorer", …)`.
+    pub fn url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+
+    /// Render the text fallback and clamp-checked embed.
+    pub fn finish(self) -> Card {
+        let content = self
+            .fields
+            .iter()
+            .map(|f| format!("• **{}:** {}", f.name, f.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!("{} **[{}]**\n{content}", self.icon, self.tag);
+        let embed = {
+            let footer = self.footer.map(|text| EmbedFooter { text });
+            let embed = Embed {
+                title: self.title,
+                color: self.color,
+                url: self.url,
+                footer,
+                fields: self.fields,
+            };
+            if embed.fits() { Some(embed) } else { None }
+        };
+        Card { content, embed }
+    }
+}
+
+/// Char-boundary-safe clamp with an ellipsis marker (pure). The
+/// marker counts against the cap: the result never exceeds `max` bytes.
+fn clamp_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max.saturating_sub('…'.len_utf8());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 impl Default for Alerter {
     fn default() -> Self {
         Self::new()
@@ -141,8 +343,9 @@ fn send_url(api_base: &str, channel: &str) -> String {
 
 /// Truncate a card to Discord's `content` cap (pure). Truncation keeps
 /// char boundaries and marks the cut; formatters sanitize fields
-/// already, so the marker text is safe to append.
-fn truncate_content(message: &str) -> String {
+/// already, so the marker text is safe to append. Public because the
+/// sidecar applies the same cap to interaction replies.
+pub fn truncate_content(message: &str) -> String {
     if message.len() <= MAX_CONTENT_LEN {
         return message.to_string();
     }
@@ -204,10 +407,22 @@ impl Alerter {
         self
     }
 
-    /// Send `message` as a detached task. Never blocks the caller.
+    /// Send plain text as a detached task. Never blocks the caller.
     /// No token or no channel means no-op (boot logs the reason).
     /// Excess load drops with a counter.
-    pub fn send(&self, message: String) {
+    pub fn send_text(&self, message: String) {
+        self.dispatch(truncate_content(&message), None);
+    }
+
+    /// Send a card as a detached task: the text fallback in `content`
+    /// plus its single embed in one POST. No token or no channel means
+    /// no-op (boot logs the reason). Excess load drops with a counter.
+    pub fn send_card(&self, card: Card) {
+        self.dispatch(truncate_content(&card.content), card.embed);
+    }
+
+    /// Shared delivery path: acquire a permit, POST, log-only failures.
+    fn dispatch(&self, content: String, embed: Option<Embed>) {
         let (Some(token), Some(channel)) = (self.token.clone(), self.channel.clone()) else {
             return;
         };
@@ -224,14 +439,22 @@ impl Alerter {
         };
         let url = send_url(&self.api_base, &channel);
         let timeout = self.timeout;
-        let body = truncate_content(&message);
         tokio::spawn(async move {
             let _permit = permit;
+            let mut body = serde_json::json!({ "content": content });
+            if let Some(embed) = embed {
+                // Plain serde structs: serialization cannot fail, but a
+                // defensive fallback only loses the embed, never the
+                // content.
+                if let Ok(value) = serde_json::to_value(&embed) {
+                    body["embeds"] = serde_json::Value::Array(vec![value]);
+                }
+            }
             let client = reqwest::Client::new();
             let run = client
                 .post(&url)
                 .header("Authorization", format!("Bot {token}"))
-                .json(&serde_json::json!({ "content": body }))
+                .json(&body)
                 .timeout(timeout)
                 .send();
             match tokio::time::timeout(timeout, run).await {
@@ -245,13 +468,6 @@ impl Alerter {
         });
     }
 
-    /// `live · adaptive`-style mode line shared by every card.
-    fn mode_line(ctx: &CardCtx<'_>) -> String {
-        let mode = Self::sanitize(ctx.mode);
-        let strategy = Self::sanitize(ctx.strategy);
-        format!("• **Mode:** `{mode} · {strategy}`")
-    }
-
     /// Entry card. `risk` is the profile provenance (`model` |
     /// `heuristic`) so operators can tell model entries from the
     /// lower-bound fallback at a glance.
@@ -263,33 +479,38 @@ impl Alerter {
         sl_pct: f64,
         notional_usd: f64,
         risk: &str,
-    ) -> String {
+    ) -> Card {
         let mint = Self::sanitize(mint);
         let risk = Self::sanitize(risk);
-        format!(
-            "🟢 **[TRADE OPENED]**\n\
-             {}\n\
-             • **Token Mint:** `{mint}`\n\
-             • **Entry Price:** `${entry_usd:.8}`\n\
-             • **Size:** `${notional_usd:.2}`\n\
-             • **Target TP:** `+{tp_pct:.1}%` | **Stop Loss:** `{sl_pct:.1}%`\n\
-             • **Risk:** `{risk}`\n\
-             • **Explorer:** {EXPLORER_ADDRESS}/{mint}",
-            Self::mode_line(ctx),
+        let explorer = format!("{EXPLORER_ADDRESS}/{mint}");
+        CardBuilder::new(
+            "🟢",
+            "TRADE OPENED",
+            format!("Trade Opened — {mint}"),
+            COLOR_GREEN,
         )
+        .mode(ctx)
+        .field("Token Mint", format!("`{mint}`"))
+        .field("Entry Price", format!("`${entry_usd:.8}`"))
+        .field("Size", format!("`${notional_usd:.2}`"))
+        .field("Target TP", format!("`+{tp_pct:.1}%`"))
+        .field("Stop Loss", format!("`{sl_pct:.1}%`"))
+        .field("Risk", format!("`{risk}`"))
+        .field("Explorer", explorer.clone())
+        .url(explorer)
+        .finish()
     }
 
     /// Day-loss halt card. Fires once per UTC day (see
     /// `DailyBreaker::halt_state`); the heartbeat carries the state
     /// after that. Exits always work — only entries halt.
-    pub fn format_halt(ctx: &CardCtx<'_>, cap_usd: f64, day_net: f64) -> String {
-        format!(
-            "🛑 **[DAY-LOSS HALT]**\n\
-             {}\n\
-             • **Cap:** `-${cap_usd:.2}/day` | **Day net:** `${day_net:+.2}`\n\
-             • Entries halted; exits always work",
-            Self::mode_line(ctx),
-        )
+    pub fn format_halt(ctx: &CardCtx<'_>, cap_usd: f64, day_net: f64) -> Card {
+        CardBuilder::new("🛑", "DAY-LOSS HALT", "Day-Loss Halt", COLOR_RED)
+            .mode(ctx)
+            .field("Cap", format!("`-${cap_usd:.2}/day`"))
+            .field("Day Net", format!("`${day_net:+.2}`"))
+            .field("Note", "entries halted; exits always work")
+            .finish()
     }
 
     /// Strip markdown and control chars from fields.
@@ -320,7 +541,7 @@ impl Alerter {
             .collect()
     }
 
-    /// Exit card.
+    /// Exit card. Green on a win, red on a loss (doc §5 palette).
     pub fn format_exit(
         ctx: &CardCtx<'_>,
         mint: &str,
@@ -329,24 +550,30 @@ impl Alerter {
         pct: f64,
         equity: f64,
         is_moonbag: bool,
-    ) -> String {
+    ) -> Card {
         let mint = Self::sanitize(mint);
         let reason = Self::sanitize(reason);
-        let icon = if net_pnl >= 0.0 { "🎯" } else { "🛑" };
-        let tag = if is_moonbag {
-            "MOONBAG PARTIAL EXIT"
+        let win = net_pnl >= 0.0;
+        let (tag, title) = if is_moonbag {
+            (
+                "MOONBAG PARTIAL EXIT",
+                format!("Moonbag Partial Exit — {mint}"),
+            )
         } else {
-            "POSITION CLOSED"
+            ("POSITION CLOSED", format!("Position Closed — {mint}"))
         };
-        format!(
-            "{icon} **[{tag}]**\n\
-             {}\n\
-             • **Token Mint:** `{mint}`\n\
-             • **Exit Reason:** `{reason}`\n\
-             • **Realized PnL:** `${net_pnl:+.2}` (`{pct:+.2}%`)\n\
-             • **Portfolio Equity:** `${equity:.2}`",
-            Self::mode_line(ctx),
+        CardBuilder::new(
+            if win { "🎯" } else { "🛑" },
+            tag,
+            title,
+            if win { COLOR_GREEN } else { COLOR_RED },
         )
+        .mode(ctx)
+        .field("Token Mint", format!("`{mint}`"))
+        .field("Exit Reason", format!("`{reason}`"))
+        .field("Realized PnL", format!("`${net_pnl:+.2}` (`{pct:+.2}%`)"))
+        .field("Portfolio Equity", format!("`${equity:.2}`"))
+        .finish()
     }
 
     /// Live buy card (bundle id for tracking).
@@ -355,32 +582,42 @@ impl Alerter {
         mint: &str,
         bundle_id: &str,
         amount_tokens: u64,
-    ) -> String {
+    ) -> Card {
         let mint = Self::sanitize(mint);
         let bundle_id = Self::sanitize(bundle_id);
-        format!(
-            "🚀 **[LIVE BUY SENT]**\n\
-             {}\n\
-             • **Token Mint:** `{mint}`\n\
-             • **Amount:** `{amount_tokens}` base units\n\
-             • **Bundle:** `{bundle_id}`\n\
-             • **Explorer:** {EXPLORER_ADDRESS}/{mint}",
-            Self::mode_line(ctx),
+        let explorer = format!("{EXPLORER_ADDRESS}/{mint}");
+        CardBuilder::new(
+            "🚀",
+            "LIVE BUY SENT",
+            format!("Live Buy Sent — {mint}"),
+            COLOR_GREEN,
         )
+        .mode(ctx)
+        .field("Token Mint", format!("`{mint}`"))
+        .field("Amount", format!("`{amount_tokens}` base units"))
+        .field("Bundle", format!("`{bundle_id}`"))
+        .field("Explorer", explorer.clone())
+        .url(explorer)
+        .finish()
     }
 
     /// Live sell dispatch card.
-    pub fn format_live_sell(ctx: &CardCtx<'_>, mint: &str, bundle_id: &str) -> String {
+    pub fn format_live_sell(ctx: &CardCtx<'_>, mint: &str, bundle_id: &str) -> Card {
         let mint = Self::sanitize(mint);
         let bundle_id = Self::sanitize(bundle_id);
-        format!(
-            "🔻 **[LIVE SELL SENT]**\n\
-             {}\n\
-             • **Token Mint:** `{mint}`\n\
-             • **Bundle:** `{bundle_id}`\n\
-             • **Explorer:** {EXPLORER_ADDRESS}/{mint}",
-            Self::mode_line(ctx),
+        let explorer = format!("{EXPLORER_ADDRESS}/{mint}");
+        CardBuilder::new(
+            "🔻",
+            "LIVE SELL SENT",
+            format!("Live Sell Sent — {mint}"),
+            COLOR_RED,
         )
+        .mode(ctx)
+        .field("Token Mint", format!("`{mint}`"))
+        .field("Bundle", format!("`{bundle_id}`"))
+        .field("Explorer", explorer.clone())
+        .url(explorer)
+        .finish()
     }
 
     /// Migration card. Missing ids render as `unknown`.
@@ -392,98 +629,96 @@ impl Alerter {
         amm_id: Option<&str>,
         base_mint: Option<&str>,
         quote_mint: Option<&str>,
-    ) -> String {
+    ) -> Card {
         let mint = Self::sanitize(mint);
         let destination = Self::sanitize(destination);
         let signature = Self::sanitize(signature);
-        let amm = amm_id
-            .map(Self::sanitize)
-            .unwrap_or_else(|| "unknown".to_string());
-        let base = base_mint
-            .map(Self::sanitize)
-            .unwrap_or_else(|| "unknown".to_string());
+        let unknown = "unknown";
+        let amm = amm_id.map(Self::sanitize).unwrap_or(unknown.to_string());
+        let base = base_mint.map(Self::sanitize).unwrap_or(unknown.to_string());
         let quote = quote_mint
             .map(Self::sanitize)
-            .unwrap_or_else(|| "unknown".to_string());
-        format!(
-            "🌉 **[MIGRATION DETECTED]**\n\
-             {}\n\
-             • **Token Mint:** `{mint}`\n\
-             • **Destination:** `{destination}`\n\
-             • **AMM:** `{}`\n\
-             • **Base Mint:** `{}`\n\
-             • **Quote Mint:** `{}`\n\
-             • **Tx:** {EXPLORER_TX}/{signature}",
-            Self::mode_line(ctx),
-            amm,
-            base,
-            quote,
+            .unwrap_or(unknown.to_string());
+        let tx = format!("{EXPLORER_TX}/{signature}");
+        CardBuilder::new(
+            "🌉",
+            "MIGRATION DETECTED",
+            format!("Migration Detected — {mint}"),
+            COLOR_GREY,
         )
+        .mode(ctx)
+        .field("Token Mint", format!("`{mint}`"))
+        .field("Destination", format!("`{destination}`"))
+        .field("AMM", format!("`{amm}`"))
+        .field("Base Mint", format!("`{base}`"))
+        .field("Quote Mint", format!("`{quote}`"))
+        .field("Tx", tx.clone())
+        .url(tx)
+        .finish()
     }
 
     /// Heartbeat card. Only mode/strategy need sanitize (rest are numbers).
-    pub fn format_heartbeat(r: &HeartbeatReport<'_>) -> String {
-        let mode = Self::sanitize(r.mode);
-        let strategy = Self::sanitize(r.strategy);
+    pub fn format_heartbeat(r: &HeartbeatReport) -> Card {
+        let mode = Self::sanitize(&r.mode);
+        let strategy = Self::sanitize(&r.strategy);
         let uptime_h = r.uptime_secs / 3_600;
         let uptime_m = (r.uptime_secs % 3_600) / 60;
         let oldest_h = r.oldest_open_age_secs / 3_600;
         let oldest_m = (r.oldest_open_age_secs % 3_600) / 60;
-        format!(
-            "💚 **[BOT HEARTBEAT]**\n\
-             • **Mode:** `{mode} · {strategy}`\n\
-             • **Uptime:** `{uptime_h}h {uptime_m}m`\n\
-             • **Logs seen:** `{}`\n\
-             • **Candidates:** `{}`\n\
-             • **Parsed:** `{}`\n\
-             • **Dropped:** `{}`\n\
-             • **Watchlist:** `{}` pending\n\
-             • **Open:** `{}` position(s)\n\
-             • **Oldest open:** `{oldest_h}h {oldest_m}m`\n\
-             • **Manual bags:** `{}` held\n\
-             • **Diverged:** `{}` (paper without live cover)\n\
-             • **Pending buys:** `{}` unconfirmed\n\
-             • **Breaker:** {}\n\
-             • **Data:** {}\n\
-             • **RPC:** `{}/{} ok · failovers {}{}`\n\
-             • **Stream gaps shed:** `{}` slots (`{}` capped backfills)\n\
-             • **GiveUps:** `{}` in window\n\
-             • **Cash:** `${:.2}`\n\
-             • **Equity:** `${:.2}`",
-            r.logs_seen,
-            r.candidates,
-            r.parse_ok,
-            r.dropped,
-            r.watchlist_pending,
-            r.open_positions,
-            r.manual_bags,
-            r.diverged,
-            r.pending_buys,
-            Self::breaker_line(r.breaker_halted, r.day_net),
-            if r.data_paused {
-                "`DEGRADED — entries paused`"
-            } else {
-                "`ok`"
-            },
-            r.rpc_healthy,
-            r.rpc_endpoints,
-            r.rpc_failover_reads,
-            if r.rpc_inconsistent {
-                " · INCONSISTENT"
-            } else {
-                ""
-            },
-            r.stream_gaps_shed,
-            r.stream_pages_capped,
-            r.giveups_window,
-            r.cash_usd,
-            r.equity_usd,
-        )
+        let data = if r.data_paused {
+            "`DEGRADED — entries paused`"
+        } else {
+            "`ok`"
+        };
+        CardBuilder::new("💚", "BOT HEARTBEAT", "Bot Heartbeat", COLOR_GREY)
+            .field("Mode", format!("`{mode} · {strategy}`"))
+            .field("Uptime", format!("`{uptime_h}h {uptime_m}m`"))
+            .field("Logs seen", format!("`{}`", r.logs_seen))
+            .field("Candidates", format!("`{}`", r.candidates))
+            .field("Parsed", format!("`{}`", r.parse_ok))
+            .field("Dropped", format!("`{}`", r.dropped))
+            .field("Watchlist", format!("`{}` pending", r.watchlist_pending))
+            .field("Open", format!("`{}` position(s)", r.open_positions))
+            .field("Oldest open", format!("`{oldest_h}h {oldest_m}m`"))
+            .field("Manual bags", format!("`{}` held", r.manual_bags))
+            .field(
+                "Diverged",
+                format!("`{}` (paper without live cover)", r.diverged),
+            )
+            .field("Pending buys", format!("`{}` unconfirmed", r.pending_buys))
+            .field("Breaker", Self::breaker_line(r.breaker_halted, r.day_net))
+            .field("Data", data)
+            .field(
+                "RPC",
+                format!(
+                    "`{}/{} ok · failovers {}{}`",
+                    r.rpc_healthy,
+                    r.rpc_endpoints,
+                    r.rpc_failover_reads,
+                    if r.rpc_inconsistent {
+                        " · INCONSISTENT"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+            .field(
+                "Stream gaps shed",
+                format!(
+                    "`{}` slots (`{}` capped backfills)",
+                    r.stream_gaps_shed, r.stream_pages_capped
+                ),
+            )
+            .field("GiveUps", format!("`{}` in window", r.giveups_window))
+            .field("Cash", format!("`${:.2}`", r.cash_usd))
+            .field("Equity", format!("`${:.2}`", r.equity_usd))
+            .finish()
     }
 
     /// Breaker line: `armed`, or `HALTED` with the day net that
-    /// tripped it. Plain values, no secrets.
-    fn breaker_line(halted: bool, day_net: f64) -> String {
+    /// tripped it. Plain values, no secrets. Public because the
+    /// sidecar's compact status renders the same breaker wording.
+    pub fn breaker_line(halted: bool, day_net: f64) -> String {
         if halted {
             format!("`HALTED (day ${day_net:+.2})`")
         } else {
@@ -497,17 +732,22 @@ impl Alerter {
         mint: &str,
         multiple: f64,
         price_usd: f64,
-    ) -> String {
+    ) -> Card {
         let mint = Self::sanitize(mint);
-        format!(
-            "🚀 **[POST-MIGRATION SPIKE]**\n\
-             {}\n\
-             • **Token Mint:** `{mint}`\n\
-             • **Move:** `{multiple:.1}x off migration`\n\
-             • **Price:** `${price_usd:.8}`\n\
-             • **Explorer:** {EXPLORER_ADDRESS}/{mint}",
-            Self::mode_line(ctx),
+        let explorer = format!("{EXPLORER_ADDRESS}/{mint}");
+        CardBuilder::new(
+            "🚀",
+            "POST-MIGRATION SPIKE",
+            format!("Post-Migration Spike — {mint}"),
+            COLOR_YELLOW,
         )
+        .mode(ctx)
+        .field("Token Mint", format!("`{mint}`"))
+        .field("Move", format!("`{multiple:.1}x` off migration"))
+        .field("Price", format!("`${price_usd:.8}`"))
+        .field("Explorer", explorer.clone())
+        .url(explorer)
+        .finish()
     }
 }
 
@@ -534,10 +774,10 @@ mod tests {
 
     /// Base heartbeat fixture; tests override individual fields.
     #[cfg(test)]
-    fn construct_heartbeat_fixture() -> HeartbeatReport<'static> {
+    fn construct_heartbeat_fixture() -> HeartbeatReport {
         HeartbeatReport {
-            mode: "live",
-            strategy: "runner",
+            mode: "live".to_string(),
+            strategy: "runner".to_string(),
             uptime_secs: 7_500,
             logs_seen: 1000,
             candidates: 50,
@@ -567,40 +807,75 @@ mod tests {
     #[test]
     fn entry_card_marks_fields() {
         let card = Alerter::format_entry(&PAPER, "MINT", 0.00000420, 40.0, -10.0, 10.0, "model");
-        assert!(card.contains("[TRADE OPENED]"));
-        assert!(card.contains("`MINT`"));
-        assert!(card.contains("$0.00000420"));
-        assert!(card.contains("+40.0%"));
-        assert!(card.contains("-10.0%"));
-        assert!(card.contains("explorer.solana.com/address/MINT"));
-        assert!(card.contains("`paper · adaptive`"));
+        assert!(card.content.contains("[TRADE OPENED]"));
+        assert!(card.content.contains("`MINT`"));
+        assert!(card.content.contains("$0.00000420"));
+        assert!(card.content.contains("+40.0%"));
+        assert!(card.content.contains("-10.0%"));
+        assert!(card.content.contains("explorer.solana.com/address/MINT"));
+        assert!(card.content.contains("`paper · adaptive`"));
+        let embed = card.embed.expect("entry embed");
+        assert_eq!(embed.title, "Trade Opened — MINT");
+        assert_eq!(embed.color, COLOR_GREEN);
+        assert_eq!(
+            embed.url.as_deref(),
+            Some("https://explorer.solana.com/address/MINT")
+        );
+        assert_eq!(embed.fields.len(), 8);
+        assert_eq!(embed.fields[0].name, "Mode");
+        assert_eq!(embed.fields[0].value, "`paper · adaptive`");
+        assert!(embed.fields[0].inline);
+        // Inline rule is value length: short values are columns, long
+        // ones take a full row (Explorer URLs with real 44-char mints).
+        assert_eq!(
+            embed.fields[7].inline,
+            embed.fields[7].value.chars().count() <= INLINE_VALUE_MAX
+        );
+        // Footer mirrors the mode line (no `Mode:` label, no backticks).
+        assert_eq!(
+            embed.footer.as_ref().map(|f| &*f.text),
+            Some("paper · adaptive")
+        );
     }
 
     #[test]
     fn exit_card_signs_and_tags() {
         let win = Alerter::format_exit(&PAPER, "M", "TakeProfit", 4.2, 42.0, 104.2, false);
-        assert!(win.contains("🎯"));
-        assert!(win.contains("POSITION CLOSED"));
-        assert!(win.contains("$+4.20"));
+        assert!(win.content.contains("🎯"));
+        assert!(win.content.contains("POSITION CLOSED"));
+        assert!(win.content.contains("$+4.20"));
+        assert_eq!(win.embed.as_ref().expect("win").color, COLOR_GREEN);
+        assert_eq!(
+            win.embed.as_ref().expect("win").title,
+            "Position Closed — M"
+        );
         let loss = Alerter::format_exit(&PAPER, "M", "StopLoss", -1.5, -15.0, 98.5, false);
-        assert!(loss.contains("🛑"));
+        assert!(loss.content.contains("🛑"));
+        assert_eq!(loss.embed.as_ref().expect("loss").color, COLOR_RED);
         let moon = Alerter::format_exit(&PAPER, "M", "Manual", 0.0, 0.0, 100.0, true);
-        assert!(moon.contains("MOONBAG PARTIAL EXIT"));
+        assert!(moon.content.contains("MOONBAG PARTIAL EXIT"));
+        assert_eq!(
+            moon.embed.as_ref().expect("moon").title,
+            "Moonbag Partial Exit — M"
+        );
     }
 
     #[test]
     fn follow_spike_card_marks_multiple() {
         let card = Alerter::format_follow_spike(&PAPER, "M", 2.0, 0.01);
-        assert!(card.contains("[POST-MIGRATION SPIKE]"));
-        assert!(card.contains("2.0x"));
-        assert!(card.contains("explorer.solana.com/address/M"));
+        assert!(card.content.contains("[POST-MIGRATION SPIKE]"));
+        assert!(card.content.contains("2.0x"));
+        assert!(card.content.contains("explorer.solana.com/address/M"));
+        let embed = card.embed.expect("spike embed");
+        assert_eq!(embed.color, COLOR_YELLOW);
+        assert_eq!(embed.title, "Post-Migration Spike — M");
     }
 
     #[test]
     fn heartbeat_card_marks_counters() {
         let card = Alerter::format_heartbeat(&HeartbeatReport {
-            mode: "live",
-            strategy: "runner",
+            mode: "live".to_string(),
+            strategy: "runner".to_string(),
             uptime_secs: 7_500,
             logs_seen: 1000,
             candidates: 50,
@@ -625,19 +900,27 @@ mod tests {
             stream_pages_capped: 1,
             giveups_window: 1,
         });
-        assert!(card.contains("[BOT HEARTBEAT]"));
-        assert!(card.contains("`live · runner`"));
-        assert!(card.contains("2h 5m"));
-        assert!(card.contains("`1000`"));
-        assert!(card.contains("`2` held"));
-        assert!(card.contains("$90.50"));
-        assert!(card.contains("$102.25"));
+        assert!(card.content.contains("[BOT HEARTBEAT]"));
+        assert!(card.content.contains("`live · runner`"));
+        assert!(card.content.contains("2h 5m"));
+        assert!(card.content.contains("`1000`"));
+        assert!(card.content.contains("`2` held"));
+        assert!(card.content.contains("$90.50"));
+        assert!(card.content.contains("$102.25"));
         // Observability lines: health, RPC pool, stream gaps, failures.
-        assert!(card.contains("**Data:** `ok`"));
-        assert!(card.contains("**RPC:** `2/2 ok · failovers 3`"));
-        assert!(card.contains("**Oldest open:** `1h 13m`"));
-        assert!(card.contains("**Stream gaps shed:** `7` slots (`1` capped backfills)"));
-        assert!(card.contains("**GiveUps:** `1` in window"));
+        assert!(card.content.contains("**Data:** `ok`"));
+        assert!(card.content.contains("**RPC:** `2/2 ok · failovers 3`"));
+        assert!(card.content.contains("**Oldest open:** `1h 13m`"));
+        assert!(
+            card.content
+                .contains("**Stream gaps shed:** `7` slots (`1` capped backfills)")
+        );
+        assert!(card.content.contains("**GiveUps:** `1` in window"));
+        // 19 fields: within the 25-field cap, and under the total cap.
+        let embed = card.embed.expect("heartbeat embed");
+        assert_eq!(embed.fields.len(), 19);
+        assert_eq!(embed.color, COLOR_GREY);
+        assert!(embed.footer.is_none());
         // Degraded state reads as paused, inconsistent as a flag.
         let degraded = Alerter::format_heartbeat(&HeartbeatReport {
             data_paused: true,
@@ -645,8 +928,16 @@ mod tests {
             rpc_inconsistent: true,
             ..construct_heartbeat_fixture()
         });
-        assert!(degraded.contains("**Data:** `DEGRADED — entries paused`"));
-        assert!(degraded.contains("`0/2 ok · failovers 3 · INCONSISTENT`"));
+        assert!(
+            degraded
+                .content
+                .contains("**Data:** `DEGRADED — entries paused`")
+        );
+        assert!(
+            degraded
+                .content
+                .contains("`0/2 ok · failovers 3 · INCONSISTENT`")
+        );
     }
 
     #[test]
@@ -660,12 +951,18 @@ mod tests {
             Some("BASE"),
             None,
         );
-        assert!(card.contains("[MIGRATION DETECTED]"));
-        assert!(card.contains("RaydiumV4"));
-        assert!(card.contains("`AMM`"));
-        assert!(card.contains("explorer.solana.com/tx/sig"));
+        assert!(card.content.contains("[MIGRATION DETECTED]"));
+        assert!(card.content.contains("RaydiumV4"));
+        assert!(card.content.contains("`AMM`"));
+        assert!(card.content.contains("explorer.solana.com/tx/sig"));
+        let embed = card.embed.expect("migration embed");
+        assert_eq!(embed.color, COLOR_GREY);
+        assert_eq!(
+            embed.url.as_deref(),
+            Some("https://explorer.solana.com/tx/sig")
+        );
         let bare = Alerter::format_migration(&LIVE, "M", "PumpSwap", "sig", None, None, None);
-        assert!(bare.contains("unknown"));
+        assert!(bare.content.contains("unknown"));
     }
 
     #[test]
@@ -673,8 +970,8 @@ mod tests {
         // Attacker-shaped inputs must not survive as mentions, fences, or links.
         let card =
             Alerter::format_exit(&PAPER, "@everyone `x`", "TakeProfit", 1.0, 1.0, 1.0, false);
-        assert!(!card.contains("@everyone"));
-        assert!(!card.contains("`x`"));
+        assert!(!card.content.contains("@everyone"));
+        assert!(!card.content.contains("`x`"));
         let mig = Alerter::format_migration(
             &PAPER,
             "M",
@@ -684,11 +981,20 @@ mod tests {
             None,
             None,
         );
-        assert!(!mig.contains('@'));
-        assert!(!mig.contains("https://evil.example"));
+        assert!(!mig.content.contains('@'));
+        assert!(!mig.content.contains("https://evil.example"));
         // Backtick payloads collapse to plain text inside the template's own span.
         let tricky = Alerter::format_migration(&PAPER, "M", "X", "s", Some("`A`M`M`"), None, None);
-        assert!(tricky.contains("`AMM`"));
+        assert!(tricky.content.contains("`AMM`"));
+        // The embed carries the same sanitized values — no side channel
+        // for mentions or link syntax (same predicates as the content).
+        let embed = mig.embed.expect("mig embed");
+        assert!(
+            !embed
+                .fields
+                .iter()
+                .any(|f| f.value.contains('@') || f.value.contains("https://evil.example"))
+        );
     }
 
     #[test]
@@ -702,12 +1008,75 @@ mod tests {
             1.0,
             false,
         );
-        assert!(!card.contains("https://evil.example"));
-        assert!(!card.contains("[click]"));
+        assert!(!card.content.contains("https://evil.example"));
+        assert!(!card.content.contains("[click]"));
         // Zero-width and bidi-override characters are stripped.
         let sneaky = "AB\u{200B}CD\u{202E}EF";
         assert_eq!(Alerter::sanitize(sneaky), "ABCDEF");
         assert_eq!(Alerter::sanitize("a\u{FEFF}b"), "ab");
+    }
+
+    #[test]
+    fn plain_text_card_has_no_embed() {
+        let card = Card::from("raw pipeline warning".to_string());
+        assert_eq!(card.content, "raw pipeline warning");
+        assert!(card.embed.is_none());
+    }
+
+    #[test]
+    fn embed_serializes_into_message_shape() {
+        // The dispatch body: `content` + `embeds[0]` with plain fields.
+        let card = Alerter::format_halt(&PAPER, 10.0, -12.34);
+        let embed = card.embed.expect("halt embed");
+        let value = serde_json::to_value(&embed).expect("plain struct serializes");
+        assert_eq!(value["title"], "Day-Loss Halt");
+        assert_eq!(value["color"], COLOR_RED);
+        assert_eq!(value["footer"]["text"], "paper · adaptive");
+        assert_eq!(value["fields"][0]["name"], "Mode");
+        assert_eq!(value["fields"][0]["inline"], true);
+        // No url on halt cards: the key is omitted entirely.
+        assert!(value.get("url").is_none());
+    }
+
+    #[test]
+    fn embed_limits_clamp_and_drop() {
+        // Field name/value clamp at Discord's caps with an ellipsis.
+        let card = CardBuilder::new("🧪", "TEST", "Test", COLOR_GREY)
+            .field("N", "v".repeat(EMBED_FIELD_VALUE_MAX + 50))
+            .field("n".repeat(EMBED_FIELD_NAME_MAX + 50), "x")
+            .finish();
+        let embed = card.embed.expect("clamped embed");
+        assert_eq!(embed.fields[0].value.len(), EMBED_FIELD_VALUE_MAX); // incl. ellipsis
+        assert!(embed.fields[0].value.ends_with('…'));
+        assert_eq!(embed.fields[1].name.len(), EMBED_FIELD_NAME_MAX);
+        // Beyond 25 fields, extras are dropped.
+        let mut many = CardBuilder::new("🧪", "TEST", "Test", COLOR_GREY);
+        for i in 0..MAX_EMBED_FIELDS + 5 {
+            many = many.field(format!("f{i}"), "v");
+        }
+        assert_eq!(
+            many.clone().finish().embed.expect("e").fields.len(),
+            MAX_EMBED_FIELDS
+        );
+        // Overflowing totals ship text-only: the fallback never breaks.
+        // (The title self-clamps, so drive the total through fields.)
+        let mut huge = CardBuilder::new("🧪", "TEST", "Test", COLOR_GREY);
+        for _ in 0..MAX_EMBED_FIELDS {
+            huge = huge.field("field", "v".repeat(240));
+        }
+        let huge = huge.finish();
+        assert!(huge.embed.is_none());
+        assert!(huge.content.contains("[TEST]"));
+    }
+
+    #[test]
+    fn clamp_chars_respects_char_boundaries() {
+        let emoji = "é".repeat(EMBED_FIELD_VALUE_MAX + 10);
+        let clamped = clamp_chars(&emoji, EMBED_FIELD_VALUE_MAX);
+        assert!(clamped.ends_with('…'));
+        // Never over the cap and never splits a char.
+        assert!(clamped.len() <= EMBED_FIELD_VALUE_MAX);
+        assert!(clamped.is_char_boundary(clamped.len() - '…'.len_utf8()));
     }
 
     #[test]
@@ -720,7 +1089,7 @@ mod tests {
         for _ in 0..MAX_INFLIGHT_ALERTS {
             held.push(alert.permits.clone().try_acquire_owned().expect("permit"));
         }
-        alert.send("storm".to_string());
+        alert.send_text("storm".to_string());
         assert_eq!(alert.dropped_count(), 1);
         drop(held);
     }
@@ -772,11 +1141,12 @@ mod tests {
     #[tokio::test]
     async fn disabled_never_sends() {
         // No token/channel: early return, nothing spawned.
-        Alerter::disabled().send("hi".to_string());
-        Alerter::new().send("hi".to_string());
+        Alerter::disabled().send_text("hi".to_string());
+        Alerter::new().send_text("hi".to_string());
         Alerter::new()
             .with_token("test-token-fixture")
-            .send("hi".to_string());
+            .send_text("hi".to_string());
+        Alerter::new().send_card(Card::from("hi".to_string()));
     }
 
     #[tokio::test]
@@ -786,7 +1156,8 @@ mod tests {
         let alert = Alerter::with_api_base("http://127.0.0.1:9")
             .with_token("test-token-fixture")
             .with_channel("123456789");
-        alert.send("hi".to_string());
+        alert.send_text("hi".to_string());
+        alert.send_card(Alerter::format_halt(&PAPER, 1.0, -1.0));
         // Let detached tasks run; assertions are "no panic, returns fast".
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -794,11 +1165,11 @@ mod tests {
     #[test]
     fn halt_card_and_breaker_line() {
         let card = Alerter::format_halt(&PAPER, 10.0, -12.34);
-        assert!(card.contains("[DAY-LOSS HALT]"));
-        assert!(card.contains("`paper · adaptive`"));
-        assert!(card.contains("-$10.00/day"));
-        assert!(card.contains("$-12.34"));
-        assert!(card.contains("exits always work"));
+        assert!(card.content.contains("[DAY-LOSS HALT]"));
+        assert!(card.content.contains("`paper · adaptive`"));
+        assert!(card.content.contains("-$10.00/day"));
+        assert!(card.content.contains("$-12.34"));
+        assert!(card.content.contains("exits always work"));
         assert_eq!(Alerter::breaker_line(false, 0.0), "`armed`");
         assert_eq!(
             Alerter::breaker_line(true, -12.34),

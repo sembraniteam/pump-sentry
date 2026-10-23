@@ -8,6 +8,7 @@ no subprocess, no external agent.
   (`DISCORD_BOT_TOKEN` env or `DISCORD_BOT_TOKEN_FILE`, captured at boot and
   scrubbed after) and a numeric channel id; without either, sends no-op.
 - Cards: entry/exit (signed PnL, moonbag tag), live buy/sell (bundle UUID), migration, 2x follow-spike, 6h heartbeat. Fields sanitized and length-capped (content truncated at 2000 chars, never split).
+- Each structured card ships as text fallback (`content`) plus one rich embed mirroring the same fields: title + mint, palette color (green entry/win, red halt/loss, yellow attention, grey info), explorer deep-link, inline fields to Discord's caps (25 fields, 6000 chars — overflow ships text-only).
 - The heartbeat carries the health view: RPC pool (`n/m ok · failovers`, inconsistency flag), data-degrade state, oldest open age, stream gaps shed (slots + capped backfills), and windowed GiveUps (buy/sell failures).
 
 ```sh
