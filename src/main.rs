@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod day_state;
+mod discord_sidecar;
 mod follow;
 mod gate;
 mod journal;
@@ -61,6 +62,24 @@ fn main() {
         cli::CliAction::Sell { mint } => cli::cmd_sell(&mint),
         cli::CliAction::Pause => cli::cmd_pause(),
         cli::CliAction::Resume => cli::cmd_resume(),
+        // The sidecar needs the token captured in this sync phase
+        // (before any thread), then its own runtime: a gateway
+        // connection, unlike the aux commands below, runs forever.
+        cli::CliAction::Discord => {
+            let Some(token) = alert::capture_bot_token() else {
+                eprintln!(
+                    "Discord sidecar refusing to start: {} (or {}_FILE) is not set — the sidecar owns the Discord connection, so it cannot run tokenless",
+                    alert::DISCORD_BOT_TOKEN_ENV,
+                    alert::DISCORD_BOT_TOKEN_ENV
+                );
+                std::process::exit(1);
+            };
+            // Indirect to keep the failure exit code the caller's.
+            if let Err(e) = discord_sidecar::run(token) {
+                eprintln!("Discord sidecar stopping: {e}");
+                std::process::exit(1);
+            }
+        }
         cli::CliAction::Replay { file } => aux_runtime().block_on(replay::cmd_replay(file)),
         cli::CliAction::Research { file } => aux_runtime().block_on(research::cmd_research(file)),
         cli::CliAction::Upgrade { allow_unverified } => cli::cmd_upgrade(allow_unverified),

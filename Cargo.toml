@@ -36,6 +36,13 @@ migration = { path = "crates/migration" }
 alert = { path = "crates/alert" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serenity = { version = "0.12", default-features = false, features = [
+    "client",
+    "gateway",
+    "model",
+    "builder",
+    "rustls_backend",
+] }
 libc = "0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

@@ -135,6 +135,14 @@ pub fn status_path() -> std::path::PathBuf {
     crate::cli::state_file_beside_log(&log_file, STATUS_FILE)
 }
 
+/// Read and parse the status file (the sidecar's only data source).
+/// A torn/foreign file is an `InvalidData` error — the caller answers
+/// best-effort from the last honest read, never invents values.
+pub fn read(path: &Path) -> std::io::Result<StatusReport> {
+    let raw = std::fs::read(path)?;
+    serde_json::from_slice(&raw).map_err(std::io::Error::other)
+}
+
 /// Serialize and atomically replace the status file (0600, tmp+rename —
 /// the sidecar never observes a torn file). Infallible fields: the
 /// report carries only plain numbers/strings.

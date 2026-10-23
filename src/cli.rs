@@ -96,6 +96,7 @@ Commands:
   sell <mint>             Queue a manual full exit for one mint now
   pause                   Kill switch: halt new entries (open positions keep managing)
   resume                  Clear the kill switch (entries may open again)
+  discord                 Run the Discord sidecar (read-only slash commands; needs DISCORD_BOT_TOKEN)
   replay [file]           Re-derive recorded decisions offline + paper/live metrics
                           (default journal: journal.jsonl next to the log)
   research [file]         Offline loss-pattern analysis + filter proposals (read-only)
@@ -152,6 +153,10 @@ pub enum CliAction {
     Pause,
     /// Clear the kill switch.
     Resume,
+    /// Run the Discord sidecar (foreground; Ctrl-C stops it).
+    /// Read-only gateway process: answers slash commands from on-disk
+    /// state; never trades and never holds custody.
+    Discord,
     /// Re-derive recorded decisions offline; paper vs live metrics.
     Replay { file: Option<String> },
     /// Offline loss-pattern analysis over the journal (read-only).
@@ -198,6 +203,7 @@ pub fn parse_cli(args: &[String]) -> CliAction {
         },
         "pause" => CliAction::Pause,
         "resume" => CliAction::Resume,
+        "discord" => CliAction::Discord,
         "replay" => CliAction::Replay {
             file: args.get(2).cloned().filter(|f| !f.is_empty() && f != "-"),
         },
