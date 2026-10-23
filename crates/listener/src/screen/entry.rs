@@ -40,6 +40,20 @@ pub struct EntryGate {
 /// Watchlist cap. Evicts nearest deadline when full.
 pub const MAX_PENDING_ENTRIES: usize = 10_000;
 
+/// One `/watchlist` line: a mint under buyer-quorum evaluation with
+/// its progress. Owned data (no lifetime gaggle) so it crosses into
+/// the bot's status payload untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryGateView {
+    pub mint: String,
+    /// Distinct non-dev buyers observed so far.
+    pub buyers: u32,
+    /// First submit (relaunch refresh keeps this).
+    pub created_secs: u64,
+    /// Quorum deadline.
+    pub deadline_secs: u64,
+}
+
 /// Cohort cap per entry.
 pub const MAX_COHORT_WALLETS: usize = 4;
 
@@ -56,6 +70,21 @@ impl EntryGate {
     /// Watchlist size (for metrics).
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Operator-facing watchlist snapshot (`/watchlist`): one line per
+    /// pending mint with its quorum progress. Pure read; no custody,
+    /// no secrets (mints are public chain data).
+    pub fn pending_view(&self) -> Vec<EntryGateView> {
+        self.pending
+            .iter()
+            .map(|(mint, entry)| EntryGateView {
+                mint: mint.clone(),
+                buyers: entry.buyers.len() as u32,
+                created_secs: entry.created_secs,
+                deadline_secs: entry.deadline_secs,
+            })
+            .collect()
     }
 
     /// True when a mint currently has a pending entry.

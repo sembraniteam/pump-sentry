@@ -47,8 +47,8 @@ pub(crate) use cache::TimedCache;
 // Re-exported by `listener::` in lib.rs; names keep their original paths.
 pub use bundle::{BundleAnalysis, BundleDetector, BundleVerdict};
 pub use entry::{
-    DevScreenConfig, DevVerdict, EntryGate, GATE_POLL_INTERVAL, GateOutcome, MAX_COHORT_WALLETS,
-    MAX_PENDING_ENTRIES, judge_developer,
+    DevScreenConfig, DevVerdict, EntryGate, EntryGateView, GATE_POLL_INTERVAL, GateOutcome,
+    MAX_COHORT_WALLETS, MAX_PENDING_ENTRIES, judge_developer,
 };
 pub use micro::{MicroSignals, TapePoint, micro_signals};
 pub use rpc::{

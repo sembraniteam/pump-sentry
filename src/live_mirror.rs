@@ -1002,15 +1002,16 @@ impl<L> LiveExecution<L> {
             .expected_entry_gap_usd(venue, notional_usd, liquidity_usd)
     }
 
-    /// Pending-buy count for the heartbeat (unconfirmed fills).
-    pub fn live_pending_count(&self) -> usize
+    /// Pending-buy mints (unconfirmed fills): the `/positions`
+    /// watch-only lines ride these, and the count is their `.len()`.
+    pub fn live_pending_mints(&self) -> Vec<String>
     where
         L: LiveSink,
     {
         self.live
             .as_ref()
-            .map(|t| t.pending_mints().len())
-            .unwrap_or(0)
+            .map(|t| t.pending_mints())
+            .unwrap_or_default()
     }
 
     /// Record one failed sell; return new count.

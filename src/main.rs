@@ -13,6 +13,7 @@ mod pipeline;
 mod replay;
 mod research;
 mod settings;
+mod status;
 
 #[cfg(test)]
 mod test_env;
@@ -701,6 +702,81 @@ fn supervision_due(last: u64, now: u64, interval_secs: u64) -> bool {
 }
 
 /// Foreground pipeline.
+/// One status/heartbeat collection (docs/discord-sidecar.md §2): every
+/// read is cache-backed or a lock-brief in-memory snapshot — the
+/// collector never does an RPC, so the 10-second sidecar cadence adds
+/// no endpoint load. Single source for both the 6-hour heartbeat card
+/// and the sidecar's `status.json` (never two drift paths).
+async fn collect_status(
+    pipeline: &Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
+    stats_task: &Arc<listener::ListenerStats>,
+    pool: &Arc<executor::rpc_pool::RpcPool>,
+    live_mode: bool,
+    boot_ts: u64,
+) -> status::StatusReport {
+    let snap = stats_task.snapshot();
+    let pending = pipeline.pending_count().await;
+    let manual = pipeline.exec.manual_keys().await;
+    let diverged = pipeline.exec.diverged_keys().await;
+    let pending_buys = pipeline.exec.live_pending_mints();
+    // One book read serves the card (cash/equity) and the `/pnl`
+    // panel (docs/discord-sidecar.md §2: one collector, never two
+    // drift paths). Bounded disclosure: a flooded book stays finite
+    // in the file; the true count ships with the sample.
+    let book = pipeline.paper_book_snapshot().await;
+    let (breaker_halted, day_net) = {
+        let mut daily = pipeline.daily.lock().await;
+        let halted = daily.tripped(pipeline.settings.max_daily_loss_usd, settings::now_secs());
+        (halted, daily.day_net())
+    };
+    let rpc_snap = pool.snapshot();
+    let oldest_open_age = pipeline.oldest_open_age_secs(settings::now_secs()).await;
+    let giveups_window = pipeline
+        .exec
+        .giveups_since(GIVEUP_HEARTBEAT_WINDOW_SECS, settings::now_secs())
+        .await as u64;
+    let mut positions = pipeline.open_position_views().await;
+    let positions_total = positions.len();
+    positions.truncate(status::POSITIONS_MAX_PUBLISHED);
+    let watchlist = pipeline.watchlist_view().await;
+    status::StatusReport {
+        ts: settings::now_secs(),
+        report: alert::HeartbeatReport {
+            mode: (if live_mode { "live" } else { "paper" }).to_string(),
+            uptime_secs: settings::now_secs().saturating_sub(boot_ts),
+            logs_seen: snap.logs_seen,
+            candidates: snap.candidates,
+            parse_ok: snap.parse_ok,
+            dropped: snap.dropped_full.saturating_add(snap.dropped_throttled),
+            watchlist_pending: pending,
+            open_positions: positions_total,
+            manual_bags: manual.len(),
+            diverged: diverged.len(),
+            pending_buys: pending_buys.len(),
+            breaker_halted,
+            day_net,
+            strategy: pipeline.strategy.as_str().to_string(),
+            cash_usd: book.cash,
+            equity_usd: book.equity,
+            data_paused: pipeline.data_degraded(),
+            rpc_endpoints: rpc_snap.endpoints,
+            rpc_healthy: rpc_snap.healthy,
+            rpc_failover_reads: rpc_snap.failover_reads,
+            rpc_inconsistent: rpc_snap.inconsistent,
+            oldest_open_age_secs: oldest_open_age,
+            stream_gaps_shed: snap.slot_gaps_shed,
+            stream_pages_capped: snap.backfill_pages_capped,
+            giveups_window,
+        },
+        pnl: book.pnl,
+        positions,
+        manual_mints: manual,
+        diverged_mints: diverged,
+        pending_buy_mints: pending_buys,
+        watchlist,
+    }
+}
+
 async fn run_pipeline(boot: Boot) {
     let Boot {
         live: live_mode,
@@ -1366,6 +1442,28 @@ async fn run_pipeline(boot: Boot) {
     let tick_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let pool_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stats_task = Arc::clone(&stats);
+    // Sidecar status publisher (docs/discord-sidecar.md §2): fresh
+    // readings on disk every few seconds so `pump-sentry discord`
+    // answers slash commands without touching this loop. Best-effort:
+    // a failed write only logs — the sidecar serves the last complete
+    // file, and trading is unaffected by construction.
+    {
+        let pipeline = Arc::clone(&pipeline);
+        let stats = Arc::clone(&stats_task);
+        let pool = Arc::clone(&pool);
+        let path = status::status_path();
+        tokio::spawn(async move {
+            let mut writer =
+                tokio::time::interval(Duration::from_secs(status::STATUS_WRITE_INTERVAL_SECS));
+            loop {
+                writer.tick().await;
+                let report = collect_status(&pipeline, &stats, &pool, live_mode, boot_ts).await;
+                if let Err(e) = status::write(&path, &report) {
+                    warn!(error = %e, "status file write failed; Discord sidecar serves stale state");
+                }
+            }
+        });
+    }
     info!("pipeline live with auto-exits (Ctrl-C to stop)");
     let mut clean_shutdown = false;
     loop {
@@ -1495,58 +1593,27 @@ async fn run_pipeline(boot: Boot) {
                 }
             }
             _ = heartbeat.tick() => {
-                let snap = stats_task.snapshot();
-                let pending = pipeline.pending_count().await;
-                let open = pipeline.open_position_mints().await.len();
-                let manual = pipeline.exec.manual_keys().await.len();
-                let diverged = pipeline.exec.diverged_keys().await.len();
-                let pending_buys = pipeline.exec.live_pending_count();
-                let (cash, equity) = pipeline.paper_cash_equity().await;
-                let (breaker_halted, day_net) = {
-                    let mut daily = pipeline.daily.lock().await;
-                    let halted = daily.tripped(
-                        pipeline.settings.max_daily_loss_usd,
-                        settings::now_secs(),
-                    );
-                    (halted, daily.day_net())
-                };
-                let rpc_snap = pool.snapshot();
-                let oldest_open_age =
-                    pipeline.oldest_open_age_secs(settings::now_secs()).await;
-                let giveups_window =
-                    pipeline.exec.giveups_since(GIVEUP_HEARTBEAT_WINDOW_SECS, settings::now_secs()).await as u64;
+                // One shared collector with the sidecar status writer:
+                // the same fresh readings, never two drift paths.
+                let report =
+                    collect_status(&pipeline, &stats_task, &pool, live_mode, boot_ts).await;
+                let h = report.report;
+                let card = Alerter::format_heartbeat(&h);
+                // Locals the rest of the arm reads (journal, logs).
+                let (cash, equity, breaker_halted, day_net) =
+                    (h.cash_usd, h.equity_usd, h.breaker_halted, h.day_net);
+                let (pending, open, manual, diverged, pending_buys) = (
+                    h.watchlist_pending,
+                    h.open_positions,
+                    h.manual_bags,
+                    h.diverged,
+                    h.pending_buys,
+                );
                 // Custody recheck, the overdue-exit warning, and the
                 // GiveUp burst monitor live on the 60-second
                 // supervision tick (AUD-003); the heartbeat card
                 // keeps its own 6-hour cadence and surfaces their
                 // latest state above.
-                let card = Alerter::format_heartbeat(&alert::HeartbeatReport {
-                    mode: if live_mode { "live" } else { "paper" },
-                    uptime_secs: settings::now_secs().saturating_sub(boot_ts),
-                    logs_seen: snap.logs_seen,
-                    candidates: snap.candidates,
-                    parse_ok: snap.parse_ok,
-                    dropped: snap.dropped_full.saturating_add(snap.dropped_throttled),
-                    watchlist_pending: pending,
-                    open_positions: open,
-                    manual_bags: manual,
-                    diverged,
-                    pending_buys,
-                    breaker_halted,
-                    day_net,
-                    strategy: pipeline.strategy.as_str(),
-                    cash_usd: cash,
-                    equity_usd: equity,
-                    data_paused: pipeline.data_degraded(),
-                    rpc_endpoints: rpc_snap.endpoints,
-                    rpc_healthy: rpc_snap.healthy,
-                    rpc_failover_reads: rpc_snap.failover_reads,
-                    rpc_inconsistent: rpc_snap.inconsistent,
-                    oldest_open_age_secs: oldest_open_age,
-                    stream_gaps_shed: snap.slot_gaps_shed,
-                    stream_pages_capped: snap.backfill_pages_capped,
-                    giveups_window,
-                });
                 // Equity-curve record (drawdown / expectation evidence).
                 if let Some(j) = pipeline.journal() {
                     if j.is_degraded() {
@@ -1563,7 +1630,7 @@ async fn run_pipeline(boot: Boot) {
                     }
                 }
                 info!("heartbeat: logs={} candidates={} watchlist={} open={} manual={} diverged={} pending_buys={} equity={:.2}",
-                    snap.logs_seen, snap.candidates, pending, open, manual, diverged, pending_buys, equity);
+                    h.logs_seen, h.candidates, pending, open, manual, diverged, pending_buys, equity);
                 // Stashed and synthetic PnL bypass the breaker by
                 // design — but invisible bypasses hide exposure, so
                 // both ride the heartbeat every round.

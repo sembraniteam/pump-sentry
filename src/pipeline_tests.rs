@@ -6,6 +6,7 @@ use crate::live::{
     TEST_MINT_B as MINT_B,
 };
 use crate::pipeline::*;
+use alert::Card;
 use executor::DeadReason;
 use executor::{ExecutorError, JitoError};
 use migration::PoolTick;
@@ -550,8 +551,8 @@ impl StubAlerts {
 }
 
 impl AlertSink for StubAlerts {
-    fn alert(&self, message: String) {
-        self.inner.lock().expect("lock").push(message);
+    fn alert(&self, card: Card) {
+        self.inner.lock().expect("lock").push(card.content);
     }
 }
 
@@ -1263,8 +1264,8 @@ async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
         StubScreener::passing(),
         None,
     );
-    let (cash_empty, equity_empty) = pipe.paper_cash_equity().await;
-    assert_eq!((cash_empty, equity_empty), (100.0, 100.0));
+    let empty = pipe.paper_book_snapshot().await;
+    assert_eq!((empty.cash, empty.equity), (100.0, 100.0));
     pipe.portfolio
         .lock()
         .await
@@ -1285,8 +1286,8 @@ async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
     // Before any tick: book value (zero unrealized). Cash reflects
     // the actually-invested size (floored whole tokens at the filled
     // entry), not the nominal ticket.
-    let (cash_book, equity_book) = pipe.paper_cash_equity().await;
-    assert!((equity_book - 100.0).abs() < 1e-9, "book {equity_book}");
+    let book = pipe.paper_book_snapshot().await;
+    assert!((book.equity - 100.0).abs() < 1e-9, "book {}", book.equity);
     let invested = {
         let portfolio = pipe.portfolio.lock().await;
         let id = portfolio.position_ids()[0];
@@ -1294,8 +1295,9 @@ async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
         pos.quantity as f64 * pos.entry_price
     };
     assert!(
-        (cash_book - (100.0 - invested)).abs() < 1e-9,
-        "cash {cash_book}"
+        (book.cash - (100.0 - invested)).abs() < 1e-9,
+        "cash {}",
+        book.cash
     );
     // A fresh flat tick marks equity realizable: the 125 bps venue
     // fee on the exit leg deducts, so equity drops below book.
@@ -1308,10 +1310,14 @@ async fn paper_cash_equity_is_realizable_over_fresh_ticks() {
         MINT.to_string(),
         Mark::new(2.0, 30_000.0),
     )]));
-    let (cash, equity) = pipe.paper_cash_equity().await;
-    assert_eq!(cash, snap.cash);
-    assert!((equity - snap.equity).abs() < 1e-9);
-    assert!(equity < 100.0, "exit costs must deduct: {equity}");
+    let marked = pipe.paper_book_snapshot().await;
+    assert_eq!(marked.cash, snap.cash);
+    assert!((marked.equity - snap.equity).abs() < 1e-9);
+    assert!(
+        marked.equity < 100.0,
+        "exit costs must deduct: {}",
+        marked.equity
+    );
     assert!(snap.unrealized_pnl < 0.0);
 }
 
@@ -3750,9 +3756,8 @@ async fn recheck_resolves_confirmed_buys_without_a_tick() {
     assert!(pipe.exec.manual_keys().await.is_empty());
     // The stub hook drains the pending entry on confirm: the pending
     // buy is fully resolved (tracked as a live bag, no manual park).
-    assert_eq!(
-        pipe.exec.live_pending_count(),
-        0,
+    assert!(
+        pipe.exec.live_pending_mints().is_empty(),
         "stub recheck consumed the pending entry on confirm"
     );
 }
@@ -5847,4 +5852,84 @@ async fn live_buy_first_touch_debit_completes() {
         "bleed={}",
         pf.total_dispatch_usd()
     );
+}
+
+#[tokio::test]
+async fn sidecar_views_answer_one_snapshot_shape() {
+    // The status collector's three new views (book snapshot, position
+    // lines, watchlist) must agree with the underlying book/gate — the
+    // sidecar answers from them verbatim (docs/discord-sidecar.md §2).
+    use crate::gate::GateState;
+    use listener::EntryGate;
+    let settings = Settings::from_map(&HashMap::new());
+    let pipe = pipeline_screened(
+        settings.clone(),
+        AuditOutcome::Allow(100),
+        StubReserves::failing(),
+        PaperPortfolio::new(100.0, 0.0),
+        StubScreener::passing(),
+        None,
+    );
+    // Empty book: an honest panel, no invented lines.
+    let book = pipe.paper_book_snapshot().await;
+    assert_eq!(book.cash, 100.0);
+    assert_eq!(book.equity, 100.0);
+    assert_eq!(book.pnl.closed_count, 0);
+    assert_eq!(book.pnl.win_rate, None);
+    assert_eq!(book.pnl.realized_pnl, 0.0);
+    assert!(book.pnl.unrealized_pnl.abs() < 1e-9);
+    assert_eq!(pipe.open_position_views().await, Vec::new());
+    // Watchlist: two submitted mints read back with gate thresholds.
+    let _ = settings;
+    *pipe.gate_state.lock().await = GateState::new(EntryGate::new(10, 5));
+    let mut gate = pipe.gate_state.lock().await;
+    assert!(
+        gate.gate
+            .submit(MINT, "11111111111111111111111111111111", now_secs())
+    );
+    assert!(
+        gate.gate
+            .submit(MINT_A, "11111111111111111111111111111111", now_secs())
+    );
+    drop(gate);
+    let wl = pipe.watchlist_view().await;
+    assert_eq!(wl.total, 2);
+    assert_eq!(wl.entries.len(), 2);
+    assert_eq!(wl.min_buyers, 5);
+    assert_eq!(wl.window_secs, 10);
+    // Position views: open a paper position without ticks — unmarked,
+    // honest None; with a fresh tick — mark present.
+    pipe.portfolio
+        .lock()
+        .await
+        .open_position_params(&simulator::OpenPositionParams {
+            mint: MINT,
+            side: Side::Long,
+            mark: Mark::new(2.0, 1e9),
+            notional_usd: 10.0,
+            tp_percent: 75.0,
+            sl_percent: -8.0,
+            trailing: false,
+            trail_percent: 0.0,
+            timeout_seconds: 0,
+            moonbag_percent: 0.0,
+            now_secs: now_secs(),
+        })
+        .expect("manual open");
+    let unmarked = pipe.open_position_views().await;
+    assert_eq!(unmarked.len(), 1);
+    assert_eq!(unmarked[0].mark_price, None);
+    assert_eq!(unmarked[0].unrealized_usd, None);
+    // Whole-token flooring at fill: not 10 nominal.
+    assert!(
+        (unmarked[0].entry_notional - 8.1).abs() < 1e-6,
+        "{}",
+        unmarked[0].entry_notional
+    );
+    pipe.on_tick(&tick(MINT, 2.5)).await;
+    let marked = pipe.open_position_views().await;
+    assert_eq!(marked[0].mark_price, Some(2.5));
+    // unrealized = tokens*2.5 - 10 (venue fee applies only to books).
+    let unreal = marked[0].unrealized_usd.expect("priced");
+    assert!(unreal > 0.0, "token price rose: {unreal}");
 }

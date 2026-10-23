@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use alert::{Alerter, CardCtx};
+use alert::{Alerter, Card, CardCtx};
 use auditor::{RugCheckClient, RugCheckError, RugCheckReport};
 use curve::{CurveError, CurveTicker, PriceTick, SolUsdFeed};
 use listener::{
@@ -35,6 +35,16 @@ use crate::live::{
 };
 use crate::live_mirror::{LiveExecution, SellCover, breaker_headline, live_base_mint};
 use crate::settings::{Settings, now_secs};
+
+/// One paper-book read: the card-side cash/equity plus the `/pnl`
+/// ledger panel, so every money surface answers the same snapshot
+/// instead of two locks apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaperBookView {
+    pub cash: f64,
+    pub equity: f64,
+    pub pnl: crate::status::PnlReport,
+}
 #[cfg(test)]
 pub(crate) use listener::BundleVerdict;
 
@@ -285,14 +295,14 @@ impl WalSink for LiveTrader {
     }
 }
 
-/// Alert sink.
+/// Alert sink: structured cards (text fallback + optional embed).
 pub trait AlertSink {
-    fn alert(&self, message: String);
+    fn alert(&self, card: Card);
 }
 
 impl AlertSink for Alerter {
-    fn alert(&self, message: String) {
-        self.send(message);
+    fn alert(&self, card: Card) {
+        self.send_card(card);
     }
 }
 
@@ -561,12 +571,84 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         }
     }
 
-    /// Paper cash plus equity.
-    pub async fn paper_cash_equity(&self) -> (f64, f64) {
+    /// One paper-book read for every money surface: the heartbeat
+    /// (cash/equity), `/pnl` (ledger panel) and the status file all
+    /// answer from this single snapshot, so no two answers can
+    /// disagree mid-lock.
+    pub async fn paper_book_snapshot(&self) -> PaperBookView {
         let marks = self.fresh_marks(now_secs()).await;
         let portfolio = self.portfolio.lock().await;
         let snap = portfolio.snapshot(&marks);
-        (snap.cash, snap.equity)
+        PaperBookView {
+            cash: snap.cash,
+            equity: snap.equity,
+            pnl: crate::status::PnlReport {
+                // Headline realized: edge minus dispatch bleed (the
+                // bleed is real money the round trips paid).
+                realized_pnl: portfolio.realized_net_pnl(),
+                unrealized_pnl: snap.unrealized_pnl,
+                mark_value: snap.mark_value,
+                realizable_value: snap.realizable_value,
+                overdraft_usd: snap.overdraft_usd,
+                closed_count: snap.closed_count,
+                win_rate: portfolio.win_rate(),
+            },
+        }
+    }
+
+    /// Open paper positions as `/positions` lines (mark basis). One
+    /// lock-brief read; unpriced positions carry `None`, never fiction.
+    pub async fn open_position_views(&self) -> Vec<crate::status::OpenPosition> {
+        let now = now_secs();
+        let marks = self.fresh_marks(now).await;
+        let portfolio = self.portfolio.lock().await;
+        portfolio
+            .position_ids()
+            .iter()
+            .filter_map(|id| portfolio.position(*id))
+            .map(|p| {
+                let mark = marks
+                    .get(&p.mint)
+                    .map(|m| m.price)
+                    .filter(|pr| pr.is_finite() && *pr > 0.0);
+                crate::status::OpenPosition {
+                    id: p.id,
+                    mint: p.mint.clone(),
+                    entry_price: p.entry_price,
+                    quantity: p.quantity,
+                    entry_notional: p.entry_notional,
+                    opened_at: p.opened_at,
+                    timeout_seconds: p.timeout_seconds,
+                    mark_price: mark,
+                    unrealized_usd: mark.map(|pr| p.quantity as f64 * pr - p.entry_notional),
+                }
+            })
+            .collect()
+    }
+
+    /// Watchlist for `/watchlist`: true total plus a capped sample
+    /// (the gate itself caps at 10k — the file must not flood).
+    pub async fn watchlist_view(&self) -> crate::status::WatchlistSnapshot {
+        let state = self.gate_state.lock().await;
+        let view: Vec<crate::status::WatchEntry> = state
+            .gate
+            .pending_view()
+            .into_iter()
+            .take(crate::status::WATCHLIST_MAX_PUBLISHED)
+            .map(|v| crate::status::WatchEntry {
+                mint: v.mint,
+                buyers: v.buyers,
+                created_secs: v.created_secs,
+                deadline_secs: v.deadline_secs,
+            })
+            .collect();
+        let total = state.gate.pending_count();
+        crate::status::WatchlistSnapshot {
+            total,
+            entries: view,
+            min_buyers: self.settings.gate_min_buyers,
+            window_secs: self.settings.gate_window_secs,
+        }
     }
 
     /// Paper ledger overdraft (AUD-010): dispatch costs debited past
@@ -686,10 +768,12 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
 }
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
-    /// Fire a card when enabled.
-    pub(crate) fn emit(&self, message: String) {
+    /// Fire a card when enabled. Plain text and structured cards both
+    /// flow through (`From<String>` wraps raw text; formatters return
+    /// cards directly).
+    pub(crate) fn emit(&self, message: impl Into<Card>) {
         if let Some(alerts) = &self.alerts {
-            alerts.alert(message);
+            alerts.alert(message.into());
         }
     }
 
