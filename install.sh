@@ -1,34 +1,41 @@
 #!/usr/bin/env bash
-#
-# pump-sentry installer (Linux & macOS). Just run it — it installs.
-#
-#   curl -fsSL https://raw.githubusercontent.com/sembraniteam/pump-sentry/main/install.sh | bash
-#
-# Pinned version:
-#   curl -fsSL .../install.sh | VERSION=vX.Y.Z bash
-#
-# Build from source instead of a release binary:
-#   curl -fsSL .../install.sh | bash -s -- --from-source
-#
-# Skip checksum verification (refused by default):
-#   curl -fsSL .../install.sh | bash -s -- --allow-unverified
-#
-# Knobs (env):
-#   VERSION      release tag (default: latest)
-#   INSTALL_DIR  binary destination (default: /usr/local/bin when writable,
-#                else $HOME/.local/bin)
 
 set -euo pipefail
+
+# Helpers first: every early exit below must have its reporter defined.
+log() { printf '%s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 APP="pump-sentry"
 REPO="sembraniteam/pump-sentry"
 [ -n "${HOME:-}" ] || die "HOME is unset"
 
-log() { printf '%s\n' "$*"; }
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-
 command -v curl >/dev/null 2>&1 || die "need 'curl'"
 command -v tar >/dev/null 2>&1 || die "need 'tar'"
+
+# Help text is embedded (never read from $0): under the documented
+# `curl | bash` usage $0 is "bash"/"sh", which awk cannot open.
+print_help() {
+    cat <<'USAGE'
+pump-sentry installer (Linux & macOS). Just run it — it installs.
+
+  curl -fsSL https://raw.githubusercontent.com/sembraniteam/pump-sentry/main/install.sh | bash
+
+Pinned version:
+  curl -fsSL .../install.sh | VERSION=vX.Y.Z bash
+
+Build from source instead of a release binary:
+  curl -fsSL .../install.sh | bash -s -- --from-source
+
+Skip checksum verification (refused by default):
+  curl -fsSL .../install.sh | bash -s -- --allow-unverified
+
+Knobs (env):
+  VERSION      release tag (default: latest)
+  INSTALL_DIR  binary destination (default: /usr/local/bin when writable,
+               else $HOME/.local/bin)
+USAGE
+}
 
 case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
     linux)  OS="linux" ;;
@@ -47,7 +54,7 @@ FROM_SOURCE=0
 for arg in "$@"; do
     case "$arg" in
         -h|--help)
-            awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"
+            print_help
             exit 0
             ;;
         --from-source) FROM_SOURCE=1 ;;
@@ -62,11 +69,19 @@ else
     # Split fetch vs parse: under `pipefail` a failed curl (or a valid
     # response with no releases) would otherwise exit silently with no
     # message — fail loudly instead.
-    API_RESP="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    API_RESP="$(curl -fsSL --retry 3 "https://api.github.com/repos/$REPO/releases/latest" \
         || die "could not fetch latest release info (network/API down? set VERSION=vX.Y.Z to pin one)")"
     TAG="$(printf '%s\n' "$API_RESP" | grep '"tag_name"' | sed 's/.*"tag_name": *"//;s/".*//' || true)"
     [ -n "$TAG" ] || die "no releases published yet (set VERSION=vX.Y.Z once one exists)"
 fi
+
+# The tag rides a URL segment and a git branch name: reject whitespace,
+# shell metacharacters, slashes, and a leading dash (which `git clone
+# --branch` would parse as an option).
+case "$TAG" in
+    ""|-*) die "invalid release tag '$TAG' (expected 'vX.Y.Z')" ;;
+    *[!A-Za-z0-9._-]*) die "invalid release tag '$TAG' (expected 'vX.Y.Z')" ;;
+esac
 
 if [ -n "${INSTALL_DIR:-}" ]; then
     DEST="$INSTALL_DIR"
@@ -75,6 +90,11 @@ elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
 else
     DEST="$HOME/.local/bin"
 fi
+# A relative INSTALL_DIR would silently install into the CWD.
+case "$DEST" in
+    /*) ;;
+    *) die "INSTALL_DIR must be an absolute path: $DEST" ;;
+esac
 
 TMP="$(mktemp -d)"
 # shellcheck disable=SC2064
@@ -122,24 +142,36 @@ else
             || die "no checksum file published; refusing unverified install (retry with --allow-unverified to override)"
         log "warning: no checksum file published; installing UNVERIFIED (--allow-unverified)"
     fi
-    # Tar-slip guard: validate member names before extracting (no
-    # absolute paths, no `..`, no symlinks — a malicious archive must
-    # not write outside $TMP).
+    # Tar-slip guard: validate members before extracting. A malicious
+    # archive must not write outside $TMP. Two checks: (a) member names
+    # stay relative and free of `..`; (b) every member is a plain file
+    # or directory — the first letter of the `-tzv` mode field rejects
+    # symlinks (l), hardlinks (h), and fifos/devices (b, c) alike, with
+    # `p`/`M`/`?` style oddities refused the same way.
     MEMBERS="$(tar -tzf "$TMP/$ASSET" 2>/dev/null)" || die "archive unreadable"
     if printf '%s\n' "$MEMBERS" | grep -E -e '^/' -e '\.\./' >/dev/null; then
         die "archive has unsafe members (absolute path or ..); refusing to install"
     fi
-    if tar -tzvf "$TMP/$ASSET" 2>/dev/null | grep -E '^l' >/dev/null; then
-        die "archive contains symlinks; refusing to install"
+    if tar -tzvf "$TMP/$ASSET" 2>/dev/null | cut -c1 | grep -qvE '^[d-]'; then
+        die "archive contains a non-plain member (symlink/hardlink/fifo/device); refusing to install"
     fi
     tar -xzf "$TMP/$ASSET" -C "$TMP" || die "extract failed"
     [ -f "$TMP/$APP" ] || die "archive has no $APP binary"
     BIN="$TMP/$APP"
 fi
 
+# A running daemon may have the installed binary open: replacing it in
+# place via `cp` truncates-and-rewrites that inode (ETXTBSY on Linux,
+# or a rewrite under a running process). Copy to a fresh then
+# atomically `mv` it — the old inode stays intact until the rename.
+if [ -x "$DEST/$APP" ] && "$DEST/$APP" status >/dev/null 2>&1; then
+    log "warning: a $APP daemon is running; the new build takes effect at its next restart"
+fi
 mkdir -p "$DEST" || die "cannot create $DEST"
-cp "$BIN" "$DEST/$APP" || die "copy to $DEST failed (permissions?)"
-chmod +x "$DEST/$APP" || die "chmod failed"
+STAGE="$DEST/.$APP.tmp.$$"
+cp "$BIN" "$STAGE" || die "copy to $DEST failed (permissions?)"
+chmod 755 "$STAGE" || { rm -f "$STAGE"; die "chmod failed"; }
+mv -f "$STAGE" "$DEST/$APP" || { rm -f "$STAGE"; die "replace at $DEST failed"; }
 log "installed $DEST/$APP"
 case ":$PATH:" in
     *":$DEST:"*) ;;
