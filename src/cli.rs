@@ -1119,10 +1119,6 @@ pub fn pending_sell_requests(log_file: &Path) -> Vec<(String, PathBuf)> {
 
 /// `sell <mint>`: queue a manual exit. Needs a running daemon.
 pub fn cmd_sell(mint: &str) {
-    if executor::parse_pubkey(mint).is_err() {
-        eprintln!("bad MINT '{mint}': not a base58 pubkey");
-        std::process::exit(1);
-    }
     let (pid_file, log_file) = resolve_paths();
     if running_daemon(&pid_file).is_none() {
         eprintln!(
@@ -1131,46 +1127,77 @@ pub fn cmd_sell(mint: &str) {
         );
         std::process::exit(1);
     }
-    let path = sell_request_path(&log_file, mint);
-    let body = format!("{{\"mint\":\"{mint}\",\"ts\":{}}}", unix_secs());
-    if let Err(e) = atomic_write_private(&path, body.as_bytes()) {
-        eprintln!("cannot queue sell request {}: {e}", path.display());
-        std::process::exit(1);
+    match queue_sell_request_at(&log_file, mint) {
+        Ok(path) => println!(
+            "manual sell queued for {mint} (daemon drains it on its next round; file {})",
+            path.display()
+        ),
+        Err(e) => {
+            eprintln!("cannot queue sell request: {e}");
+            std::process::exit(1);
+        }
     }
-    println!("manual sell queued for {mint} (daemon drains it on its next round)");
+}
+
+/// Queue a manual-exit request file (`sell-<mint>.json`, same bytes the
+/// daemon drains). Shared by CLI `sell` and the Discord sidecar's
+/// `/sell`: one writer, never two shapes. Validates the mint like the
+/// CLI (base58 pubkey) but does NOT check the daemon — the caller
+/// decides whether a stopped bot may hold a queued request (CLI
+/// refuses; the sidecar refuses via stale-status instead).
+pub fn queue_sell_request_at(log_file: &Path, mint: &str) -> Result<PathBuf, String> {
+    if executor::parse_pubkey(mint).is_err() {
+        return Err(format!("bad MINT '{mint}': not a base58 pubkey"));
+    }
+    let path = sell_request_path(log_file, mint);
+    let body = format!("{{\"mint\":\"{mint}\",\"ts\":{}}}", unix_secs());
+    atomic_write_private(&path, body.as_bytes())
+        .map_err(|e| format!("cannot queue sell request {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Kill switch on: write the marker. New entries halt within one gate
 /// round; open positions, exits, and `sell` are unaffected, and the
 /// marker survives restarts until `resume`.
 pub fn cmd_pause() -> ! {
-    let path = entries_paused_path();
+    match set_entries_paused_at(&entries_paused_path()) {
+        Ok(path) => {
+            println!(
+                "entries paused (marker {}): no new position opens; open positions keep managing (exits, `sell <mint>`). Resume with `pump-sentry resume`.",
+                path.display()
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("cannot write kill-switch marker: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Write the kill-switch marker (same bytes as CLI `pause`). Shared by
+/// CLI and the sidecar's `/pause`: one writer, never two shapes.
+pub fn set_entries_paused_at(path: &Path) -> Result<PathBuf, String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         let _ = std::fs::create_dir_all(parent);
     }
     let body = format!("paused by `pump-sentry pause` at unix_ts={}\n", unix_secs());
-    if let Err(e) = write_private_file(&path, body.as_bytes()) {
-        eprintln!("cannot write kill-switch marker {}: {e}", path.display());
-        std::process::exit(1);
-    }
-    println!(
-        "entries paused (marker {}): no new position opens; open positions keep managing (exits, `sell <mint>`). Resume with `pump-sentry resume`.",
-        path.display()
-    );
-    std::process::exit(0);
+    write_private_file(path, body.as_bytes())
+        .map_err(|e| format!("cannot write kill-switch marker {}: {e}", path.display()))?;
+    Ok(path.to_path_buf())
 }
 
 /// Kill switch off: remove the marker.
 pub fn cmd_resume() -> ! {
     let path = entries_paused_path();
-    match std::fs::remove_file(&path) {
-        Ok(()) => {
+    match clear_entries_paused_at(&path) {
+        Ok(true) => {
             println!("entries resumed (removed {})", path.display());
             std::process::exit(0);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Ok(false) => {
             println!(
                 "entries were not paused (no {}); nothing to resume",
                 path.display()
@@ -1181,6 +1208,20 @@ pub fn cmd_resume() -> ! {
             eprintln!("cannot remove kill-switch marker {}: {e}", path.display());
             std::process::exit(1);
         }
+    }
+}
+
+/// Remove the kill-switch marker. `Ok(true)` = was paused, now clear;
+/// `Ok(false)` = was not paused (no-op). Shared by CLI `resume` and
+/// the sidecar's `/resume`: one remover, never two shapes.
+pub fn clear_entries_paused_at(path: &Path) -> Result<bool, String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!(
+            "cannot remove kill-switch marker {}: {e}",
+            path.display()
+        )),
     }
 }
 
@@ -2212,6 +2253,53 @@ mod tests {
         let json = s.to_json();
         assert!(json.contains("\"paper_open\":[\"MINT\"]"), "{json}");
         assert!(json.contains("\"watchlist_pending\":3"), "{json}");
+    }
+
+    #[test]
+    fn queue_sell_request_at_writes_drainable_files() {
+        // Shared writer (CLI `sell` + sidecar `/sell`): one shape, and
+        // the daemon's drain predicate (`sell_request_body_mint`)
+        // accepts what it writes.
+        let dir = std::env::temp_dir().join(format!(
+            "cli-queue-sell-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let log = dir.join("bot.log");
+        let mint = ids::WSOL_MINT.to_string();
+        let path = queue_sell_request_at(&log, &mint).expect("queue");
+        assert_eq!(path, sell_request_path(&log, &mint));
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(sell_request_body_mint(&body), Some(mint));
+        // Invalid mints never touch the disk.
+        assert!(queue_sell_request_at(&log, "ABC").is_err());
+        assert!(queue_sell_request_at(&log, "").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_resume_markers_roundtrip() {
+        // Shared marker writer/remover (CLI + sidecar `/pause` /
+        // `/resume`): same bytes, same idempotence contract.
+        let dir = std::env::temp_dir().join(format!(
+            "cli-pause-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let marker = dir.join("entries-paused");
+        assert!(!marker_present(&marker));
+        set_entries_paused_at(&marker).expect("pause");
+        assert!(marker_present(&marker));
+        // Pause is idempotent (re-arm refreshes, never errors).
+        set_entries_paused_at(&marker).expect("pause again");
+        assert!(marker_present(&marker));
+        // Resume clears once, then no-ops honestly.
+        assert!(clear_entries_paused_at(&marker).expect("resume"));
+        assert!(!marker_present(&marker));
+        assert!(!clear_entries_paused_at(&marker).expect("resume again"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,35 +1,50 @@
-//! Discord sidecar (docs/discord-sidecar.md §2/§4, rollout step 2).
+//! Discord sidecar (docs/discord-sidecar.md §2/§4, rollout steps 2–4).
 //!
 //! `pump-sentry discord` runs next to the bot: it owns the gateway
-//! connection and answers read-only slash commands (`/status`,
-//! `/heartbeat`, `/positions`, `/pnl`, `/watchlist`, `/config`) from
-//! on-disk state — never from the trading loop.
+//! connection and answers slash commands from on-disk state — never
+//! from the trading loop. Tier 1 is read-only (`/status`,
+//! `/heartbeat`, `/positions`, `/pnl`, `/watchlist`, `/config`);
+//! Tier 2 control (`/sell`, `/pause`, `/resume`) writes only the
+//! existing control files (sell-request files, pause marker — the same
+//! bytes the CLI writes, via the shared `cli` writers).
 //!
 //! Guardrails baked in:
-//! - Reads only: `status.json` (the bot's 10-second trailing file,
-//!   `src/status`). Tier 1 has no write path at all in this step.
+//! - Tier 1 reads only: `status.json` (the bot's 10-second trailing
+//!   file, `src/status`).
+//! - Tier 2 writes only existing control shapes, allowlisted operators
+//!   only (`operator_ids`), Confirm/Cancel buttons for `/sell` and
+//!   `/resume` (unsafe direction), stale-book and stopped-daemon
+//!   refusals for `/sell`, every invocation audited to
+//!   `discord-audit.jsonl` + the tracing log.
 //! - No custody by construction: no private key, no signing, no
 //!   dispatch. One secret: the bot token (env/file,
 //!   `DISCORD_BOT_TOKEN[_FILE]`).
 //! - Guild-locked: interactions from any other server are denied.
-//! - Fail closed: no status file, parse failure, or stale data answers
-//!   "no readable on-disk status … nothing to report" — never
-//!   invented values.
-//! - Ack window: handlers do nothing but read one small file, then
-//!   respond (well inside Discord's 3 s).
+//! - Fail closed: no status file, parse failure, stale data, unknown
+//!   mint, expired/missing confirm, or audit failure answers "no action
+//!   taken" — never invented values or half-applied control.
+//! - Ack window: handlers do nothing but read one small file (Tier 1)
+//!   or write one small file (Tier 2), then respond (well inside
+//!   Discord's 3 s).
 
 use alert::discord::truncate_content;
 use alert::{Alerter, Card};
 use serenity::async_trait;
 use serenity::builder::{
-    CreateCommand, CreateEmbed, CreateEmbedFooter, CreateInteractionResponse,
-    CreateInteractionResponseMessage,
+    CreateActionRow, CreateButton, CreateCommand, CreateCommandOption, CreateEmbed,
+    CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseMessage,
 };
-use serenity::model::application::CommandInteraction;
 use serenity::model::application::Interaction;
+use serenity::model::application::{
+    ButtonStyle, CommandDataOptionValue, CommandInteraction, CommandOptionType,
+    ComponentInteraction,
+};
 use serenity::model::gateway::Ready;
 use serenity::model::id::GuildId;
 use serenity::prelude::*;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
 use crate::settings::{Settings, now_secs};
@@ -42,9 +57,25 @@ pub const POSITIONS_COMMAND: &str = "positions";
 pub const PNL_COMMAND: &str = "pnl";
 pub const WATCHLIST_COMMAND: &str = "watchlist";
 pub const CONFIG_COMMAND: &str = "config";
+/// Tier 2 control commands (allowlisted operators only, §6).
+pub const SELL_COMMAND: &str = "sell";
+pub const PAUSE_COMMAND: &str = "pause";
+pub const RESUME_COMMAND: &str = "resume";
+
 /// A status older than this (6 missed 10 s writes) reads as "bot may
 /// be down" instead of as fresh state.
 pub const STALE_WARN_SECS: u64 = 60;
+
+/// Confirm-button lifetime: no click within this window is a silent
+/// no-op (logged, audited as expired). Memory-only: a sidecar restart
+/// invalidates every outstanding button (fail closed — re-issue).
+pub const CONFIRM_TTL_SECS: u64 = 300;
+
+/// Tier 2 audit log beside the state files (doc §6/§8: a separate
+/// sidecar log, not `journal.jsonl` — the journal schema is the bot's
+/// trading record and Tier 2 must not reshape it). One JSON object per
+/// line: who/when/command/args/outcome. Never only in Discord.
+pub const AUDIT_FILE: &str = "discord-audit.jsonl";
 
 /// Sidecar boot config (`discord.toml` next to `config.toml`,
 /// `DISCORD_CONFIG_FILE` override). Kept out of the bot's
@@ -56,6 +87,17 @@ pub struct SidecarConfig {
     /// Discord guild whose members may ask the sidecar things.
     /// Guild-locked (doc §6): everything else is denied.
     pub guild_id: u64,
+    /// Discord user IDs allowed Tier 2 control (`/sell`, `/pause`,
+    /// `/resume`). Empty (default) = nobody: Tier 2 denies everyone
+    /// until the operator lists IDs (fail closed, never fail open).
+    #[serde(default)]
+    pub operator_ids: Vec<u64>,
+}
+
+/// Tier 2 gate: guild first (existing rule), then allowlist. Tier 1
+/// stays guild-only; only control checks this list.
+fn is_operator(operator_ids: &[u64], user_id: u64) -> bool {
+    operator_ids.contains(&user_id)
 }
 
 /// Sidecar config path: own env override or beside `config.toml`.
@@ -560,6 +602,193 @@ fn config_text() -> String {
     out
 }
 
+/// Tier 2 audit trail (doc §6): every control invocation — allowed
+/// or denied, executed or cancelled — lands here plus the tracing log,
+/// never only in Discord. Separate file from the bot journal by
+/// decision (doc §8): the journal schema is the trading record.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AuditEvent<'a> {
+    ts: u64,
+    user_id: u64,
+    user_name: &'a str,
+    guild_id: u64,
+    command: &'a str,
+    args: &'a str,
+    outcome: &'a str,
+}
+
+/// Audit log path: beside the state files, resolved like every other
+/// state path so both processes agree.
+fn audit_path() -> std::path::PathBuf {
+    let (_, log_file) = crate::cli::resolve_paths();
+    crate::cli::state_file_beside_log(&log_file, AUDIT_FILE)
+}
+
+/// Append one audit line (0600, best-effort). Returns whether the line
+/// landed: callers flag a missed audit loudly instead of pretending.
+/// No secrets ever enter the line (mints/guild/user IDs are chain or
+/// operator identifiers, never keys or tokens).
+fn audit_append(event: &AuditEvent<'_>) -> bool {
+    let mut line = match serde_json::to_vec(event) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = %e, "Tier 2 audit serialize failed");
+            return false;
+        }
+    };
+    line.push(b'\n');
+    let path = audit_path();
+    let ok = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(&line)
+        })
+        .is_ok();
+    if !ok {
+        error!(path = %path.display(), "Tier 2 audit append failed");
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).is_err() {
+            warn!(path = %path.display(), "Tier 2 audit chmod 0600 failed");
+        }
+    }
+    true
+}
+
+/// Convenience: build, log, and append one Tier 2 audit event. Always
+/// logs via tracing (infallible); the file append is best-effort with
+/// a loud warn, and the return tells the caller whether it landed.
+fn audit(
+    user_id: u64,
+    user_name: &str,
+    guild_id: u64,
+    command: &str,
+    args: &str,
+    outcome: &str,
+) -> bool {
+    info!(
+        user_id,
+        user_name, guild_id, command, args, outcome, "Tier 2 control"
+    );
+    audit_append(&AuditEvent {
+        ts: now_secs(),
+        user_id,
+        user_name,
+        guild_id,
+        command,
+        args,
+        outcome,
+    })
+}
+
+/// A control action awaiting its button click. Memory-only: a restart
+/// drops every pending confirm (unknown custom_id = re-issue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingAction {
+    /// Queue a sell-request file for this mint on Confirm.
+    Sell { mint: String },
+    /// Clear the pause marker on Confirm.
+    Resume,
+}
+
+#[derive(Debug, Clone)]
+struct PendingConfirm {
+    action: PendingAction,
+    /// Requester user ID (audited; any operator may click).
+    requester: u64,
+    /// Unix seconds at issue; clicks past TTL are expired no-ops.
+    created: u64,
+}
+
+/// Button custom_id wire shape: `ps2:<nonce>:<confirm|cancel>`.
+/// The nonce is the whole key (the action rides server-side, never in
+/// the button — a forged custom_id matches no pending entry).
+fn confirm_custom_id(nonce: &str, verb: &str) -> String {
+    format!("ps2:{nonce}:{verb}")
+}
+
+/// Parse a button custom_id back into (nonce, verb).
+fn parse_confirm_id(custom_id: &str) -> Option<(&str, &str)> {
+    let rest = custom_id.strip_prefix("ps2:")?;
+    let (nonce, verb) = rest.rsplit_once(':')?;
+    if nonce.is_empty() || (verb != "confirm" && verb != "cancel") {
+        return None;
+    }
+    Some((nonce, verb))
+}
+
+/// True when the pending confirm outlived its click window.
+fn confirm_expired(created: u64, now: u64) -> bool {
+    now.saturating_sub(created) >= CONFIRM_TTL_SECS
+}
+
+/// Where a mint lives in the status file, for the `/sell` confirm
+/// detail and the unknown-mint refusal (doc §6: unknown mint = no
+/// action, stated explicitly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MintRef {
+    /// Open paper position (index into `report.positions`).
+    Open(usize),
+    ManualBag,
+    Diverged,
+    PendingBuy,
+    Unknown,
+}
+
+/// Classify a mint against the trailing file. Open positions first
+/// (the confirm shows entry/mark detail); every other list is a
+/// watch-only disclosure, never a sell target detail.
+fn find_mint(report: &StatusReport, mint: &str) -> MintRef {
+    if let Some(i) = report.positions.iter().position(|p| p.mint == mint) {
+        return MintRef::Open(i);
+    }
+    if report.manual_mints.iter().any(|m| m == mint) {
+        return MintRef::ManualBag;
+    }
+    if report.diverged_mints.iter().any(|m| m == mint) {
+        return MintRef::Diverged;
+    }
+    if report.pending_buy_mints.iter().any(|m| m == mint) {
+        return MintRef::PendingBuy;
+    }
+    MintRef::Unknown
+}
+
+/// Mint argument of a `/sell` invocation (the single required string
+/// option). `None` when absent or mistyped (Discord enforces the
+/// shape; this is the fail-closed fallback).
+fn sell_mint_arg(cmd: &CommandInteraction) -> Option<String> {
+    cmd.data.options.iter().find_map(|o| match &o.value {
+        CommandDataOptionValue::String(s) => {
+            if o.name == "mint" {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+/// Confirm/cancel button row for a pending Tier 2 action. Ephemeral
+/// prompts carry their own row; the custom_ids key server-side state.
+fn confirm_row(nonce: &str) -> Vec<CreateActionRow> {
+    vec![CreateActionRow::Buttons(vec![
+        CreateButton::new(confirm_custom_id(nonce, "confirm"))
+            .label("Confirm")
+            .style(ButtonStyle::Danger),
+        CreateButton::new(confirm_custom_id(nonce, "cancel"))
+            .label("Cancel")
+            .style(ButtonStyle::Secondary),
+    ])]
+}
+
 /// The sidecar's answer to one interaction (payload plus whether the
 /// response must be ephemeral — explicit no-data / wrong-guild cases).
 struct Answer {
@@ -570,6 +799,501 @@ struct Answer {
 struct Sidecar {
     /// The one guild the sidecar answers in (guild-locked, doc §6).
     guild_id: GuildId,
+    /// Allowlisted Tier 2 operators (user IDs from `discord.toml`).
+    operators: Vec<u64>,
+    /// Outstanding confirm buttons (nonce → pending action).
+    pending: Arc<Mutex<HashMap<String, PendingConfirm>>>,
+    /// Nonce source for confirm buttons.
+    nonce: AtomicU64,
+}
+
+impl Sidecar {
+    /// Tier 2 gate: allowlisted operator? Deny text is ephemeral and
+    /// audited — a non-operator learns nothing except the refusal.
+    fn operator_check(
+        &self,
+        user_id: u64,
+        user_name: &str,
+        command: &str,
+        args: &str,
+    ) -> Option<Answer> {
+        if is_operator(&self.operators, user_id) {
+            return None;
+        }
+        audit(
+            user_id,
+            user_name,
+            self.guild_id.get(),
+            command,
+            args,
+            "denied_not_operator",
+        );
+        Some(Answer {
+            message: CreateInteractionResponseMessage::new()
+                .ephemeral(true)
+                .content(
+                    "Tier 2 control is allowlisted: your Discord user ID is not in `operator_ids` (`discord.toml`). No action taken.",
+                ),
+        })
+    }
+
+    /// Fresh trailing file or refusal: control acts on the book, so a
+    /// stale book is a hard stop (doc §6 fail closed). `/pause` skips
+    /// this (safe direction, marker semantics need no book). Boxed
+    /// error: the message payload is large (clippy `result_large_err`).
+    fn fresh_report(&self) -> Result<StatusReport, Box<Answer>> {
+        match status::read(&status::status_path()) {
+            Ok(report) if now_secs().saturating_sub(report.ts) <= STALE_WARN_SECS => Ok(report),
+            Ok(report) => Err(Box::new(Answer {
+                message: CreateInteractionResponseMessage::new()
+                    .ephemeral(true)
+                    .content(truncate_content(&format!(
+                        "⚠ Status is {}s old (limit {STALE_WARN_SECS}s) — the bot may be down. Control refuses a stale book: no action taken.",
+                        now_secs().saturating_sub(report.ts)
+                    ))),
+            })),
+            Err(re) => Err(Box::new(self.no_data(&re))),
+        }
+    }
+
+    /// Issue a confirm prompt: stores the pending action, returns the
+    /// ephemeral message with Confirm/Cancel buttons.
+    fn issue_confirm(&self, action: PendingAction, detail: String, user_id: u64) -> Answer {
+        let nonce = format!(
+            "{:x}{:x}",
+            now_secs(),
+            self.nonce.fetch_add(1, Ordering::Relaxed)
+        );
+        self.pending.lock().expect("pending lock").insert(
+            nonce.clone(),
+            PendingConfirm {
+                action,
+                requester: user_id,
+                created: now_secs(),
+            },
+        );
+        let _ = user_id;
+        Answer {
+            message: CreateInteractionResponseMessage::new()
+                .ephemeral(true)
+                .content(truncate_content(&format!(
+                    "{detail}\nConfirm within {}m — no confirm = no-op.",
+                    CONFIRM_TTL_SECS / 60
+                )))
+                .components(confirm_row(&nonce)),
+        }
+    }
+
+    /// `/sell <mint>`: validate, show position detail, arm Confirm.
+    /// Nothing is written here — the file lands only on the button.
+    fn render_sell(&self, cmd: &CommandInteraction) -> Answer {
+        let user_id = cmd.user.id.get();
+        let user_name = cmd.user.name.clone();
+        let Some(mint) = sell_mint_arg(cmd) else {
+            audit(
+                user_id,
+                &user_name,
+                self.guild_id.get(),
+                SELL_COMMAND,
+                "",
+                "denied_no_mint",
+            );
+            return Answer {
+                message: CreateInteractionResponseMessage::new()
+                    .ephemeral(true)
+                    .content("`/sell` needs a mint: `/sell mint:<address>`. No action taken."),
+            };
+        };
+        if let Some(deny) = self.operator_check(user_id, &user_name, SELL_COMMAND, &mint) {
+            return deny;
+        }
+        if executor::parse_pubkey(&mint).is_err() {
+            audit(
+                user_id,
+                &user_name,
+                self.guild_id.get(),
+                SELL_COMMAND,
+                &mint,
+                "denied_bad_mint",
+            );
+            return Answer {
+                message: CreateInteractionResponseMessage::new()
+                    .ephemeral(true)
+                    .content(format!("`{mint}` is not a base58 pubkey. No action taken.")),
+            };
+        }
+        let report = match self.fresh_report() {
+            Ok(r) => r,
+            Err(answer) => {
+                audit(
+                    user_id,
+                    &user_name,
+                    self.guild_id.get(),
+                    SELL_COMMAND,
+                    &mint,
+                    "denied_stale_status",
+                );
+                return *answer;
+            }
+        };
+        let (pid_file, _) = crate::cli::resolve_paths();
+        if crate::cli::running_daemon(&pid_file).is_none() {
+            audit(
+                user_id,
+                &user_name,
+                self.guild_id.get(),
+                SELL_COMMAND,
+                &mint,
+                "denied_no_daemon",
+            );
+            return Answer {
+                message: CreateInteractionResponseMessage::new()
+                    .ephemeral(true)
+                    .content("No daemon running — a sell request would sit unread. Start the bot first. No action taken."),
+            };
+        }
+        let detail = match find_mint(&report, &mint) {
+            MintRef::Open(i) => {
+                let p = &report.positions[i];
+                let held = now_secs().saturating_sub(p.opened_at);
+                let mark_part = match (p.mark_price, p.unrealized_usd) {
+                    (Some(mark), Some(unreal)) => {
+                        format!("mark {mark} ({})", signed_usd(unreal))
+                    }
+                    _ => "no fresh mark — held at basis".to_string(),
+                };
+                format!(
+                    "Sell confirm — #{id} {mint} — {qty} tok @ {entry} = {basis} · {mark_part} · held {held}",
+                    id = p.id,
+                    mint = short_mint(&p.mint),
+                    qty = tok_count(p.quantity),
+                    entry = p.entry_price,
+                    basis = usd(p.entry_notional),
+                    held = dur(held),
+                )
+            }
+            MintRef::ManualBag => format!(
+                "Sell confirm — {} is an unpaired live bag (on-chain, outside the paper book). Queuing the request file; the daemon drains what it holds.",
+                short_mint(&mint)
+            ),
+            MintRef::Diverged => format!(
+                "Sell confirm — {} is diverged (reconciling remote). Queuing the request file; the daemon drains what it holds.",
+                short_mint(&mint)
+            ),
+            MintRef::PendingBuy => format!(
+                "Sell confirm — {} has an unsettled buy awaiting confirmation. Queuing the request file; the daemon drains what it holds.",
+                short_mint(&mint)
+            ),
+            MintRef::Unknown => {
+                audit(
+                    user_id,
+                    &user_name,
+                    self.guild_id.get(),
+                    SELL_COMMAND,
+                    &mint,
+                    "denied_unknown_mint",
+                );
+                return Answer {
+                    message: CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
+                        .content(format!(
+                            "`{}` is in no book list (open, bags, diverged, pending). Unknown mint: no action taken.",
+                            short_mint(&mint)
+                        )),
+                };
+            }
+        };
+        audit(
+            user_id,
+            &user_name,
+            self.guild_id.get(),
+            SELL_COMMAND,
+            &mint,
+            "confirm_armed",
+        );
+        self.issue_confirm(PendingAction::Sell { mint }, detail, user_id)
+    }
+
+    /// `/pause`: safe direction — no confirm. Writes the same marker
+    /// bytes as CLI `pause`; idempotent (already paused = honest note).
+    fn render_pause(&self, cmd: &CommandInteraction) -> Answer {
+        let user_id = cmd.user.id.get();
+        let user_name = cmd.user.name.clone();
+        if let Some(deny) = self.operator_check(user_id, &user_name, PAUSE_COMMAND, "") {
+            return deny;
+        }
+        let path = crate::cli::entries_paused_path();
+        let already = crate::cli::marker_present(&path);
+        match crate::cli::set_entries_paused_at(&path) {
+            Ok(_) => {
+                let outcome = if already {
+                    "executed_already_paused"
+                } else {
+                    "executed"
+                };
+                let landed = audit(
+                    user_id,
+                    &user_name,
+                    self.guild_id.get(),
+                    PAUSE_COMMAND,
+                    "",
+                    outcome,
+                );
+                let mut text = if already {
+                    "Entries paused (was already paused — marker timestamp refreshed). Open positions keep managing."
+                } else {
+                    "Entries paused: no new position opens; open positions keep managing (exits, `sell <mint>`). Resume with `/resume`."
+                }
+                .to_string();
+                if !landed {
+                    text.push_str(
+                        "\n⚠ Audit append failed — check the sidecar log; the pause itself landed.",
+                    );
+                }
+                Answer {
+                    message: CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
+                        .content(text),
+                }
+            }
+            Err(e) => {
+                audit(
+                    user_id,
+                    &user_name,
+                    self.guild_id.get(),
+                    PAUSE_COMMAND,
+                    "",
+                    "error_marker_write",
+                );
+                Answer {
+                    message: CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
+                        .content(format!(
+                            "Pause marker write failed ({e}). Entries NOT paused."
+                        )),
+                }
+            }
+        }
+    }
+
+    /// `/resume`: unsafe direction — arms Confirm when paused; honest
+    /// no-op when already clear.
+    fn render_resume(&self, cmd: &CommandInteraction) -> Answer {
+        let user_id = cmd.user.id.get();
+        let user_name = cmd.user.name.clone();
+        if let Some(deny) = self.operator_check(user_id, &user_name, RESUME_COMMAND, "") {
+            return deny;
+        }
+        if !crate::cli::marker_present(&crate::cli::entries_paused_path()) {
+            audit(
+                user_id,
+                &user_name,
+                self.guild_id.get(),
+                RESUME_COMMAND,
+                "",
+                "noop_not_paused",
+            );
+            return Answer {
+                message: CreateInteractionResponseMessage::new()
+                    .ephemeral(true)
+                    .content("Entries were not paused; nothing to resume."),
+            };
+        }
+        audit(
+            user_id,
+            &user_name,
+            self.guild_id.get(),
+            RESUME_COMMAND,
+            "",
+            "confirm_armed",
+        );
+        self.issue_confirm(
+            PendingAction::Resume,
+            "Resume confirm — clearing the pause marker re-enables new entries.".to_string(),
+            user_id,
+        )
+    }
+
+    /// Button click: resolve the pending action (expiry sweep first),
+    /// enforce operator-ness of the clicker, execute or cancel.
+    /// Answers by editing the prompt message in place.
+    async fn render_component(&self, ctx: &Context, comp: &ComponentInteraction) {
+        let user_id = comp.user.id.get();
+        let user_name = comp.user.name.clone();
+        let guild_id = comp.guild_id.map(|g| g.get()).unwrap_or(0);
+        // Expired entries die here (lazy sweep: every click reaps).
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .retain(|_, p| !confirm_expired(p.created, now_secs()));
+        let outcome_text = match parse_confirm_id(&comp.data.custom_id) {
+            None => {
+                audit(
+                    user_id,
+                    &user_name,
+                    guild_id,
+                    "button",
+                    &comp.data.custom_id,
+                    "denied_unknown_button",
+                );
+                "Unknown button (restarted sidecar, or forged custom_id). Re-issue the command. No action taken.".to_string()
+            }
+            Some((nonce, verb)) => {
+                let pending = self.pending.lock().expect("pending lock").remove(nonce);
+                match (pending, verb) {
+                    (None, _) => {
+                        audit(
+                            user_id,
+                            &user_name,
+                            guild_id,
+                            "button",
+                            &comp.data.custom_id,
+                            "expired",
+                        );
+                        "Confirm expired (or already handled) — re-issue the command. No action taken.".to_string()
+                    }
+                    (Some(p), "cancel") => {
+                        let cmd = match &p.action {
+                            PendingAction::Sell { .. } => SELL_COMMAND,
+                            PendingAction::Resume => RESUME_COMMAND,
+                        };
+                        audit(user_id, &user_name, guild_id, cmd, "", "cancelled");
+                        "Cancelled. No action taken.".to_string()
+                    }
+                    (Some(p), _) => {
+                        if !is_operator(&self.operators, user_id) {
+                            let cmd = match &p.action {
+                                PendingAction::Sell { .. } => SELL_COMMAND,
+                                PendingAction::Resume => RESUME_COMMAND,
+                            };
+                            audit(
+                                user_id,
+                                &user_name,
+                                guild_id,
+                                cmd,
+                                "",
+                                "denied_not_operator",
+                            );
+                            // Put it back: a non-operator's click must
+                            // not burn the requester's pending confirm.
+                            self.pending
+                                .lock()
+                                .expect("pending lock")
+                                .insert(nonce.to_string(), p);
+                            "Tier 2 control is allowlisted: your Discord user ID is not in `operator_ids`. No action taken.".to_string()
+                        } else {
+                            let requester = p.requester;
+                            self.execute_confirmed(
+                                user_id, &user_name, guild_id, requester, p.action,
+                            )
+                            .await
+                        }
+                    }
+                }
+            }
+        };
+        let response = CreateInteractionResponse::UpdateMessage(
+            CreateInteractionResponseMessage::new()
+                .content(truncate_content(&outcome_text))
+                .components(vec![]),
+        );
+        if let Err(e) = comp.create_response(&ctx.http, response).await {
+            warn!(error = %e, "Discord component response failed");
+        }
+    }
+
+    /// Runs the confirmed action (files only — the sidecar never signs
+    /// or dispatches) and returns the outcome text for the prompt edit.
+    async fn execute_confirmed(
+        &self,
+        user_id: u64,
+        user_name: &str,
+        guild_id: u64,
+        requester: u64,
+        action: PendingAction,
+    ) -> String {
+        match action {
+            PendingAction::Sell { mint } => {
+                let (_, log_file) = crate::cli::resolve_paths();
+                match crate::cli::queue_sell_request_at(&log_file, &mint) {
+                    Ok(path) => {
+                        let args = format!("{mint} (requested by {requester})");
+                        let landed = audit(
+                            user_id,
+                            user_name,
+                            guild_id,
+                            SELL_COMMAND,
+                            &args,
+                            "executed",
+                        );
+                        let mut text = format!(
+                            "Sell queued for {} (daemon drains it on its next round; file {}).",
+                            short_mint(&mint),
+                            path.display()
+                        );
+                        if !landed {
+                            text.push_str(" ⚠ Audit append failed — check the sidecar log; the request itself landed.");
+                        }
+                        text
+                    }
+                    Err(e) => {
+                        audit(
+                            user_id,
+                            user_name,
+                            guild_id,
+                            SELL_COMMAND,
+                            &mint,
+                            "error_queue_write",
+                        );
+                        format!("Sell-request write failed ({e}). No action taken.")
+                    }
+                }
+            }
+            PendingAction::Resume => {
+                match crate::cli::clear_entries_paused_at(&crate::cli::entries_paused_path()) {
+                    Ok(true) => {
+                        let args = format!("requested by {requester}");
+                        let landed = audit(
+                            user_id,
+                            user_name,
+                            guild_id,
+                            RESUME_COMMAND,
+                            &args,
+                            "executed",
+                        );
+                        let mut text = String::from("Entries resumed: new entries may open again.");
+                        if !landed {
+                            text.push_str(" ⚠ Audit append failed — check the sidecar log; the marker itself cleared.");
+                        }
+                        text
+                    }
+                    Ok(false) => {
+                        audit(
+                            user_id,
+                            user_name,
+                            guild_id,
+                            RESUME_COMMAND,
+                            "",
+                            "noop_already_clear",
+                        );
+                        "Marker was already clear (a concurrent resume won). Nothing to resume."
+                            .to_string()
+                    }
+                    Err(e) => {
+                        audit(
+                            user_id,
+                            user_name,
+                            guild_id,
+                            RESUME_COMMAND,
+                            "",
+                            "error_marker_clear",
+                        );
+                        format!("Pause-marker clear failed ({e}). Entries still paused.")
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Sidecar {
@@ -717,6 +1441,20 @@ impl EventHandler for Sidecar {
                 .description("Buyer-quorum watchlist: mints, buyers, deadlines"),
             CreateCommand::new(CONFIG_COMMAND)
                 .description("Effective trading config from config.toml (endpoints redacted)"),
+            CreateCommand::new(SELL_COMMAND)
+                .description("Queue a manual full exit for one mint (operators only, confirms)")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "mint",
+                        "Mint address to exit fully",
+                    )
+                    .required(true),
+                ),
+            CreateCommand::new(PAUSE_COMMAND)
+                .description("Kill switch: halt new entries (operators only, no confirm)"),
+            CreateCommand::new(RESUME_COMMAND)
+                .description("Clear the kill switch (operators only, confirms)"),
         ];
         match self.guild_id.set_commands(&ctx.http, commands).await {
             Ok(registered) => {
@@ -738,41 +1476,55 @@ impl EventHandler for Sidecar {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Interaction::Command(cmd) = interaction else {
-            return;
-        };
-        // Guild gate first: nothing answers before the server
-        // check (fail closed).
-        if let Some(deny) = self.guild_check(&cmd) {
-            let response = CreateInteractionResponse::Message(deny.message);
-            if let Err(e) = cmd.create_response(&ctx.http, response).await {
-                warn!(
-                    command = %cmd.data.name,
-                    error = %e,
-                    "Discord interaction response failed"
-                );
+        match interaction {
+            Interaction::Command(cmd) => {
+                // Guild gate first for Tier 2 as well: nothing control
+                // runs before the server check (fail closed).
+                if let Some(deny) = self.guild_check(&cmd) {
+                    let response = CreateInteractionResponse::Message(deny.message);
+                    if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                        warn!(
+                            command = %cmd.data.name,
+                            error = %e,
+                            "Discord interaction response failed"
+                        );
+                    }
+                    return;
+                }
+                let dispatched = match cmd.data.name.as_str() {
+                    STATUS_COMMAND => self.render_status(now_secs()),
+                    HEARTBEAT_COMMAND => self.render_heartbeat(now_secs()),
+                    POSITIONS_COMMAND => self.render_positions(now_secs()),
+                    PNL_COMMAND => self.render_pnl(now_secs()),
+                    WATCHLIST_COMMAND => self.render_watchlist(now_secs()),
+                    CONFIG_COMMAND => self.render_config(),
+                    SELL_COMMAND => self.render_sell(&cmd),
+                    PAUSE_COMMAND => self.render_pause(&cmd),
+                    RESUME_COMMAND => self.render_resume(&cmd),
+                    other => {
+                        warn!(command = other, "ignoring unknown command for this sidecar");
+                        return;
+                    }
+                };
+                let response = CreateInteractionResponse::Message(dispatched.message);
+                if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                    warn!(
+                        command = %cmd.data.name,
+                        error = %e,
+                        "Discord interaction response failed"
+                    );
+                }
             }
-            return;
-        }
-        let dispatched = match cmd.data.name.as_str() {
-            STATUS_COMMAND => self.render_status(now_secs()),
-            HEARTBEAT_COMMAND => self.render_heartbeat(now_secs()),
-            POSITIONS_COMMAND => self.render_positions(now_secs()),
-            PNL_COMMAND => self.render_pnl(now_secs()),
-            WATCHLIST_COMMAND => self.render_watchlist(now_secs()),
-            CONFIG_COMMAND => self.render_config(),
-            other => {
-                warn!(command = other, "ignoring unknown command for this sidecar");
-                return;
+            Interaction::Component(comp) => {
+                // Buttons are Tier 2 only: guild gate, then the pending
+                // lookup enforces its own operator check (a non-operator
+                // click never burns the requester's confirm).
+                if comp.guild_id.is_none_or(|g| g != self.guild_id) {
+                    return;
+                }
+                self.render_component(&ctx, &comp).await;
             }
-        };
-        let response = CreateInteractionResponse::Message(dispatched.message);
-        if let Err(e) = cmd.create_response(&ctx.http, response).await {
-            warn!(
-                command = %cmd.data.name,
-                error = %e,
-                "Discord interaction response failed"
-            );
+            _ => {}
         }
     }
 }
@@ -783,11 +1535,17 @@ impl EventHandler for Sidecar {
 pub fn run(token: String) -> Result<(), String> {
     let (config_path, cfg) = load_config()?;
     let guild_id = GuildId::new(cfg.guild_id);
-    let sidecar = Sidecar { guild_id };
+    let sidecar = Sidecar {
+        guild_id,
+        operators: cfg.operator_ids.clone(),
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        nonce: AtomicU64::new(0),
+    };
     info!(
         guild = cfg.guild_id,
+        operators = cfg.operator_ids.len(),
         config = %config_path.display(),
-        "Discord sidecar starting (read-only Tier 1)"
+        "Discord sidecar starting (Tier 1 read-only + Tier 2 allowlisted control)"
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -796,8 +1554,8 @@ pub fn run(token: String) -> Result<(), String> {
         .build()
         .map_err(|e| format!("sidecar runtime: {e}"))?;
     rt.block_on(async move {
-        // No message content, no presence: read-only slash command
-        // handling needs no privileged intents at all.
+        // No message content, no presence: slash commands plus confirm
+        // buttons need no privileged intents at all.
         let mut client = Client::builder(token, GatewayIntents::empty())
             .event_handler(sidecar)
             .await
@@ -869,11 +1627,27 @@ mod tests {
     fn config_deny_unknown_fields_toml_parse() {
         assert_eq!(
             parse_config("guild_id = 123").expect("ok"),
-            SidecarConfig { guild_id: 123 }
+            SidecarConfig {
+                guild_id: 123,
+                operator_ids: Vec::new(),
+            }
         );
         // Typo trap: unknown keys refuse, never silently ignore.
         assert!(parse_config("guild_id = 123\nguildi_d = 456").is_err());
         assert!(parse_config("").is_err());
+    }
+
+    #[test]
+    fn config_parses_operator_allowlist() {
+        let cfg = parse_config("guild_id = 123\noperator_ids = [111, 222]").expect("ok");
+        assert_eq!(cfg.operator_ids, vec![111, 222]);
+        assert!(is_operator(&cfg.operator_ids, 111));
+        assert!(is_operator(&cfg.operator_ids, 222));
+        assert!(!is_operator(&cfg.operator_ids, 333));
+        // Empty (default) = nobody: fail closed, never fail open.
+        let bare = parse_config("guild_id = 123").expect("ok");
+        assert!(bare.operator_ids.is_empty());
+        assert!(!is_operator(&bare.operator_ids, 111));
     }
 
     #[test]
@@ -1259,8 +2033,93 @@ mod tests {
             cfg,
             SidecarConfig {
                 guild_id: 987_654_321,
+                operator_ids: Vec::new(),
             }
         );
         drop(guard);
+    }
+
+    #[test]
+    fn confirm_buttons_roundtrip_and_expire() {
+        assert_eq!(
+            parse_confirm_id(&confirm_custom_id("abc123", "confirm")),
+            Some(("abc123", "confirm"))
+        );
+        assert_eq!(
+            parse_confirm_id(&confirm_custom_id("abc123", "cancel")),
+            Some(("abc123", "cancel"))
+        );
+        // Forged/foreign shapes never match: restart-invalidated or
+        // mistyped buttons re-issue instead of executing.
+        assert_eq!(parse_confirm_id("confirm"), None);
+        assert_eq!(parse_confirm_id("ps2::confirm"), None);
+        assert_eq!(parse_confirm_id("ps2:abc:launch"), None);
+        assert_eq!(parse_confirm_id("other:abc:confirm"), None);
+        // TTL boundary: clicks inside the window run, at/past it die.
+        assert!(!confirm_expired(1_000, 1_000 + CONFIRM_TTL_SECS - 1));
+        assert!(confirm_expired(1_000, 1_000 + CONFIRM_TTL_SECS));
+        assert!(confirm_expired(1_000, 1_000 + CONFIRM_TTL_SECS + 60));
+        // Clock skew (created in the future) never reads as expired.
+        assert!(!confirm_expired(2_000, 1_000));
+    }
+
+    #[test]
+    fn find_mint_classifies_every_list() {
+        let now = 1_000_000;
+        let mut report = fixture_report(now);
+        report.positions = vec![status::OpenPosition {
+            id: 7,
+            mint: "OPENMINT11111111111111111111111111111111111".to_string(),
+            entry_price: 0.001,
+            quantity: 100,
+            entry_notional: 10.0,
+            opened_at: now,
+            timeout_seconds: 0,
+            mark_price: None,
+            unrealized_usd: None,
+        }];
+        report.manual_mints = vec!["BAGMINT2222222222222222222222222222222222222".to_string()];
+        report.diverged_mints = vec!["DIVERGE333333333333333333333333333333333333".to_string()];
+        report.pending_buy_mints = vec!["PENDING4444444444444444444444444444444444444".to_string()];
+        assert_eq!(
+            find_mint(&report, "OPENMINT11111111111111111111111111111111111"),
+            MintRef::Open(0)
+        );
+        assert_eq!(
+            find_mint(&report, "BAGMINT2222222222222222222222222222222222222"),
+            MintRef::ManualBag
+        );
+        assert_eq!(
+            find_mint(&report, "DIVERGE333333333333333333333333333333333333"),
+            MintRef::Diverged
+        );
+        assert_eq!(
+            find_mint(&report, "PENDING4444444444444444444444444444444444444"),
+            MintRef::PendingBuy
+        );
+        assert_eq!(
+            find_mint(&report, "NOBODY5555555555555555555555555555555555555"),
+            MintRef::Unknown
+        );
+    }
+
+    #[test]
+    fn audit_line_carries_attribution_never_secrets() {
+        let event = AuditEvent {
+            ts: 1_700_000_000,
+            user_id: 111,
+            user_name: "op",
+            guild_id: 999,
+            command: "sell",
+            args: "MINT (requested by 111)",
+            outcome: "executed",
+        };
+        let value = serde_json::to_value(&event).expect("audit serializes");
+        assert_eq!(value["user_id"], 111);
+        assert_eq!(value["command"], "sell");
+        assert_eq!(value["outcome"], "executed");
+        let raw = serde_json::to_string(&event).expect("line");
+        assert!(!raw.contains("token"), "{raw}");
+        assert!(!raw.contains("key"), "{raw}");
     }
 }

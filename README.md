@@ -40,6 +40,7 @@ Pipeline: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum →
 | `pump-sentry init-config`  | write the default `config.toml` (`CONFIG_FILE` overrides path) |
 | `pump-sentry replay [file]` | re-derive recorded decisions offline from `journal.jsonl`; exit 1 on any mismatch/unverifiable step |
 | `pump-sentry research [file]` | offline loss-pattern analysis over the journal: loss clusters plus ranked filter proposals with avoided-vs-foregone math and halves; read-only by construction |
+| `pump-sentry discord` | run the Discord sidecar (separate process): Tier 1 read-only slash commands (`/status`, `/heartbeat`, `/positions`, `/pnl`, `/watchlist`, `/config`) plus Tier 2 allowlisted control (`/sell`, `/pause` direct, `/resume` with button confirm); writes only the existing control files, never trades itself; needs `DISCORD_BOT_TOKEN` and a `discord.toml` (`guild_id` + `operator_ids`), takes no lock |
 
 State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, `bot.lock`, sell requests, WAL, day-state, kill-switch marker, snapshots); `LOG_FILE`/`PID_FILE` override it, and the exclusive `bot.lock` (flock) refuses a second process on the same state dir before it reads config or custody. Long runs need `ops/logrotate/pump-sentry`.
 
