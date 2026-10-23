@@ -5897,6 +5897,8 @@ async fn sidecar_views_answer_one_snapshot_shape() {
     assert_eq!(wl.entries.len(), 2);
     assert_eq!(wl.min_buyers, 5);
     assert_eq!(wl.window_secs, 10);
+    // No audit ran in this harness: scores ride None, never fiction.
+    assert!(wl.entries.iter().all(|e| e.audit_score.is_none()));
     // Position views: open a paper position without ticks — unmarked,
     // honest None; with a fresh tick — mark present.
     pipe.portfolio
@@ -5932,4 +5934,13 @@ async fn sidecar_views_answer_one_snapshot_shape() {
     // unrealized = tokens*2.5 - 10 (venue fee applies only to books).
     let unreal = marked[0].unrealized_usd.expect("priced");
     assert!(unreal > 0.0, "token price rose: {unreal}");
+    // Gate inputs ride the same views the collector publishes: paper
+    // basis is the floored fill (not the nominal ticket), live extras
+    // are zero (no live trader in this harness).
+    let (live_extra, live_bags, paper_locked) = pipe.gate_limit_inputs().await;
+    assert_eq!((live_extra, live_bags), (0, 0));
+    assert!(
+        (paper_locked - unmarked[0].entry_notional).abs() < 1e-9,
+        "{paper_locked}"
+    );
 }

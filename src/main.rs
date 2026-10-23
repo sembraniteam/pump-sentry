@@ -743,10 +743,16 @@ async fn collect_status(
     // drift paths). Bounded disclosure: a flooded book stays finite
     // in the file; the true count ships with the sample.
     let book = pipeline.paper_book_snapshot().await;
-    let (breaker_halted, day_net) = {
+    let (breaker_halted, day_net, day_damaged) = {
         let mut daily = pipeline.daily.lock().await;
         let halted = daily.tripped(pipeline.settings.max_daily_loss_usd, settings::now_secs());
-        (halted, daily.day_net())
+        // A poisoned tally is `-inf` (not JSON-finite): publish the
+        // damage flag with a finite placeholder instead. Renderers
+        // must print UNKNOWN, never the placeholder as a number.
+        let raw = daily.day_net();
+        let damaged = daily.persistence_halted(settings::now_secs());
+        let net = if raw.is_finite() { raw } else { 0.0 };
+        (halted, net, damaged)
     };
     let rpc_snap = pool.snapshot();
     let oldest_open_age = pipeline.oldest_open_age_secs(settings::now_secs()).await;
@@ -756,6 +762,7 @@ async fn collect_status(
         .await as u64;
     let mut positions = pipeline.open_position_views().await;
     let positions_total = positions.len();
+    let (live_extra, live_bags, paper_locked) = pipeline.gate_limit_inputs().await;
     positions.truncate(status::POSITIONS_MAX_PUBLISHED);
     let watchlist = pipeline.watchlist_view().await;
     status::StatusReport {
@@ -793,6 +800,10 @@ async fn collect_status(
         diverged_mints: diverged,
         pending_buy_mints: pending_buys,
         watchlist,
+        heat_live_extra: live_extra,
+        exposure_live_bags: live_bags,
+        exposure_paper_locked: paper_locked,
+        day_tally_damaged: day_damaged,
     }
 }
 

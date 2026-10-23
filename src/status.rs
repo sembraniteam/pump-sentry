@@ -51,6 +51,27 @@ pub struct StatusReport {
     /// [`WATCHLIST_MAX_PUBLISHED`], the true total, and the gate's
     /// thresholds so progress reads against a target.
     pub watchlist: WatchlistSnapshot,
+    /// Gate heat inputs, exactly as the entry gate compares them
+    /// (`gate.rs`): paper opens plus live-held extras refuse at
+    /// `>= max_open_positions`; prospective exposure (deployed + one
+    /// more ticket) refuses past `max_exposure_usd`.
+    /// Live-extra mints held outside paper (`held_base_mints`
+    /// minus paper mints).
+    #[serde(default)]
+    pub heat_live_extra: usize,
+    /// Unpaired live bags for the exposure dollar cap
+    /// (`live_unpaired_bag_count`: each its own ticket).
+    #[serde(default)]
+    pub exposure_live_bags: usize,
+    /// Paper cost basis actually invested (floored size at fill).
+    #[serde(default)]
+    pub exposure_paper_locked: f64,
+    /// The day-loss tally is damaged (corrupt file poison or a failed
+    /// persist latch): the breaker is fail-closed HALTED and `day_net`
+    /// below is a finite placeholder, never the true tally. Renderers
+    /// must say UNKNOWN, never print the placeholder as a number.
+    #[serde(default)]
+    pub day_tally_damaged: bool,
 }
 
 /// Bounded disclosure of a possibly huge list: the file stays finite
@@ -92,6 +113,10 @@ pub struct WatchEntry {
     pub created_secs: u64,
     /// Quorum deadline.
     pub deadline_secs: u64,
+    /// RugCheck score at last audit (`None` = unaudited so far).
+    /// `/token` reports it; absence is stated, never invented.
+    #[serde(default)]
+    pub audit_score: Option<u32>,
 }
 
 /// `/watchlist` payload: capped entries plus the true total, with the
@@ -144,11 +169,50 @@ pub fn read(path: &Path) -> std::io::Result<StatusReport> {
 }
 
 /// Serialize and atomically replace the status file (0600, tmp+rename —
-/// the sidecar never observes a torn file). Infallible fields: the
-/// report carries only plain numbers/strings.
+/// the sidecar never observes a torn file). Refuses non-finite floats
+/// with an error instead of writing JSON `null`s the sidecar cannot
+/// parse back into `f64` (a poisoned `-inf` day tally must fail the
+/// write loudly; the collector publishes the damage flag alongside a
+/// finite placeholder, and the last complete file stays readable).
 pub fn write(path: &Path, report: &StatusReport) -> std::io::Result<()> {
+    if has_non_finite(report) {
+        return Err(std::io::Error::other(
+            "status report carries a non-finite float; refusing to write JSON nulls",
+        ));
+    }
     let json = serde_json::to_vec(report).map_err(std::io::Error::other)?;
     crate::cli::atomic_write_private(path, &json)
+}
+
+/// True when any published float would serialize as JSON `null`
+/// (`NaN`/`±inf`), which `f64` fields cannot read back. New float
+/// fields must be added here — the compiler will not catch a miss,
+/// the roundtrip test below guards the current set.
+fn has_non_finite(report: &StatusReport) -> bool {
+    let r = &report.report;
+    let floats = [
+        r.day_net,
+        r.cash_usd,
+        r.equity_usd,
+        report.pnl.realized_pnl,
+        report.pnl.unrealized_pnl,
+        report.pnl.mark_value,
+        report.pnl.realizable_value,
+        report.pnl.overdraft_usd,
+        report.exposure_paper_locked,
+    ];
+    if floats.iter().any(|v| !v.is_finite()) {
+        return true;
+    }
+    if report.pnl.win_rate.is_some_and(|v| !v.is_finite()) {
+        return true;
+    }
+    report.positions.iter().any(|p| {
+        !p.entry_price.is_finite()
+            || !p.entry_notional.is_finite()
+            || p.mark_price.is_some_and(|v| !v.is_finite())
+            || p.unrealized_usd.is_some_and(|v| !v.is_finite())
+    })
 }
 
 #[cfg(test)]
@@ -205,6 +269,10 @@ mod tests {
                 min_buyers: 5,
                 window_secs: 10,
             },
+            heat_live_extra: 0,
+            exposure_live_bags: 0,
+            exposure_paper_locked: 0.0,
+            day_tally_damaged: false,
         }
     }
 
@@ -247,5 +315,87 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(leftover, vec![STATUS_FILE.to_string()]);
+    }
+
+    #[test]
+    fn damaged_tally_roundtrips_with_finite_placeholder() {
+        // A poisoned `-inf` tally must never reach JSON `null`: the
+        // collector publishes the damage flag with a finite
+        // placeholder, and the file stays parseable.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join(STATUS_FILE);
+        let mut report = fixture(1_700_000_000);
+        report.day_tally_damaged = true;
+        report.report.day_net = 0.0;
+        write(&path, &report).expect("finite placeholder writes");
+        let back = read(&path).expect("parseable");
+        assert!(back.day_tally_damaged);
+        assert_eq!(back.report.day_net, 0.0);
+    }
+
+    #[test]
+    fn old_files_without_new_gate_fields_still_parse() {
+        // Backward compat: pre-extension files lack the new keys.
+        // `read` must adopt them as defaults, never refuse the file.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join(STATUS_FILE);
+        write(&path, &fixture(1_700_000_000)).expect("write");
+        let mut raw = std::fs::read_to_string(&path).expect("read");
+        for key in [
+            "heat_live_extra",
+            "exposure_live_bags",
+            "exposure_paper_locked",
+            "day_tally_damaged",
+            "audit_score",
+        ] {
+            raw = raw.replace(&format!("\"{key}\":"), "\"removed_\":");
+        }
+        std::fs::write(&path, &raw).expect("rewrite");
+        let back = read(&path).expect("old file parses");
+        assert_eq!(back.heat_live_extra, 0);
+        assert_eq!(back.exposure_live_bags, 0);
+        assert_eq!(back.exposure_paper_locked, 0.0);
+        assert!(!back.day_tally_damaged);
+    }
+
+    #[test]
+    fn write_refuses_non_finite_floats() {
+        // Every published float must survive a JSON round trip: `NaN`
+        // and `±inf` serialize as `null`, which `f64` fields cannot
+        // read back. Refuse loudly instead of poisoning the file.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join(STATUS_FILE);
+        for poison in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+            let mut report = fixture(1_700_000_000);
+            report.report.day_net = poison;
+            assert!(
+                write(&path, &report).is_err(),
+                "day_net {poison:?} must refuse"
+            );
+            let mut report = fixture(1_700_000_000);
+            report.pnl.unrealized_pnl = poison;
+            assert!(
+                write(&path, &report).is_err(),
+                "unrealized {poison:?} must refuse"
+            );
+            let mut report = fixture(1_700_000_000);
+            report.positions.push(OpenPosition {
+                id: 1,
+                mint: "M".to_string(),
+                entry_price: poison,
+                quantity: 1,
+                entry_notional: 1.0,
+                opened_at: 1,
+                timeout_seconds: 0,
+                mark_price: None,
+                unrealized_usd: None,
+            });
+            assert!(
+                write(&path, &report).is_err(),
+                "position price {poison:?} must refuse"
+            );
+        }
+        // Nothing partial left behind by refused writes.
+        assert!(std::fs::read(&path).is_err(), "no file from refused writes");
     }
 }

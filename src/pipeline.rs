@@ -636,10 +636,11 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             .into_iter()
             .take(crate::status::WATCHLIST_MAX_PUBLISHED)
             .map(|v| crate::status::WatchEntry {
-                mint: v.mint,
+                mint: v.mint.clone(),
                 buyers: v.buyers,
                 created_secs: v.created_secs,
                 deadline_secs: v.deadline_secs,
+                audit_score: state.meta.get(&v.mint).and_then(|s| s.audit_score),
             })
             .collect();
         let total = state.gate.pending_count();
@@ -649,6 +650,29 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
             min_buyers: self.settings.gate_min_buyers,
             window_secs: self.settings.gate_window_secs,
         }
+    }
+
+    /// Exact gate inputs for `/risk` (same comparisons as `gate.rs`):
+    /// paper mints + basis from the same position views, live extras
+    /// from the same exec state the gate reads — never re-derived
+    /// downstream. Returns `(live_extra, live_bags, paper_locked)`.
+    pub async fn gate_limit_inputs(&self) -> (usize, usize, f64)
+    where
+        L: LiveSink,
+    {
+        let views = self.open_position_views().await;
+        let paper_mints: std::collections::HashSet<String> =
+            views.iter().map(|p| p.mint.clone()).collect();
+        let paper_locked: f64 = views.iter().map(|p| p.entry_notional).sum();
+        let live_extra = self
+            .exec
+            .held_base_mints()
+            .await
+            .into_iter()
+            .filter(|m| !paper_mints.contains(m))
+            .count();
+        let live_bags = self.exec.live_unpaired_bag_count(&paper_mints).await;
+        (live_extra, live_bags, paper_locked)
     }
 
     /// Paper ledger overdraft (AUD-010): dispatch costs debited past

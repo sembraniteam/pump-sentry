@@ -1,5 +1,6 @@
 .idea
+.opencode/opencode.jsonc
+.DS_Store
 /target
 /logs/
-.opencode/opencode.jsonc
 docs

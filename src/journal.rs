@@ -552,6 +552,169 @@ pub fn load_lines(path: &Path) -> (Vec<JournalLine>, usize, usize, Option<String
     (lines, blank, bad, None)
 }
 
+/// The tail slice of a [`load_recent_lines`] read.
+#[derive(Debug, Default)]
+pub struct JournalTail {
+    /// Decoded lines, newest last (capped at the requested line cap).
+    pub lines: Vec<JournalLine>,
+    /// Decoded-record lines inside the scanned span. When
+    /// `truncated`, this counts only the byte-window, not the file.
+    pub scanned: usize,
+    /// Foreign/undecodable lines inside the scanned span.
+    pub bad: usize,
+    /// True when the byte cap skipped some (possibly most) of the
+    /// file: the window's first line may be torn (it is dropped, not
+    /// invented as damage), and `scanned`/`bad` say nothing about the
+    /// history before it.
+    pub truncated: bool,
+    /// Fail-closed read error (missing file is None, an empty journal).
+    pub error: Option<String>,
+}
+
+/// Read only the trailing slice of the journal: same line grammar
+/// and fail-closed semantics as [`load_lines`], but memory stays
+/// bounded no matter how large the file grows (the sidecar answers
+/// `/research` and `/token` from recent history, never a full replay).
+/// **Both caps bind: `max_bytes` (fread from the end) and `max_lines`
+/// (kept).** The byte cap bounds the read itself, so an unbounded
+/// journal cannot stretch a Discord ack past the 3-second window
+/// (memory attendance alone does not bound scan time). Within the
+/// scanned span every line is counted, so callers say honestly how
+/// much history the slice covers — and, when `truncated`, that older
+/// history was not scanned at all.
+pub fn load_recent_lines(path: &Path, max_lines: usize, max_bytes: u64) -> JournalTail {
+    JournalTail::from_file(path, max_lines, max_bytes)
+}
+impl JournalTail {
+    fn from_file(path: &Path, max_lines: usize, max_bytes: u64) -> Self {
+        use std::collections::VecDeque;
+        use std::io::{Read, Seek, SeekFrom};
+        // An empty cap still keeps one line (bounded windows, never
+        // zero-work surprises for the caller below).
+        let cap = max_lines.max(1);
+        let file_len = match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self::default();
+            }
+            Err(e) => {
+                return Self {
+                    error: Some(e.to_string()),
+                    ..Self::default()
+                };
+            }
+            Ok(m) => m.len(),
+        };
+        if file_len > max_bytes {
+            // File exceeds the cap: read only the last `max_bytes`
+            // (the read itself is bounded, so scan time cannot chase an
+            // unbounded journal). One extra leading byte tells whether
+            // the window begins exactly on a line boundary: keep the
+            // whole window then; otherwise the first line is torn and
+            // is dropped, never invented as damage (its history is
+            // explicitly unscanned, not broken).
+            let mut buffer = Vec::new();
+            return match std::fs::File::open(path).and_then(|mut f| {
+                f.seek(SeekFrom::Start(file_len - max_bytes - 1))?;
+                (&mut f).take(max_bytes + 1).read_to_end(&mut buffer)
+            }) {
+                Err(e) => Self {
+                    truncated: true,
+                    error: Some(e.to_string()),
+                    ..Self::default()
+                },
+                Ok(_) => {
+                    let body = match buffer.first() {
+                        Some(&b'\n') => &buffer[1..],
+                        _ => buffer
+                            .iter()
+                            .position(|&b| b == b'\n')
+                            .map(|i| &buffer[i + 1..])
+                            .unwrap_or(&[]),
+                    };
+                    let mut held: VecDeque<JournalLine> = VecDeque::new();
+                    let mut scanned = 0usize;
+                    let mut bad = 0usize;
+                    for raw in String::from_utf8_lossy(body).lines() {
+                        match decode_line(raw) {
+                            Decoded::Line(line) => {
+                                scanned += 1;
+                                if held.len() >= cap {
+                                    held.pop_front();
+                                }
+                                held.push_back(*line);
+                            }
+                            Decoded::Blank => {}
+                            Decoded::Bad => bad += 1,
+                        }
+                    }
+                    Self {
+                        lines: held.into_iter().collect(),
+                        scanned,
+                        bad,
+                        truncated: true,
+                        error: None,
+                    }
+                }
+            };
+        }
+        // File fits inside the byte cap: a full scan (whole-span
+        // counting, torn-line handling identical to `load_lines`).
+        let mut held: VecDeque<JournalLine> = VecDeque::new();
+        let mut scanned = 0usize;
+        let mut bad = 0usize;
+        match std::fs::File::open(path) {
+            Err(e) => {
+                return Self {
+                    error: Some(e.to_string()),
+                    ..Self::default()
+                };
+            }
+            Ok(file) => {
+                for raw in std::io::BufReader::new(file).lines() {
+                    match raw {
+                        Ok(line) => match decode_line(&line) {
+                            Decoded::Line(line) => {
+                                scanned += 1;
+                                if held.len() >= cap {
+                                    held.pop_front();
+                                }
+                                held.push_back(*line);
+                            }
+                            Decoded::Blank => {}
+                            Decoded::Bad => bad += 1,
+                        },
+                        // Read error counts as damage, never as a blank
+                        // line. One count, then stop: a reader that
+                        // keeps erroring (a directory fd, dying disk)
+                        // must not spin "bad" counts forever, and the
+                        // lines decoded before the failure stay usable.
+                        Err(_) => {
+                            bad += 1;
+                            return Self {
+                                lines: held.into_iter().collect(),
+                                scanned,
+                                bad,
+                                truncated: false,
+                                error: Some(
+                                    "read failed mid-file; lines kept before it, the rest unproven"
+                                        .to_string(),
+                                ),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            lines: held.into_iter().collect(),
+            scanned,
+            bad,
+            truncated: false,
+            error: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,5 +956,103 @@ mod tests {
         } else {
             assert!(sink.is_degraded(), "flush failure means loud degradation");
         }
+    }
+
+    #[test]
+    fn recent_tail_bounds_memory_but_counts_everything() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut text = String::new();
+        for i in 0..10u64 {
+            let line = JournalLine::Tick {
+                ts: i,
+                mint: "M".into(),
+                mark: simulator::Mark::price_only(1.0),
+                sol_feed: Some(100.0),
+                tick_observed_at: i,
+                complete: false,
+                manual_exits: false,
+            };
+            writeln!(text, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+        }
+        text.push_str("\nnot json\n");
+        std::fs::write(&path, &text).unwrap();
+        let bytes = text.len() as u64;
+        let tail = load_recent_lines(&path, 4, bytes);
+        assert_eq!(tail.error, None);
+        assert!(!tail.truncated, "fitting file scans fully");
+        assert_eq!(
+            tail.scanned, 10,
+            "total covers the whole file, not the slice"
+        );
+        assert_eq!(tail.lines.len(), 4, "memory bounded by the cap");
+        assert_eq!(tail.bad, 1);
+        // Newest-last order kept: tail holds ts 6..10.
+        let ts: Vec<u64> = tail
+            .lines
+            .iter()
+            .map(|l| match l {
+                JournalLine::Tick { ts, .. } => *ts,
+                _ => u64::MAX,
+            })
+            .collect();
+        assert_eq!(ts, vec![6, 7, 8, 9]);
+        // Missing file is an empty journal, never an error.
+        let tail = load_recent_lines(&dir.path().join("absent.jsonl"), 4, bytes);
+        assert_eq!((tail.lines.len(), tail.scanned), (0, 0));
+        assert!(tail.error.is_none());
+    }
+
+    #[test]
+    fn recent_tail_byte_cap_skips_history_loudly() {
+        // L1: the byte cap bounds the actual read, so a huge journal
+        // cannot stretch a Discord ack; the truncation is visible to
+        // callers and the torn first line is dropped, never decoded
+        // as damage.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let tick = |ts: u64| -> String {
+            let line = JournalLine::Tick {
+                ts,
+                mint: "M".into(),
+                mark: simulator::Mark::price_only(1.0),
+                sol_feed: Some(100.0),
+                tick_observed_at: ts,
+                complete: false,
+                manual_exits: false,
+            };
+            format!("{}\n", serde_json::to_string(&line).unwrap())
+        };
+        let first = tick(1);
+        let tail_text: String = (2..=5).map(tick).collect();
+        std::fs::write(&path, format!("{first}{tail_text}")).unwrap();
+        let total_bytes = (first.len() + tail_text.len()) as u64;
+        // Window covers the last 4 lines exactly (no torn line: the
+        // byte window starts right at the boundary).
+        let tail = load_recent_lines(&path, 100, tail_text.len() as u64);
+        assert!(tail.truncated);
+        assert_eq!(tail.scanned, 4, "complete lines inside the window count");
+        assert_eq!(tail.lines.len(), 4);
+        let ts: Vec<u64> = tail
+            .lines
+            .iter()
+            .map(|l| match l {
+                JournalLine::Tick { ts, .. } => *ts,
+                _ => u64::MAX,
+            })
+            .collect();
+        assert_eq!(ts, vec![2, 3, 4, 5]);
+        assert!(tail.error.is_none(), "an unscanned prefix is not an error");
+        // Mid-line window start: the torn line is dropped, not "bad".
+        let tail = load_recent_lines(&path, 100, total_bytes - first.len() as u64 / 2);
+        assert!(tail.truncated);
+        assert_eq!(tail.scanned, 4, "torn lead line dropped, complete kept");
+        assert_eq!(tail.bad, 0, "a torn line is unscanned history, not damage");
+        // A window with no complete line at all yields an empty tail.
+        let tail = load_recent_lines(&path, 100, (first.len() / 2) as u64);
+        assert!(tail.truncated);
+        assert!(tail.lines.is_empty());
+        assert_eq!(tail.scanned, 0);
     }
 }

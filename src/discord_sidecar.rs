@@ -57,6 +57,11 @@ pub const POSITIONS_COMMAND: &str = "positions";
 pub const PNL_COMMAND: &str = "pnl";
 pub const WATCHLIST_COMMAND: &str = "watchlist";
 pub const CONFIG_COMMAND: &str = "config";
+/// Tier 3 — read-only analysis (guild-locked, ephemeral; never
+/// control, never audited as control).
+pub const RESEARCH_COMMAND: &str = "research";
+pub const RISK_COMMAND: &str = "risk";
+pub const TOKEN_COMMAND: &str = "token";
 /// Tier 2 control commands (allowlisted operators only, §6).
 pub const SELL_COMMAND: &str = "sell";
 pub const PAUSE_COMMAND: &str = "pause";
@@ -156,7 +161,11 @@ fn status_compact_text(report: &StatusReport, now: u64) -> String {
     } else {
         ""
     };
-    let brk = Alerter::breaker_line(r.breaker_halted, r.day_net);
+    let brk = if report.day_tally_damaged {
+        "HALTED (tally damaged)".to_string()
+    } else {
+        Alerter::breaker_line(r.breaker_halted, r.day_net)
+    };
     let data = if r.data_paused {
         "`DEGRADED — entries paused`"
     } else {
@@ -208,10 +217,20 @@ fn no_status_text(reason: &str) -> String {
 
 /// Full `/heartbeat` answer: the exact production card (text fallback
 /// + embed) with the trailing-file freshness note.
+///
+/// A damaged tally cannot print its day figures as numbers. The card's
+/// day-net line is the collector's finite placeholder, so a loud
+/// caveat rides alongside it.
 fn heartbeat_card(report: &StatusReport, now: u64) -> Card {
     let age = now.saturating_sub(report.ts);
     let mut card = Alerter::format_heartbeat(&report.report);
     card.content = truncate_content(&format!("{}\n(status age: {age}s)", card.content));
+    if report.day_tally_damaged {
+        card.content = truncate_content(&format!(
+            "{}\n⚠ Day-loss tally damaged — day figures unknown, breaker fail-closed HALTED",
+            card.content
+        ));
+    }
     card
 }
 
@@ -433,8 +452,16 @@ fn pnl_text(report: &StatusReport) -> String {
          Book lifetime: realized {} over {} closed · win rate {win}\n\
          Open book: unrealized {} (realizable basis) · mark {} → would net {} closing full size (exit-discount {})\n\
          {cash_line}",
-        signed_usd(r.day_net),
-        Alerter::breaker_line(r.breaker_halted, r.day_net),
+        if report.day_tally_damaged {
+            "UNKNOWN (tally damaged)".to_string()
+        } else {
+            signed_usd(r.day_net)
+        },
+        if report.day_tally_damaged {
+            "HALTED (tally damaged)".to_string()
+        } else {
+            Alerter::breaker_line(r.breaker_halted, r.day_net)
+        },
         signed_usd(pnl.realized_pnl),
         pnl.closed_count,
         signed_usd(pnl.unrealized_pnl),
@@ -487,6 +514,404 @@ fn watchlist_text(report: &StatusReport, now: u64) -> String {
     out
 }
 
+/// Journal lines read per `/research` answer: bounded tail, never a
+/// full replay (memory stays flat no matter how large the file grows).
+/// Lines are the cap on what is KEPT; bytes bound what is SCANNED (a
+/// multi-GB journal must not stretch the 3-second ack).
+/// `load_recent_lines` counts everything it scans, so coverage stays
+/// honest (`last N of M`), and its `truncated` flag keeps the byte
+/// window loud when it skips history.
+const RESEARCH_JOURNAL_TAIL: usize = 5000;
+const RESEARCH_JOURNAL_MAX_BYTES: u64 = 8 << 20;
+/// Journal lines scanned per `/token` answer (filtered to one mint,
+/// newest few shown). Same two-cap discipline as `/research`.
+const TOKEN_JOURNAL_TAIL: usize = 2000;
+const TOKEN_JOURNAL_MAX_BYTES: u64 = 1 << 20;
+/// Trail lines shown per mint (newest last).
+const TOKEN_TRAIL_SHOWN: usize = 6;
+
+/// `/research` answer (pure): paper patterns only, never live
+/// evidence. Same math as `pump-sentry research`, shrunk to one
+/// ephemeral answer. Coverage names the scanned span exactly (whole
+/// file, line tail, or bounded byte tail with history skipped) and
+/// discloses unreadable lines within it.
+fn research_text(
+    s: &crate::research::ResearchSummary,
+    tail: &crate::journal::JournalTail,
+) -> String {
+    let damage = if tail.bad > 0 {
+        format!(", {} unreadable skipped", tail.bad)
+    } else {
+        String::new()
+    };
+    let coverage = if tail.truncated {
+        format!(
+            "journal tail read, last {scanned} lines (older history not scanned{damage})",
+            scanned = tail.scanned,
+            damage = damage,
+        )
+    } else if tail.scanned > tail.lines.len() {
+        format!(
+            "journal live read, last {} of {} lines{damage}",
+            tail.lines.len(),
+            tail.scanned
+        )
+    } else {
+        format!("journal live read, {} lines{damage}", tail.scanned)
+    };
+    let thin = if s.top_proposal_thin {
+        " — THIN (noise, not evidence)"
+    } else {
+        ""
+    };
+    format!(
+        "**Research** — paper patterns only, never live evidence ({coverage})\n\
+         Universe: {exits} signaled exits · {losses} losses · {wins} wins · net {net}\n\
+         Worst cluster: {clabel} — n={cn} total loss {closs}\n\
+         Top proposal: {pname} — net {pnet} over {pex} skipped{thin}\n\
+         Promote only via: paper backtest → halves agree → live confirm → explicit approval.",
+        exits = s.exits,
+        losses = s.losses,
+        wins = s.wins,
+        net = signed_usd(s.net_pnl),
+        clabel = s.top_cluster_label,
+        cn = s.top_cluster_n,
+        closs = usd(s.top_cluster_loss),
+        pname = s.top_proposal_name,
+        pnet = signed_usd(s.top_proposal_net),
+        pex = s.top_proposal_excluded,
+    )
+}
+
+/// `/risk` answer (pure): limit utilization quoting the gate's actual
+/// enforcement (`src/gate.rs`) from the exact inputs the collector
+/// publishes — not a parallel formula:
+/// - Heat: `open_positions + heat_live_extra >= max` refuses; the
+///   sidecar prints the same sum and the same admission rule.
+/// - Exposure: `deployed + notional > cap` refuses, with
+///   `deployed = paper_locked + live_bags × notional`.
+/// - Day loss: `day_net <= -cap` trips; cap `0` is OFF and never
+///   renders `armed`.
+/// - `day_tally_damaged`: the tally is unknown (poison/latch) —
+///   figures print UNKNOWN and the halt attributes to persistence,
+///   never to the loss cap.
+fn risk_text(s: &Settings, report: &StatusReport) -> String {
+    let r = &report.report;
+    let cap = s.max_daily_loss_usd;
+    let day_line = if report.day_tally_damaged {
+        "day UNKNOWN (tally damaged — restart-persistent halt, delete the day-state file to resume or wait for UTC rollover)".to_string()
+    } else if cap.is_finite() && cap > 0.0 {
+        let used_pct = if r.day_net < 0.0 {
+            100.0 * (-r.day_net) / cap
+        } else {
+            0.0
+        };
+        format!(
+            "day {} vs cap {} ({:.0}% used)",
+            signed_usd(r.day_net),
+            usd(cap),
+            used_pct
+        )
+    } else {
+        format!(
+            "day {} vs cap off — no day-loss breaker",
+            signed_usd(r.day_net)
+        )
+    };
+    // Same sum the gate compares: paper opens plus live-held extras
+    // refuse at `>= max`, so the gate admits while used < max.
+    let heat_used = r.open_positions + report.heat_live_extra;
+    let heat_line = format!(
+        "Opens {o} + {live} live-held = {used}/{max} (gate admits while used < {max})",
+        o = r.open_positions,
+        live = report.heat_live_extra,
+        used = heat_used,
+        max = s.max_open_positions,
+    );
+    // Same dollars the gate compares: deployed plus the prospective
+    // ticket refuses past the cap.
+    let deployed = report.exposure_paper_locked + report.exposure_live_bags as f64 * s.notional_usd;
+    let prospective = deployed + s.notional_usd;
+    let exposure_line = if s.max_exposure_usd.is_finite() && s.max_exposure_usd > 0.0 {
+        format!(
+            "exposure {} + next {} ticket = {} vs cap {} ({:.0}% committed)",
+            usd(deployed),
+            usd(s.notional_usd),
+            usd(prospective),
+            usd(s.max_exposure_usd),
+            100.0 * prospective / s.max_exposure_usd,
+        )
+    } else {
+        format!(
+            "exposure {} + next {} ticket vs cap off",
+            usd(deployed),
+            usd(s.notional_usd),
+        )
+    };
+    // Breaker attribution: damage halts regardless of the cap (never
+    // blame the loss cap for it); otherwise the halt means the cap
+    // tripped, and `armed` only renders for a real cap.
+    let breaker_line = if report.day_tally_damaged {
+        "HALTED — tally damaged (fail-closed), not the loss cap".to_string()
+    } else if r.breaker_halted {
+        format!(
+            "`HALTED (day {} vs cap {})`",
+            signed_usd(r.day_net),
+            if cap.is_finite() && cap > 0.0 {
+                usd(cap)
+            } else {
+                "off".to_string()
+            }
+        )
+    } else if cap.is_finite() && cap > 0.0 {
+        "`armed`".to_string()
+    } else {
+        String::from("cap off (day-loss breaker disabled)")
+    };
+    format!(
+        "**Risk** — limit utilization (caps from config.toml as read just now)\n\
+         Day loss: {day}\n\
+         {heat} · {exposure}\n\
+         Breaker: {brk} · Entries: {entries} · Data: {data}",
+        day = day_line,
+        heat = heat_line,
+        exposure = exposure_line,
+        brk = breaker_line,
+        entries = if crate::cli::marker_present(&crate::cli::entries_paused_path()) {
+            "`PAUSED` via kill switch"
+        } else {
+            "`open`"
+        },
+        data = if r.data_paused {
+            "`DEGRADED — entries paused`"
+        } else {
+            "`ok`"
+        },
+    )
+}
+
+/// Mint behind one journal line (`None` for bookkeeping lines that
+/// carry no mint). Tick lines are noise for a trail and skipped.
+fn journal_mint(line: &crate::journal::JournalLine) -> Option<&str> {
+    use crate::journal::JournalLine as J;
+    match line {
+        J::Open { mint, .. }
+        | J::Exit { mint, .. }
+        | J::BuyAttempt { mint, .. }
+        | J::BuySkip { mint, .. }
+        | J::BuyOutcome { mint, .. }
+        | J::SellAttempt { mint, .. }
+        | J::SellGiveUp { mint, .. }
+        | J::Gap { mint, .. } => Some(mint),
+        J::Tick { .. } | J::Boot { .. } | J::Equity { .. } => None,
+    }
+}
+
+/// One trail line, newest last. Only decision-carrying variants
+/// render; ticks never do (they would flood the answer).
+fn journal_trail_line(line: &crate::journal::JournalLine) -> Option<String> {
+    use crate::journal::JournalLine as J;
+    match line {
+        J::Open {
+            risk,
+            model,
+            regime,
+            ..
+        } => Some(format!(
+            "open · risk {risk}{model}{regime}",
+            model = model
+                .as_deref()
+                .map(|m| format!(" · model {m}"))
+                .unwrap_or_default(),
+            regime = regime
+                .as_deref()
+                .map(|g| format!(" · regime {g}"))
+                .unwrap_or_default(),
+        )),
+        J::Exit { trade, .. } => Some(format!(
+            "exit {:?} · {} ({:+.1}%)",
+            trade.reason,
+            signed_usd(trade.net_pnl),
+            trade.net_pnl_percent
+        )),
+        J::BuySkip { reason, .. } => Some(format!("buy skipped — {reason}")),
+        J::BuyAttempt { bundle, fill, .. } => Some(format!(
+            "buy attempt · bundle {bundle}{filled}",
+            bundle = short_mint(bundle),
+            filled = if fill.is_some() {
+                " · filled"
+            } else {
+                " · unconfirmed"
+            },
+        )),
+        J::BuyOutcome {
+            verdict, detail, ..
+        } => Some(format!(
+            "buy {verdict}{detail}",
+            detail = detail
+                .as_deref()
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default(),
+        )),
+        J::SellAttempt {
+            venue,
+            tokens,
+            price_usd,
+            ..
+        } => Some(format!("sell {venue} {tokens} tok @ {price_usd}")),
+        J::SellGiveUp { cause, .. } => Some(format!("sell giveup — {cause}")),
+        J::Gap {
+            leg,
+            gap_usd,
+            venue,
+            ..
+        } => Some(format!(
+            "{leg} gap {}{}",
+            signed_usd(*gap_usd),
+            if venue.is_empty() {
+                String::new()
+            } else {
+                format!(" via {venue}")
+            }
+        )),
+        J::Tick { .. } | J::Boot { .. } | J::Equity { .. } => None,
+    }
+}
+
+/// `/token` answer (pure): where one mint stands plus its recent
+/// journal trail. Absence is stated per source and per coverage
+/// window, never invented: the book claims only cover lists the file
+/// publishes in full, watchlist claims respect the capped sample, and
+/// trail absence names the scanned span and any unreadable lines.
+fn token_text(
+    report: &StatusReport,
+    mint: &str,
+    trail: &[&crate::journal::JournalLine],
+    tail: &crate::journal::JournalTail,
+) -> String {
+    let mut out = format!("**Token** {short}\n", short = short_mint(mint));
+    let mint_ref = find_mint(report, mint);
+    // Open positions publish as a capped sample: overflowed = absence
+    // from the shown slice proves nothing about the open book.
+    let book_sample_overflow = report.report.open_positions > report.positions.len();
+    match mint_ref {
+        MintRef::Open(i) => {
+            let p = &report.positions[i];
+            out.push_str(&format!(
+                "Book: open #{id} — {qty} tok @ {entry} = {basis} · held {held}\n",
+                id = p.id,
+                qty = tok_count(p.quantity),
+                entry = p.entry_price,
+                basis = usd(p.entry_notional),
+                held = dur(now_secs().saturating_sub(p.opened_at)),
+            ));
+        }
+        MintRef::ManualBag => {
+            out.push_str("Book: unpaired live bag (on-chain, outside the paper book)\n");
+        }
+        MintRef::Diverged => {
+            out.push_str("Book: diverged (reconciling remote)\n");
+        }
+        MintRef::PendingBuy => {
+            out.push_str("Book: pending buy (unconfirmed, watch-only)\n");
+        }
+        MintRef::Unknown => {
+            // Only claim "not open" when the sample is complete — an
+            // overflowed cap means absence here proves nothing about
+            // the open book.
+            if !book_sample_overflow {
+                out.push_str("Book: no record (not open, bagged, diverged, or pending)\n");
+            } else {
+                out.push_str(&format!(
+                    "Book: not in the shown sample — {o} open, {n} shown (file cap) — so absence here is not proof of absence\n",
+                    o = report.report.open_positions,
+                    n = report.positions.len(),
+                ));
+            }
+        }
+    }
+    match report.watchlist.entries.iter().find(|e| e.mint == mint) {
+        Some(e) => {
+            let now = now_secs();
+            let phase = if e.deadline_secs <= now {
+                "deadline passed".to_string()
+            } else {
+                format!("expires in {}", dur(e.deadline_secs - now))
+            };
+            if mint_ref == MintRef::Unknown {
+                // Watch pending, quorum in flight: this is the ONE
+                // state a watchlist line means.
+                out.push_str(&format!(
+                    "Watchlist: {buyers}/{min} buyers · {phase} · audit {score}\n",
+                    buyers = e.buyers,
+                    min = report.watchlist.min_buyers,
+                    phase = phase,
+                    score = e
+                        .audit_score
+                        .map(|s| format!("score {s}"))
+                        .unwrap_or_else(|| "unaudited so far".to_string()),
+                ));
+            } else {
+                // Held or live-and-held mints stay on the gate's watch
+                // (the watch pins while the curve is live). Quorum
+                // numbers next to a book line must not read as "still
+                // waiting": name the pin, not a phantom gate wait.
+                out.push_str(&format!(
+                    "Watchlist: still tracked while held ({buyers}/{min} buyers · {phase}) — the watch pins while the mint is held; no quorum wait\n",
+                    buyers = e.buyers,
+                    min = report.watchlist.min_buyers,
+                    phase = phase,
+                ));
+            }
+        }
+        None if mint_ref == MintRef::Unknown
+            && report.watchlist.total > report.watchlist.entries.len() =>
+        {
+            // Sampled watchlist: absence from the shown slice is not
+            // "not watched" when the file capped the entries.
+            out.push_str(&format!(
+                "Watchlist: not in the shown sample — {} of {} shown (file cap), so absence here is not proof of absence\n",
+                report.watchlist.entries.len(),
+                report.watchlist.total,
+            ));
+        }
+        None => {}
+    }
+    let shown: Vec<String> = trail
+        .iter()
+        .filter_map(|l| journal_trail_line(l))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(TOKEN_TRAIL_SHOWN)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if shown.is_empty() {
+        out.push_str(&format!(
+            "Trail: no journal entries for this mint in the last {scanned} lines",
+            scanned = tail.scanned,
+        ));
+        if tail.error.is_some() {
+            out.push_str(" (journal unreadable — absence here proves nothing)");
+        } else {
+            if tail.truncated {
+                out.push_str(" (older history not scanned — absence here is not proof)");
+            }
+            if tail.bad > 0 {
+                out.push_str(&format!(", {bad} unreadable skipped", bad = tail.bad));
+            }
+        }
+    } else {
+        out.push_str("Trail (newest last):\n");
+        for line in shown {
+            out.push_str(&format!("- {line}\n"));
+        }
+    }
+    out
+}
+
 /// `on`/`off` for boolean switches in config text.
 fn on_off(v: bool) -> &'static str {
     if v { "on" } else { "off" }
@@ -514,10 +939,7 @@ fn config_text() -> String {
             None,
         ),
         Err(e) => {
-            return format!(
-                "⚠ Config unreadable at `{}`: {e} — the running bot refuses to boot with a broken file; fix it and retry.",
-                path.display()
-            );
+            return config_refusal(&path, &e.to_string());
         }
     };
     let s = Settings::from_file(table.as_ref());
@@ -600,6 +1022,25 @@ fn config_text() -> String {
     }
     out.push_str("Values are the file as read just now — the running bot's copy dates to its boot; restart applies changes.");
     out
+}
+
+/// Operator-facing refusal for an unreadable `config.toml` (shared by
+/// `/config` and `/risk`). The parse error itself is logged to the
+/// sidecar's own log, NOT echoed to Discord: a TOML parse error quotes
+/// the offending line, and an offending line can be an endpoint URL
+/// (`?api-key=` / path secrets) — identical redaction by construction
+/// to `/config`'s endpoint lines. The bot refuses to boot on these,
+/// so the fix is an operator edit anyway.
+fn config_refusal(path: &std::path::Path, error: &str) -> String {
+    warn!(
+        path = %path.display(),
+        error,
+        "config.toml unreadable; details stay in the sidecar log (error text can quote config lines)"
+    );
+    format!(
+        "⚠ Config unreadable at `{}` — fix it and retry; the running bot refuses to boot with a broken file. Parse details go to the sidecar log only (a parse error can quote the offending line, which may carry endpoint secrets).",
+        path.display()
+    )
 }
 
 /// Tier 2 audit trail (doc §6): every control invocation — allowed
@@ -764,9 +1205,23 @@ fn find_mint(report: &StatusReport, mint: &str) -> MintRef {
 /// option). `None` when absent or mistyped (Discord enforces the
 /// shape; this is the fail-closed fallback).
 fn sell_mint_arg(cmd: &CommandInteraction) -> Option<String> {
+    string_option(cmd, "mint")
+}
+
+/// Mint argument of a `/token` invocation. Same shape contract as
+/// `/sell` (one required `mint` string), separate name so the two
+/// commands never share parsing.
+fn token_mint_arg(cmd: &CommandInteraction) -> Option<String> {
+    string_option(cmd, "mint")
+}
+
+/// One required string option by name. `None` when absent or
+/// mistyped (Discord enforces the shape; this is the fail-closed
+/// fallback).
+fn string_option(cmd: &CommandInteraction, name: &str) -> Option<String> {
     cmd.data.options.iter().find_map(|o| match &o.value {
         CommandDataOptionValue::String(s) => {
-            if o.name == "mint" {
+            if o.name == name {
                 Some(s.clone())
             } else {
                 None
@@ -1422,6 +1877,108 @@ impl Sidecar {
                 .content(truncate_content(&config_text())),
         }
     }
+
+    /// `/research`: offline paper-pattern summary from the journal
+    /// tail. Ephemeral (money-adjacent) and read-only; the journal is
+    /// a live file, so staleness does not apply — coverage is stated.
+    fn render_research(&self) -> Answer {
+        let tail = crate::journal::load_recent_lines(
+            &crate::journal::default_journal_path(),
+            RESEARCH_JOURNAL_TAIL,
+            RESEARCH_JOURNAL_MAX_BYTES,
+        );
+        let text = match tail.error {
+            Some(e) => format!(
+                "⚠ Journal unreadable ({e}) — an unreadable journal is not evidence of zero decisions. Nothing to report."
+            ),
+            None if tail.lines.is_empty() => {
+                let mut text = "No decisions recorded yet — the bot has not journaled any entry signal. Nothing to analyze.".to_string();
+                if tail.truncated {
+                    text.push_str(" (read bounded to a recent tail; older history not scanned)");
+                }
+                text
+            }
+            None => {
+                let m = crate::replay::metrics(&tail.lines);
+                match crate::research::summarize(&m.micro_rows) {
+                    Some(s) => research_text(&s, &tail),
+                    None => "No signaled exits yet — opens exist but nothing closed against an entry signal.".to_string(),
+                }
+            }
+        };
+        Answer {
+            message: CreateInteractionResponseMessage::new()
+                .ephemeral(true)
+                .content(truncate_content(&text)),
+        }
+    }
+
+    /// `/risk`: limit utilization from config caps against live usage.
+    /// Ephemeral: posture data. Caps read from `config.toml` as read
+    /// just now (same parser as `/config`); usage rides `status.json`.
+    fn render_risk(&self, now: u64) -> Answer {
+        let path = crate::config::resolve_config_path();
+        let settings = match crate::config::read_table(&path) {
+            Ok(table) => Settings::from_file(table.as_ref()),
+            Err(e) => {
+                return Answer {
+                    message: CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
+                        .content(truncate_content(&config_refusal(&path, &e.to_string()))),
+                };
+            }
+        };
+        match self.read_report() {
+            Ok(report) => Answer {
+                message: CreateInteractionResponseMessage::new()
+                    .ephemeral(true)
+                    .content(with_freshness(risk_text(&settings, &report), &report, now)),
+            },
+            Err(re) => self.no_data(&re),
+        }
+    }
+
+    /// `/token <mint>`: where one mint stands — book, watchlist (with
+    /// audit score), custody lists — plus its recent journal trail.
+    /// Ephemeral: per-mint decision history. Unknown mints answer
+    /// honestly ("no record"), never as fiction.
+    fn render_token(&self, cmd: &CommandInteraction, now: u64) -> Answer {
+        let Some(mint) = token_mint_arg(cmd) else {
+            return Answer {
+                message: CreateInteractionResponseMessage::new()
+                    .ephemeral(true)
+                    .content("`/token` needs a mint: `/token mint:<address>`. No action taken."),
+            };
+        };
+        if executor::parse_pubkey(&mint).is_err() {
+            return Answer {
+                message: CreateInteractionResponseMessage::new()
+                    .ephemeral(true)
+                    .content(format!("`{mint}` is not a base58 pubkey. No action taken.")),
+            };
+        }
+        match self.read_report() {
+            Ok(report) => {
+                let tail = crate::journal::load_recent_lines(
+                    &crate::journal::default_journal_path(),
+                    TOKEN_JOURNAL_TAIL,
+                    TOKEN_JOURNAL_MAX_BYTES,
+                );
+                let trail: Vec<&crate::journal::JournalLine> = tail
+                    .lines
+                    .iter()
+                    .filter(|l| journal_mint(l) == Some(mint.as_str()))
+                    .collect();
+                let text = token_text(&report, &mint, &trail, &tail);
+                Answer {
+                    message: CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
+                        .content(with_freshness(text, &report, now)),
+                }
+            }
+            Err(re) => self.no_data(&re),
+        }
+    }
 }
 
 #[async_trait]
@@ -1441,6 +1998,20 @@ impl EventHandler for Sidecar {
                 .description("Buyer-quorum watchlist: mints, buyers, deadlines"),
             CreateCommand::new(CONFIG_COMMAND)
                 .description("Effective trading config from config.toml (endpoints redacted)"),
+            CreateCommand::new(RESEARCH_COMMAND)
+                .description("Offline paper-pattern summary from the journal (private reply)"),
+            CreateCommand::new(RISK_COMMAND)
+                .description("Limit utilization: caps vs live usage (private reply)"),
+            CreateCommand::new(TOKEN_COMMAND)
+                .description("One mint: book state, audit score, journal trail (private reply)")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "mint",
+                        "Mint address to inspect",
+                    )
+                    .required(true),
+                ),
             CreateCommand::new(SELL_COMMAND)
                 .description("Queue a manual full exit for one mint (operators only, confirms)")
                 .add_option(
@@ -1498,6 +2069,9 @@ impl EventHandler for Sidecar {
                     PNL_COMMAND => self.render_pnl(now_secs()),
                     WATCHLIST_COMMAND => self.render_watchlist(now_secs()),
                     CONFIG_COMMAND => self.render_config(),
+                    RESEARCH_COMMAND => self.render_research(),
+                    RISK_COMMAND => self.render_risk(now_secs()),
+                    TOKEN_COMMAND => self.render_token(&cmd, now_secs()),
                     SELL_COMMAND => self.render_sell(&cmd),
                     PAUSE_COMMAND => self.render_pause(&cmd),
                     RESUME_COMMAND => self.render_resume(&cmd),
@@ -1570,6 +2144,7 @@ pub fn run(token: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::JournalTail;
 
     fn fixture_report(ts: u64) -> StatusReport {
         StatusReport {
@@ -1620,6 +2195,10 @@ mod tests {
                 min_buyers: 5,
                 window_secs: 10,
             },
+            heat_live_extra: 0,
+            exposure_live_bags: 0,
+            exposure_paper_locked: 0.0,
+            day_tally_damaged: false,
         }
     }
 
@@ -1776,12 +2355,14 @@ mod tests {
                     buyers: 3,
                     created_secs: now - 20,
                     deadline_secs: now + 17,
+                    audit_score: Some(80),
                 },
                 status::WatchEntry {
                     mint: "HjND2YSo7ySRbvYSFETYu7inQMSHzcFraWmxJTdcgYG8".to_string(),
                     buyers: 9,
                     created_secs: now - 400,
                     deadline_secs: now - 12,
+                    audit_score: None,
                 },
             ],
             min_buyers: 5,
@@ -2121,5 +2702,426 @@ mod tests {
         let raw = serde_json::to_string(&event).expect("line");
         assert!(!raw.contains("token"), "{raw}");
         assert!(!raw.contains("key"), "{raw}");
+    }
+
+    fn micro_row(ts: u64, net: f64, regime: Option<&str>) -> crate::replay::MicroRow {
+        crate::replay::MicroRow {
+            ts,
+            net_pnl: net,
+            micro: listener::MicroSignals {
+                buys: 5,
+                sells: 1,
+                buy_ratio: Some(0.9),
+                buy_volume_base: 5_000_000,
+                sell_volume_base: 1_000_000,
+                unique_traders: 4,
+                top_wallet_share_pct: Some(60.0),
+                creator_net_base: 0,
+                velocity_delta: None,
+            },
+            regime: regime.map(str::to_string),
+            model: Some("test-model".to_string()),
+            source: "model".to_string(),
+        }
+    }
+
+    #[test]
+    fn research_text_headlines_paper_evidence() {
+        let rows = vec![
+            micro_row(1, -2.0, Some("momentum")),
+            micro_row(2, 3.0, Some("momentum")),
+        ];
+        let s = crate::research::summarize(&rows).expect("universe nonempty");
+        let backdrop = |ts: u64| crate::journal::JournalLine::Tick {
+            ts,
+            mint: "M".to_string(),
+            mark: simulator::Mark::price_only(1.0),
+            sol_feed: Some(100.0),
+            tick_observed_at: ts,
+            complete: false,
+            manual_exits: false,
+        };
+        let tail = JournalTail {
+            lines: vec![backdrop(1), backdrop(2)],
+            scanned: 2,
+            ..JournalTail::default()
+        };
+        let text = research_text(&s, &tail);
+        assert!(
+            text.contains("**Research** — paper patterns only"),
+            "{text}"
+        );
+        assert!(
+            text.contains("2 signaled exits · 1 losses · 1 wins"),
+            "{text}"
+        );
+        assert!(text.contains("journal live read, 2 lines"), "{text}");
+        assert!(text.contains("Top proposal:"), "{text}");
+        assert!(text.contains("explicit approval"), "{text}");
+        assert!(crate::research::summarize(&[]).is_none());
+    }
+
+    #[test]
+    fn research_text_names_the_bounded_tail_and_bad_lines() {
+        // L1/L2: a byte-capped scan must never read as a full replay,
+        // and unreadable lines inside the scanned span are disclosed —
+        // silence would fabricate a clean slate.
+        let s = crate::research::summarize(&[micro_row(1, -2.0, Some("momentum"))])
+            .expect("universe nonempty");
+        let backdrop = |ts: u64| crate::journal::JournalLine::Tick {
+            ts,
+            mint: "M".to_string(),
+            mark: simulator::Mark::price_only(1.0),
+            sol_feed: Some(100.0),
+            tick_observed_at: ts,
+            complete: false,
+            manual_exits: false,
+        };
+        let mut tail = JournalTail {
+            lines: vec![backdrop(1)],
+            scanned: 7,
+            ..JournalTail::default()
+        };
+        let text = research_text(&s, &tail);
+        assert!(
+            text.contains("journal live read, last 1 of 7 lines"),
+            "{text}"
+        );
+        tail.truncated = true;
+        tail.bad = 3;
+        let text = research_text(&s, &tail);
+        assert!(text.contains("older history not scanned"), "{text}");
+        assert!(text.contains("3 unreadable skipped"), "{text}");
+        assert!(!text.contains("of 7"), "{text}");
+    }
+
+    #[test]
+    fn risk_text_utilizes_caps_honestly() {
+        // Default cap is 0 = OFF: the answer must not pretend an
+        // armed day-loss breaker exists (L5).
+        let s = Settings::from_file(None);
+        let mut report = fixture_report(1_000_000);
+        report.report.day_net = -4.0;
+        report.report.open_positions = 1;
+        let text = risk_text(&s, &report);
+        assert!(text.contains("**Risk** — limit utilization"), "{text}");
+        assert!(text.contains("cap off — no day-loss breaker"), "{text}");
+        assert!(
+            text.contains("cap off (day-loss breaker disabled)"),
+            "{text}"
+        );
+        assert!(!text.contains("`armed`"), "{text}");
+        assert!(text.contains("Breaker: "), "{text}");
+        // Kill-switch state reads live, not from the file.
+        assert!(text.contains("Entries: "), "{text}");
+    }
+
+    #[test]
+    fn risk_text_matches_gate_utilization_for_heat_and_exposure() {
+        // The collector publishes the gate's own inputs, so `/risk`
+        // prints the same sums the gate compares — no re-derivation.
+        let mut s = Settings::from_file(None);
+        s.max_open_positions = 3;
+        s.max_daily_loss_usd = 50.0;
+        s.max_exposure_usd = 40.0;
+        s.notional_usd = 10.0;
+        let mut report = fixture_report(1_000_000);
+        report.report.day_net = -12.5;
+        report.report.open_positions = 1;
+        report.heat_live_extra = 2;
+        report.exposure_live_bags = 2;
+        report.exposure_paper_locked = 10.0;
+        let text = risk_text(&s, &report);
+        // Heat: paper 1 + live-held 2 = 3/3, at the gate's refuse point
+        // (`>= max` refuses, so the gate admits while used < max).
+        assert!(text.contains("Opens 1 + 2 live-held = 3/3"), "{text}");
+        assert!(text.contains("gate admits while used < 3"), "{text}");
+        // Exposure: deployed $30, prospective $40 vs cap $40 (100%).
+        assert!(
+            text.contains(
+                "exposure $30.00 + next $10.00 ticket = $40.00 vs cap $40.00 (100% committed)"
+            ),
+            "{text}"
+        );
+        // Day loss matches the breaker's own boundary: 12.5/50 = 25%.
+        assert!(
+            text.contains("day -$12.50 vs cap $50.00 (25% used)"),
+            "{text}"
+        );
+        // Breaker armed, and armed honestly (cap on).
+        assert!(text.contains("Breaker: `armed`"), "{text}");
+    }
+
+    #[test]
+    fn risk_text_marks_damaged_tally_unknown_never_a_number() {
+        // The collector publishes a finite placeholder with the damage
+        // flag: renderers must print UNKNOWN, never the placeholder.
+        let mut s = Settings::from_file(None);
+        s.max_daily_loss_usd = 50.0;
+        s.max_exposure_usd = 100.0;
+        let mut report = fixture_report(1_000_000);
+        report.report.breaker_halted = true;
+        report.report.day_net = 0.0; // placeholder, not the tally
+        report.day_tally_damaged = true;
+        let text = risk_text(&s, &report);
+        assert!(text.contains("day UNKNOWN (tally damaged"), "{text}");
+        assert!(
+            text.contains("HALTED — tally damaged (fail-closed), not the loss cap"),
+            "{text}"
+        );
+        assert!(!text.contains("$0.00 vs cap"), "{text}");
+        assert!(!text.contains("`armed`"), "{text}");
+        // Undamaged over-cap halt still carries the numbers.
+        report.day_tally_damaged = false;
+        report.report.day_net = -51.0;
+        let text = risk_text(&s, &report);
+        assert!(
+            text.contains("`HALTED (day -$51.00 vs cap $50.00)`"),
+            "{text}"
+        );
+        // Halted with the cap off and no damage: cap named, not blamed.
+        s.max_daily_loss_usd = 0.0;
+        report.report.day_net = -4.0;
+        let text = risk_text(&s, &report);
+        assert!(text.contains("`HALTED (day -$4.00 vs cap off)`"), "{text}");
+    }
+
+    #[test]
+    fn pnl_text_marks_damaged_tally_unknown() {
+        let mut report = fixture_report(1_000_000);
+        report.report.breaker_halted = true;
+        report.report.day_net = 0.0; // placeholder, not the tally
+        report.day_tally_damaged = true;
+        let text = pnl_text(&report);
+        assert!(text.contains("day UNKNOWN (tally damaged)"), "{text}");
+        assert!(text.contains("HALTED (tally damaged)"), "{text}");
+        assert!(!text.contains("day +$0.00"), "{text}");
+    }
+
+    #[test]
+    fn heartbeat_card_caveats_damaged_tally() {
+        let mut report = fixture_report(1_000_000 - 4);
+        report.day_tally_damaged = true;
+        report.report.day_net = 0.0;
+        let card = heartbeat_card(&report, 1_000_000);
+        assert!(
+            card.content.contains("tally damaged — day figures unknown"),
+            "{}",
+            card.content
+        );
+        // Undamaged cards carry no caveat.
+        let plain = heartbeat_card(&fixture_report(1_000_000 - 4), 1_000_000);
+        assert!(
+            !plain.content.contains("tally damaged"),
+            "{}",
+            plain.content
+        );
+    }
+
+    #[test]
+    fn status_compact_marks_damaged_breaker() {
+        let mut report = fixture_report(1_000_000 - 3);
+        report.report.breaker_halted = true;
+        report.report.day_net = 0.0;
+        report.day_tally_damaged = true;
+        let text = status_compact_text(&report, 1_000_000);
+        assert!(text.contains("HALTED (tally damaged)"), "{text}");
+        // No money figures leak through the placeholder.
+        assert!(!text.contains("+$0.00"), "{text}");
+    }
+
+    #[test]
+    fn token_text_reports_book_watchlist_and_trail() {
+        let now = 1_000_000;
+        let report = watchlist_fixture(now);
+        let mint = "FjND2YSo7ySRbvYSFETYu7inQMSHzcFraWmxJTdcgYG7";
+        let open = crate::journal::JournalLine::Open {
+            ts: now - 100,
+            mint: mint.to_string(),
+            risk: "model".to_string(),
+            model: Some("m".to_string()),
+            venue_fee_bps: 125.0,
+            sol_feed: None,
+            mark: simulator::Mark::price_only(1.0),
+            ticket_usd: 10.0,
+            position: simulator::Position {
+                id: 1,
+                mint: mint.to_string(),
+                side: simulator::Side::Long,
+                entry_price: 1.0,
+                quantity: 10,
+                entry_notional: 10.0,
+                entry_fee: 0.0,
+                tp_percent: 50.0,
+                sl_percent: -10.0,
+                trail_percent: 5.0,
+                trailing_stop: false,
+                best_price: 1.0,
+                opened_at: now - 100,
+                timeout_seconds: 3600,
+                moonbag_percent: 0.0,
+            },
+            micro: None,
+            regime: Some("momentum".to_string()),
+            flip_loss_pct: None,
+        };
+        let trail = vec![&open];
+        let tail = JournalTail {
+            lines: vec![open.clone()],
+            scanned: 1,
+            ..JournalTail::default()
+        };
+        let text = token_text(&report, mint, &trail, &tail);
+        assert!(text.contains("**Token** FjND…gYG7"), "{text}");
+        assert!(text.contains("Watchlist: 3/5 buyers"), "{text}");
+        assert!(text.contains("audit score 80"), "{text}");
+        assert!(text.contains("open · risk model"), "{text}");
+        // Watchlisted-and-unknown mint stays an honest absence, but the
+        // book claim no longer covers "watched" (the sample semantics);
+        // unknown + empty trail names the scanned span.
+        let mut unknown = report.clone();
+        unknown.report.open_positions = 0; // complete book sample
+        let text = token_text(
+            &unknown,
+            "HjND2YSo7ySRbvYSFETYu7inQMSHzcFraWmxJTdcgYG8",
+            &[],
+            &tail,
+        );
+        assert!(text.contains("no record"), "{text}");
+        assert!(
+            text.contains("Trail: no journal entries for this mint in the last 1 lines"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn token_text_resolves_book_watchlist_contradiction_for_held_mints() {
+        // L3: the gate pins a held mint's watch (curve stays live), so
+        // a book line plus a raw quorum line would contradict itself
+        // ("waiting for quorum" while already open).
+        let now = 1_000_000;
+        let mut report = watchlist_fixture(now);
+        let mint = "FjND2YSo7ySRbvYSFETYu7inQMSHzcFraWmxJTdcgYG7";
+        report.report.open_positions = 1;
+        report.positions = vec![status::OpenPosition {
+            id: 9,
+            mint: mint.to_string(),
+            entry_price: 0.001,
+            quantity: 100,
+            entry_notional: 10.0,
+            opened_at: now - 60,
+            timeout_seconds: 0,
+            mark_price: None,
+            unrealized_usd: None,
+        }];
+        let tail = JournalTail::default();
+        let text = token_text(&report, mint, &[], &tail);
+        assert!(text.contains("Book: open #9"), "{text}");
+        assert!(
+            text.contains("Watchlist: still tracked while held (3/5 buyers"),
+            "{text}"
+        );
+        assert!(!text.contains("· audit score 80"), "{text}");
+        assert!(!text.contains("Watchlist: 3/5 buyers"), "{text}");
+    }
+
+    #[test]
+    fn token_text_honors_capped_samples_for_absence_claims() {
+        // L3: open positions and watchlist entries both publish as
+        // capped samples; an overflowed cap must downgrade every
+        // absence claim ("not open" / "not watched") to "not in the
+        // shown sample".
+        let now = 1_000_000;
+        let mut report = watchlist_fixture(now);
+        report.report.open_positions = 61;
+        report.positions = vec![status::OpenPosition {
+            id: 1,
+            mint: "EjND2YSo7ySRbvYSFETYu7inQMSHzcFraWmxJTdcgYG5".to_string(),
+            entry_price: 0.001,
+            quantity: 100,
+            entry_notional: 10.0,
+            opened_at: now - 60,
+            timeout_seconds: 0,
+            mark_price: None,
+            unrealized_usd: None,
+        }];
+        report.watchlist.total = 75;
+        let tail = JournalTail::default();
+        let text = token_text(
+            &report,
+            "ZZZ1111111111111111111111111111111111111111",
+            &[],
+            &tail,
+        );
+        assert!(
+            text.contains("not in the shown sample — 61 open, 1 shown"),
+            "{text}"
+        );
+        assert!(
+            text.contains("absence here is not proof of absence"),
+            "{text}"
+        );
+        assert!(
+            text.contains("not in the shown sample — 2 of 75 shown"),
+            "{text}"
+        );
+        // Complete book + watching mints still claim exactly.
+        report.report.open_positions = 0;
+        report.positions.clear();
+        report.watchlist.total = 2;
+        let text = token_text(
+            &report,
+            "ZZZ1111111111111111111111111111111111111111",
+            &[],
+            &tail,
+        );
+        assert!(
+            text.contains("Book: no record (not open, bagged, diverged, or pending)"),
+            "{text}"
+        );
+        // Equal count = complete sample: plain absence, no hedge.
+        assert!(!text.contains("not in the shown sample"), "{text}");
+        assert!(!text.contains("not proof"), "{text}");
+    }
+
+    #[test]
+    fn token_text_discloses_bad_journal_lines_behind_a_readable_file() {
+        // L2: a corrupt-but-readable journal must not read as a clean
+        // slate for an untraced mint.
+        let now = 1_000_000;
+        let report = fixture_report(now);
+        let tail = JournalTail {
+            bad: 4,
+            scanned: 11,
+            truncated: true,
+            ..JournalTail::default()
+        };
+        let text = token_text(
+            &report,
+            "ZZZ1111111111111111111111111111111111111111",
+            &[],
+            &tail,
+        );
+        assert!(
+            text.contains("no journal entries for this mint in the last 11 lines"),
+            "{text}"
+        );
+        assert!(text.contains("4 unreadable skipped"), "{text}");
+        assert!(text.contains("older history not scanned"), "{text}");
+        // An actually-unreadable journal says so outright.
+        let tail = JournalTail {
+            error: Some("permission denied".to_string()),
+            ..JournalTail::default()
+        };
+        let text = token_text(
+            &report,
+            "ZZZ1111111111111111111111111111111111111111",
+            &[],
+            &tail,
+        );
+        assert!(
+            text.contains("journal unreadable — absence here proves nothing"),
+            "{text}"
+        );
     }
 }

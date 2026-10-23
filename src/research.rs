@@ -171,6 +171,76 @@ fn print_loss_clusters(title: &str, clusters: &[LossCluster]) {
     }
 }
 
+/// Compact offline summary for `/research`: universe, net, worst
+/// loss cluster (regime cut), best filter proposal. Same inputs and
+/// caveats as the CLI report, shrunk to one Discord answer. `None` =
+/// no signaled exits yet. Paper-only, never live evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResearchSummary {
+    pub exits: usize,
+    pub losses: usize,
+    pub wins: usize,
+    pub net_pnl: f64,
+    pub top_cluster_label: String,
+    pub top_cluster_loss: f64,
+    pub top_cluster_n: usize,
+    pub top_proposal_name: String,
+    pub top_proposal_net: f64,
+    pub top_proposal_excluded: usize,
+    /// True when the top proposal is thin (noise, not evidence).
+    pub top_proposal_thin: bool,
+}
+
+/// Rank the universe exactly like the CLI report, then keep only the
+/// headliners. Pure: the sidecar answers from the same math the
+/// operator already sees in `pump-sentry research`.
+pub(crate) fn summarize(rows: &[MicroRow]) -> Option<ResearchSummary> {
+    if rows.is_empty() {
+        return None;
+    }
+    let losses = rows.iter().filter(|r| r.net_pnl < 0.0).count();
+    let net_pnl: f64 = rows.iter().map(|r| r.net_pnl).sum();
+    let clusters = loss_clusters(rows, |r| {
+        Some(regime_label(r.regime.as_deref()).to_string())
+    });
+    let mut proposals: Vec<Proposal> = candidate_rules()
+        .into_iter()
+        .map(|(name, rule)| evaluate_rule(&name, rows, rule))
+        .collect();
+    proposals.sort_by(|a, b| {
+        b.net_delta
+            .partial_cmp(&a.net_delta)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let (cluster_label, cluster_loss, cluster_n) = clusters
+        .first()
+        .map(|c| (c.label.clone(), c.total_loss, c.n))
+        .unwrap_or_else(|| ("no losing clusters".to_string(), 0.0, 0));
+    let (prop_name, prop_net, prop_excluded, prop_thin) = proposals
+        .first()
+        .map(|p| {
+            (
+                p.name.clone(),
+                p.net_delta,
+                p.excluded,
+                p.excluded < MICRO_BIN_MIN,
+            )
+        })
+        .unwrap_or_else(|| ("no proposals".to_string(), 0.0, 0, true));
+    Some(ResearchSummary {
+        exits: rows.len(),
+        losses,
+        wins: rows.len().saturating_sub(losses),
+        net_pnl,
+        top_cluster_label: cluster_label,
+        top_cluster_loss: cluster_loss,
+        top_cluster_n: cluster_n,
+        top_proposal_name: prop_name,
+        top_proposal_net: prop_net,
+        top_proposal_excluded: prop_excluded,
+        top_proposal_thin: prop_thin,
+    })
+}
 fn print_proposals(rows: &[MicroRow]) {
     println!("-- filter proposals (paper-only; halves = stability check) --");
     let mut proposals: Vec<Proposal> = candidate_rules()
@@ -319,6 +389,23 @@ mod tests {
             row(5, 1.0, sig(Some(0.75), Some(15.0), 0), Some("conservative")),
             row(6, -3.0, sig(Some(0.9), Some(70.0), -100), Some("momentum")),
         ]
+    }
+
+    #[test]
+    fn summarize_headlines_match_cli_math() {
+        let s = summarize(&fixture_rows()).expect("universe nonempty");
+        assert_eq!((s.exits, s.losses, s.wins), (6, 4, 2));
+        assert!((s.net_pnl - (-2.5)).abs() < 1e-9);
+        assert_eq!(s.top_cluster_label, "regime momentum");
+        assert!((s.top_cluster_loss - 6.0).abs() < 1e-9);
+        assert_eq!(s.top_cluster_n, 3);
+        // Concentrated bleed dominates this fixture: some top_wallet
+        // rule must win with positive net delta. Six rows make every
+        // rule thin by construction — the flag must say so honestly.
+        assert!(s.top_proposal_net > 0.0);
+        assert!(s.top_proposal_thin);
+        assert!(s.top_proposal_excluded < MICRO_BIN_MIN);
+        assert_eq!(summarize(&[]), None);
     }
 
     #[test]

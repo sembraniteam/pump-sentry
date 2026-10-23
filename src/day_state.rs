@@ -212,6 +212,15 @@ impl DayBook {
         self.poisoned || self.persist_failed
     }
 
+    /// Public read of the persistence halt for status publishing: a
+    /// poisoned tally is `-inf` (not JSON-finite), so the collector
+    /// must publish the damage flag with a finite placeholder instead.
+    /// Rolls the poison window first, like every other read.
+    pub fn persistence_halted(&mut self, now_secs: u64) -> bool {
+        self.maybe_unpoison(now_secs);
+        self.halted_for_persistence()
+    }
+
     /// Fold one closed trade in and persist it. A failed write latches
     /// halt (AUD-006): the in-memory tally stays authoritative for the
     /// run, but the file no longer backs it, so the breaker must not
