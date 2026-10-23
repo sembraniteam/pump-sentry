@@ -1253,7 +1253,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // Second fill is real custody: park it.
                 if self.is_live_tracked(trader, mint).await {
                     warn!(%mint, %bundle, amount = position.amount_tokens, "LIVE buy landed for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
-                    trader.record_manual(&position, &bundle);
+                    trader.record_manual(&position, &bundle).await;
                     self.exec
                         .park_manual(format!("{mint}#2-{}", short_tag(&bundle)), position)
                         .await;
@@ -1264,7 +1264,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 }
                 let amount = position.amount_tokens;
                 // WAL first.
-                trader.acknowledge_buy(&position, &bundle);
+                trader.acknowledge_buy(&position, &bundle).await;
                 self.exec.insert_tracked(position).await;
                 self.exec.clear_diverged(mint).await;
                 // Tracked custody proves the live leg: its paper
@@ -1345,7 +1345,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 warn!(%mint, error = %reason, "LIVE buy dispatch unknown; parked for manual review (may hold — check mint activity on explorer, no signature exists)");
                 self.journal_buy_outcome(mint, None, "unknown", Some(reason.to_string()), None)
                     .await;
-                trader.record_manual(&position, "dispatch-unknown");
+                trader.record_manual(&position, "dispatch-unknown").await;
                 self.exec.park_manual(mint.to_string(), *position).await;
                 self.emit(format!(
                     "LIVE buy dispatch unknown on {mint}; MANUAL REVIEW REQUIRED (fill unknown)"
@@ -1456,7 +1456,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// non-finite amounts skip (nothing to book).
     async fn debit_dispatch_usd(&self, usd: f64) {
         if usd.is_finite() && usd > 0.0 {
-            self.daily.lock().await.record(-usd, now_secs());
+            self.daily.lock().await.record(-usd, now_secs()).await;
             self.portfolio.lock().await.debit_dispatch_cost(usd);
         }
     }
@@ -1485,7 +1485,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             None,
                         )
                         .await;
-                        trader.record_manual(&recheck.position, &recheck.bundle_id);
+                        trader
+                            .record_manual(&recheck.position, &recheck.bundle_id)
+                            .await;
                         self.exec
                             .park_manual(
                                 format!("{mint}#late-{}", short_tag(&recheck.bundle_id)),
@@ -1497,7 +1499,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     }
                     let amount = recheck.position.amount_tokens;
                     // WAL first, then track.
-                    trader.acknowledge_buy(&recheck.position, &recheck.bundle_id);
+                    trader
+                        .acknowledge_buy(&recheck.position, &recheck.bundle_id)
+                        .await;
                     self.exec.insert_tracked(recheck.position).await;
                     self.exec.clear_diverged(&mint).await;
                     // Late confirm establishes live coverage too (AUD-002).
@@ -1575,7 +1579,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         None,
                     )
                     .await;
-                    trader.record_manual(&recheck.position, &recheck.signature);
+                    trader
+                        .record_manual(&recheck.position, &recheck.signature)
+                        .await;
                     self.exec.park_manual(mint.clone(), recheck.position).await;
                     self.exec.note_giveup(now_secs()).await;
                     self.emit(format!("LIVE buy unconfirmed on {mint} (sig {}); MANUAL REVIEW REQUIRED (may hold)", recheck.signature));
@@ -1605,7 +1611,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let now = now_secs();
         let mut daily = self.daily.lock().await;
         if total.is_finite() {
-            daily.record(total, now);
+            daily.record(total, now).await;
         }
     }
 
@@ -1629,7 +1635,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         }
         for pnl in pnls {
-            self.daily.lock().await.record(pnl, now);
+            self.daily.lock().await.record(pnl, now).await;
         }
     }
 
@@ -1673,7 +1679,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         }
         let pnl = display * (price_usd - basis);
         if pnl.is_finite() {
-            self.daily.lock().await.record(pnl, now_secs());
+            self.daily.lock().await.record(pnl, now_secs()).await;
         }
     }
 
@@ -1688,7 +1694,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     {
         self.exec.reset_retry(mint).await;
         if let Some(held) = self.exec.tracked(mint).await {
-            trader.record_manual(&held, "sell-retries-exhausted");
+            trader.record_manual(&held, "sell-retries-exhausted").await;
         }
         if let Some(held) = self.exec.remove_tracked(mint).await {
             self.exec.park_manual(mint.to_string(), held).await;
@@ -1884,7 +1890,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         match sell_result {
             Ok(bundle) => {
                 // WAL first.
-                trader.record_sell(mint, probe.amount_tokens, &bundle);
+                trader.record_sell(mint, probe.amount_tokens, &bundle).await;
                 let emptied = self.exec.subtract_fill(mint, probe.amount_tokens).await;
                 // Success resets the budget.
                 self.exec.reset_retry(mint).await;
@@ -2080,7 +2086,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             warn!(%mint, amount = held.amount_tokens, "manual sell resurrects a parked bag for explicit exit");
             if let Some(trader) = self.exec.live.as_ref() {
-                trader.unrecord_manual(&held);
+                trader.unrecord_manual(&held).await;
             }
             self.exec.insert_tracked(held).await;
         }
@@ -2207,7 +2213,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         break;
                     };
                     if let Some(trader) = self.exec.live.as_ref() {
-                        trader.unrecord_manual(&held);
+                        trader.unrecord_manual(&held).await;
                     }
                     self.exec.insert_tracked(held).await;
                 }

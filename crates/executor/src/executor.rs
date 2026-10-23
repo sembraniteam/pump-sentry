@@ -1131,11 +1131,14 @@ impl SwapExecutor {
         }
         let balance = self
             .wallet
-            .assert_solvency(
+            // Sell floor: this route idempotently creates the
+            // destination WSOL ATA (rent may be consumed), but carries
+            // no buy-side 0.05 reserve.
+            .assert_sell_solvency(
                 &self.rpc,
-                0,
                 self.effective_tip(order.tip_lamports, bundled),
                 self.priority_fee_lamports(),
+                true,
             )
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "raydium sell pre-flight ok");
@@ -1311,11 +1314,14 @@ impl SwapExecutor {
         }
         let balance = self
             .wallet
-            .assert_solvency(
+            // Sell floor: this route idempotently creates the
+            // quote-side WSOL ATA (rent may be consumed), but carries
+            // no buy-side 0.05 reserve.
+            .assert_sell_solvency(
                 &self.rpc,
-                0,
                 self.effective_tip(order.tip_lamports, bundled),
                 self.priority_fee_lamports(),
+                true,
             )
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "pumpswap sell pre-flight ok");
@@ -1769,11 +1775,14 @@ impl SwapExecutor {
         }
         let balance = self
             .wallet
-            .assert_solvency(
+            // Sell floor: tip + priority + fee + rent-exempt
+            // floor; no ATA rent (v3 WSOL sells return native SOL to
+            // the payer, no account created) and no buy-side reserve.
+            .assert_sell_solvency(
                 &self.rpc,
-                0,
                 self.effective_tip(order.tip_lamports, bundled),
                 self.priority_fee_lamports(),
+                false,
             )
             .await?;
         info!(mint = %order.mint, balance, amount = order.amount_tokens, "sell pre-flight ok");
@@ -2877,5 +2886,151 @@ mod tests {
             .await
             .expect("mayhem SOL quote must pass the scope gate");
         assert!(!ixs.is_empty(), "preflight builds dispatch ixs");
+    }
+
+    /// A 0.04 SOL wallet — far below the 0.05 SOL buy
+    /// reserve — covers fee + priority + tip and stays rent-exempt
+    /// after the exit, so the curve sell preflight must construct
+    /// dispatch instructions ("exits never block"). Fails at HEAD,
+    /// which demanded the buy-side reserve on sells. Fee inputs ride
+    /// the frozen mainnet schedule (same bytes the quote tests decode);
+    /// global carries only the gate byte. Mock call order (each method
+    /// pops its own queue): balance; mint owner, curve state, global
+    /// gate, fee schedule, mint supply, WSOL quote-mint owner.
+    #[tokio::test]
+    async fn low_balance_curve_sell_builds_instructions() {
+        use solana_client::rpc_request::RpcRequest;
+        use solana_rpc_client::mock_sender::MocksMap;
+
+        let creator = Pubkey::new_from_array([9; 32]);
+        let mint = Pubkey::new_from_array([10; 32]);
+        let curve = Pubkey::new_from_array([11; 32]);
+        let token_prog = crate::instructions::TOKEN_PROGRAM_ID;
+        let fee_bin: &[u8] = include_bytes!("../../listener/tests/fixtures/fee_config_live.bin");
+        let mut global = vec![0u8; 1046];
+        global[1045] = 1;
+        let mut mint_blob = vec![0u8; 64];
+        mint_blob[36..44].copy_from_slice(&1_000_000_000_000_000u64.to_le_bytes());
+        let mut mocks = MocksMap::default();
+        // 0.04 SOL: below the 0.05 buy reserve, above every sell leg.
+        mocks.insert(RpcRequest::GetBalance, mock_resp(40_000_000u64));
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &[0u8; 8]),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(
+                &crate::instructions::PUMP_PROGRAM_ID,
+                &mock_curve(&creator, &crate::instructions::WSOL_MINT, false, false),
+            ),
+        );
+        // preflight_sell_v3 reads the WSOL quote-mint owner next, then
+        // re-quotes (global gate, fee schedule, mint supply).
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &[0u8; 8]),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&crate::instructions::PUMP_PROGRAM_ID, &global),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&crate::instructions::FEE_CONFIG_PROGRAM, fee_bin),
+        );
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            mock_ui_account(&token_prog, &mint_blob),
+        );
+        mocks.insert(
+            RpcRequest::GetTokenAccountBalance,
+            mock_resp(MockTokAmt {
+                amount: "100000000000".to_string(),
+                decimals: 6,
+                ui_amount_string: "100000".to_string(),
+            }),
+        );
+        let exec = mock_executor(mocks);
+        let sell = SellOrder {
+            mint,
+            bonding_curve: curve,
+            associated_bonding_curve: curve,
+            amount_tokens: 100_000_000_000,
+            min_sol_output: 1,
+            tip_lamports: 0,
+            slippage_bps: 200,
+            creator: Some(creator),
+        };
+        let ixs = exec
+            .preflight_sell(&sell, false)
+            .await
+            .expect("0.04 SOL wallet must construct a curve sell");
+        assert!(
+            ixs.iter()
+                .any(|ix| ix.program_id == crate::instructions::PUMP_PROGRAM_ID),
+            "sell v3 swap ix built: {ixs:?}"
+        );
+    }
+
+    /// Genuinely unpayable exits still refuse before even a
+    /// token-balance read, naming every shortfall leg (tip, priority,
+    /// fee, ATA rent if the route creates the ATA, rent-exempt floor)
+    /// so an operator sees which knob blocks the return of funds.
+    #[tokio::test]
+    async fn unpayable_curve_sell_refuses_with_named_legs() {
+        use solana_client::rpc_request::RpcRequest;
+        use solana_rpc_client::mock_sender::MocksMap;
+
+        let creator = Pubkey::new_from_array([9; 32]);
+        let mint = Pubkey::new_from_array([10; 32]);
+        let curve = Pubkey::new_from_array([11; 32]);
+        let mut mocks = MocksMap::default();
+        // 100_000 lamports: below fee + rent-exempt floor (895_880)
+        // with no tip and no priority.
+        mocks.insert(RpcRequest::GetBalance, mock_resp(100_000u64));
+        let exec = mock_executor(mocks);
+        let err = exec
+            .preflight_sell(
+                &SellOrder {
+                    mint,
+                    bonding_curve: curve,
+                    associated_bonding_curve: curve,
+                    amount_tokens: 100_000_000_000,
+                    min_sol_output: 1,
+                    tip_lamports: 0,
+                    slippage_bps: 200,
+                    creator: Some(creator),
+                },
+                false,
+            )
+            .await
+            .expect_err("below fee+floor must refuse");
+        match &err {
+            ExecutorError::Wallet(WalletGuardError::SellInsufficientFunds {
+                available_lamports,
+                required_lamports,
+                tip_lamports,
+                priority_lamports,
+                fee_lamports,
+                ata_rent_lamports,
+                floor_lamports,
+            }) => {
+                assert_eq!(*available_lamports, 100_000);
+                // tip 0 + priority 0 + fee 5_000 + rent-exempt floor 890_880.
+                assert_eq!(*required_lamports, 895_880);
+                assert_eq!(*tip_lamports, 0);
+                assert_eq!(*priority_lamports, 0);
+                assert_eq!(*fee_lamports, 5_000);
+                assert_eq!(*ata_rent_lamports, 0);
+                assert_eq!(*floor_lamports, 890_880);
+            }
+            other => panic!("sell-specific refusal expected, got {other}"),
+        }
+        let text = ids::strip_error_url(&err.to_string());
+        assert!(
+            text.contains("tip 0") && text.contains("fee 5000"),
+            "shortfall legs readable for the operator: {text}"
+        );
     }
 }

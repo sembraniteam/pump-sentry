@@ -1171,7 +1171,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // the heartbeat carries the halted state after that.
         let (tripped, fire, day_net) = {
             let mut daily = self.daily.lock().await;
-            let (tripped, fire) = daily.halt_state(self.settings.max_daily_loss_usd, now_secs());
+            let (tripped, fire) = daily
+                .halt_state(self.settings.max_daily_loss_usd, now_secs())
+                .await;
             (tripped, fire, daily.day_net())
         };
         if tripped {
@@ -1467,7 +1469,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     && open_leg_usd > 0.0
                     && !self.exec.is_synthetic(mint).await
                 {
-                    self.daily.lock().await.record(-open_leg_usd, now);
+                    self.daily.lock().await.record(-open_leg_usd, now).await;
                 }
                 self.emit(card);
                 // No feed means no live leg: exits would be manual.

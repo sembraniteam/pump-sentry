@@ -90,6 +90,30 @@ pub enum LiveError {
 pub const LIVE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 /// Dispatch deadline. Timeout means unknown fill, needs review.
 pub const LIVE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Test-only injection point: a delay inside the WAL
+/// writer's critical section, so the slow-writer test can prove the
+/// trading path does not pin a Tokio worker on a slow durable write.
+#[cfg(test)]
+static WAL_TEST_SLOW_WRITE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the slow-write injection for one test; any exit resets it, so
+/// a failing test cannot leak the delay into other tests.
+#[cfg(test)]
+struct SlowWalWrite;
+#[cfg(test)]
+impl SlowWalWrite {
+    fn set(ms: u64) -> Self {
+        WAL_TEST_SLOW_WRITE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for SlowWalWrite {
+    fn drop(&mut self) {
+        WAL_TEST_SLOW_WRITE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 /// Min spacing between sell retries per mint.
 pub const SELL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 /// Failed sells before manual exit.
@@ -860,36 +884,44 @@ impl LiveTrader {
     /// the WAL so a crash between dispatch and confirm does not blind
     /// the next boot's guard (replay seeds recent traces back). The
     /// signature is kept for reconciliation before any release.
-    fn note_sell_bundle(&self, mint: &str, receipt: &JitoReceipt) {
-        if let Ok(mut guard) = self.last_sell_bundle.lock() {
-            guard.insert(
-                mint.to_string(),
-                SellGuard {
-                    bundle_id: receipt.bundle_id.clone(),
-                    signature: Some(receipt.signature.clone()),
-                    blockhash: Some(receipt.blockhash.to_string()),
-                    noted_at: now_secs(),
-                },
-            );
-        } else {
-            tracing::warn!(
-                "sell-bundle lock poisoned during note_sell_bundle; resend guard degraded"
-            );
-        }
-        self.write_wal_sell_pending(mint, receipt);
+    async fn note_sell_bundle(&self, mint: &str, receipt: &JitoReceipt) {
+        {
+            if let Ok(mut guard) = self.last_sell_bundle.lock() {
+                guard.insert(
+                    mint.to_string(),
+                    SellGuard {
+                        bundle_id: receipt.bundle_id.clone(),
+                        signature: Some(receipt.signature.clone()),
+                        blockhash: Some(receipt.blockhash.to_string()),
+                        noted_at: now_secs(),
+                    },
+                );
+            } else {
+                tracing::warn!(
+                    "sell-bundle lock poisoned during note_sell_bundle; resend guard degraded"
+                );
+            }
+        } // guard dropped before the await below (must stay !Send-clean)
+        self.write_wal_sell_pending(mint, receipt).await;
     }
 
     /// Forget a sell bundle after terminal confirm (landed or dead),
     /// retiring its WAL trace with it.
-    fn clear_sell_bundle(&self, mint: &str) {
-        if let Ok(mut guard) = self.last_sell_bundle.lock() {
-            if let Some(entry) = guard.remove(mint) {
-                self.write_wal_settled(&entry.bundle_id);
-            }
-        } else {
-            tracing::warn!(
-                "sell-bundle lock poisoned during clear_sell_bundle; resend guard degraded"
-            );
+    async fn clear_sell_bundle(&self, mint: &str) {
+        let retire = {
+            let mut guard = match self.last_sell_bundle.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::warn!(
+                        "sell-bundle lock poisoned during clear_sell_bundle; resend guard degraded"
+                    );
+                    return;
+                }
+            };
+            guard.remove(mint).map(|entry| entry.bundle_id)
+        }; // guard dropped before the await below (must stay !Send-clean)
+        if let Some(bundle_id) = retire {
+            self.write_wal_settled(&bundle_id).await;
         }
     }
 
@@ -982,14 +1014,14 @@ impl LiveTrader {
             PriorSell::Landed => {
                 // Terminal: forget the guard now (retiring its WAL
                 // trace) instead of status-probing it until TTL.
-                self.clear_sell_bundle(mint);
+                self.clear_sell_bundle(mint).await;
                 tracing::warn!(%mint, bundle = %entry.bundle_id, signature = ?entry.signature,
                     "prior sell LANDED on-chain; releasing resend — ledger may be stale, MANUAL REVIEW if the bag no longer exists");
                 false
             }
             PriorSell::Dead => {
                 // Terminal: provably no-fill — forget the guard now.
-                self.clear_sell_bundle(mint);
+                self.clear_sell_bundle(mint).await;
                 false
             }
         }
@@ -1096,7 +1128,7 @@ impl LiveTrader {
                 RecheckOutcome::StillUnknown => {}
                 // Terminal verdicts retire the WAL line.
                 _ => {
-                    self.write_wal_settled(&entry.bundle_id);
+                    self.write_wal_settled(&entry.bundle_id).await;
                     let mint = entry.position.mint.to_string();
                     self.with_pending("recheck-settle", (), |guard| {
                         guard.remove(mint.as_str());
@@ -1319,7 +1351,7 @@ impl LiveTrader {
             entry_usd_per_token,
         );
         Self::track_pending(&self.pending, &mint_str, intended.clone(), &receipt);
-        self.write_wal_pending(&intended, &receipt);
+        self.write_wal_pending(&intended, &receipt).await;
         let dispatch_blockhash = receipt.blockhash.to_string();
         match self
             .executor
@@ -1358,7 +1390,7 @@ impl LiveTrader {
             DispatchVerdict::Dead(reason) => {
                 Self::untrack_pending(&self.pending, &mint_str);
                 // Proven no-fill: retire the line so boot skips it.
-                self.write_wal_settled(&receipt.bundle_id);
+                self.write_wal_settled(&receipt.bundle_id).await;
                 Err(LiveError::Dead {
                     reason,
                     context: format!("buy bundle {}; no fill", receipt.bundle_id),
@@ -1417,22 +1449,26 @@ impl LiveTrader {
 
     /// Append one line (synced). Serialized across threads sharing
     /// this trader: one formatted line must be one contiguous write.
-    /// A failure cannot undo the dispatch that already happened, but
-    /// it latches entries off: no further live risk may open while
-    /// custody cannot be recorded.
-    fn wal_append(&self, line: String) {
+    /// Returns the failure reason instead of marking the latch — the
+    /// caller (wal_append) does that, and a std-thread caller in tests
+    /// runs it inline and marks. Never called on a Tokio worker.
+    fn wal_append_sync(&self, line: String) -> Result<(), String> {
         let Some(path) = self.wal_path.as_ref() else {
-            return;
+            return Ok(());
         };
         // Serialize before touching the filesystem so concurrent
         // dispatches cannot interleave bytes on the same file.
         let _guard = match self.wal_lock.lock() {
             Ok(g) => g,
-            Err(_) => {
-                self.mark_wal_degraded("wal lock poisoned");
-                return;
-            }
+            Err(_) => return Err("wal lock poisoned".to_string()),
         };
+        #[cfg(test)]
+        {
+            let ms = WAL_TEST_SLOW_WRITE_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if ms > 0 {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1446,13 +1482,32 @@ impl LiveTrader {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        match opts.open(path) {
-            Ok(mut f) => {
-                if writeln!(f, "{line}").is_err() || f.sync_all().is_err() {
-                    self.mark_wal_degraded("append/fsync failed");
-                }
-            }
-            Err(e) => self.mark_wal_degraded(&format!("open failed: {e}")),
+        let mut file = opts.open(path).map_err(|e| format!("open failed: {e}"))?;
+        writeln!(file, "{line}").map_err(|e| format!("append/fsync failed: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("append/fsync failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Append one line (synced) without pinning a Tokio worker: the
+    /// open + write + fsync runs on the blocking pool, serialized by
+    /// the WAL mutex held inside the closure, and the caller still
+    /// waits for THIS line's durability before its ack continues —
+    /// WAL-before-ack is load-bearing for custody. A
+    /// failure latches entries off exactly as the on-worker version
+    /// did (`mark_wal_degraded`).
+    async fn wal_append(&self, line: String) {
+        if self.wal_path.is_none() {
+            return; // no WAL path: never a degrade
+        }
+        let me = self.clone();
+        let joined = tokio::task::spawn_blocking(move || me.wal_append_sync(line)).await;
+        let outcome = match joined {
+            Ok(res) => res,
+            Err(join) => Err(format!("wal append task aborted: {join}")),
+        };
+        if let Err(reason) = outcome {
+            self.mark_wal_degraded(&reason);
         }
     }
 
@@ -1479,28 +1534,29 @@ impl LiveTrader {
     /// Write the per-boot schema stamp (provenance only; no custody).
     /// Called once after boot replay so every WAL names its writer and
     /// schema from the first line of the fresh session onward.
-    pub fn wal_write_meta(&self, ts: u64) {
+    pub async fn wal_write_meta(&self, ts: u64) {
         self.wal_record(&wal::WalLine::Meta {
             schema: wal::WAL_SCHEMA_VERSION,
             version: env!("CARGO_PKG_VERSION").to_string(),
             ts,
-        });
+        })
+        .await;
     }
 
     /// Append one typed line (synced). No-op without a WAL path; a
     /// serialize failure would be an engine bug: latched, not panicked.
-    fn wal_record(&self, line: &wal::WalLine) {
+    async fn wal_record(&self, line: &wal::WalLine) {
         if self.wal_path.is_none() {
             return;
         }
         match serde_json::to_string(line) {
-            Ok(json) => self.wal_append(json),
+            Ok(json) => self.wal_append(json).await,
             Err(e) => self.mark_wal_degraded(&format!("serialize failed: {e}")),
         }
     }
 
     /// Record a dispatch BEFORE confirming.
-    fn write_wal_pending(&self, position: &LivePosition, receipt: &JitoReceipt) {
+    async fn write_wal_pending(&self, position: &LivePosition, receipt: &JitoReceipt) {
         self.wal_record(&wal::WalLine::Pending {
             mint: position.mint.to_string(),
             curve: position.curve.to_string(),
@@ -1512,31 +1568,34 @@ impl LiveTrader {
             blockhash: Some(receipt.blockhash.to_string()),
             ts: Some(now_secs()),
             entry_usd: option_entry_usd(position.entry_usd_per_token),
-        });
+        })
+        .await;
     }
 
     /// Record a sell dispatch BEFORE confirming (crash window
     /// coverage: replay seeds the resend guard from unsettled lines).
-    fn write_wal_sell_pending(&self, mint: &str, receipt: &JitoReceipt) {
+    async fn write_wal_sell_pending(&self, mint: &str, receipt: &JitoReceipt) {
         self.wal_record(&wal::WalLine::SellPending {
             mint: mint.to_string(),
             bundle: receipt.bundle_id.clone(),
             sig: Some(receipt.signature.clone()),
             blockhash: Some(receipt.blockhash.to_string()),
             ts: now_secs(),
-        });
+        })
+        .await;
     }
 
     /// Record a dead bundle so boot skips it.
-    fn write_wal_settled(&self, bundle_id: &str) {
+    async fn write_wal_settled(&self, bundle_id: &str) {
         self.wal_record(&wal::WalLine::Settled {
             bundle: bundle_id.to_string(),
             ts: Some(now_secs()),
-        });
+        })
+        .await;
     }
 
     /// Record a fill and retire pending. Call AFTER tracking it.
-    pub fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
+    pub async fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
         self.wal_record(&wal::WalLine::Position {
             mint: position.mint.to_string(),
             curve: position.curve.to_string(),
@@ -1546,13 +1605,14 @@ impl LiveTrader {
             bundle: Some(bundle_id.to_string()),
             ts: Some(now_secs()),
             entry_usd: option_entry_usd(position.entry_usd_per_token),
-        });
-        self.write_wal_settled(bundle_id);
+        })
+        .await;
+        self.write_wal_settled(bundle_id).await;
     }
 
     /// Record a human-exit bag. `note` is a lookup id (bundle,
     /// signature, or cause).
-    pub fn record_manual(&self, position: &LivePosition, note: &str) {
+    pub async fn record_manual(&self, position: &LivePosition, note: &str) {
         self.wal_record(&wal::WalLine::Manual {
             mint: position.mint.to_string(),
             curve: position.curve.to_string(),
@@ -1562,27 +1622,30 @@ impl LiveTrader {
             note: Some(note.to_string()),
             ts: Some(now_secs()),
             entry_usd: option_entry_usd(position.entry_usd_per_token),
-        });
+        })
+        .await;
     }
 
     /// Retire a manual bag taken for exit. Call AFTER taking: a crash
     /// between take and sell-settle must not replay the bag as a ghost.
-    pub fn unrecord_manual(&self, position: &LivePosition) {
+    pub async fn unrecord_manual(&self, position: &LivePosition) {
         self.wal_record(&wal::WalLine::TakeManual {
             mint: position.mint.to_string(),
             amount: position.amount_tokens,
             ts: Some(now_secs()),
-        });
+        })
+        .await;
     }
 
     /// Record a confirmed sell.
-    pub fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
+    pub async fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
         self.wal_record(&wal::WalLine::Sell {
             mint: mint.to_string(),
             amount: amount_tokens,
             bundle: Some(bundle_id.to_string()),
             ts: Some(now_secs()),
-        });
+        })
+        .await;
     }
 
     /// Congestion pricing for heartbeat display: `(base, floor,
@@ -1702,7 +1765,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE sell dispatched");
-        self.note_sell_bundle(&mint_str, &receipt);
+        self.note_sell_bundle(&mint_str, &receipt).await;
         self.confirm_pool_sell(&mint_str, &receipt, "sell").await
     }
 
@@ -1727,14 +1790,14 @@ impl LiveTrader {
             .await
         {
             DispatchVerdict::Landed => {
-                self.clear_sell_bundle(mint);
+                self.clear_sell_bundle(mint).await;
                 Ok(receipt.bundle_id.clone())
             }
             DispatchVerdict::Dead(reason) => {
                 // Terminally dead: never lands, so drop the id — the
                 // resend guard must not pay a status query for it, nor
                 // hold a resend for a bundle that cannot compete.
-                self.clear_sell_bundle(mint);
+                self.clear_sell_bundle(mint).await;
                 Err(LiveError::Dead {
                     reason,
                     context: format!("{label} bundle {}; still holding", receipt.bundle_id),
@@ -1773,7 +1836,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE raydium sell dispatched");
-        self.note_sell_bundle(&mint_str, &receipt);
+        self.note_sell_bundle(&mint_str, &receipt).await;
         self.confirm_pool_sell(&mint_str, &receipt, "raydium sell")
             .await
     }
@@ -1801,7 +1864,7 @@ impl LiveTrader {
             }
         };
         tracing::info!(mint = %position.mint, bundle = %receipt.bundle_id, "LIVE pumpswap sell dispatched");
-        self.note_sell_bundle(&mint_str, &receipt);
+        self.note_sell_bundle(&mint_str, &receipt).await;
         self.confirm_pool_sell(&mint_str, &receipt, "pumpswap sell")
             .await
     }
@@ -1991,8 +2054,8 @@ mod tests {
         assert!(!LiveTrader::sell_guard_expired(2_000, 1_000));
     }
 
-    #[test]
-    fn terminal_sell_forgets_guard_immediately() {
+    #[tokio::test]
+    async fn terminal_sell_forgets_guard_immediately() {
         // Terminal states (landed/dead) drop the resend guard at once
         // instead of status-probing it until TTL: fewer RPC calls, no
         // stale-hold noise. `clear_sell_bundle` is what the release
@@ -2014,7 +2077,7 @@ mod tests {
                 .expect("lock")
                 .contains_key("MINT")
         );
-        trader.clear_sell_bundle("MINT");
+        trader.clear_sell_bundle("MINT").await;
         assert!(
             trader
                 .last_sell_bundle
@@ -2025,7 +2088,7 @@ mod tests {
             "terminal sell must not linger to TTL"
         );
         // Unknown mint: no panic, no WAL side effects (no WAL path).
-        trader.clear_sell_bundle("NOPE");
+        trader.clear_sell_bundle("NOPE").await;
     }
 
     #[test]
@@ -2467,27 +2530,31 @@ mod tests {
         assert_eq!((imported, held_out.len()), (1, 0));
     }
 
-    #[test]
-    fn concurrent_wal_appends_recover_all_lines() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_wal_appends_recover_all_lines() {
         // Concurrent dispatches share one trader: appends must be
         // serialized so replay recovers every line with zero skips.
         // Without the lock, interleaved `writeln!` syscalls tear lines.
+        // The blocking-pool writer (`wal_append_sync`) is the actual
+        // append path inside `wal_append`, so that is what races here.
         let dir = tempfile::tempdir().expect("tmpdir");
         let trader = cost_trader(10_000, 0, 0).with_wal(dir.path().join("wal.jsonl"));
         let threads: Vec<_> = (0..8)
             .map(|t| {
                 let trader = trader.clone();
-                std::thread::spawn(move || {
+                tokio::task::spawn_blocking(move || {
                     for i in 0..25 {
-                        trader.wal_append(format!(
-                            "{{\"t\":\"settled\",\"bundle\":\"B{t}-{i}\",\"ts\":{i}}}"
-                        ));
+                        trader
+                            .wal_append_sync(format!(
+                                "{{\"t\":\"settled\",\"bundle\":\"B{t}-{i}\",\"ts\":{i}}}"
+                            ))
+                            .expect("append");
                     }
                 })
             })
             .collect();
         for h in threads {
-            h.join().expect("thread");
+            h.await.expect("task");
         }
         let replay = wal::replay_file(&dir.path().join("wal.jsonl")).expect("replay");
         assert_eq!(replay.skipped, 0, "no torn lines");
@@ -2498,8 +2565,94 @@ mod tests {
         assert_eq!(raw.lines().count(), 200, "every append landed");
     }
 
-    #[test]
-    fn wal_write_failure_latches_entries_off() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_wal_write_does_not_pin_the_worker() {
+        // The open+write+fsync must run on the blocking pool: while a
+        // WAL write is slow, a current-thread runtime (ONE worker)
+        // keeps serving other tasks. If the write blocked the worker,
+        // the cooperative task would never advance and the loop would
+        // exhaust.
+        let _slow = SlowWalWrite::set(300);
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let trader = cost_trader(10_000, 0, 0).with_wal(dir.path().join("wal.jsonl"));
+        let append = tokio::spawn({
+            let trader = trader.clone();
+            async move {
+                trader
+                    .wal_append("{\"t\":\"settled\",\"bundle\":\"B1\"}".into())
+                    .await
+            }
+        });
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let spinner = tokio::spawn({
+            let counter = counter.clone();
+            async move {
+                loop {
+                    tokio::task::yield_now().await;
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        append.await.expect("writer task");
+        let steps = counter.load(std::sync::atomic::Ordering::Relaxed);
+        spinner.abort();
+        // A task switched in through spawn_blocking keeps the single
+        // worker free, so the cooperative loop runs far more steps
+        // than a pinned worker could manage during the 300 ms write.
+        assert!(
+            steps > 100,
+            "cooperative work stalled during the WAL write: {steps}"
+        );
+        assert_eq!(
+            wal::replay_file(&dir.path().join("wal.jsonl"))
+                .expect("replay")
+                .skipped,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_acks_all_await_their_own_durability() {
+        // Concurrent entry confirmations each await their WAL line's
+        // durability; when all acks return, every line is on disk with
+        // zero tears (the WAL lock serializes the blocking writers).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let trader = cost_trader(10_000, 0, 0).with_wal(dir.path().join("wal.jsonl"));
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let trader = trader.clone();
+            handles.push(tokio::spawn(async move {
+                trader
+                    .acknowledge_buy(
+                        &LivePosition {
+                            mint: test_pubkey(i as u8),
+                            curve: test_pubkey(i as u8 + 1),
+                            assoc_curve: test_pubkey(i as u8 + 2),
+                            amount_tokens: 1_000 + i as u64,
+                            creator: None,
+                            entry_usd_per_token: 0.0,
+                        },
+                        &format!("B{i}"),
+                    )
+                    .await;
+            }));
+        }
+        for h in handles {
+            h.await.expect("ack task");
+        }
+        let path = dir.path().join("wal.jsonl");
+        let raw = std::fs::read_to_string(&path).expect("read wal");
+        // 32 fills x (Position + Settled) lines, all landed by now.
+        assert_eq!(raw.lines().count(), 64, "every awaited line landed");
+        assert_eq!(
+            wal::replay_file(&path).expect("replay").skipped,
+            0,
+            "no torn lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_write_failure_latches_entries_off() {
         // A WAL write failure cannot unsend the dispatch, but it must
         // latch: no further entry opens while custody is unrecorded.
         let dir = std::env::temp_dir().join(format!("pump-live-wal-{}", std::process::id()));
@@ -2510,17 +2663,19 @@ mod tests {
         std::fs::write(&blocked, b"").expect("file");
         let trader = cost_trader(10_000, 0, 0).with_wal(blocked.join("wal.jsonl"));
         assert!(!trader.wal_degraded(), "clean start");
-        trader.acknowledge_buy(
-            &LivePosition {
-                mint: test_pubkey(7),
-                curve: test_pubkey(8),
-                assoc_curve: test_pubkey(9),
-                amount_tokens: 1_000,
-                creator: None,
-                entry_usd_per_token: 0.0,
-            },
-            "B1",
-        );
+        trader
+            .acknowledge_buy(
+                &LivePosition {
+                    mint: test_pubkey(7),
+                    curve: test_pubkey(8),
+                    assoc_curve: test_pubkey(9),
+                    amount_tokens: 1_000,
+                    creator: None,
+                    entry_usd_per_token: 0.0,
+                },
+                "B1",
+            )
+            .await;
         assert!(trader.wal_degraded(), "failed write latches entries off");
         let _ = std::fs::remove_dir_all(&dir);
     }

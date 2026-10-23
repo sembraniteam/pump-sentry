@@ -355,7 +355,7 @@ async fn replay_live_wal(
         // Fresh WAL: stamp the writer even with nothing to replay, so
         // versioning evidence exists from the first session onward.
         if let Some(trader) = pipeline.exec.live.as_ref() {
-            trader.wal_write_meta(settings::now_secs());
+            trader.wal_write_meta(settings::now_secs()).await;
         }
         return;
     }
@@ -371,7 +371,7 @@ async fn replay_live_wal(
     if let Some(trader) = pipeline.exec.live.as_ref() {
         // Compaction rewrote the file; the stamp goes in after it so
         // the fresh session's schema/writer provenance survives.
-        trader.wal_write_meta(settings::now_secs());
+        trader.wal_write_meta(settings::now_secs()).await;
         // Seed before the pending move below (borrow discipline).
         let recent = replay.recent_sell_pending(settings::now_secs());
         // AUD-009: import what the rechecker can own; a second pending
@@ -666,7 +666,7 @@ async fn reconcile_boot_custody(
                                 ..pos
                             };
                             warn!(%mint, amount, "boot reconcile: manual note handed off (verify, then exit)");
-                            trader.record_manual(&held, "boot-balance-mismatch");
+                            trader.record_manual(&held, "boot-balance-mismatch").await;
                             pipeline.exec.park_manual(key, held).await;
                             counts.handed_off += 1;
                         }
@@ -745,7 +745,9 @@ async fn collect_status(
     let book = pipeline.paper_book_snapshot().await;
     let (breaker_halted, day_net, day_damaged) = {
         let mut daily = pipeline.daily.lock().await;
-        let halted = daily.tripped(pipeline.settings.max_daily_loss_usd, settings::now_secs());
+        let halted = daily
+            .tripped(pipeline.settings.max_daily_loss_usd, settings::now_secs())
+            .await;
         // A poisoned tally is `-inf` (not JSON-finite): publish the
         // damage flag with a finite placeholder instead. Renderers
         // must print UNKNOWN, never the placeholder as a number.
@@ -1488,7 +1490,18 @@ async fn run_pipeline(boot: Boot) {
             loop {
                 writer.tick().await;
                 let report = collect_status(&pipeline, &stats, &pool, live_mode, boot_ts).await;
-                if let Err(e) = status::write(&path, &report) {
+                // The staged tmp+fsync+rename never waits on a runtime
+                // worker: this task runs every 10 s regardless of
+                // trading load.
+                let write_path = path.clone();
+                let written =
+                    tokio::task::spawn_blocking(move || status::write(&write_path, &report))
+                        .await
+                        .map_err(|join| {
+                            std::io::Error::other(format!("status writer aborted: {join}"))
+                        })
+                        .and_then(|res| res);
+                if let Err(e) = written {
                     warn!(error = %e, "status file write failed; Discord sidecar serves stale state");
                 }
             }

@@ -6,19 +6,46 @@ on:
     branches: ["main"]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: rust-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  clippy:
-    name: Clippy
+  audit:
+    name: Audit
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Cache Cargo audit binary
+        id: cache-audit
+        uses: actions/cache@v6
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-0.22.2
+          path: ~/.cargo/bin/cargo-audit
+
+      - name: Install Cargo audit
+        if: steps.cache-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Run security audit
+        run: |
+          cargo audit --version
+          cargo audit --deny warnings
+
+  clippy:
+    name: Clippy & format
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Clippy & Rustfmt component
         run: |
@@ -27,6 +54,7 @@ jobs:
 
       - name: Show Rust toolchain
         run: |
+          rustup show active-toolchain
           rustc --version
           cargo --version
           cargo clippy --version
@@ -38,48 +66,49 @@ jobs:
       - name: Cache Cargo dependencies
         uses: actions/cache@v6
         with:
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
 
       - name: Clippy workspace all targets, warnings deny
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test workspace
-    needs: clippy
+    needs: [audit, clippy]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Show Rust toolchain
         run: |
+          rustup show active-toolchain
           rustc --version
           cargo --version
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v6
         with:
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
 
       - name: Run workspace tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   build:
     name: Build (${{ matrix.asset }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [test, audit]
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -94,31 +123,33 @@ jobs:
           - runner: macos-latest
             target: aarch64-apple-darwin
             asset: pump-sentry-darwin-arm64
-          - runner: macos-15-intel
+          - runner: macos-latest
             target: x86_64-apple-darwin
             asset: pump-sentry-darwin-x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Ensure Rust target installed
         run: rustup target add ${{ matrix.target }}
 
       - name: Show Rust toolchain
         run: |
+          rustup show active-toolchain
           rustc --version
           cargo --version
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v6
         with:
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -150,11 +181,20 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+
+      - name: Verify asset checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && for f in *.sha256; do sha256sum -c "$f"; done)
 
       - uses: softprops/action-gh-release@v3
         with:

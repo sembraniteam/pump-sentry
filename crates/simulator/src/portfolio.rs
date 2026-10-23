@@ -181,6 +181,11 @@ pub struct PaperPortfolio {
     /// Absolute lamports, not a rate: the drag as a percent falls as
     /// `NOTIONAL_USD` rises (see `paper_dispatch_legs_usd`).
     paper_dispatch_legs: (f64, f64),
+    /// Test-only one-shot: the next `book` call on this portfolio
+    /// fails its pricing, so the settle error path (position and cash
+    /// must survive untouched) is reachable in a regression test.
+    #[cfg(test)]
+    fail_book_once: bool,
 }
 
 /// Detail history cap.
@@ -203,7 +208,15 @@ impl PaperPortfolio {
             closed_total: 0,
             total_dispatch_usd: 0.0,
             paper_dispatch_legs: (0.0, 0.0),
+            #[cfg(test)]
+            fail_book_once: false,
         }
+    }
+
+    /// Test-only one-shot failure hook for `book` (see the field doc).
+    #[cfg(test)]
+    pub(crate) fn fail_book_once(&mut self) {
+        self.fail_book_once = true;
     }
 
     /// Set fill model.
@@ -486,11 +499,19 @@ impl PaperPortfolio {
             }
         }
         if fraction >= 1.0 {
-            let position = self
-                .positions
-                .remove(&id)
-                .ok_or(PortfolioError::PositionNotFound(id))?;
-            let trade = self.book(&CloseSlice::whole(&position), mark, reason, now_secs)?;
+            // Book BEFORE removing: the pricing already passed the
+            // pre-mutation probe above, but any future error path in
+            // `book` must not be able to destroy a position without
+            // crediting cash (paper-ledger loss).
+            let slice = {
+                let position = self
+                    .positions
+                    .get(&id)
+                    .ok_or(PortfolioError::PositionNotFound(id))?;
+                CloseSlice::whole(position)
+            };
+            let trade = self.book(&slice, mark, reason, now_secs)?;
+            self.positions.remove(&id);
             self.record(trade.clone());
             return Ok(trade);
         }
@@ -548,6 +569,14 @@ impl PaperPortfolio {
         // Execution pricing, uncapped: the settle probe above priced
         // the identical slice, so this agrees with the trigger by
         // construction and can only fail on an unpriced exit.
+        #[cfg(test)]
+        if self.fail_book_once {
+            self.fail_book_once = false;
+            return Err(PortfolioError::CurveExhausted {
+                notional: slice.quantity as f64 * mark.price,
+                liquidity: mark.liquidity_usd,
+            });
+        }
         let exit_price = self
             .fill_for_mint(&slice.mint)
             .exit_price(slice.side, mark, slice.quantity)
@@ -702,6 +731,62 @@ mod tests {
 
     fn funded() -> PaperPortfolio {
         PaperPortfolio::new(100.0, 0.0).with_fill_model(FillModel::Exact)
+    }
+
+    #[test]
+    fn full_close_error_preserves_position_and_cash() {
+        // A failed `book` on the full-close path must not destroy the
+        // position or move cash: the removal happens only after the
+        // booking succeeds. The one-shot hook forces the pricing
+        // failure that today cannot trigger naturally (the pre-mutation
+        // probe prices the identical slice); without the reordering,
+        // this error path silently drops the position with no credit.
+        let mut pf = funded();
+        let id = pf
+            .open_position_params(&OpenPositionParams {
+                mint: "M1",
+                side: Side::Long,
+                mark: Mark::new(1.0, 1_000_000.0),
+                notional_usd: 10.0,
+                tp_percent: 60.0,
+                sl_percent: -8.0,
+                trailing: false,
+                trail_percent: 0.0,
+                timeout_seconds: 90,
+                moonbag_percent: 0.0,
+                now_secs: 1001,
+            })
+            .expect("open");
+        let cash = pf.cash;
+        pf.fail_book_once();
+        let err = pf
+            .close_position(
+                id,
+                &Mark::new(2.0, 1_000_000.0),
+                ExitReason::TakeProfit,
+                1002,
+            )
+            .expect_err("forced book failure");
+        assert!(
+            matches!(err, PortfolioError::CurveExhausted { .. }),
+            "{err:?}"
+        );
+        assert!(
+            pf.position(id).is_some(),
+            "forced error must not drop the position"
+        );
+        assert_eq!(pf.cash, cash, "cash is untouched on the error path");
+        assert_eq!(pf.closed_total, 0, "no trade is recorded on the error path");
+        // The error is one-shot: the next close books normally.
+        pf.close_position(
+            id,
+            &Mark::new(2.0, 1_000_000.0),
+            ExitReason::TakeProfit,
+            1003,
+        )
+        .expect("retry books normally");
+        assert_eq!(pf.closed_total, 1);
+        assert_eq!(pf.cash, cash + 20.0, "full close credits the sale");
     }
 
     #[test]

@@ -34,6 +34,31 @@ pub enum WalletGuardError {
         available_lamports: u64,
         required_lamports: u64,
     },
+    /// Exit refuse: every shortfall leg is named so an operator sees
+    /// which knob blocked the exit (tip / priority / fee / ATA rent /
+    /// rent-exempt floor). Buys report [`WalletGuardError::InsufficientFunds`]
+    /// with the 0.05 reserve instead — this variant is sell-only and
+    /// must never gate a buy.
+    #[error(
+        "Insufficient SOL to exit: have {available_lamports} lamports, need {required_lamports} = tip {tip_lamports} + priority {priority_lamports} + base fee {fee_lamports} + ATA rent {ata_rent_lamports} + rent-exempt floor {floor_lamports}"
+    )]
+    SellInsufficientFunds {
+        available_lamports: u64,
+        required_lamports: u64,
+        /// Jito tip left on this dispatch (0 on plain sends).
+        tip_lamports: u64,
+        /// Compute-budget priority fee for this dispatch.
+        priority_lamports: u64,
+        /// Base per-signature fee (`ids::BASE_TX_FEE_LAMPORTS`).
+        fee_lamports: u64,
+        /// One ATA rent when the route creates the destination WSOL
+        /// ATA, else 0 (the curve v3 sell returns proceeds as native
+        /// SOL to the payer and creates no account).
+        ata_rent_lamports: u64,
+        /// Rent-exempt minimum the payer must hold after the exit
+        /// (`ids::SYSTEM_ACCT_RENT_EXEMPT_LAMPORTS`).
+        floor_lamports: u64,
+    },
     #[error("RPC query failed: {0}")]
     Rpc(#[from] ClientError),
     #[error("balance read timed out")]
@@ -208,6 +233,54 @@ impl WalletGuard {
         }
         Ok(balance)
     }
+
+    /// Sell-side solvency: `tip + priority + base fee` (`+` one ATA
+    /// rent only when the route creates the destination WSOL ATA), and
+    /// a hard floor so the payer stays rent-exempt after the
+    /// transaction. Deliberately **not** [`WalletGuard::assert_solvency`]:
+    /// the 0.05 SOL reserve is a *buy* funding rule — a sale funds its
+    /// own fee legs atomically from the swap proceeds (Jito bundles
+    /// them into one transaction), so applying the reserve to an exit
+    /// would strand a drained wallet's bag ("exits never block").
+    /// `needs_ata`: Raydium/PumpSwap legs create the destination WSOL
+    /// ATA when missing (rent is genuinely consumed there); the curve
+    /// v3 sell returns proceeds as native SOL to the payer and creates
+    /// no account. Deadline-bound, same read as buys.
+    pub async fn assert_sell_solvency(
+        &self,
+        rpc: &RpcClient,
+        tip_lamports: u64,
+        priority_lamports: u64,
+        needs_ata: bool,
+    ) -> Result<u64, WalletGuardError> {
+        let balance = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            rpc.get_balance(&self.pubkey()),
+        )
+        .await
+        .map_err(|_| WalletGuardError::Timeout)?
+        .map_err(WalletGuardError::Rpc)?;
+        let floor = ids::SYSTEM_ACCT_RENT_EXEMPT_LAMPORTS;
+        let fee_lamports = ids::BASE_TX_FEE_LAMPORTS;
+        let ata_rent_lamports = if needs_ata { ids::ATA_RENT_LAMPORTS } else { 0 };
+        let required = tip_lamports
+            .saturating_add(priority_lamports)
+            .saturating_add(fee_lamports)
+            .saturating_add(ata_rent_lamports)
+            .saturating_add(floor);
+        if balance < required {
+            return Err(WalletGuardError::SellInsufficientFunds {
+                available_lamports: balance,
+                required_lamports: required,
+                tip_lamports,
+                priority_lamports,
+                fee_lamports,
+                ata_rent_lamports,
+                floor_lamports: floor,
+            });
+        }
+        Ok(balance)
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +300,184 @@ mod tests {
     #[test]
     fn reserve_floor_is_005_sol() {
         assert_eq!(MIN_SOL_RESERVE_LAMPORTS, 50_000_000);
+    }
+
+    /// Nonblocking client over the solana mock sender: `getBalance`
+    /// responses pop per-method queues in insertion order, so each
+    /// test dials its own balance(s). No network, no wallet state.
+    fn mock_rpc(balances: &[u64]) -> RpcClient {
+        use solana_client::{rpc_client::RpcClientConfig, rpc_request::RpcRequest};
+        use solana_rpc_client::mock_sender::{MockSender, MocksMap};
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct MockCtx {
+            slot: u64,
+            api_version: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct MockResp<T: serde::Serialize> {
+            context: MockCtx,
+            value: T,
+        }
+        let mut mocks = MocksMap::default();
+        for balance in balances {
+            let resp = MockResp {
+                context: MockCtx {
+                    slot: 1,
+                    api_version: "4.3.0",
+                },
+                value: *balance,
+            };
+            mocks.insert(
+                RpcRequest::GetBalance,
+                serde_json::to_value(resp).expect("mock response serializes"),
+            );
+        }
+        let sender = MockSender::new_with_mocks_map("wallet-solvency", mocks);
+        RpcClient::new_sender(
+            sender,
+            RpcClientConfig::with_commitment(
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            ),
+        )
+    }
+
+    fn test_wallet() -> WalletGuard {
+        WalletGuard::from_base58(&bs58::encode(Keypair::new().to_bytes()).into_string())
+            .expect("wallet")
+    }
+
+    /// 0.04 SOL covers tip + priority + base fee and keeps
+    /// the payer rent-exempt after the exit, but sits far below the
+    /// 0.05 SOL buy reserve. A sell must pass: exits never block on a
+    /// buy funding rule. Fails at HEAD.
+    #[tokio::test]
+    async fn sell_solvency_passes_below_buy_reserve() {
+        let guard = test_wallet();
+        let rpc = mock_rpc(&[40_000_000]);
+        let balance = guard
+            .assert_sell_solvency(&rpc, 100_000, 0, false)
+            .await
+            .expect("sell passes on fee legs alone");
+        assert_eq!(balance, 40_000_000);
+    }
+
+    /// A wallet that cannot even cover tip + priority + fee
+    /// (here 100_000 < 995_880) still refuses — with every shortfall
+    /// leg named so the operator sees why the exit was rejected.
+    /// Independently derived floor: 100_000 + 0 + 5_000 + 890_880.
+    #[tokio::test]
+    async fn sell_solvency_refuses_below_fee_legs_with_named_legs() {
+        let guard = test_wallet();
+        let rpc = mock_rpc(&[100_000]);
+        match guard.assert_sell_solvency(&rpc, 100_000, 0, false).await {
+            Err(WalletGuardError::SellInsufficientFunds {
+                available_lamports,
+                required_lamports,
+                tip_lamports,
+                priority_lamports,
+                fee_lamports,
+                ata_rent_lamports,
+                floor_lamports,
+            }) => {
+                assert_eq!(available_lamports, 100_000);
+                assert_eq!(
+                    required_lamports,
+                    tip_lamports
+                        + priority_lamports
+                        + fee_lamports
+                        + ata_rent_lamports
+                        + floor_lamports
+                );
+                assert_eq!(required_lamports, 995_880);
+                assert_eq!(fee_lamports, 5_000);
+                assert_eq!(ata_rent_lamports, 0, "curve sells create no account");
+                assert_eq!(floor_lamports, 890_880);
+            }
+            other => panic!("expected named sell refusal, got {other:?}"),
+        }
+        // The rendered error (what operators read) must name the legs.
+        let rendered = match guard
+            .assert_sell_solvency(&mock_rpc(&[100_000]), 100_000, 0, false)
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("must refuse"),
+        };
+        assert!(
+            rendered.contains("tip 100000") && rendered.contains("fee 5000"),
+            "shortfall legs must be readable: {rendered}"
+        );
+    }
+
+    /// One ATA rent is added only when the route creates the
+    /// destination WSOL ATA (Raydium/PumpSwap). A wallet that clears
+    /// the curve floor still refuses those routes, and one at exactly
+    /// the ATA-carrying floor passes both spellings.
+    #[tokio::test]
+    async fn sell_solvency_scopes_ata_rent_to_routes_that_create_it() {
+        let guard = test_wallet();
+        // 900_000: above fee+floor (895_880), below the ATA-carrying
+        // floor (895_880 + 2_039_280 = 2_935_160).
+        let rpc = mock_rpc(&[900_000]);
+        guard
+            .assert_sell_solvency(&rpc, 0, 0, false)
+            .await
+            .expect("no-ATA route: fee legs are enough");
+        let err = guard
+            .assert_sell_solvency(&mock_rpc(&[900_000]), 0, 0, true)
+            .await
+            .expect_err("ATA-creating route needs the rent leg");
+        assert!(
+            matches!(
+                err,
+                WalletGuardError::SellInsufficientFunds {
+                    ata_rent_lamports: 2_039_280,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        // At the exact ATA-carrying requirement, both spellings pass.
+        let at = mock_rpc(&[2_935_160]);
+        guard
+            .assert_sell_solvency(&at, 0, 0, true)
+            .await
+            .expect("exact ATA floor passes");
+        guard
+            .assert_sell_solvency(&mock_rpc(&[2_935_160]), 0, 0, false)
+            .await
+            .expect("no-ATA route needs less, so passes too");
+    }
+
+    /// Buys keep [`WalletGuard::assert_solvency`] exactly as
+    /// before — the 0.05 SOL reserve is a *buy* funding rule. A 0.04
+    /// SOL wallet that passes every sell leg is refused for a buy, and
+    /// the refusal is the reserve error, not the sell variant.
+    #[tokio::test]
+    async fn buy_solvency_still_requires_005_reserve() {
+        let guard = test_wallet();
+        let err = guard
+            .assert_solvency(&mock_rpc(&[40_000_000]), 0, 100_000, 0)
+            .await
+            .expect_err("buy must keep the reserve");
+        match err {
+            WalletGuardError::InsufficientFunds {
+                available_lamports,
+                required_lamports,
+            } => {
+                // trade 0 + tip 100_000 + priority 0 + fee 5_000 + one
+                // ATA rent 2_039_280 + reserve 50_000_000.
+                assert_eq!(available_lamports, 40_000_000);
+                assert_eq!(required_lamports, 52_144_280);
+            }
+            other => panic!("reserve refusal expected, got {other}"),
+        }
+        // At the exact requirement the buy passes.
+        guard
+            .assert_solvency(&mock_rpc(&[52_144_280]), 0, 100_000, 0)
+            .await
+            .expect("exact reserve passes for buys");
     }
 
     #[test]

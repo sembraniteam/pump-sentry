@@ -314,6 +314,16 @@ small until the execution gap line says otherwise. Prefer
 group/world readable) and set `hot_wallet_max_sol` so the wallet never
 sits above what you are willing to lose.
 
+Supply-chain gate (release CI): `cargo audit --deny warnings` runs with
+**no ignore list**. The Discord sidecar used serenity's rustls backend, pinning `rustls 0.22` +
+`rustls-webpki 0.102` (7 RustSec advisories) alongside `ctutils 0.4.3`
+(1 advisory) in the Solana tree; none of them remain in
+`Cargo.lock` — the sidecar now uses the serenity `native_tls_backend`
+(system TLS; on Linux this links OpenSSL, so `libssl` becomes a runtime
+dependency), and `ctutils` is bumped past its advisory. Sells keep a
+fee-leg-only solvency floor (exits never block on the 0.05 SOL buy
+reserve).
+
 ## Safety
 
 **Golden rules (everyone):**

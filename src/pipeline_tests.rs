@@ -450,13 +450,13 @@ impl CostLedger for StubLive {
 
 impl WalSink for StubLive {
     // No durability: stub custody lives in test memory.
-    fn acknowledge_buy(&self, _position: &LivePosition, _bundle_id: &str) {}
+    async fn acknowledge_buy(&self, _position: &LivePosition, _bundle_id: &str) {}
 
-    fn record_manual(&self, _position: &LivePosition, _note: &str) {}
+    async fn record_manual(&self, _position: &LivePosition, _note: &str) {}
 
-    fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {}
+    async fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {}
 
-    fn unrecord_manual(&self, _position: &LivePosition) {}
+    async fn unrecord_manual(&self, _position: &LivePosition) {}
 
     fn wal_degraded(&self) -> bool {
         self.inner.wal_degraded.load(Ordering::Relaxed)
@@ -1336,7 +1336,7 @@ async fn daily_breaker_blocks_opens_but_not_exits() {
         None,
     );
     // Seed a blown day, then run the full confirm flow.
-    pipe.daily.lock().await.record(-10.0, now_secs());
+    pipe.daily.lock().await.record(-10.0, now_secs()).await;
     pipe.on_launch(&LaunchRequest {
         mint: MINT,
         curve: CURVE,

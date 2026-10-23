@@ -24,6 +24,12 @@ pub const COMPUTE_BUDGET_PROGRAM_ID: Pubkey =
 pub const BASE_TX_FEE_LAMPORTS: u64 = 5_000;
 /// Rent for one ATA (165 bytes). Change only on rent/ATA change.
 pub const ATA_RENT_LAMPORTS: u64 = 2_039_280;
+/// Rent-exempt minimum for one system account with no data
+/// (128 bytes, two years of rent at genesis rates). A payer must
+/// hold at least this after a transaction; sell solvency keeps the
+/// wallet rent-exempt post-exit (`assert_sell_solvency`). Change
+/// only on a rent-system change.
+pub const SYSTEM_ACCT_RENT_EXEMPT_LAMPORTS: u64 = 890_880;
 /// Basis-point denominator (100%): slippage, fees, pro-rata math.
 pub const BPS_DENOMINATOR: u64 = 10_000;
 /// Lamports per SOL (chain constant).
@@ -71,6 +77,7 @@ mod tests {
         // Network/rent changes are deliberate edits here, never silent drift.
         assert_eq!(BASE_TX_FEE_LAMPORTS, 5_000);
         assert_eq!(ATA_RENT_LAMPORTS, 2_039_280);
+        assert_eq!(SYSTEM_ACCT_RENT_EXEMPT_LAMPORTS, 890_880);
         assert_eq!(BPS_DENOMINATOR, 10_000);
     }
 }

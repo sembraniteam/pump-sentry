@@ -21,8 +21,13 @@
 //!   `DISCORD_BOT_TOKEN[_FILE]`).
 //! - Guild-locked: interactions from any other server are denied.
 //! - Fail closed: no status file, parse failure, stale data, unknown
-//!   mint, expired/missing confirm, or audit failure answers "no action
-//!   taken" — never invented values or half-applied control.
+//!   mint, or expired/missing confirm answers "no action taken" —
+//!   never invented values or half-applied control. Auditability is
+//!   per command: `/resume` (unsafe direction) refuses to act without
+//!   a durable audit line (no audit record ⇒ no resume); `/sell` and
+//!   `/pause` (availability of exits) keep executing on audit failure
+//!   — the audit line retries once and the reply names the gap
+//!   loudly.
 //! - Ack window: handlers do nothing but read one small file (Tier 1)
 //!   or write one small file (Tier 2), then respond (well inside
 //!   Discord's 3 s).
@@ -45,6 +50,7 @@ use serenity::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::settings::{Settings, now_secs};
@@ -75,6 +81,16 @@ pub const STALE_WARN_SECS: u64 = 60;
 /// no-op (logged, audited as expired). Memory-only: a sidecar restart
 /// invalidates every outstanding button (fail closed — re-issue).
 pub const CONFIRM_TTL_SECS: u64 = 300;
+
+/// Outstanding confirm buttons per sidecar process. A new confirm at
+/// the cap is refused (the operator cancels or waits out outstanding
+/// ones first): no silent eviction can strand a pending action that a
+/// click may still resolve.
+pub const PENDING_CONFIRM_CAP: usize = 64;
+
+/// Interval between expired-confirm sweeps ("no click" entries are
+/// dropped when the TTL passes, not only when some button is clicked).
+pub const CONFIRM_SWEEP_INTERVAL_SECS: u64 = 60;
 
 /// Tier 2 audit log beside the state files (doc §6/§8: a separate
 /// sidecar log, not `journal.jsonl` — the journal schema is the bot's
@@ -147,8 +163,9 @@ pub fn load_config() -> Result<(std::path::PathBuf, SidecarConfig), String> {
     Ok((path, cfg))
 }
 
-/// Compact `/status` answer (pure). No money figures by design — it is
-/// a public channel reply; `/heartbeat` carries the ledger view.
+/// Compact `/status` answer (pure). Operator-only reply: the halted
+/// breaker line can carry the day figure, so `/status` is rendered
+/// ephemerally (`render_status`); nothing ledger-money is public.
 fn status_compact_text(report: &StatusReport, now: u64) -> String {
     let r = &report.report;
     let age = now.saturating_sub(report.ts);
@@ -1079,10 +1096,22 @@ fn audit_append(event: &AuditEvent<'_>) -> bool {
     };
     line.push(b'\n');
     let path = audit_path();
-    let ok = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    // Created owner-only from the first byte: the pre-chmod window at
+    // HEAD (create with the umask, chmod after the write) let any
+    // local user read the ids/outcomes between open and chmod. The
+    // best-effort chmod survives for pre-existing files.
+    let open = {
+        #[allow(unused_mut)]
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&path)
+    };
+    let ok = open
         .and_then(|mut f| {
             use std::io::Write;
             f.write_all(&line)
@@ -1104,7 +1133,10 @@ fn audit_append(event: &AuditEvent<'_>) -> bool {
 
 /// Convenience: build, log, and append one Tier 2 audit event. Always
 /// logs via tracing (infallible); the file append is best-effort with
-/// a loud warn, and the return tells the caller whether it landed.
+/// a loud error and one immediate retry, and the return tells the
+/// caller whether the line landed. Per-command failure contracts
+/// differ (see the module doc): the availability direction
+/// (`/sell`, `/pause`) keeps executing; the resume direction refuses.
 fn audit(
     user_id: u64,
     user_name: &str,
@@ -1117,7 +1149,7 @@ fn audit(
         user_id,
         user_name, guild_id, command, args, outcome, "Tier 2 control"
     );
-    audit_append(&AuditEvent {
+    let event = AuditEvent {
         ts: now_secs(),
         user_id,
         user_name,
@@ -1125,7 +1157,15 @@ fn audit(
         command,
         args,
         outcome,
-    })
+    };
+    if audit_append(&event) {
+        return true;
+    }
+    // Retry immediately once; the failure stays loud either way so an
+    // operator can scrape it. Two failures means the audit dir is
+    // broken (disk full, permissions), not a transient hiccup.
+    error!(command, "Tier 2 audit append failed; retrying once");
+    audit_append(&event)
 }
 
 /// A control action awaiting its button click. Memory-only: a restart
@@ -1311,22 +1351,50 @@ impl Sidecar {
         }
     }
 
+    /// Reap expired confirm entries (every issue and every click use
+    /// this; a timed task in `run` reaps without any interaction).
+    fn sweep_expired_confirms(&self) {
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .retain(|_, p| !confirm_expired(p.created, now_secs()));
+    }
+
     /// Issue a confirm prompt: stores the pending action, returns the
     /// ephemeral message with Confirm/Cancel buttons.
     fn issue_confirm(&self, action: PendingAction, detail: String, user_id: u64) -> Answer {
+        // Reap expired entries on every issue: a long-lived sidecar
+        // whose buttons are never clicked must not grow the map.
+        self.sweep_expired_confirms();
         let nonce = format!(
             "{:x}{:x}",
             now_secs(),
             self.nonce.fetch_add(1, Ordering::Relaxed)
         );
-        self.pending.lock().expect("pending lock").insert(
-            nonce.clone(),
-            PendingConfirm {
-                action,
-                requester: user_id,
-                created: now_secs(),
-            },
-        );
+        {
+            let mut map = self.pending.lock().expect("pending lock");
+            if map.len() >= PENDING_CONFIRM_CAP {
+                warn!(
+                    cap = PENDING_CONFIRM_CAP,
+                    "confirm button refused: outstanding-confirm cap reached"
+                );
+                return Answer {
+                    message: CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
+                        .content(truncate_content(&format!(
+                            "{detail}\n⚠ Confirm queue is full ({PENDING_CONFIRM_CAP} outstanding) — cancel or wait out an outstanding confirm first. No action armed."
+                        ))),
+                };
+            }
+            map.insert(
+                nonce.clone(),
+                PendingConfirm {
+                    action,
+                    requester: user_id,
+                    created: now_secs(),
+                },
+            );
+        }
         let _ = user_id;
         Answer {
             message: CreateInteractionResponseMessage::new()
@@ -1477,6 +1545,18 @@ impl Sidecar {
         if let Some(deny) = self.operator_check(user_id, &user_name, PAUSE_COMMAND, "") {
             return deny;
         }
+        let text = self.pause_handle(user_id, &user_name, self.guild_id.get());
+        Answer {
+            message: CreateInteractionResponseMessage::new()
+                .ephemeral(true)
+                .content(text),
+        }
+    }
+
+    /// `/pause` execution: the pause lands first (exit availability),
+    /// then the audit line (retried once); a failed audit only warns —
+    /// pausing must never depend on auditability.
+    fn pause_handle(&self, user_id: u64, user_name: &str, guild_id: u64) -> String {
         let path = crate::cli::entries_paused_path();
         let already = crate::cli::marker_present(&path);
         match crate::cli::set_entries_paused_at(&path) {
@@ -1486,14 +1566,7 @@ impl Sidecar {
                 } else {
                     "executed"
                 };
-                let landed = audit(
-                    user_id,
-                    &user_name,
-                    self.guild_id.get(),
-                    PAUSE_COMMAND,
-                    "",
-                    outcome,
-                );
+                let landed = audit(user_id, user_name, guild_id, PAUSE_COMMAND, "", outcome);
                 let mut text = if already {
                     "Entries paused (was already paused — marker timestamp refreshed). Open positions keep managing."
                 } else {
@@ -1505,28 +1578,18 @@ impl Sidecar {
                         "\n⚠ Audit append failed — check the sidecar log; the pause itself landed.",
                     );
                 }
-                Answer {
-                    message: CreateInteractionResponseMessage::new()
-                        .ephemeral(true)
-                        .content(text),
-                }
+                text
             }
             Err(e) => {
                 audit(
                     user_id,
-                    &user_name,
-                    self.guild_id.get(),
+                    user_name,
+                    guild_id,
                     PAUSE_COMMAND,
                     "",
                     "error_marker_write",
                 );
-                Answer {
-                    message: CreateInteractionResponseMessage::new()
-                        .ephemeral(true)
-                        .content(format!(
-                            "Pause marker write failed ({e}). Entries NOT paused."
-                        )),
-                }
+                format!("Pause marker write failed ({e}). Entries NOT paused.")
             }
         }
     }
@@ -1577,10 +1640,7 @@ impl Sidecar {
         let user_name = comp.user.name.clone();
         let guild_id = comp.guild_id.map(|g| g.get()).unwrap_or(0);
         // Expired entries die here (lazy sweep: every click reaps).
-        self.pending
-            .lock()
-            .expect("pending lock")
-            .retain(|_, p| !confirm_expired(p.created, now_secs()));
+        self.sweep_expired_confirms();
         let outcome_text = match parse_confirm_id(&comp.data.custom_id) {
             None => {
                 audit(
@@ -1705,9 +1765,24 @@ impl Sidecar {
                 }
             }
             PendingAction::Resume => {
+                // Resume is the unsafe direction, so auditability is
+                // load-bearing: the line is written (and retried)
+                // BEFORE the marker clears — no durable audit record,
+                // no resume. A failed clear after a landed line stays
+                // honest via the follow-up audit outcome below.
+                let args = format!("requested by {requester}");
+                if !audit(
+                    user_id,
+                    user_name,
+                    guild_id,
+                    RESUME_COMMAND,
+                    &args,
+                    "executing",
+                ) {
+                    return "Audit write failed — resume REFUSED (no audit record, no resume). Fix the audit file's directory and retry `/resume`.".to_string();
+                }
                 match crate::cli::clear_entries_paused_at(&crate::cli::entries_paused_path()) {
                     Ok(true) => {
-                        let args = format!("requested by {requester}");
                         let landed = audit(
                             user_id,
                             user_name,
@@ -1776,6 +1851,10 @@ impl Sidecar {
         match status::read(&status::status_path()) {
             Ok(report) if fresh(&report) => Answer {
                 message: CreateInteractionResponseMessage::new()
+                    // Operator-only: the halted-breaker line can name
+                    // the day figure, which the project keeps out of
+                    // public channels (see the `/pnl` rule).
+                    .ephemeral(true)
                     .content(truncate_content(&status_compact_text(&report, now))),
             },
             Ok(report) => Answer {
@@ -1796,17 +1875,23 @@ impl Sidecar {
     }
 
     /// `/heartbeat`: the full production card from on-disk state.
+    /// Ephemeral: the card carries the ledger view (cash/equity, and
+    /// the halted breaker's day figure), which stays operator-only
+    /// exactly like `/pnl`.
     fn render_heartbeat(&self, now: u64) -> Answer {
         let inner = status::read(&status::status_path()).map(|r| heartbeat_card(&r, now));
         match inner {
             Ok(card) => {
                 let message = match &card.embed {
                     Some(embed) => CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
                         .content(&card.content)
                         .embeds(vec![embed_from(embed)]),
                     // Reachable only if the card someday overflows its
                     // own limits: the text fallback is the answer.
-                    None => CreateInteractionResponseMessage::new().content(&card.content),
+                    None => CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
+                        .content(&card.content),
                 };
                 Answer { message }
             }
@@ -2103,16 +2188,31 @@ impl EventHandler for Sidecar {
     }
 }
 
+/// The sidecar's only in-process storage is the confirm-button map:
+/// reap expired entries on a timer, independent of any interaction,
+/// so unclicked confirms never outgrow the cap by lapping the TTL.
+async fn sweep_pending_confirms(pending: Arc<Mutex<HashMap<String, PendingConfirm>>>) {
+    let mut every = tokio::time::interval(Duration::from_secs(CONFIRM_SWEEP_INTERVAL_SECS));
+    loop {
+        every.tick().await;
+        pending
+            .lock()
+            .expect("pending lock")
+            .retain(|_, p| !confirm_expired(p.created, now_secs()));
+    }
+}
+
 /// Capture the token (sync, pre-thread), load the config, connect.
 /// Boot errors are fail-stop: an operator wants the sidecar refusing
 /// to half-run, not a phantom gateway connection.
 pub fn run(token: String) -> Result<(), String> {
     let (config_path, cfg) = load_config()?;
     let guild_id = GuildId::new(cfg.guild_id);
+    let pending = Arc::new(Mutex::new(HashMap::new()));
     let sidecar = Sidecar {
         guild_id,
         operators: cfg.operator_ids.clone(),
-        pending: Arc::new(Mutex::new(HashMap::new())),
+        pending: Arc::clone(&pending),
         nonce: AtomicU64::new(0),
     };
     info!(
@@ -2128,6 +2228,7 @@ pub fn run(token: String) -> Result<(), String> {
         .build()
         .map_err(|e| format!("sidecar runtime: {e}"))?;
     rt.block_on(async move {
+        tokio::spawn(sweep_pending_confirms(pending));
         // No message content, no presence: slash commands plus confirm
         // buttons need no privileged intents at all.
         let mut client = Client::builder(token, GatewayIntents::empty())
@@ -3122,6 +3223,237 @@ mod tests {
         assert!(
             text.contains("journal unreadable — absence here proves nothing"),
             "{text}"
+        );
+    }
+
+    // ---- Tier 2 audit-failure contracts + confirm-map bounds ----
+
+    fn sidecar() -> Sidecar {
+        Sidecar {
+            guild_id: GuildId::new(1),
+            operators: vec![2],
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            nonce: AtomicU64::new(0),
+        }
+    }
+
+    /// Isolate audit/marker path resolution: `LOG_FILE` steers every
+    /// state file used here into one temp dir.
+    struct AuditScenario {
+        _env: crate::test_env::Scoped,
+        dir: tempfile::TempDir,
+    }
+
+    impl AuditScenario {
+        fn new(_tag: &str) -> Self {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let env = crate::test_env::scoped(&[(
+                "LOG_FILE",
+                Some(dir.path().join("bot.log").to_str().expect("utf8")),
+            )]);
+            Self { _env: env, dir }
+        }
+
+        fn audit_file(&self) -> std::path::PathBuf {
+            self.dir.path().join("discord-audit.jsonl")
+        }
+
+        /// The audit file exists, appends are read-only (two audit
+        /// attempts fail for the same reason: disk state, not parsing).
+        fn block_audit(&self) {
+            std::fs::write(self.audit_file(), b"seed\n").expect("seed");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(self.audit_file(), std::fs::Permissions::from_mode(0o444))
+                    .expect("chmod 0444");
+            }
+        }
+    }
+
+    impl Drop for AuditScenario {
+        fn drop(&mut self) {
+            // A read-only seed file would break the tempdir cleanup.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if self.audit_file().exists() {
+                    let _ = std::fs::set_permissions(
+                        self.audit_file(),
+                        std::fs::Permissions::from_mode(0o644),
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_refuses_without_a_durable_audit_line() {
+        // The unsafe direction fails closed on a broken audit trail:
+        // the pause marker survives, nothing cleared.
+        let sc = AuditScenario::new("resume-refuse");
+        sc.block_audit();
+        let sidecar = sidecar();
+        let marker = crate::cli::entries_paused_path();
+        crate::cli::set_entries_paused_at(&marker).expect("must be paused");
+        let text = sidecar
+            .execute_confirmed(2, "op", 1, 2, PendingAction::Resume)
+            .await;
+        assert!(text.contains("REFUSED"), "{text}");
+        assert!(
+            crate::cli::marker_present(&marker),
+            "no audit line, no resume — marker stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_executes_and_audits_when_writeable() {
+        let sc = AuditScenario::new("resume-exec");
+        let sidecar = sidecar();
+        let marker = crate::cli::entries_paused_path();
+        crate::cli::set_entries_paused_at(&marker).expect("must be paused");
+        let text = sidecar
+            .execute_confirmed(2, "op", 1, 2, PendingAction::Resume)
+            .await;
+        assert!(text.contains("Entries resumed"), "{text}");
+        assert!(!crate::cli::marker_present(&marker));
+        let log = std::fs::read_to_string(sc.audit_file()).expect("audit");
+        assert!(log.contains("\"executing\""), "{log}");
+        assert!(log.contains("\"executed\""), "{log}");
+    }
+
+    #[tokio::test]
+    async fn sell_still_executes_when_audit_unwritable() {
+        // Availability direction: an exit request must not depend on a
+        // writable audit file. The reply names the gap loudly.
+        let sc = AuditScenario::new("sell-audit-fail");
+        sc.block_audit();
+        let sidecar = sidecar();
+        let text = sidecar
+            .execute_confirmed(
+                2,
+                "op",
+                1,
+                2,
+                PendingAction::Sell {
+                    mint: "11111111111111111111111111111111".to_string(),
+                },
+            )
+            .await;
+        assert!(text.contains("Sell queued"), "{text}");
+        assert!(text.contains("Audit append failed"), "{text}");
+        // The request file exists (drained by the daemon).
+        let (_, log_file) = crate::cli::resolve_paths();
+        let found = std::fs::read_dir(log_file.parent().unwrap())
+            .expect("dir")
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("sell-"));
+        assert!(found, "sell request file must be on disk");
+    }
+
+    #[tokio::test]
+    async fn pause_still_executes_when_audit_unwritable() {
+        // Availability direction: the pause marker lands; audit failure
+        // only warns in the reply.
+        let sc = AuditScenario::new("pause-audit-fail");
+        sc.block_audit();
+        let sidecar = sidecar();
+        let text = sidecar.pause_handle(2, "op", 1);
+        assert!(text.contains("Entries paused"), "{text}");
+        assert!(text.contains("Audit append failed"), "{text}");
+        assert!(crate::cli::marker_present(
+            &crate::cli::entries_paused_path()
+        ));
+    }
+
+    #[tokio::test]
+    async fn audit_file_is_created_private_at_creation() {
+        let sc = AuditScenario::new("audit-0600");
+        std::fs::remove_file(sc.audit_file()).ok();
+        let sidecar = sidecar();
+        sidecar.pause_handle(2, "op", 1); // single audit write creates the file
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(sc.audit_file())
+                .expect("audit file")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "created owner-only from the first byte"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_cap_refuses_when_full() {
+        let sidecar = sidecar();
+        {
+            let mut map = sidecar.pending.lock().expect("pending lock");
+            for i in 0..PENDING_CONFIRM_CAP {
+                map.insert(
+                    format!("pending#{i}"),
+                    PendingConfirm {
+                        action: PendingAction::Resume,
+                        requester: 2,
+                        created: now_secs(),
+                    },
+                );
+            }
+        }
+        let answer = sidecar.issue_confirm(PendingAction::Resume, "detail".to_string(), 2);
+        let content = serde_json::to_value(&answer.message)
+            .expect("message serializes")
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content.contains("queue is full"), "{content}");
+        assert_eq!(
+            sidecar.pending.lock().expect("pending lock").len(),
+            PENDING_CONFIRM_CAP,
+            "refusal inserts nothing"
+        );
+    }
+
+    #[test]
+    fn expired_confirms_are_reaped_without_a_click() {
+        let sidecar = sidecar();
+        {
+            let mut map = sidecar.pending.lock().expect("pending lock");
+            for i in 0..PENDING_CONFIRM_CAP {
+                map.insert(
+                    format!("pending#{i}"),
+                    PendingConfirm {
+                        action: PendingAction::Resume,
+                        requester: 2,
+                        // One entry expired; the rest are fresh.
+                        created: if i == 0 {
+                            now_secs().saturating_sub(CONFIRM_TTL_SECS + 60)
+                        } else {
+                            now_secs()
+                        },
+                    },
+                );
+            }
+        }
+        let answer = sidecar.issue_confirm(PendingAction::Resume, "detail".to_string(), 2);
+        // Only the expired entry fell out of the map before the insert.
+        let content = serde_json::to_value(&answer.message)
+            .expect("message serializes")
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(!content.contains("queue is full"), "{content}");
+        let map = sidecar.pending.lock().expect("pending lock");
+        assert_eq!(map.len(), PENDING_CONFIRM_CAP, "one reaped, one inserted");
+        assert!(
+            map.values()
+                .all(|p| !confirm_expired(p.created, now_secs())),
+            "no expired entry survives an issue"
         );
     }
 }

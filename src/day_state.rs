@@ -221,21 +221,24 @@ impl DayBook {
         self.halted_for_persistence()
     }
 
-    /// Fold one closed trade in and persist it. A failed write latches
-    /// halt (AUD-006): the in-memory tally stays authoritative for the
-    /// run, but the file no longer backs it, so the breaker must not
-    /// keep allowing entries it could not survive a restart with.
-    pub fn record(&mut self, net_pnl: f64, now_secs: u64) {
+    /// Fold one closed trade in and persist it (write runs on the
+    /// blocking pool: a slow fsync never pins a Tokio worker holding
+    /// [`crate::pipeline::Pipeline`]'s day-state lock). A failed write
+    /// latches halt (AUD-006): the in-memory tally stays authoritative
+    /// for the run, but the file no longer backs it, so the breaker
+    /// must not keep allowing entries it could not survive a restart
+    /// with.
+    pub async fn record(&mut self, net_pnl: f64, now_secs: u64) {
         self.maybe_unpoison(now_secs);
         self.breaker.record(net_pnl, now_secs);
-        self.persist();
+        self.persist().await;
     }
 
     /// Same contract as `DailyBreaker::tripped`; a day rollover
     /// persists (today's zero replaces yesterday's tally). Poisoned =
     /// halted (a corrupt tally must never read as "no losses"); a
     /// failed persist halts the same way until a write succeeds.
-    pub fn tripped(&mut self, cap_usd: f64, now_secs: u64) -> bool {
+    pub async fn tripped(&mut self, cap_usd: f64, now_secs: u64) -> bool {
         self.maybe_unpoison(now_secs);
         if self.halted_for_persistence() {
             return true;
@@ -243,7 +246,7 @@ impl DayBook {
         let rolled = now_secs / 86_400 != self.breaker.day;
         let tripped = self.breaker.tripped(cap_usd, now_secs);
         if rolled {
-            self.persist();
+            self.persist().await;
             if self.persist_failed {
                 return true;
             }
@@ -256,7 +259,7 @@ impl DayBook {
     /// Poisoned = halted with a firing card (loud, once per day). A
     /// failed persist halts the same way and fires the card once per
     /// run-day until the next write succeeds.
-    pub fn halt_state(&mut self, cap_usd: f64, now_secs: u64) -> (bool, bool) {
+    pub async fn halt_state(&mut self, cap_usd: f64, now_secs: u64) -> (bool, bool) {
         self.maybe_unpoison(now_secs);
         if self.halted_for_persistence() {
             // Loud once per run-day (per-UTC-day one-shot): stamp the
@@ -272,7 +275,7 @@ impl DayBook {
         let before = self.breaker.halt_alerted_day;
         let out = self.breaker.halt_state(cap_usd, now_secs);
         if self.breaker.halt_alerted_day != before {
-            self.persist();
+            self.persist().await;
         }
         out
     }
@@ -288,11 +291,14 @@ impl DayBook {
     /// latches `persist_failed` (AUD-006): the book halts until a
     /// later write succeeds — a recovered write clears the latch and
     /// the next persistence keeps the breaker honest across restarts.
-    fn persist(&mut self) {
+    /// The open+write+fsync+rename runs on the blocking pool: the
+    /// caller holds the pipeline's day-state lock across the await, so
+    /// the wait must not happen on a runtime worker (trade-close path).
+    async fn persist(&mut self) {
         if self.poisoned {
             return;
         }
-        let Some(path) = self.path.as_deref() else {
+        let Some(path) = self.path.clone() else {
             return;
         };
         let state = DayState {
@@ -301,17 +307,29 @@ impl DayBook {
             day_net: self.breaker.day_net,
             halt_alerted_day: self.breaker.halt_alerted_day,
         };
-        match save(path, &state) {
+        let persisted_path = path.clone();
+        let write_path = path.clone();
+        let joined = tokio::task::spawn_blocking(move || save(&write_path, &state)).await;
+        let outcome = match joined {
+            Ok(res) => res,
+            Err(join) => Err(std::io::Error::other(format!(
+                "day-state writer aborted: {join}"
+            ))),
+        };
+        match outcome {
             Ok(()) => {
                 if self.persist_failed {
                     self.persist_failed = false;
-                    tracing::info!(file = %path.display(), "day-state write recovered; persistence latch cleared");
+                    tracing::info!(
+                        file = %path.display(),
+                        "day-state write recovered; persistence latch cleared"
+                    );
                 }
             }
             Err(e) => {
                 if !self.persist_failed {
                     tracing::error!(
-                        file = %path.display(), error = %e,
+                        file = %persisted_path.display(), error = %e,
                         "day-state WRITE FAILED: the tally cannot persist, so a restart would read it as lost — entries halt until a write succeeds (exits keep running; fix the state dir)"
                     );
                 }
@@ -413,8 +431,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn damaged_file_poisons_the_book_until_rollover() {
+    #[tokio::test]
+    async fn damaged_file_poisons_the_book_until_rollover() {
         // A corrupt tally halts entries for the day (fail closed) with
         // one loud card — a restart cannot silently reset the loss.
         let day = 20_000u64;
@@ -426,23 +444,23 @@ mod tests {
         let mut book = DayBook::open(Some(path.clone()), now);
         assert!(book.poisoned, "damaged file poisons the book");
         assert!(
-            book.tripped(1_000_000.0, now),
+            book.tripped(1_000_000.0, now).await,
             "poisoned book halts entries"
         );
         assert_eq!(
-            book.halt_state(1_000_000.0, now),
+            book.halt_state(1_000_000.0, now).await,
             (true, true),
             "first card fires"
         );
         assert_eq!(
-            book.halt_state(1_000_000.0, now + 30),
+            book.halt_state(1_000_000.0, now + 30).await,
             (true, false),
             "no card spam after the first"
         );
         // A restart with the same damaged file stays halted.
         let mut restarted = DayBook::open(Some(path.clone()), now + 60);
         assert!(restarted.poisoned);
-        assert!(restarted.tripped(1_000_000.0, now + 60));
+        assert!(restarted.tripped(1_000_000.0, now + 60).await);
         // Next UTC day, same damaged file: still halted — a restart
         // cannot prove today's tally is zero (an earlier process may
         // have traded and crashed). Fail closed until the operator
@@ -451,15 +469,15 @@ mod tests {
         let mut rolled = DayBook::open(Some(path.clone()), next);
         assert!(rolled.poisoned);
         assert!(
-            rolled.tripped(1_000_000.0, next),
+            rolled.tripped(1_000_000.0, next).await,
             "damaged file still halts after restart"
         );
         // Operator clears the file: fresh day resumes.
         std::fs::remove_file(&path).expect("operator clears the file");
         let mut cleared = DayBook::open(Some(path.clone()), next + 60);
         assert!(!cleared.poisoned);
-        assert!(!cleared.tripped(1_000_000.0, next + 60));
-        cleared.record(-1.0, next + 60);
+        assert!(!cleared.tripped(1_000_000.0, next + 60).await);
+        cleared.record(-1.0, next + 60).await;
         assert_eq!(
             loaded(&path).day_net,
             -1.0,
@@ -469,22 +487,22 @@ mod tests {
         // yesterday's unknown tally is moot, so the poison clears and
         // the clean tally persists over the damaged file.
         std::fs::write(&path, "{not json").expect("re-damage");
-        book.tripped(1_000_000.0, next + 120);
+        book.tripped(1_000_000.0, next + 120).await;
         assert!(!book.poisoned, "UTC rollover clears a running poison");
-        assert!(!book.tripped(1_000_000.0, next + 120));
-        book.record(-2.0, next + 120);
+        assert!(!book.tripped(1_000_000.0, next + 120).await);
+        book.record(-2.0, next + 120).await;
         let state = loaded(&path);
         assert_eq!((state.day, state.day_net), (day + 1, -2.0));
     }
 
-    #[test]
-    fn book_resumes_today_and_resets_older() {
+    #[tokio::test]
+    async fn book_resumes_today_and_resets_older() {
         let day = 20_000u64;
         let now = day * 86_400 + 10;
         let path = scratch("resume").join(DAY_STATE_FILE);
         let mut book = DayBook::open(Some(path.clone()), now);
-        book.record(-7.0, now);
-        book.record(2.0, now);
+        book.record(-7.0, now).await;
+        book.record(2.0, now).await;
         assert_eq!(book.day_net(), -5.0);
         let state = loaded(&path);
         assert_eq!((state.day, state.day_net), (day, -5.0));
@@ -492,47 +510,50 @@ mod tests {
         // Restart: same day resumes, the tally must not reset.
         let mut restarted = DayBook::open(Some(path.clone()), now + 60);
         assert_eq!(restarted.day_net(), -5.0);
-        assert!(restarted.tripped(3.0, now + 60), "resumed loss still trips");
-        restarted.record(-1.0, now + 120);
+        assert!(
+            restarted.tripped(3.0, now + 60).await,
+            "resumed loss still trips"
+        );
+        restarted.record(-1.0, now + 120).await;
         assert_eq!(loaded(&path).day_net, -6.0);
 
         // Next UTC day: fresh, and the rollover is persisted.
         let next = (day + 1) * 86_400 + 10;
         let mut rolled = DayBook::open(Some(path.clone()), next);
         assert_eq!(rolled.day_net(), 0.0);
-        assert!(!rolled.tripped(3.0, next));
-        rolled.record(-1.0, next);
+        assert!(!rolled.tripped(3.0, next).await);
+        rolled.record(-1.0, next).await;
         let state = loaded(&path);
         assert_eq!((state.day, state.day_net), (day + 1, -1.0));
     }
 
-    #[test]
-    fn halt_card_marker_survives_a_restart() {
+    #[tokio::test]
+    async fn halt_card_marker_survives_a_restart() {
         let day = 20_000u64;
         let now = day * 86_400 + 10;
         let path = scratch("halt-card").join(DAY_STATE_FILE);
         let mut book = DayBook::open(Some(path.clone()), now);
-        book.record(-10.0, now);
-        assert_eq!(book.halt_state(5.0, now), (true, true), "first card");
+        book.record(-10.0, now).await;
+        assert_eq!(book.halt_state(5.0, now).await, (true, true), "first card");
         let mut restarted = DayBook::open(Some(path), now + 30);
         assert_eq!(
-            restarted.halt_state(5.0, now + 30),
+            restarted.halt_state(5.0, now + 30).await,
             (true, false),
             "restart must not re-fire today's card"
         );
     }
 
-    #[test]
-    fn unbacked_book_records_without_touching_disk() {
+    #[tokio::test]
+    async fn unbacked_book_records_without_touching_disk() {
         let now = 20_000 * 86_400 + 10;
         let mut book = DayBook::open(None, now);
-        book.record(-4.0, now);
+        book.record(-4.0, now).await;
         assert_eq!(book.day_net(), -4.0);
-        assert!(book.tripped(1.0, now));
+        assert!(book.tripped(1.0, now).await);
     }
 
-    #[test]
-    fn failed_persist_latches_halt_until_a_write_succeeds() {
+    #[tokio::test]
+    async fn failed_persist_latches_halt_until_a_write_succeeds() {
         // AUD-006: a disk-full/read-only/permission write failure
         // after a correct boot cannot loosen the live breaker. The
         // tally is in memory for this run, but a restart would read a
@@ -559,31 +580,34 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
             .expect("make dir read-only");
         let mut book = DayBook::open(Some(path.clone()), now);
-        book.record(-2.0, now);
+        book.record(-2.0, now).await;
         assert!(book.persist_failed, "failed write latches");
         assert!(
-            book.tripped(1_000_000.0, now),
+            book.tripped(1_000_000.0, now).await,
             "a failed persist halts entries (fail-closed)"
         );
         assert_eq!(
-            book.halt_state(1_000_000.0, now),
+            book.halt_state(1_000_000.0, now).await,
             (true, true),
             "loud card fires"
         );
         assert_eq!(
-            book.halt_state(1_000_000.0, now + 30),
+            book.halt_state(1_000_000.0, now + 30).await,
             (true, false),
             "no card spam"
         );
         // Still-losing in-memory tally must not be readable as a win:
         // the file never got the number, but the run knows.
-        assert!(book.tripped(1.9, now + 60), "in-memory loss still trips");
+        assert!(
+            book.tripped(1.9, now + 60).await,
+            "in-memory loss still trips"
+        );
         // A later `record` retries the write (the latch is a state,
         // not a skip-list): it must not loosen the breaker even while
         // still failing.
-        book.record(-1.0, now + 80);
+        book.record(-1.0, now + 80).await;
         assert!(
-            book.tripped(2.9, now + 80),
+            book.tripped(2.9, now + 80).await,
             "still failing writes keep the halt"
         );
         // Recovery: make the dir writable and record again — the
@@ -591,10 +615,10 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
             .expect("restore dir");
-        book.record(-0.1, now + 90);
+        book.record(-0.1, now + 90).await;
         assert!(!book.persist_failed, "a successful write clears the latch");
         assert!(
-            !book.tripped(1_000_000.0, now + 90),
+            !book.tripped(1_000_000.0, now + 90).await,
             "entries resume after recovery (cap far above the tally)"
         );
         assert_eq!(loaded(&path).day_net, -3.1, "recovered tally persisted");
@@ -640,17 +664,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn day_rollover_persists_zero_and_survives_write_failures() {
+    #[tokio::test]
+    async fn day_rollover_persists_zero_and_survives_write_failures() {
         // The latch never masks a fresh day: a normal rollover still
         // persists zero when the dir is writable and unpoisons cleanly.
         let day = 20_000u64;
         let now = day * 86_400 + 10;
         let path = scratch("rollover-latch").join(DAY_STATE_FILE);
         let mut book = DayBook::open(Some(path.clone()), now);
-        book.record(-8.0, now);
+        book.record(-8.0, now).await;
         let next = (day + 1) * 86_400 + 10;
-        assert!(!book.tripped(1.0, next), "fresh day is not halted");
+        assert!(!book.tripped(1.0, next).await, "fresh day is not halted");
         assert_eq!(loaded(&path).day_net, 0.0, "rollover persisted zero");
         assert!(!book.persist_failed);
     }

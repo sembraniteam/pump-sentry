@@ -175,22 +175,25 @@ pub trait CostLedger {
     fn failed_dispatch_cost_lamports(&self) -> u64;
 }
 
-/// Custody event log. Prod writes WAL-first; stubs record calls for
-/// assertions. No defaults anywhere: every implementor states each
-/// behavior, so a new method forces every stub to decide.
+/// Custody event log. Prod writes WAL-first (each append awaited
+/// inside the caller, on the blocking pool); stubs record calls for
+/// assertions. Async: the durability wait (open+write+fsync) never
+/// blocks a Tokio worker, so callers must be async too. No defaults
+/// anywhere: every implementor states each behavior, so a new method
+/// forces every stub to decide.
 pub trait WalSink {
     /// Record a fill (call AFTER tracking).
-    fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str);
+    async fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str);
 
     /// Record a manual bag (call BEFORE parking).
-    fn record_manual(&self, position: &LivePosition, note: &str);
+    async fn record_manual(&self, position: &LivePosition, note: &str);
 
     /// Record a sell (call BEFORE subtracting).
-    fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str);
+    async fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str);
 
     /// Retire a manual bag taken for exit (call AFTER taking): without
     /// this, a crash before compaction replays the bag as a ghost.
-    fn unrecord_manual(&self, position: &LivePosition);
+    async fn unrecord_manual(&self, position: &LivePosition);
 
     /// True once a WAL write failed this run: the claim of record is
     /// broken, so no new entry may open until a restart (exits and
@@ -274,20 +277,20 @@ impl CostLedger for LiveTrader {
 }
 
 impl WalSink for LiveTrader {
-    fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
-        LiveTrader::acknowledge_buy(self, position, bundle_id)
+    async fn acknowledge_buy(&self, position: &LivePosition, bundle_id: &str) {
+        LiveTrader::acknowledge_buy(self, position, bundle_id).await
     }
 
-    fn record_manual(&self, position: &LivePosition, note: &str) {
-        LiveTrader::record_manual(self, position, note)
+    async fn record_manual(&self, position: &LivePosition, note: &str) {
+        LiveTrader::record_manual(self, position, note).await
     }
 
-    fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
-        LiveTrader::record_sell(self, mint, amount_tokens, bundle_id)
+    async fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
+        LiveTrader::record_sell(self, mint, amount_tokens, bundle_id).await
     }
 
-    fn unrecord_manual(&self, position: &LivePosition) {
-        LiveTrader::unrecord_manual(self, position)
+    async fn unrecord_manual(&self, position: &LivePosition) {
+        LiveTrader::unrecord_manual(self, position).await
     }
 
     fn wal_degraded(&self) -> bool {
