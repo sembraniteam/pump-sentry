@@ -10,12 +10,23 @@ use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 /// Three pages at the default 100-sig `sig_limit` covers 300 sigs.
 pub(crate) const DEV_HISTORY_MAX_PAGES: usize = 3;
 
+/// Dev-verdict cache key: the wallet AND the mint under screening.
+/// A verdict with the self-mint exclusion (AUD-006) is meaningless for
+/// any other launch by the same dev.
+fn dev_auth_key(dev: &Pubkey, self_mint: Option<Pubkey>) -> String {
+    match self_mint {
+        Some(mint) => format!("{dev}/{mint}"),
+        None => dev.to_string(),
+    }
+}
+
 pub async fn screen_developer(
     rpc: &RpcClient,
     commitment: CommitmentConfig,
     dev: &Pubkey,
     now_secs: u64,
     cfg: &DevScreenConfig,
+    self_mint: Option<Pubkey>,
 ) -> Result<DevVerdict, ClientError> {
     // Backward page walk (AUD-010): the launch count must come from the
     // WHOLE walked history, and the walk must prove its own
@@ -126,7 +137,7 @@ pub async fn screen_developer(
                 return (0usize, false);
             }
             // Undecodable keys prove nothing: count unreadable, never zero.
-            match count_dev_creates(&fetched, dev) {
+            match count_dev_creates(&fetched, dev, self_mint) {
                 Some(count) => (count, false),
                 None => (0usize, true),
             }
@@ -591,49 +602,62 @@ impl RpcScreener {
         }
     }
 
-    /// Dev verdict. Fails closed on transport errors.
-    /// Full verdicts cache. Early age-rejects don't:
-    /// young wallets age out.
+    /// Dev verdict for the launch `self_mint` the dev is screened
+    /// against. Fails closed on transport errors. Full verdicts cache
+    /// — keyed by dev AND mint (AUD-006): the count excludes the
+    /// screened launch's own `create`, so a verdict for one launch is
+    /// not a verdict for another by the same dev. Early age-rejects
+    /// don't cache: young wallets age out.
     pub async fn dev_verdict(
         &self,
         dev: &Pubkey,
+        self_mint: Option<Pubkey>,
         now_secs: u64,
     ) -> Result<DevVerdict, ScreenError> {
-        if let Some(hit) = self.dev_cache.lock().await.get(&dev.to_string(), now_secs) {
+        let key = dev_auth_key(dev, self_mint);
+        if let Some(hit) = self.dev_cache.lock().await.get(&key, now_secs) {
             return Ok(hit);
         }
-        self.dev_fetch(dev, now_secs).await
+        self.dev_fetch(dev, self_mint, now_secs).await
     }
 
     /// Dev verdict that bypasses the cache. Confirm-time screening
     /// must observe fresh history: a new launch by the same dev inside
     /// the cache TTL must not ride a stale pass (AUD-004). The fresh
-    /// result replenishes the cache so repeat screens within one
-    /// launch still share one read.
+    /// result replenishes the cache (dev AND mint keyed, AUD-006) so
+    /// repeat screens within one launch still share one read.
     pub async fn dev_verdict_fresh(
         &self,
         dev: &Pubkey,
+        self_mint: Option<Pubkey>,
         now_secs: u64,
     ) -> Result<DevVerdict, ScreenError> {
-        let verdict = self.dev_fetch(dev, now_secs).await?;
+        let verdict = self.dev_fetch(dev, self_mint, now_secs).await?;
         if verdict.pass || verdict.prior_launches > 0 {
+            let key = dev_auth_key(dev, self_mint);
             self.dev_cache
                 .lock()
                 .await
-                .put(dev.to_string(), verdict.clone(), now_secs);
+                .put(key, verdict.clone(), now_secs);
         }
         Ok(verdict)
     }
 
     /// One walk: query, timeout, decode. Shared by the cached and
     /// fresh paths so both agree on failure semantics.
-    async fn dev_fetch(&self, dev: &Pubkey, now_secs: u64) -> Result<DevVerdict, ScreenError> {
+    async fn dev_fetch(
+        &self,
+        dev: &Pubkey,
+        self_mint: Option<Pubkey>,
+        now_secs: u64,
+    ) -> Result<DevVerdict, ScreenError> {
         match with_screen_timeout(screen_developer(
             &self.rpc,
             self.commitment,
             dev,
             now_secs,
             &self.dev_cfg,
+            self_mint,
         ))
         .await
         {

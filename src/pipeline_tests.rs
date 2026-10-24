@@ -789,7 +789,7 @@ impl StubScreener {
 }
 
 impl Screener for StubScreener {
-    async fn screen_dev(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
+    async fn screen_dev(&self, dev: &str, _self_mint: &str) -> Result<DevVerdict, ScreenError> {
         if self
             .inner
             .reject_wallets
@@ -824,7 +824,11 @@ impl Screener for StubScreener {
         }
     }
 
-    async fn screen_dev_fresh(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
+    async fn screen_dev_fresh(
+        &self,
+        dev: &str,
+        self_mint: &str,
+    ) -> Result<DevVerdict, ScreenError> {
         if self.inner.fresh_rejects.load(Ordering::Relaxed) {
             return Ok(DevVerdict {
                 pass: false,
@@ -835,7 +839,7 @@ impl Screener for StubScreener {
                 reason: "stub serial launcher at confirm".to_string(),
             });
         }
-        Screener::screen_dev(self, dev).await
+        Screener::screen_dev(self, dev, self_mint).await
     }
 
     async fn observe_curve(

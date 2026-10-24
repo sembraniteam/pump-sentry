@@ -354,15 +354,22 @@ pub enum CurveRead {
 
 /// Screening source.
 pub trait Screener {
-    /// Dev verdict; `Err` skips fail-closed.
-    async fn screen_dev(&self, dev: &str) -> Result<DevVerdict, ScreenError>;
+    /// Dev verdict for `self_mint`, the launch under screening; `Err`
+    /// skips fail-closed. The verdict's launch count excludes the
+    /// screened launch's own `create` (AUD-006), so callers must state
+    /// it.
+    async fn screen_dev(&self, dev: &str, self_mint: &str) -> Result<DevVerdict, ScreenError>;
     /// Dev verdict that must not ride a cached pass. Confirm-time
     /// re-screening uses this: fresh history between intake and quorum
     /// must be observed, not the intake-time verdict (AUD-004).
     /// Default defers to `screen_dev` so screens with no cache (or no
     /// history-walk) keep one path.
-    async fn screen_dev_fresh(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
-        self.screen_dev(dev).await
+    async fn screen_dev_fresh(
+        &self,
+        dev: &str,
+        self_mint: &str,
+    ) -> Result<DevVerdict, ScreenError> {
+        self.screen_dev(dev, self_mint).await
     }
     /// Swaps since `since_sig`, plus watermark. A truncated view must
     /// never confirm — a variant, not a flag, so new consumers cannot
@@ -402,14 +409,21 @@ pub trait Screener {
 }
 
 impl Screener for RpcScreener {
-    async fn screen_dev(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
+    async fn screen_dev(&self, dev: &str, self_mint: &str) -> Result<DevVerdict, ScreenError> {
         let dev = listener::parse_address(dev)?;
-        self.dev_verdict(&dev, now_secs()).await
+        let self_mint = listener::parse_address(self_mint)?;
+        self.dev_verdict(&dev, Some(self_mint), now_secs()).await
     }
 
-    async fn screen_dev_fresh(&self, dev: &str) -> Result<DevVerdict, ScreenError> {
+    async fn screen_dev_fresh(
+        &self,
+        dev: &str,
+        self_mint: &str,
+    ) -> Result<DevVerdict, ScreenError> {
         let dev = listener::parse_address(dev)?;
-        self.dev_verdict_fresh(&dev, now_secs()).await
+        let self_mint = listener::parse_address(self_mint)?;
+        self.dev_verdict_fresh(&dev, Some(self_mint), now_secs())
+            .await
     }
 
     async fn observe_curve(

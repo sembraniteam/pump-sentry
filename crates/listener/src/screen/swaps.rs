@@ -230,9 +230,16 @@ fn correct_exact_quote_amounts(
 /// Count `create` ixs by `dev`. Powers the prior-launch check.
 /// `None` when keys don't resolve: callers must count it unreadable
 /// (fail-closed), never as zero launches.
+/// `skip_mint` excludes the launch under screening's OWN `create` (its
+/// mint sits at index 0 of both the `create` and `create_v2` layouts,
+/// `parser::IDX_MINT`/`IDX_V2_MINT`): the count must be PRIOR launches,
+/// so screening the active launch never counts it against the dev
+/// (AUD-006) — the indexed confirm-time history would otherwise read
+/// one too high, and intake (unindexed) would read one too low.
 pub fn count_dev_creates(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,
     dev: &Pubkey,
+    skip_mint: Option<Pubkey>,
 ) -> Option<usize> {
     let tx_with_meta = &fetched.transaction;
     let EncodedTransaction::Json(ui_tx) = &tx_with_meta.transaction else {
@@ -256,20 +263,31 @@ pub fn count_dev_creates(
         let Some(raw) = decode_ix_data(data_b58) else {
             return;
         };
-        // Author differs by version: v1 at 7, v2 at 5.
-        let author_idx = if raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR) {
-            IDX_CREATE_V2_USER
+        // Author and mint slots differ by version: v1 author at 7, v2
+        // at 5; the mint is at 0 for both (`parser::IDX_MINT` and
+        // `IDX_V2_MINT`).
+        let (author_idx, mint_idx) = if raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR) {
+            (IDX_CREATE_V2_USER, IDX_V2_MINT)
         } else if raw.starts_with(&PUMP_CREATE_DISCRIMINATOR) {
-            IDX_CREATE_USER
+            (IDX_CREATE_USER, IDX_MINT)
         } else {
             return;
         };
         let author = accounts
             .get(author_idx)
             .and_then(|idx| keys.get(usize::from(*idx)).copied());
-        if author == Some(*dev) {
-            count += 1;
+        if author != Some(*dev) {
+            return;
         }
+        if let Some(skip_mint) = skip_mint {
+            let mint = accounts
+                .get(mint_idx)
+                .and_then(|idx| keys.get(usize::from(*idx)).copied());
+            if mint == Some(skip_mint) {
+                return;
+            }
+        }
+        count += 1;
     };
     for_each_compiled_ix(raw, &tx_with_meta.meta, &mut check);
     Some(count)

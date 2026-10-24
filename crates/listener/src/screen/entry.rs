@@ -318,7 +318,7 @@ pub fn judge_developer(
             prior_launches,
             history_truncated: false,
             reason: format!(
-                "serial launcher: {prior_launches} prior launches (max {})",
+                "serial launcher: {prior_launches} prior launches (max {}, excluding this launch)",
                 cfg.max_prior_launches
             ),
         };

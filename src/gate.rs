@@ -508,9 +508,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         fresh: bool,
     ) -> Option<f64> {
         let verdict = if fresh {
-            self.screener.screen_dev_fresh(wallet).await
+            self.screener.screen_dev_fresh(wallet, mint).await
         } else {
-            self.screener.screen_dev(wallet).await
+            self.screener.screen_dev(wallet, mint).await
         };
         match verdict {
             Ok(verdict) if verdict.pass => {

@@ -1,8 +1,8 @@
 //! Entry gate plus dev screening.
 
 use crate::parser::{
-    IDX_CREATE_V2_USER, PUMP_CREATE_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID,
-    decode_ix_data,
+    IDX_CREATE_V2_USER, IDX_MINT, IDX_V2_MINT, PUMP_CREATE_DISCRIMINATOR,
+    PUMP_CREATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID, decode_ix_data,
 };
 pub use ids::{
     ASSOCIATED_TOKEN_PROGRAM_ID, MIGRATE_POOL_ACCOUNT_INDEX, MIGRATE_V2_POOL_ACCOUNT_INDEX,
@@ -433,20 +433,108 @@ mod tests {
         let tx_v2 = swap_tx(vec![v2]);
         // Position 5 → key(5) (v2 author); position 7 → key(7) (v1 author).
         assert_eq!(
-            count_dev_creates(&tx_v1, &Pubkey::new_from_array([7; 32])),
+            count_dev_creates(&tx_v1, &Pubkey::new_from_array([7; 32]), None),
             Some(1)
         );
         assert_eq!(
-            count_dev_creates(&tx_v1, &Pubkey::new_from_array([5; 32])),
+            count_dev_creates(&tx_v1, &Pubkey::new_from_array([5; 32]), None),
             Some(0)
         );
         assert_eq!(
-            count_dev_creates(&tx_v2, &Pubkey::new_from_array([5; 32])),
+            count_dev_creates(&tx_v2, &Pubkey::new_from_array([5; 32]), None),
             Some(1)
         );
         assert_eq!(
-            count_dev_creates(&tx_v2, &Pubkey::new_from_array([7; 32])),
+            count_dev_creates(&tx_v2, &Pubkey::new_from_array([7; 32]), None),
             Some(0)
+        );
+    }
+
+    /// A `create` (v1 or v2) whose mint sits in a slot list at the
+    /// AUD-006 layout: slot 0 = mint, `author_slot` = author.
+    fn create_by_dev(disc: &[u8; 8], author_slot: usize) -> UiCompiledInstruction {
+        let mut data = disc.to_vec();
+        data.extend_from_slice(&[9u8; 16]);
+        UiCompiledInstruction {
+            program_id_index: 0,
+            // Explicit key list in the mint tx below: [0]=pump program,
+            // [1]=mint, [2]=author. Index 0 in every slot pad means the
+            // pump program (harmless); only the mint and author slots
+            // resolve meaningfully.
+            accounts: (0..=author_slot as u8)
+                .map(|i| match i as usize {
+                    0 => 1,
+                    a if a == author_slot => 2,
+                    _ => 0,
+                })
+                .collect(),
+            data: bs58::encode(data).into_string(),
+            stack_height: None,
+        }
+    }
+
+    /// Mint tx with explicit keys: pump program, self mint, author.
+    fn mint_tx(
+        instructions: Vec<UiCompiledInstruction>,
+    ) -> EncodedConfirmedTransactionWithStatusMeta {
+        let self_mint = key(200);
+        let author = key(201);
+        let account_keys = vec![PUMP_PROGRAM_ID.to_string(), self_mint, author];
+        funding_tx_with_meta(&account_keys, instructions, None)
+    }
+
+    #[test]
+    fn dev_screen_excludes_the_screened_launch_create() {
+        // AUD-006: the indexed confirm-time history contains the
+        // launch's OWN create; counting it makes `max_priors` off by
+        // one. Both layouts must skip a create carrying the screened
+        // mint, and never skip any other create by the same dev.
+        for (disc, author_slot) in [
+            (&PUMP_CREATE_DISCRIMINATOR, IDX_CREATE_USER),
+            (&PUMP_CREATE_V2_DISCRIMINATOR, IDX_CREATE_V2_USER),
+        ] {
+            let tx = mint_tx(vec![create_by_dev(disc, author_slot)]);
+            let dev = Pubkey::new_from_array([201; 32]);
+            let self_mint = Pubkey::new_from_array([200; 32]);
+            // With the exclusion: priors = 0 — the launch itself is
+            // never one of its own priors.
+            assert_eq!(
+                count_dev_creates(&tx, &dev, Some(self_mint)),
+                Some(0),
+                "self create must be skipped"
+            );
+            // Without a screened mint (raw view) the create counts: one
+            // canary proves the zero comes from the skip, not the parse.
+            assert_eq!(count_dev_creates(&tx, &dev, None), Some(1));
+        }
+    }
+
+    #[test]
+    fn dev_screen_counts_genuine_priors_alongside_the_self_create() {
+        // AUD-006: a prior tx whose create mints something else
+        // counts; the tx's own mint does not.
+        let prior_tx = mint_tx(vec![create_by_dev(
+            &PUMP_CREATE_V2_DISCRIMINATOR,
+            IDX_CREATE_V2_USER,
+        )]);
+        let other_mint = Pubkey::new_from_array([77; 32]);
+        assert_eq!(
+            count_dev_creates(
+                &prior_tx,
+                &Pubkey::new_from_array([201; 32]),
+                Some(other_mint)
+            ),
+            Some(1),
+            "a true prior launch counts"
+        );
+        assert_eq!(
+            count_dev_creates(
+                &prior_tx,
+                &Pubkey::new_from_array([201; 32]),
+                Some(Pubkey::new_from_array([200; 32]))
+            ),
+            Some(0),
+            "the same mint is the self create inside the same tx"
         );
     }
 
