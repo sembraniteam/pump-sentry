@@ -58,7 +58,7 @@ pub struct Settings {
     /// refuses an open when the ten largest non-curve token accounts
     /// own more than this. The launch's associated bonding-curve token
     /// account (which holds the unsold supply, not a holder's stake) is
-    /// excluded from the sum (AUD-004).
+    /// excluded from the sum .
     /// Unreadable holdings refuse while armed (fail-closed); exits never
     /// block.
     pub max_top_holder_pct: f64,
@@ -388,7 +388,7 @@ impl Settings {
     }
 
     /// Warnings for bad values. Empty when sane.
-    /// Endpoint-trust findings (AUD-016): `(fatals, warns)`. Fatals
+    /// Endpoint-trust findings : `(fatals, warns)`. Fatals
     /// refuse a live boot; warns surface in every mode. Remote
     /// plain-http endpoints (RPC, fallbacks, Jito, geyser) carry
     /// traffic/credentials in cleartext, and a wrong-cluster fallback
@@ -574,7 +574,7 @@ impl Settings {
                 "INFERENCE_API_KEY is set with a non-local plain-http INFERENCE_ENDPOINT: the bearer token travels in cleartext — use https or keep inference on localhost".to_string(),
             );
         }
-        // AUD-016: endpoint trust — paper keeps warnings (the live gate
+        // Endpoint trust — paper keeps warnings (the live gate
         // refuses the fatal items).
         let (endpoint_fatals, endpoint_warns) = self.endpoint_trust(false);
         out.extend(endpoint_warns);
@@ -740,7 +740,7 @@ impl Settings {
         out
     }
 
-    /// Live boot gate (AUD-005): true when the primary RPC is the
+    /// Live boot gate : true when the primary RPC is the
     /// shipped public default, documented as unfit for live reads
     /// (drops candidates, truncates quorum, rate limits).
     pub fn on_public_rpc_default(&self) -> bool {
@@ -1136,7 +1136,7 @@ pub(crate) fn is_plaintext_remote(endpoint: &str) -> bool {
         || host == "::1")
 }
 
-/// Cluster identity of a Solana endpoint URL (AUD-016): the first
+/// Cluster identity of a Solana endpoint URL : the first
 /// recognizable cluster marker. `None` = unidentifiable (a warning,
 /// never a refusal on its own — many providers use opaque domains).
 /// Whole-URL match keeps the existing split-brain check's semantics.
@@ -1168,7 +1168,7 @@ pub(crate) fn is_ws_url(url: &str) -> bool {
 /// Endpoint equality that ignores spelling: scheme (http/https/ws/wss
 /// and case), explicit-vs-default ports, and a trailing slash. Used by
 /// the public-RPC live gate so `https://HOST/`, `HTTP://HOST`, and
-/// `https://HOST:443` all match the shipped default (AUD-024).
+/// `https://HOST:443` all match the shipped default .
 fn same_endpoint(a: &str, b: &str) -> bool {
     fn normalized(raw: &str) -> Option<(String, String)> {
         let parsed = url::Url::parse(raw.trim()).ok()?;
@@ -1251,7 +1251,7 @@ mod tests {
         assert!(s.fallback_rpc_urls.is_empty());
     }
 
-    /// Live-boot endpoint-trust predicate (AUD-016).
+    /// Live-boot endpoint-trust predicate .
     #[test]
     fn endpoint_trust_refuses_remote_plain_http_endpoints() {
         // Remote plain-http RPC is a fatal (keyed reads in cleartext).
@@ -1286,7 +1286,7 @@ mod tests {
         assert!(fatals.iter().any(|f| f.contains("YELLOWSTONE_ENDPOINT")));
     }
 
-    /// AUD-023: the WS ingestion URL is secret-bearing and feeds every
+    /// The WS ingestion URL is secret-bearing and feeds every
     /// decision, so it follows the same transport/cluster trust as the
     /// HTTP endpoints.
     #[test]
@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn public_rpc_boot_gate_predicate() {
-        // AUD-005: live boots refuse the shipped public default unless
+        // Live boots refuse the shipped public default unless
         // the operator opts in; the predicate identifies the default
         // exactly (blank/unset count, real endpoints don't).
         let s = Settings::from_map(&HashMap::new());
@@ -1503,7 +1503,7 @@ mod tests {
             !s.on_public_rpc_default(),
             "a real endpoint is not the public default"
         );
-        // AUD-024: spelling must not bypass the gate.
+        // Spelling must not bypass the gate.
         for spelling in [
             "https://api.mainnet-beta.solana.com/",
             "http://api.mainnet-beta.solana.com",

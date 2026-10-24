@@ -234,7 +234,7 @@ fn correct_exact_quote_amounts(
 /// mint sits at index 0 of both the `create` and `create_v2` layouts,
 /// `parser::IDX_MINT`/`IDX_V2_MINT`): the count must be PRIOR launches,
 /// so screening the active launch never counts it against the dev
-/// (AUD-006) — the indexed confirm-time history would otherwise read
+///  — the indexed confirm-time history would otherwise read
 /// one too high, and intake (unindexed) would read one too low.
 pub fn count_dev_creates(
     fetched: &EncodedConfirmedTransactionWithStatusMeta,

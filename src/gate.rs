@@ -239,8 +239,7 @@ pub struct PendingSignal {
     pub intake_secs: u64,
     /// Previous round's tape point (observe time + buy records) for
     /// microstructure velocity. Written back to the map on every
-    /// observed waiting round (AUD-003: a local-only write here left
-    /// `velocity_delta` null forever); the confirm reads the stored
+    /// observed waiting round (a local-only write here left `velocity_delta` null forever); the confirm reads the stored
     /// point, never a re-stamped audit time. A defer rewatch inserts
     /// the confirmed round's local point as the fresh window's start.
     pub prev_tape: Option<TapePoint>,
@@ -697,7 +696,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                                 GateStep::Aborted(reason)
                             }
                             GateOutcome::Wait => {
-                                // AUD-003: persist this round's tape point
+                                // Persist this round's tape point
                                 // so the NEXT round's velocity compares
                                 // against it. Field-level write only (no
                                 // insert): a concurrently-advanced
@@ -886,7 +885,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // rugs). Reuses nothing from intake — worst trust wins again —
         // and fails closed on any screen failure. Worst trust also
         // means fresh history: confirm screens bypass the dev-verdict
-        // cache (AUD-004), so a launch this wallet made after intake
+        // cache , so a launch this wallet made after intake
         // cannot ride a stale pass.
         let dev_trust = match self.screen_wallet(mint, &signal.dev, "dev", true).await {
             Some(trust) => trust,
@@ -1251,7 +1250,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Heat stays mint-based (`held_base_mints`): positions are
             // counted per mint, so a duplicate bag must not consume
             // slots. `live_unpaired_bag_count` is for the exposure
-            // dollar cap only (AUD-014).
+            // dollar cap only .
             let live_extra = self
                 .exec
                 .held_base_mints()
@@ -1322,7 +1321,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // round-trip internally.
         let mut profile = *profile;
         if let Some(bps) = req.venue_fee_bps {
-            // AUD-007: the typed fee guard only — an invalid raw
+            // The typed fee guard only — an invalid raw
             // `fee_bps` (>=100%, negative, NaN) contributes NO widening.
             // It already fails closed in paper settlement; an unguarded
             // raw value here could clamp every live stop to the -100%
@@ -1505,7 +1504,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             "ticker watch failed on {mint}; paper open WITHOUT live cover"
                         ));
                     } else {
-                        // AUD-002: paper-only open with no live leg at
+                        // Paper-only open with no live leg at
                         // all (bundle suspect / override pricing):
                         // never let its simulated PnL reach the live
                         // breaker; clear any stale coverage stamp.
@@ -1520,7 +1519,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     self.live_buy(mint, curve, assoc_curve, mark, sol, creator)
                         .await;
                 } else {
-                    // AUD-002: same as the failed-watch arm — the
+                    // Same as the failed-watch arm — the
                     // paper open has no live leg by design.
                     self.exec
                         .mark_diverged(

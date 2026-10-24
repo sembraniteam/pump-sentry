@@ -140,7 +140,7 @@ pub struct PortfolioSnapshot {
     pub mark_value: f64,
     /// Signed exit value of open positions (size impact + venue fee).
     pub realizable_value: f64,
-    /// Dispatch costs debited past available cash (AUD-010): zero when
+    /// Dispatch costs debited past available cash : zero when
     /// the book is solvent; positive means cash over its means and
     /// `equity` carries the shortfall (`cash` itself reads negative).
     pub overdraft_usd: f64,
@@ -266,7 +266,7 @@ impl PaperPortfolio {
     }
 
     /// Debit dispatch cost. Bleeds `cash`, allowed to go negative
-    /// (AUD-010): a cost past available cash writes a visible
+    /// : a cost past available cash writes a visible
     /// overdraft (`PortfolioSnapshot.overdraft_usd > 0`) instead of
     /// being silently absorbed by a zero floor — equity then reflects
     /// the shortfall, and a negative cash fails any new Long open
@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn debit_dispatch_cost_bleeds_cash_to_a_visible_overdraft() {
-        // AUD-010: an overspend is never absorbed at a zero floor —
+        // An overspend is never absorbed at a zero floor —
         // cash goes negative, the snapshot surfaces the overdraft, and
         // equity carries the shortfall.
         let mut pf = PaperPortfolio::new(10.0, 0.0);

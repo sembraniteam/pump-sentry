@@ -18,7 +18,7 @@
 //! a replay over a degraded journal still runs, but its `skipped`
 //! accounting is loud about the gap.
 //!
-//! Secret hygiene (AUD-005): journal lines carry transport error text
+//! Secret hygiene : journal lines carry transport error text
 //! (redacted at the call sites), and the file itself is owner-only
 //! (0600 on unix) like the log and the WAL — an analytics-only record
 //! must never be group/world-readable, and redaction here is defense
@@ -327,7 +327,7 @@ impl JournalSink {
             opts.mode(0o600);
         }
         let file = opts.open(path)?;
-        // Re-seal an existing file to owner-only (AUD-005): a journal
+        // Re-seal an existing file to owner-only : a journal
         // created by an older release (procedural umask, often 0644)
         // must not stay group/world-readable now that it carries
         // redacted-but-sensitive transport details.
@@ -741,7 +741,7 @@ mod tests {
 
     #[test]
     fn journal_is_owner_only_and_reseals_looser_files() {
-        // AUD-005: the decision journal may carry redacted transport
+        // The decision journal may carry redacted transport
         // detail; owner-only (0600) is required on a fresh file, and a
         // pre-existing looser file (older release, umask) is re-sealed.
         #[cfg(unix)]

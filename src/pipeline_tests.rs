@@ -105,7 +105,7 @@ struct StubLiveInner {
     /// parks for manual review with no resend.
     fail_sells_unknown: AtomicBool,
     /// Deterministic Jito rejection (HTTP 429 rate limit): retryable,
-    /// never unknown custody (AUD-002).
+    /// never unknown custody .
     fail_sells_rate_limited: AtomicBool,
     /// Overlap-test hook: sells of `block_mint` wait on `unblock`.
     block_mint: StdMutex<Option<String>>,
@@ -115,21 +115,19 @@ struct StubLiveInner {
     pending: StdMutex<Vec<String>>,
     /// Deterministic recheck hang: `std::future::pending` forever —
     /// any code path that awaits a recheck must not be on the tick
-    /// path (AUD-013 regression guard).
+    /// path .
     hang_recheck: AtomicBool,
     /// Pending entries resolve as `Confirmed` on the next recheck.
     recheck_confirms: AtomicBool,
     /// Pending entries resolve as provably `Dead` on the next recheck
-    /// (AUD-003: divergence marking on the recheck path).
+    /// (divergence marking on the recheck path).
     recheck_dies: AtomicBool,
     /// Pending entries resolve as `GiveUp` on the next recheck:
     /// unresolved past the retry budget, parked for manual review.
     recheck_gives_up: AtomicBool,
     /// Simulated WAL write failure (entries must halt).
     wal_degraded: AtomicBool,
-    /// Recorded custody WAL-event order (AUD-001/002 regression
-    /// assertions: `ack` writes position-then-settled; give-up writes
-    /// manual-then-settled; pending retirement trails them).
+    /// Recorded custody WAL-event order (assertions: `ack` writes position-then-settled; give-up writes manual-then-settled; pending retirement trails them).
     wal_events: StdMutex<Vec<&'static str>>,
 }
 
@@ -275,7 +273,7 @@ impl SellSink for StubLive {
         if self.inner.fail_sells_rate_limited.load(Ordering::Relaxed) {
             // Deterministic Jito refusal (429): the engine answered
             // without accepting, so this is a retryable failure and
-            // never unknown custody (AUD-002).
+            // never unknown custody .
             return Err(LiveError::Dispatch(ExecutorError::Jito(
                 JitoError::RateLimited,
             )));
@@ -397,14 +395,14 @@ impl PendingStore for StubLive {
     async fn recheck_pending(&self) -> Vec<PendingRecheck> {
         if self.inner.hang_recheck.load(Ordering::Relaxed) {
             // Hang forever: deterministic stale-forever future. Used
-            // by the AUD-013 guard test (a tick must never wait behind
+            // By the guard test (a tick must never wait behind
             // a recheck round).
             std::future::pending::<()>().await;
             return Vec::new();
         }
         if self.inner.recheck_confirms.load(Ordering::Relaxed) {
             // Peek, never drain: the pending claim of record stays
-            // visible until `retire_pending_for` (AUD-001) retires it
+            // visible until `retire_pending_for`  retires it
             // after the durable `Position` claim is published.
             let mints = self.inner.pending.lock().expect("lock").clone();
             return mints
@@ -476,7 +474,7 @@ impl PendingStore for StubLive {
     }
 
     async fn retire_pending_for(&self, mint: &str) {
-        // AUD-001: the retirement is an explicit post-publication step;
+        // The retirement is an explicit post-publication step;
         // the real writer appends the `Settled` tombstone first.
         self.inner.wal_events.lock().expect("lock").push("settled");
         self.inner.wal_events.lock().expect("lock").push("retire");
@@ -513,7 +511,7 @@ impl CostLedger for StubLive {
 }
 
 impl WalSink for StubLive {
-    // Stubs record the custody WAL-event ORDER for AUD-001/002
+    // Stubs record the custody WAL-event ORDER for
     // assertions; no durability: stub custody lives in test memory.
     async fn acknowledge_buy(&self, _position: &LivePosition, _bundle_id: &str) {
         let mut events = self.inner.wal_events.lock().expect("lock");
@@ -716,14 +714,13 @@ struct StubScreenerInner {
     bundle: StdMutex<BundleOutcome>,
     migration: StdMutex<Option<MigrationReport>>,
     truncated: AtomicBool,
-    /// Confirm-time fresh screens reject (serial-launcher detected
-    /// between intake and quorum; AUD-004 wiring proof).
+    /// Confirm-time fresh screens reject (serial-launcher detected between intake and quorum; wiring proof).
     fresh_rejects: AtomicBool,
     /// Canned top-10 holder share (`None` = RPC failure).
     top_holders: StdMutex<Option<f64>>,
-    /// Last exclude arg the confirm passed (AUD-004 wiring proof).
+    /// Last exclude arg the confirm passed .
     excluded_curve_ata: StdMutex<Option<String>>,
-    /// Migration-hunt invocations (AUD-027: paper closes must not hunt).
+    /// Migration-hunt invocations (paper closes must not hunt).
     migration_hunts: std::sync::atomic::AtomicUsize,
 }
 
@@ -1014,7 +1011,7 @@ fn dead_engine() -> Option<RiskEngine> {
 
 #[tokio::test]
 async fn second_gate_round_carries_a_live_tape_velocity() {
-    // AUD-003: the stored tape point must persist across observed
+    // The stored tape point must persist across observed
     // rounds. Round 1 sees two distinct buyers (Wait); its point is
     // written back to the map; the confirm round's velocity_delta is
     // then `Some`, computed against round 1 (never a permanent null).
@@ -1725,7 +1722,7 @@ async fn entry_bleed_cap_blocks_only_proven_bleeders() {
 
 #[tokio::test]
 async fn confirm_excludes_the_curve_ata_in_the_holder_read() {
-    // AUD-004: the confirm must present the launch's associated
+    // The confirm must present the launch's associated
     // bonding-curve token account as the excluded vault, so the cap
     // measures holder-only concentration.
     let screener = StubScreener::with_swaps_and_top_holders(
@@ -2290,7 +2287,7 @@ async fn migration_hunt_routes_pool_exit_end_to_end() {
 
 #[tokio::test]
 async fn complete_tick_resolves_migration_before_first_sell_attempt() {
-    // AUD-001: an open live bag held at curve completion must be sold
+    // An open live bag held at curve completion must be sold
     // through the pool leg on the FIRST complete tick. Previously the
     // hunt ran only from `maybe_unwatch`, which returns early while a
     // bag is tracked — so five curve attempts failed `BadOrder` and the
@@ -2348,7 +2345,7 @@ async fn complete_tick_resolves_migration_before_first_sell_attempt() {
 
 #[tokio::test]
 async fn recovered_bag_without_a_curve_tick_resolves_its_pool_feed() {
-    // AUD-021: after a restart the paper book is empty and the recovered
+    // After a restart the paper book is empty and the recovered
     // bag's curve may already be graduated (no more ticks). The boot
     // hunt must register the pool leg without waiting for a tick.
     use listener::MigrationDestination;
@@ -2415,7 +2412,7 @@ async fn recovered_bag_without_a_curve_tick_resolves_its_pool_feed() {
 
 #[test]
 fn paper_closes_skip_the_pre_close_migration_hunt() {
-    // AUD-027: the hunt is only useful when a live leg can route the
+    // The hunt is only useful when a live leg can route the
     // exit; a paper close must not spend an exit-lane permit on it.
     assert!(!should_hunt_before_close(false, true, true));
     assert!(!should_hunt_before_close(true, false, true));
@@ -2425,7 +2422,7 @@ fn paper_closes_skip_the_pre_close_migration_hunt() {
 
 #[tokio::test]
 async fn complete_tick_with_hunt_none_preserves_fail_closed_refusal() {
-    // AUD-001 case (b): when the hunt finds no valid pool, the
+    // Case (b): when the hunt finds no valid pool, the
     // fail-closed behavior is preserved — no phantom pool sell, the
     // curve leg is still the (refusing) route, and the bag stays held.
     let live = StubLive::working();
@@ -2475,7 +2472,7 @@ async fn complete_tick_with_hunt_none_preserves_fail_closed_refusal() {
 
 #[tokio::test]
 async fn invalid_fee_bps_cannot_disable_paper_stops() {
-    // AUD-007: an invalid FEE_BPS (>=100%) used to ride raw into the
+    // An invalid FEE_BPS (>=100%) used to ride raw into the
     // gate's fee-aware stop widening, clamping the stop to the -100%
     // floor. The typed guard must neutralize it: the standard stop
     // still fires.
@@ -2519,7 +2516,7 @@ async fn invalid_fee_bps_cannot_disable_paper_stops() {
 
 #[tokio::test]
 async fn confirm_rescreen_bypasses_dev_verdict_cache() {
-    // AUD-004: a dev who launched again between intake and quorum gets
+    // A dev who launched again between intake and quorum gets
     // a confirm-time re-screen with FRESH history — the cached intake
     // pass must not admit the open.
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
@@ -2552,7 +2549,7 @@ async fn confirm_rescreen_bypasses_dev_verdict_cache() {
 
 #[tokio::test]
 async fn recheck_dead_marks_paper_diverged() {
-    // AUD-003: a pending buy proven dead on recheck leaves the paper
+    // A pending buy proven dead on recheck leaves the paper
     // position without live cover — the divergence mark must be set
     // (as the direct-dead path does) so heartbeat counts and alerts
     // report the exposure gap.
@@ -3106,7 +3103,7 @@ async fn bundle_suspect_trades_paper_only() {
 
 #[tokio::test]
 async fn diverged_close_never_feeds_live_day_loss_breaker() {
-    // AUD-002: in live mode, a paper open whose live leg failed must
+    // In live mode, a paper open whose live leg failed must
     // not feed its simulated PnL into `max_daily_loss_usd` — a phantom
     // paper win must not loosen (or offset into) a live circuit breaker.
     let live = StubLive::working();
@@ -3146,7 +3143,7 @@ async fn diverged_close_never_feeds_live_day_loss_breaker() {
 
 #[tokio::test]
 async fn bundle_suspect_close_never_feeds_live_day_loss_breaker() {
-    // AUD-002: paper-only opens (bundle suspect) settle through the
+    // Paper-only opens (bundle suspect) settle through the
     // tick path with `live_settled == true` and no live custody — their
     // simulated PnL must be excluded from the live breaker.
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
@@ -3185,7 +3182,7 @@ async fn bundle_suspect_close_never_feeds_live_day_loss_breaker() {
 
 #[tokio::test]
 async fn covered_realized_loss_still_trips_live_day_loss_cap() {
-    // AUD-002 control: a covered trade's realized (modeled) loss still
+    // Control: a covered trade's realized (modeled) loss still
     // trips the cap at the configured threshold.
     let live = StubLive::working();
     let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
@@ -3916,7 +3913,7 @@ async fn pending_buy_pins_the_watch_until_recheck() {
 
 #[tokio::test]
 async fn tick_never_waits_behind_a_slow_pending_recheck() {
-    // AUD-013: the tick path must not run pending-buy rechecks inline
+    // The tick path must not run pending-buy rechecks inline
     // (a resolved round can take a 60s confirm deadline). The stub's
     // recheck future hangs forever; if any tick path still awaits it,
     // this tick times out.
@@ -3956,13 +3953,13 @@ async fn tick_never_waits_behind_a_slow_pending_recheck() {
     .await;
     assert!(
         result.is_ok(),
-        "a hanging pending recheck must not delay the tick's TP/SL path (AUD-013)"
+        "a hanging pending recheck must not delay the tick's TP/SL path "
     );
 }
 
 #[tokio::test]
 async fn recheck_resolves_confirmed_buys_without_a_tick() {
-    // AUD-013: the dedicated recheck task keeps resolving late-confirmed
+    // The dedicated recheck task keeps resolving late-confirmed
     // buys with no tick activity — the buy already in `live_positions`
     // (live tracked) must confirm WITHOUT merging into a recheck round
     // from a tick and instead park the manual path.
@@ -4014,7 +4011,7 @@ async fn recheck_resolves_confirmed_buys_without_a_tick() {
 
 #[tokio::test]
 async fn recheck_confirm_writes_the_claim_before_retiring_the_pending() {
-    // AUD-001: a `Confirmed` recheck handoff must publish the durable
+    // A `Confirmed` recheck handoff must publish the durable
     // claim (`Position`, then the settled tombstone) and only then
     // retire the pending claim of record. The stub records the custody
     // WAL-event order; replay of that order must yield custody at
@@ -4054,7 +4051,7 @@ async fn recheck_confirm_writes_the_claim_before_retiring_the_pending() {
 
 #[tokio::test]
 async fn recheck_pending_stays_claimed_until_the_handoff_publishes() {
-    // AUD-001 crash window: a resolution verdict alone must not retire
+    // Crash window: a resolution verdict alone must not retire
     // the pending claim (WAL or memory) — stopping right after the
     // recheck verdict leaves the claim of record intact, so a replay
     // still sees live custody (pending re-imported at boot).
@@ -4090,7 +4087,7 @@ async fn recheck_pending_stays_claimed_until_the_handoff_publishes() {
 
 #[tokio::test]
 async fn recheck_giveup_writes_the_manual_claim_before_retiring() {
-    // AUD-001: a `GiveUp` (may-hold) park must write the durable
+    // A `GiveUp` (may-hold) park must write the durable
     // `Manual` claim and park the bag BEFORE the pending claim is
     // retired — a crash in between replays either claim, never
     // neither.
@@ -4138,7 +4135,7 @@ async fn recheck_giveup_writes_the_manual_claim_before_retiring() {
 
 #[tokio::test]
 async fn recheck_dead_retires_from_the_recheck_without_a_claim() {
-    // AUD-001: a provably-dead buy has no replacement claim; the
+    // A provably-dead buy has no replacement claim; the
     // recheck itself appends the settled tombstone and drops the
     // pending (unchanged order, now the ONLY inline retirement).
     let sys = "11111111111111111111111111111111";
@@ -4169,7 +4166,7 @@ async fn recheck_dead_retires_from_the_recheck_without_a_claim() {
 
 #[tokio::test]
 async fn paper_close_full_window_waits_until_the_pending_confirms() {
-    // AUD-001 concurrent-exit window: with the pending still the claim
+    // Concurrent-exit window: with the pending still the claim
     // of record (no tracked bag yet), a full paper close must defer
     // (no live sell, no breaker booking, watch retained). Publishing
     // the confirmed bag afterwards restores the managed tracked state.
@@ -4516,7 +4513,7 @@ async fn live_sell_fires_on_paper_close() {
 
 #[tokio::test]
 async fn paper_close_stays_deferred_while_a_live_buy_is_pending() {
-    // AUD-008: TP close while the live buy for the mint is still
+    // TP close while the live buy for the mint is still
     // pending — `live_sell` reports unsettled, the bag is unsold and
     // the PnL stays deferred (no breaker input before the outcome).
     let live = StubLive::working();
@@ -4564,7 +4561,7 @@ async fn paper_close_stays_deferred_while_a_live_buy_is_pending() {
 
 #[tokio::test]
 async fn stale_sol_feed_with_a_parked_manual_bag_stays_deferred() {
-    // AUD-007: the stale-SOL early return must apply the same
+    // The stale-SOL early return must apply the same
     // settlement contract as the fresh path. A parked manual bag (the
     // give-up shape: no tracked bag, manual claim only) is live
     // exposure, so the paper close reports unsettled and its PnL stays
@@ -4655,7 +4652,7 @@ async fn stale_sol_feed_with_a_parked_manual_bag_stays_deferred() {
 
 #[tokio::test]
 async fn exposure_counts_each_unpaired_live_bag() {
-    // AUD-014: duplicate bags on one mint are separate live tickets.
+    // Duplicate bags on one mint are separate live tickets.
     // live mirror state: 2 tracked bags (one suffixed dup), 1 parked
     // manual dup, and a pending receipt on the same mint.
     let live = StubLive::working();
@@ -5027,7 +5024,7 @@ async fn manual_sell_closes_both_legs() {
 
 #[tokio::test]
 async fn manual_sell_waits_while_a_live_buy_is_pending() {
-    // AUD-007: `sell <mint>` during the unresolved LIVE-buy window must
+    // `Sell <mint>` during the unresolved LIVE-buy window must
     // NOT settle — the request is kept so the daemon drain retries
     // after the pending recheck confirms (and then sells the bag).
     let sys = "11111111111111111111111111111111";
@@ -5109,7 +5106,7 @@ async fn manual_sell_exits_parked_manual_bag() {
 
 #[tokio::test]
 async fn manual_sell_resurrection_writes_the_new_claim_before_retiring_the_old() {
-    // AUD-002: resurrecting a parked bag appends the durable tracked
+    // Resurrecting a parked bag appends the durable tracked
     // claim (`record_position`) BEFORE `unrecord_manual` retires the
     // parked claim of record, and inserts the tracked bag last. A
     // crash at any point replays the manual bag or the tracked claim
@@ -5157,7 +5154,7 @@ async fn manual_sell_resurrection_writes_the_new_claim_before_retiring_the_old()
 
 #[tokio::test]
 async fn giveup_parked_manual_exit_records_paper_headline_once() {
-    // AUD-020 (a): an unknown-outcome buy parks a bag without a
+    // (A): an unknown-outcome buy parks a bag without a
     // coverage stamp; `sell <mint>` later sells it for real SOL. The
     // settle point must stamp coverage so the paper headline reaches
     // the live day-loss breaker instead of being dropped as
@@ -5186,8 +5183,7 @@ async fn giveup_parked_manual_exit_records_paper_headline_once() {
     pipe.poll_gates().await;
     assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
     assert!(pipe.exec.live_positions.lock().await.is_empty());
-    // The buy never landed: paper is uncovered (the AUD-002 guard would
-    // drop its PnL).
+    // The buy never landed: paper is uncovered (the guard would drop its PnL).
     assert!(!pipe.exec.breaker_eligible(MINT).await);
     // Simulate the GiveUp park (the same shape the recheck leaves).
     pipe.exec.live_manual.lock().await.insert(
@@ -5217,7 +5213,7 @@ async fn giveup_parked_manual_exit_records_paper_headline_once() {
 
 #[tokio::test]
 async fn live_only_exit_books_realized_pnl_from_persisted_basis() {
-    // AUD-020 (b): after a restart the paper book is empty, so a
+    // (B): after a restart the paper book is empty, so a
     // WAL-recovered bag exits with no paper leg. Its realized PnL must
     // come from the persisted entry basis, not vanish.
     let sys = "11111111111111111111111111111111";
@@ -5256,7 +5252,7 @@ async fn live_only_exit_books_realized_pnl_from_persisted_basis() {
 
 #[tokio::test]
 async fn live_only_exit_without_basis_is_counted_and_alerted() {
-    // AUD-020 residual: a legacy WAL line carries no entry cost. The
+    // Residual: a legacy WAL line carries no entry cost. The
     // exit cannot be booked, so it must be counted loudly — never
     // silently dropped.
     let sys = "11111111111111111111111111111111";
@@ -5300,7 +5296,7 @@ async fn live_only_exit_without_basis_is_counted_and_alerted() {
 
 #[tokio::test]
 async fn paper_leg_exit_never_books_realized_on_top_of_the_headline() {
-    // AUD-020 (iii): a covered/paper-leg exit is booked through the
+    // (Iii): a covered/paper-leg exit is booked through the
     // paper headline, so the realized fallback must stay silent.
     let sys = "11111111111111111111111111111111";
     let live = StubLive::working();
@@ -5856,7 +5852,7 @@ async fn live_sell_retries_on_cooldown_then_gives_up() {
 
 #[tokio::test]
 async fn sell_unknown_dispatch_parks_without_resend() {
-    // AUD-002: a sell dispatch that times out with no receipt is
+    // A sell dispatch that times out with no receipt is
     // unknown custody — the mint parks for manual review on the first
     // failure (no retry budget spent), and the next tick must NOT
     // resend: a landed-but-unseen bundle plus a resend would
@@ -5902,7 +5898,7 @@ async fn sell_unknown_dispatch_parks_without_resend() {
 
 #[tokio::test]
 async fn sell_rate_limited_retries_instead_of_parking() {
-    // AUD-002: a Jito HTTP 429 is a deterministic rejection — the
+    // A Jito HTTP 429 is a deterministic rejection — the
     // engine answered without accepting, so the sell must consume the
     // retry budget (note_failure + cooldown retry) instead of parking
     // the bag as unknown custody exactly under congestion.

@@ -64,7 +64,7 @@ pub enum BundleStatus {
     Unknown,
 }
 
-/// Transport class of a `sendBundle` failure (AUD-002). A bundle can
+/// Transport class of a `sendBundle` failure . A bundle can
 /// only be "unknown custody" when the failure is a transport-level
 /// ambiguity — the request may have reached the engine and the answer
 /// may have been lost. Every other failure is a deterministic
@@ -167,7 +167,7 @@ impl JitoClient {
             base,
             tips: std::sync::Arc::new(std::sync::Mutex::new((
                 JITO_TIP_ACCOUNTS.iter().map(|s| s.to_string()).collect(),
-                // Seeded fresh (AUD-011): the initial dispatch reads the
+                // Seeded fresh : the initial dispatch reads the
                 // official list from cache. No tip fetch ever sits on
                 // the dispatch path; a background refresher keeps the
                 // cache current.
@@ -247,7 +247,7 @@ impl JitoClient {
         parse_inflight_status(&body, bundle_id)
     }
 
-    /// Landed-tip floor in lamports: LIVE-cache read only (AUD-006) —
+    /// Landed-tip floor in lamports: LIVE-cache read only  —
     /// no network I/O on the dispatch path. A stalled oracle leaves the
     /// last cached floor in place (0 before the first refresh, meaning
     /// the configured base tip rules unmodified). Freshness is owned by
@@ -278,7 +278,7 @@ impl JitoClient {
         }
     }
 
-    /// Test-only floor-cache seed (AUD-006): `TIP_FLOOR_URL` is a
+    /// Test-only floor-cache seed : `TIP_FLOOR_URL` is a
     /// hardcoded upstream oracle, so tests can never inject a floor
     /// through [`Self::refresh_tip_floor`]; dispatch reads are proven
     /// cache-only against this seeded cache instead.
@@ -418,7 +418,7 @@ pub fn select_tip_account(seed: u64) -> Pubkey {
 }
 
 impl JitoClient {
-    /// Tip account for this dispatch: LIVE-cache read only (AUD-011) —
+    /// Tip account for this dispatch: LIVE-cache read only  —
     /// no network I/O between the decision and bundle submission. An
     /// empty cache falls back to the official constants. Freshness is
     /// owned by [`Self::refresh_tips`] driven from a background task.
@@ -832,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn classify_send_failure_separates_transport_ambiguity_from_rejections() {
-        // AUD-002: only an ambiguous transport failure may claim "may
+        // Only an ambiguous transport failure may claim "may
         // still land". A 429, a JSON-RPC error, an encode/URL failure
         // are deterministic rejections: the bundle provably never
         // landed, so no custody claim may ever be created from them.
@@ -897,7 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn tip_account_never_fetches_on_the_dispatch_path() {
-        // AUD-011: a fresh-boot dispatch reads the seeded official list.
+        // A fresh-boot dispatch reads the seeded official list.
         // A live tip-accounts server stays unreached (no request).
         let paths = Arc::new(Mutex::new(Vec::new()));
         let base = serve_scripted(Arc::clone(&paths), Vec::new()).await;
@@ -956,7 +956,7 @@ mod tests {
         )
         .await;
         let client = JitoClient::new(&base).expect("client");
-        // AUD-011: dispatch reads never fetch; the explicit refresher
+        // Dispatch reads never fetch; the explicit refresher
         // does. Refresh first, then dispatch (live list drives picks).
         client.refresh_tips().await;
         let picked = client.tip_account(1).await.to_string();
@@ -975,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn tip_floor_dispatch_reads_cache_only() {
-        // AUD-006: the dispatch-path floor read never touches the
+        // The dispatch-path floor read never touches the
         // oracle. A stalled/never-answering oracle is simulated by a
         // server that answers no request; the seeded cache value comes
         // straight back and no request was made.

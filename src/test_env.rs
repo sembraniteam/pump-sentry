@@ -1,4 +1,4 @@
-//! Test-only process-global environment/CWD guard (AUD-022).
+//! Test-only process-global environment/CWD guard .
 //!
 //! Process-global environment variables and the working directory are
 //! shared by every test thread in this binary. All mutations from `src/`
@@ -106,7 +106,7 @@ impl Drop for CwdGuard {
 mod tests {
     use super::*;
 
-    /// AUD-022 acceptance: the helper restores values even when the
+    /// The helper restores values even when the
     /// guarded region unwinds from a panic.
     #[test]
     fn scoped_restores_on_unwind() {

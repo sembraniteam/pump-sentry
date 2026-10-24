@@ -52,7 +52,7 @@ fn main() {
     match cli::parse_cli(&argv) {
         // The trader runs through the synchronous boot phase first:
         // lock, settings, and secret capture happen before any thread
-        // exists (AUD-001, AUD-015).
+        // exists .
         cli::CliAction::Run { live } => run_binary(live),
         cli::CliAction::Start { live } => cli::cmd_start(live, "start"),
         cli::CliAction::Restart { live } => cli::cmd_restart(live),
@@ -121,8 +121,8 @@ fn aux_runtime() -> tokio::runtime::Runtime {
 /// Values captured in the synchronous boot phase, before any thread
 /// exists. Secrets and env-derived settings cross into the async world
 /// as owned data; nothing re-reads (or mutates) the environment after
-/// boot (AUD-015). The state-dir lock is acquired here too — before
-/// the config file, secrets, WAL, or day-state are touched (AUD-001).
+/// boot . The state-dir lock is acquired here too — before
+/// the config file, secrets, WAL, or day-state are touched .
 struct Boot {
     live: bool,
     live_via: &'static str,
@@ -135,7 +135,7 @@ struct Boot {
 }
 
 /// Secret-bearing environment variables scrubbed in the sync boot
-/// phase (AUD-015) once Settings/captured values own the data: RPC
+/// phase  once Settings/captured values own the data: RPC
 /// URLs carry `?api-key=`/path keys. Nothing re-reads them after boot;
 /// later children (upgrade checks) inherit a clean env.
 /// `_FILE` variants are NOT here (paths, not secrets);
@@ -160,12 +160,12 @@ fn scrub_secret_env() {
 }
 
 /// Effective live mode: `--live` or the exact `IS_LIVE=true` value.
-/// Pure so the pid-record identity is testable (AUD-026).
+/// Pure so the pid-record identity is testable .
 fn live_mode_from(live_arg: bool, is_live: Option<&str>) -> bool {
     live_arg || is_live == Some("true")
 }
 
-/// Paper-ledger commission from the typed fee (AUD-025): an invalid
+/// Paper-ledger commission from the typed fee : an invalid
 /// raw value contributes 0 bps, never an impossible 100%/side fee.
 fn paper_fee_bps(settings: &Settings) -> f64 {
     settings.fee().map_or(0.0, |bps| f64::from(bps.get()))
@@ -210,7 +210,7 @@ fn run_binary(live_arg: bool) {
     // Paper unless explicitly live. Only exact `true` enables live;
     // attribute the source (a lingering IS_LIVE=true in the shell is
     // the sharpest mode footgun). Resolved BEFORE the pid record so
-    // `status` reports the mode the process actually runs (AUD-026).
+    // `status` reports the mode the process actually runs .
     let is_live_env = std::env::var("IS_LIVE").ok();
     let live_mode = live_mode_from(live_arg, is_live_env.as_deref());
     let live_via: &'static str = if live_arg { "--live" } else { "IS_LIVE=true" };
@@ -280,13 +280,13 @@ fn run_binary(live_arg: bool) {
     // token and the trading keypair — secrets live in guarded memory,
     // not in `/proc` environ or later children). This happens BEFORE
     // any thread exists: `env::remove_var` is process-global and not
-    // thread-safe (AUD-015). `_FILE` variables stay: they name
+    // thread-safe . `_FILE` variables stay: they name
     // paths, they are not secrets.
     scrub_secret_env();
 
     // Live wallet load happens in the sync phase too: the keypair is
     // scrubbed from the environment inside `load_from_env`, and that
-    // mutation must not race a worker thread (AUD-015). A load failure
+    // mutation must not race a worker thread . A load failure
     // exits before the live banner (fail fast; same message).
     let wallet = if live_mode {
         match WalletGuard::load_from_env() {
@@ -378,7 +378,7 @@ async fn replay_live_wal(
         trader.wal_write_meta(settings::now_secs()).await;
         // Seed before the pending move below (borrow discipline).
         let recent = replay.recent_sell_pending(settings::now_secs());
-        // AUD-009: import what the rechecker can own; a second pending
+        // Import what the rechecker can own; a second pending
         // for the same mint is held out for a visible parked claim —
         // either bundle may have landed, so silent loss is not an
         // option. `played_pending` is not otherwise used after this.
@@ -470,7 +470,7 @@ async fn replay_live_wal(
         file = %path.display(),
         "WAL replay: recovered live custody from unclean shutdown; MANUAL REVIEW REQUIRED (delete the file to clear resolved bags)"
     );
-    // AUD-021: resolve the migration now for recovered bags. Their curve
+    // Resolve the migration now for recovered bags. Their curve
     // may already have graduated and stopped ticking, so waiting for a
     // complete tick can strand the only automated exit. Bounded per bag;
     // unresolved bags retry on the supervision recheck.
@@ -536,7 +536,7 @@ struct BootCustodyCounts {
     awaiting_confirm: usize,
 }
 
-/// Single-flight guard for the background custody cycle (AUD-005): at
+/// Single-flight guard for the background custody cycle : at
 /// most one cycle runs at a time; an unfinished one is aborted at
 /// shutdown before the snapshot (the cycle is read-only on custody and
 /// the WAL, so an abort is safe — the next boot re-derives both).
@@ -579,11 +579,9 @@ impl CustodyCycle {
     }
 }
 
-/// Mid-run custody cycle task (AUD-005, runs OFF the event loop): the
+/// Mid-run custody cycle task (runs OFF the event loop): the
 /// 30-minute claims-vs-chain recheck, then the recovered-bag migration
-/// hunt (AUD-021: a graduated curve can stop ticking, stranding the
-/// only automated exit; riding the recheck bounds the RPC cost — one
-/// hunt may take its full 15s deadline). Reports
+/// hunt (a graduated curve can stop ticking, stranding the only automated exit; riding the recheck bounds the RPC cost — one hunt may take its full 15s deadline). Reports
 /// `(ledger shorts, unfed bags)` back to the supervisor via `tx`.
 async fn custody_cycle(
     pipeline: Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
@@ -622,7 +620,7 @@ async fn custody_recheck(
     classify_custody_claims(claims, trader).await
 }
 
-/// Custody reader for the claim classification walk (AUD-005): what a
+/// Custody reader for the claim classification walk : what a
 /// ledger watcher must expose. `Send` is explicit — the walk runs in a
 /// spawned background task.
 trait CustodyReader {
@@ -659,7 +657,7 @@ impl<T: CustodyReader + ?Sized> CustodyReader for &T {
     }
 }
 
-/// Custody-claim classification walk (AUD-005): the recheck's per-mint
+/// Custody-claim classification walk : the recheck's per-mint
 /// loop, split from the concrete pipeline so tests can stub a slow or
 /// unreadable ledger. Sequential and read-only — one chain read per
 /// claim at a time; an unreadable balance keeps the claims (fail
@@ -780,12 +778,12 @@ async fn reconcile_boot_custody(
     counts
 }
 
-/// Heartbeat cadence: the mode/status card only (AUD-003). All
+/// Heartbeat cadence: the mode/status card only . All
 /// execution-quality/custody monitors run on [`SUPERVISION_SECS`].
 const HEARTBEAT_SECS: u64 = 6 * 3_600;
 
 /// Supervision cadence: the custody recheck, GiveUp burst monitor,
-/// and overdue-exit warning are sampled this often (AUD-003).
+/// and overdue-exit warning are sampled this often .
 const SUPERVISION_SECS: u64 = 60;
 
 /// Mid-run custody drift check cadence in seconds (30 minutes, the
@@ -799,7 +797,7 @@ const STALE_OPEN_WARN_SECS: u64 = 3_600;
 /// GiveUp window surfaced in the heartbeat (trailing giveups card).
 const GIVEUP_HEARTBEAT_WINDOW_SECS: u64 = 3_600;
 
-/// Exit-lane reserve (AUD-008): curve ticks, pool ticks, and manual
+/// Exit-lane reserve : curve ticks, pool ticks, and manual
 /// sells dispatch from their own permit budget, so a launch flood
 /// (audits, dev screens, forensics burning every launch permit) can
 /// never consume the lanes exits dispatch on. The two lanes together
@@ -809,7 +807,7 @@ pub(crate) const EXIT_LANE_PERMITS: usize = 8;
 /// Concurrent-unit bound across both lanes plus the in-flight JoinSet.
 pub(crate) const MAX_IN_FLIGHT: usize = 32;
 
-/// Time-injected cadence check for the supervision timers (AUD-003):
+/// Time-injected cadence check for the supervision timers :
 /// `true` once at least `interval_secs` have elapsed since `last`.
 /// Pure so the supervision cadences are testable without running the
 /// event loop.
@@ -915,7 +913,7 @@ async fn run_pipeline(boot: Boot) {
         yellowstone_token,
         discord_token,
         // Held until this function returns: this process owns the
-        // state dir for its whole lifetime (AUD-001).
+        // state dir for its whole lifetime .
         _state_lock,
     } = boot;
 
@@ -992,7 +990,7 @@ async fn run_pipeline(boot: Boot) {
     }
     // Live gates: real funds never run on defaults.
     if live_mode {
-        // Day-tally writability BEFORE the funding gate (AUD-006): the
+        // Day-tally writability BEFORE the funding gate : the
         // restart-persistent loss breaker is mandatory in live, and a
         // tally the process cannot write would read back as a fresh
         // day across a restart.
@@ -1026,7 +1024,7 @@ async fn run_pipeline(boot: Boot) {
             );
             std::process::exit(1);
         }
-        // AUD-007: an invalid commission must not boot live. Paper
+        // An invalid commission must not boot live. Paper
         // settlement fails closed at/above 100% on its own, and the
         // gate's stop widening only consumes the typed value now — but
         // a mistyped FEE_BPS silently changes live risk geometry, so
@@ -1046,7 +1044,7 @@ async fn run_pipeline(boot: Boot) {
             );
             std::process::exit(1);
         }
-        // AUD-016: endpoint trust — remote cleartext endpoints and
+        // Endpoint trust — remote cleartext endpoints and
         // cross-cluster fallbacks never back live reads/dispatch (the
         // override, set + logged, downgrades a flagged fallback).
         let (fatals, _) = settings.endpoint_trust(
@@ -1058,7 +1056,7 @@ async fn run_pipeline(boot: Boot) {
         if !fatals.is_empty() {
             std::process::exit(1);
         }
-        // AUD-005: live never silently boots on the public RPC default —
+        // Live never silently boots on the public RPC default —
         // the project documents it dropping candidates and truncating
         // quorum reads. Refuse unless the operator explicitly opts in.
         let public_rpc_optin =
@@ -1126,7 +1124,7 @@ async fn run_pipeline(boot: Boot) {
         // arrive inline. REST stays for ticks/screens/sim. The x-token
         // is env-only (secret, never the config file, never logged);
         // `_FILE` avoids exporting it into shell history. The token
-        // was captured and scrubbed in the sync boot phase (AUD-015)
+        // was captured and scrubbed in the sync boot phase
         // and crosses here as owned data.
         let token = yellowstone_token;
         match listener::GeyserSubscriber::subscribe_with_rpc(
@@ -1179,7 +1177,7 @@ async fn run_pipeline(boot: Boot) {
         }
     };
     // The token lives in guarded memory only from the sync boot scrub
-    // onward (AUD-015); nothing re-reads the environment here.
+    // onward ; nothing re-reads the environment here.
 
     let mut engine_builder = RiskEngine::builder()
         .endpoint(&settings.inference_endpoint)
@@ -1198,7 +1196,7 @@ async fn run_pipeline(boot: Boot) {
     };
 
     let start_balance = settings.start_balance;
-    // AUD-025: the paper ledger consumes the same typed commission as
+    // The paper ledger consumes the same typed commission as
     // settlement and stop widening. An invalid `FEE_BPS` contributes
     // no commission (the gate already refuses to widen stops with it),
     // instead of booking an impossible 100%/side fee into the book.
@@ -1210,7 +1208,7 @@ async fn run_pipeline(boot: Boot) {
         // the wallet holds more, so a leaked key or an un-swept wallet
         // can only lose what the operator allows to sit there. Exits
         // never consult it. The wallet was loaded (and the key env
-        // scrubbed) in the sync boot phase (AUD-015).
+        // scrubbed) in the sync boot phase .
         let hot_cap = settings.hot_wallet_cap_lamports();
         let wallet = match wallet.take() {
             Some(wallet) => wallet.with_hot_wallet_cap(hot_cap),
@@ -1246,7 +1244,7 @@ async fn run_pipeline(boot: Boot) {
                 settings.priority_fee_micro_lamports,
             )
             .with_strict_sim(settings.sim_strict);
-        // Background tip refresher (AUD-011): the tip-list cache lives so
+        // Background tip refresher : the tip-list cache lives so
         // dispatch never waits on `getTipAccounts` — the refresher owns
         // the fetch, and dispatch reads the cache (fallback: official
         // constants). A half-TTL cadence repairs past a blip faster than
@@ -1263,7 +1261,7 @@ async fn run_pipeline(boot: Boot) {
                 ticker.tick().await;
             }
         });
-        // Background tip-floor refresher (AUD-006): same contract for
+        // Background tip-floor refresher : same contract for
         // the landed-tip floor — `tip_floor_lamports` is a cache read on
         // the dispatch path; a stalled oracle costs freshness, never
         // dispatch latency. Half-TTL (30s) cadence.
@@ -1464,7 +1462,7 @@ async fn run_pipeline(boot: Boot) {
         replay_live_wal(&pipeline, &ticker).await;
     }
 
-    // Pending-buy rechecks (AUD-013): a dedicated supervisor task, NOT
+    // Pending-buy rechecks : a dedicated supervisor task, NOT
     // the tick path — a recheck round runs a 60-second confirm deadline
     // per entry, and a tick that waits behind it can starve its own
     // exit for a minute. The existing `recheck_busy` still bounds
@@ -1510,13 +1508,12 @@ async fn run_pipeline(boot: Boot) {
     let mut gate_timer = tokio::time::interval(gate_interval);
     gate_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Heartbeat cadence (mode/status card only; the supervision
-    // monitors live on `SUPERVISION_SECS`, AUD-003).
+    // Heartbeat cadence (mode/status card only; the supervision monitors live on `SUPERVISION_SECS`).
     let boot_ts = settings::now_secs();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Supervision cadence (AUD-003): the short timer that runs the
+    // Supervision cadence : the short timer that runs the
     // execution-quality/custody monitors — the custody recheck at its
     // documented 30-minute cadence, the GiveUp burst monitor on its own
     // configured window, and the overdue-exit warning. Sampling these
@@ -1538,7 +1535,7 @@ async fn run_pipeline(boot: Boot) {
     let mut ingestion_banned_seen = false;
     // Data-degrade card mirror (rising-edge card, same policy).
     let mut data_degraded_seen = false;
-    // Rising-edge mirrors for the supervision monitors (AUD-003): a
+    // Rising-edge mirrors for the supervision monitors : a
     // warn fires when the condition starts and clears when it ends —
     // a 60-second sampler must not spam every tick.
     let mut overdue_warned = false;
@@ -1552,10 +1549,10 @@ async fn run_pipeline(boot: Boot) {
     // Latched ledger shorts (live mode): mints whose chain balance
     // fell short of the claims at the last completed recheck.
     // Refreshed only by a passing recheck — the pause outlives the
-    // timer by design. Applied via channel (AUD-005), never awaited
+    // timer by design. Applied via channel , never awaited
     // inside a `select!` arm.
     let mut ledger_shorts: Vec<String> = Vec::new();
-    // AUD-005: guarded background recheck. The channel carries the
+    // Guarded background recheck. The channel carries the
     // recheck + migration-retry result back to the loop; the flag
     // prevents overlapping tasks and stale spawns.
     let (recheck_tx, mut recheck_rx) = mpsc::unbounded_channel::<(Vec<String>, usize)>();
@@ -1683,8 +1680,7 @@ async fn run_pipeline(boot: Boot) {
             _ = supervision.tick() => {
                 // Custody recheck (live only) at its documented
                 // 30-minute cadence, sampled every supervision tick
-                // (AUD-003: it was only reachable at the 6-hour
-                // heartbeat). AUD-005: the recheck and the recovered-bag
+                // (It was only reachable at the 6-hour heartbeat).: the recheck and the recovered-bag
                 // migration hunt are multi-second RPC walks; they run in
                 // one guarded background task so the event loop never
                 // awaits them — a queued exit tick must always be read.
@@ -1721,9 +1717,7 @@ async fn run_pipeline(boot: Boot) {
                     overdue_warned = false;
                 }
                 // GiveUp burst monitor on its configured trailing
-                // window, sampled every supervision tick (AUD-003: a
-                // burst was only visible if it fell just before a
-                // 6-hour heartbeat). Rising edge, like the other
+                // window, sampled every supervision tick (a burst was only visible if it fell just before a 6-hour heartbeat). Rising edge, like the other
                 // supervision latches.
                 if pipeline.settings.alert_giveup_burst_n > 0 {
                     let now = settings::now_secs();
@@ -1741,7 +1735,7 @@ async fn run_pipeline(boot: Boot) {
                     }
                 }
             }
-            // AUD-005: finished background recheck reports back; the
+            // Finished background recheck reports back; the
             // loop applies the ledger-short latch here instead of
             // awaiting RPC inline.
             Some((shorts, unfed)) = recheck_rx.recv() => {
@@ -1772,7 +1766,7 @@ async fn run_pipeline(boot: Boot) {
                 );
                 // Custody recheck, the overdue-exit warning, and the
                 // GiveUp burst monitor live on the 60-second
-                // supervision tick (AUD-003); the heartbeat card
+                // supervision tick ; the heartbeat card
                 // keeps its own 6-hour cadence and surfaces their
                 // latest state above.
                 // Equity-curve record (drawdown / expectation evidence).
@@ -1806,7 +1800,7 @@ async fn run_pipeline(boot: Boot) {
                         warn!("{unaccounted_n} settled live exit(s) had no persisted entry cost (legacy WAL): realized PnL is UNACCOUNTED and the day-loss tally under-counts them");
                     }
                 }
-                // AUD-021: custody with no pool leg has no guaranteed
+                // Custody with no pool leg has no guaranteed
                 // automated exit once its curve stops ticking.
                 let unfed = pipeline.bags_without_pool_leg().await.len();
                 if unfed > 0 {
@@ -1817,7 +1811,7 @@ async fn run_pipeline(boot: Boot) {
                 if tick_dropped > 0 || pool_dropped > 0 {
                     warn!("saturation drops: curve_ticks={tick_dropped} pool_ticks={pool_dropped} (delayed exits are slippage paper never pays)");
                 }
-                // Paper-ledger overdraft (AUD-010): dispatch costs past
+                // Paper-ledger overdraft : dispatch costs past
                 // available cash surface as a warning instead of being
                 // absorbed at a zero cash floor.
                 let overdraft_usd = pipeline.paper_overdraft_usd().await;
@@ -2038,7 +2032,7 @@ async fn run_pipeline(boot: Boot) {
                     data_degraded_seen = false;
                     pipeline.emit("Data sources healthy again: entries resume.".to_string());
                 }
-                // Manual-sell drain every 15th round (AUD-008): each sell
+                // Manual-sell drain every 15th round : each sell
                 // dispatches from the exit lane inside the bounded
                 // JoinSet — the event loop never awaits a sell, so a
                 // slow dispatch+confirm cannot stall ticks/launches.
@@ -2097,7 +2091,7 @@ async fn run_pipeline(boot: Boot) {
     sol_handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
     // Pending rechecks stop between rounds and join BEFORE the
-    // snapshot (AUD-013): a trailing round may still park resolved
+    // snapshot : a trailing round may still park resolved
     // confirmations, which the snapshot must see. A round that
     // outlives the stop window is aborted loudly; WAL replay
     // recovers its pending state on the next boot.
@@ -2114,7 +2108,7 @@ async fn run_pipeline(boot: Boot) {
         }
     }
 
-    // AUD-005: abort the background custody recheck / migration hunt, if
+    // Abort the background custody recheck / migration hunt, if
     // one is still running, BEFORE the snapshot. The task only reads chain
     // balances and refreshes recovered-bag feeds (no WAL writes), so an
     // abort is safe: the next boot re-derives both from the WAL and chain.
@@ -2236,7 +2230,7 @@ mod tests {
     use solana_pubkey::Pubkey;
     use tokio::sync::mpsc;
 
-    /// AUD-026: the pid record must carry the effective mode. Only
+    /// The pid record must carry the effective mode. Only
     /// `--live` or the exact `IS_LIVE=true` value is live.
     #[test]
     fn pid_record_follows_the_effective_live_mode() {
@@ -2251,7 +2245,7 @@ mod tests {
         }
     }
 
-    /// AUD-025: the paper ledger consumes the typed commission; an
+    /// The paper ledger consumes the typed commission; an
     /// invalid `FEE_BPS` contributes none (and does not widen stops).
     #[test]
     fn paper_ledger_ignores_an_invalid_fee() {
@@ -2269,7 +2263,7 @@ mod tests {
         assert_eq!(paper_fee_bps(&valid), 345.0);
     }
 
-    /// AUD-008: a launch flood that holds every launch-lane permit
+    /// A launch flood that holds every launch-lane permit
     /// cannot consume the exits' reserve — the dispatch-lane split
     /// keeps a curve/pool tick's and a manual sell's dispatcher
     /// independently available.
@@ -2296,7 +2290,7 @@ mod tests {
         );
     }
 
-    /// AUD-015: the boot scrub list covers every secret-bearing env
+    /// The boot scrub list covers every secret-bearing env
     /// var the boot owns; `_FILE` variants (paths) stay.
     #[test]
     fn secret_env_scrub_covers_every_secret() {
@@ -2318,7 +2312,7 @@ mod tests {
         }
     }
 
-    /// AUD-015 acceptance: after the boot scrub, child processes
+    /// After the boot scrub, child processes
     /// (which inherit the process env) see no secret variables/values.
     #[test]
     #[cfg(unix)]
@@ -2338,7 +2332,7 @@ mod tests {
             (alert::DISCORD_BOT_TOKEN_ENV, "test-token-fixture-5"),
             ("SOLANA_PRIVATE_KEY", "test-mint-fixture-6"),
         ];
-        // Restored on drop even while unwinding (AUD-022 guard).
+        // Restored on drop even while unwinding .
         let _guard = {
             let vars: Vec<(&str, Option<&str>)> =
                 secrets.iter().map(|(k, v)| (*k, Some(*v))).collect();
@@ -2365,7 +2359,7 @@ mod tests {
         assert!(stdout.contains("="), "expected name=value lines");
     }
 
-    /// AUD-003: the supervision sampler must be shorter than every
+    /// The supervision sampler must be shorter than every
     /// window it observes — the documented 30-minute custody recheck
     /// and the one-hour GiveUp window — and the heartbeat card keeps
     /// its own 6-hour cadence.
@@ -2455,7 +2449,7 @@ mod tests {
         );
     }
 
-    /// Sleepy ledger stub (AUD-005 tests): counts reads and reports its
+    /// Sleepy ledger stub : counts reads and reports its
     /// phase through `state` (0 idle, 1 chain read in flight, 2 done).
     /// `pending_for` marks one mint; every read returns `chain`.
     struct SleepyReader {
@@ -2508,8 +2502,7 @@ mod tests {
         }
     }
 
-    /// The walk's fail-closed semantics (AUD-005, the same rule set as
-    /// the boot reconcile): a pending claim is skipped with no chain
+    /// The walk's fail-closed semantics (the same rule set as the boot reconcile): a pending claim is skipped with no chain
     /// read, a short ledger is latched for the pause, and a backed
     /// claim stays silent.
     #[tokio::test]
@@ -2585,7 +2578,7 @@ mod tests {
         );
     }
 
-    /// The watched behavior (AUD-005): a queued exit tick is served
+    /// The watched behavior : a queued exit tick is served
     /// while the custody walk is still in flight. The spawn shape is
     /// the supervision arm's own (guard + classify walk); the
     /// current-thread runtime proves a walk awaited INLINE in a select

@@ -240,7 +240,7 @@ impl EntryGate {
 
 /// Dev history policy.
 /// Age covers the walk. Launches count across the whole walked
-/// history (AUD-010); `sample_txs` no longer truncates the count.
+/// history ; `sample_txs` no longer truncates the count.
 /// `sig_limit` sizes one signature page of the backward walk.
 #[derive(Debug, Clone)]
 pub struct DevScreenConfig {
@@ -250,8 +250,7 @@ pub struct DevScreenConfig {
     pub max_prior_launches: usize,
     /// Txs sampled for the launch count.
     ///
-    /// Obsolete for the count (AUD-010 removed the slice: a truncated
-    /// history fails closed, so the count walks the whole history);
+    /// Obsolete for the count (removed the slice: a truncated history fails closed, so the count walks the whole history);
     /// kept parsed for config compatibility. `sig_limit` now bounds
     /// one page of the walk and is kept at or above this value.
     pub sample_txs: usize,
@@ -280,7 +279,7 @@ pub struct DevVerdict {
     /// Launches seen in the sampled window.
     pub prior_launches: usize,
     /// The launch count is a LOWER BOUND: the walk stopped at the
-    /// page budget with older history unread (AUD-010). Truncated
+    /// page budget with older history unread . Truncated
     /// verdicts never pass — this is evidence for the operator log.
     pub history_truncated: bool,
     /// Human-readable cause for logs.

@@ -2,7 +2,7 @@ use super::swaps::{for_each_compiled_ix, resolve_keys};
 use super::*;
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 
-/// Dev-history backward walk budget (AUD-010): a serial launcher with
+/// Dev-history backward walk budget : a serial launcher with
 /// a full signature window can hide prior launches beyond the newest
 /// page, so the walk accumulates pages until the history is really
 /// exhausted or this budget is hit — a capped-but-unexhausted walk
@@ -11,7 +11,7 @@ use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 pub(crate) const DEV_HISTORY_MAX_PAGES: usize = 3;
 
 /// Dev-verdict cache key: the wallet AND the mint under screening.
-/// A verdict with the self-mint exclusion (AUD-006) is meaningless for
+/// A verdict with the self-mint exclusion  is meaningless for
 /// any other launch by the same dev.
 fn dev_auth_key(dev: &Pubkey, self_mint: Option<Pubkey>) -> String {
     match self_mint {
@@ -28,7 +28,7 @@ pub async fn screen_developer(
     cfg: &DevScreenConfig,
     self_mint: Option<Pubkey>,
 ) -> Result<DevVerdict, ClientError> {
-    // Backward page walk (AUD-010): the launch count must come from the
+    // Backward page walk : the launch count must come from the
     // WHOLE walked history, and the walk must prove its own
     // completeness (last page ended short/empty). Newest first.
     let mut sigs: Vec<RpcConfirmedTransactionStatusWithSignature> = Vec::new();
@@ -85,7 +85,7 @@ pub async fn screen_developer(
     let tx_config = json_tx_config(commitment);
     // Bounded fan-out (5-wide). Failed txs skipped. Unreadable counted.
     // Every walked sig is a candidate: the count is over the history,
-    // not a newest-slice sample (AUD-010).
+    // not a newest-slice sample .
     let candidates: Vec<(Signature, bool)> = sigs
         .iter()
         .filter_map(|s| {
@@ -164,7 +164,7 @@ pub async fn screen_developer(
     Ok(walk_verdict(age_secs, prior_launches, walk_truncated, cfg))
 }
 
-/// Verdict for a walked dev history (pure, AUD-010). Truncation is
+/// Verdict for a walked dev history (pure). Truncation is
 /// never a pass: the observed launch count is a lower bound, so a
 /// wallet whose walk stopped at the page budget is rejected until its
 /// whole history provably fits the walk. Age rules still dominate
@@ -203,7 +203,7 @@ pub(crate) fn sample_trustworthy(failed: usize, total: usize) -> bool {
 /// Returns `(records, newest_sig, truncated)`.
 /// Truncated rounds must not advance quorum.
 ///
-/// Paging (AUD-004): every page's fullness is recorded; the read is
+/// Paging : every page's fullness is recorded; the read is
 /// "exhausted" only when it terminated on an empty or short page — a
 /// full-page run stopped by the cap means older history exists and the
 /// view is partial, for first reads AND detailed reads alike. A missed
@@ -222,7 +222,7 @@ pub async fn read_curve_swaps(
     let mut watermark_found = false;
     let mut pages = 0usize;
     let mut fetch_failed = false;
-    // Fullness flag per READ page (AUD-004): `true` = the page hit the
+    // Fullness flag per READ page : `true` = the page hit the
     // 25-sig fetch limit. The last flag decides "history exhausted".
     let mut page_full_flags: Vec<bool> = Vec::new();
 
@@ -354,7 +354,7 @@ fn merge_page_fetches(
 /// Truncation rule for a curve read. Pure, pinned by tests: any fetch
 /// failure forces the truncated path (the hole could hide the abort
 /// signal). Exhaustion, not the `exhaustive` read mode, decides
-/// completeness (AUD-004): a full-page run stopped by the cap is a
+/// completeness : a full-page run stopped by the cap is a
 /// partial view even on the first (watermark-less) read — never
 /// confirm, never advance quorum on it; a truncated-history read that
 /// ran out of pages-by-history is complete over all available
@@ -375,7 +375,7 @@ fn curve_truncated(
     !history_exhausted
 }
 
-/// Pure exhaustion rule over the pages actually read (AUD-004): the
+/// Pure exhaustion rule over the pages actually read : the
 /// read saw all available history only when its LAST page ran short
 /// (or was empty; an empty flag list has no history at all). `true`
 /// for every page of a full-page run = the read stopped at the cap
@@ -604,7 +604,7 @@ impl RpcScreener {
 
     /// Dev verdict for the launch `self_mint` the dev is screened
     /// against. Fails closed on transport errors. Full verdicts cache
-    /// — keyed by dev AND mint (AUD-006): the count excludes the
+    /// — keyed by dev AND mint : the count excludes the
     /// screened launch's own `create`, so a verdict for one launch is
     /// not a verdict for another by the same dev. Early age-rejects
     /// don't cache: young wallets age out.
@@ -623,8 +623,8 @@ impl RpcScreener {
 
     /// Dev verdict that bypasses the cache. Confirm-time screening
     /// must observe fresh history: a new launch by the same dev inside
-    /// the cache TTL must not ride a stale pass (AUD-004). The fresh
-    /// result replenishes the cache (dev AND mint keyed, AUD-006) so
+    /// the cache TTL must not ride a stale pass . The fresh
+    /// result replenishes the cache (dev AND mint keyed) so
     /// repeat screens within one launch still share one read.
     pub async fn dev_verdict_fresh(
         &self,
@@ -695,7 +695,7 @@ impl RpcScreener {
     /// amounts or a zero supply refuse rather than price a fiction.
     /// `curve_ata` (the launch's associated bonding-curve token
     /// account, from the launch event) is excluded from the sum
-    /// (AUD-004): that vault holds the unsold real supply and is not a
+    /// : that vault holds the unsold real supply and is not a
     /// holder. The array is filtered before `take(10)`, so the metric
     /// still reports ten holder accounts when the vault ranks in the
     /// top ten; the read fails closed if the excluded account's own
@@ -1206,7 +1206,7 @@ impl RpcScreener {
 }
 
 /// Sum the ten largest non-vault token accounts as a percent of supply.
-/// Pure so the exclusion semantics (AUD-004) are unit-testable without
+/// Pure so the exclusion semantics  are unit-testable without
 /// a live RPC. Filtering happens before `take(10)`, so an excluded
 /// vault inside the top ten does not shrink the holder count. A row
 /// inside the counted window that is unparseable fails closed.
@@ -1371,7 +1371,7 @@ mod tests {
     use super::super::swaps::SwapSide;
     use super::*;
 
-    /// AUD-004 fixture row for the holder-share math. `amount` carries
+    /// Fixture row for the holder-share math. `amount` carries
     /// base units as the RPC does; the address string is decorative.
     fn token_row(address: &str, units: u128) -> RpcTokenAccountBalance {
         RpcTokenAccountBalance {
@@ -1385,7 +1385,7 @@ mod tests {
         }
     }
 
-    /// AUD-004: the holder-share math excludes the bonding-curve vault
+    /// The holder-share math excludes the bonding-curve vault
     /// by address before the top-ten window, so a vault that ranks
     /// first does not displace a real holder from the metric.
     #[test]
@@ -1483,7 +1483,7 @@ mod tests {
 
     #[test]
     fn exhaustion_rule_is_decided_by_the_last_page() {
-        // AUD-004: fullness flags decide "all available history read".
+        // Fullness flags decide "all available history read".
         assert!(history_exhausted(&[]), "no pages at all: nothing to miss");
         assert!(
             !history_exhausted(&[true, true, true]),
@@ -1504,7 +1504,7 @@ mod tests {
     fn truncation_rule_pins_watermark_and_cap_shapes() {
         // First read (no watermark) that stops at the cap with full
         // pages: PARTIAL. Older pages may hide the dev sell — never
-        // confirm on it (AUD-004 core).
+        // confirm on it .
         assert!(curve_truncated(false, false, false, false));
         // First read where history ran out: complete.
         assert!(!curve_truncated(false, false, true, false));
@@ -1528,7 +1528,7 @@ mod tests {
 
     #[test]
     fn walk_verdict_never_passes_a_truncated_history() {
-        // AUD-010: a full newest window with a hidden create beyond
+        // A full newest window with a hidden create beyond
         // the walk budget is a lower-bound count — reject even when
         // the visible count is zero or exactly at the max.
         let cfg = dev_cfg();

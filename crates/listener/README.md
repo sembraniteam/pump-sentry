@@ -8,7 +8,7 @@ Real-time detector for new Pump.fun tokens: `logsSubscribe` → `getTransaction`
 - Retries: 250ms transient + ~1s jittered tier for 429 (HTTP + JSON-RPC surfaces); permits never held across sleeps.
 - `screen`: dev/creator history (reject fresh/serial, fail-closed; the dev walk is page-budgeted, so a truncated history fails closed instead of passing a lower-bound count), buyer-quorum watchlist (dev dump aborts), bundle forensics at confirm (reject drops, suspect paper-only). Confirm-time re-screens bypass the verdict cache, so a launch inside the TTL cannot ride a stale verdict.
 - `screen::micro` (`MicroSignals`): per-round confirm-tape microstructure — buys/sells, buy ratio, base-unit volumes, unique traders, top-wallet share, insider net flow, round-over-round velocity. Pure computation over already-observed swaps: no new RPC. Round-over-round velocity joins one round's record to the stored previous point (`PendingSignal.prev_tape`).
-- `Screener::top_holder_pct`: top-10 supply share excluding the launch's associated bonding-curve token account (AUD-004), read once per confirm for the armed cap and the risk model alike (unreadable refuses while armed; unarmed it is `None`, never zero).
+- `Screener::top_holder_pct`: top-10 supply share excluding the launch's associated bonding-curve token account, read once per confirm for the armed cap and the risk model alike (unreadable refuses while armed; unarmed it is `None`, never zero).
 - Funders resolve by walking to genesis (page-capped, deadline-bound); RPC caches: dev verdicts 1h (repeat screens only — confirm re-screens are always fresh), funder 24h (transient misses never cached).
 - Zero panics; `create`/`create_v2` layouts frozen-sample proven.
 

@@ -451,7 +451,7 @@ mod tests {
     }
 
     /// A `create` (v1 or v2) whose mint sits in a slot list at the
-    /// AUD-006 layout: slot 0 = mint, `author_slot` = author.
+    /// Layout: slot 0 = mint, `author_slot` = author.
     fn create_by_dev(disc: &[u8; 8], author_slot: usize) -> UiCompiledInstruction {
         let mut data = disc.to_vec();
         data.extend_from_slice(&[9u8; 16]);
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn dev_screen_excludes_the_screened_launch_create() {
-        // AUD-006: the indexed confirm-time history contains the
+        // The indexed confirm-time history contains the
         // launch's OWN create; counting it makes `max_priors` off by
         // one. Both layouts must skip a create carrying the screened
         // mint, and never skip any other create by the same dev.
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn dev_screen_counts_genuine_priors_alongside_the_self_create() {
-        // AUD-006: a prior tx whose create mints something else
+        // A prior tx whose create mints something else
         // counts; the tx's own mint does not.
         let prior_tx = mint_tx(vec![create_by_dev(
             &PUMP_CREATE_V2_DISCRIMINATOR,

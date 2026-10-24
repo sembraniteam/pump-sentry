@@ -159,7 +159,7 @@ pub trait PendingStore {
     /// published: append the `Settled` tombstone and drop the
     /// in-memory entry. Call only AFTER the replacement claim
     /// (`Position`/`Manual`) is durable — WAL-before-ack keeps the
-    /// pending claim of record until then (AUD-001).
+    /// pending claim of record until then .
     async fn retire_pending_for(&self, mint: &str);
 }
 
@@ -198,12 +198,12 @@ pub trait WalSink {
 
     /// Record a durable tracked claim with no bundle attribution: a
     /// parked manual bag being resurrected for a tracked exit. Call
-    /// BEFORE `unrecord_manual` (AUD-002, WAL-before-ack).
+    /// BEFORE `unrecord_manual` (WAL-before-ack).
     async fn record_position(&self, position: &LivePosition);
 
     /// Retire the tracked claim of a bag handed from the exit path into
     /// the manual notes, so every parked bag replays with one claim
-    /// (AUD-002). Call AFTER the manual claim is durable.
+    /// . Call AFTER the manual claim is durable.
     async fn take_position(&self, position: &LivePosition);
 
     /// Record a sell (call BEFORE subtracting).
@@ -356,12 +356,12 @@ pub enum CurveRead {
 pub trait Screener {
     /// Dev verdict for `self_mint`, the launch under screening; `Err`
     /// skips fail-closed. The verdict's launch count excludes the
-    /// screened launch's own `create` (AUD-006), so callers must state
+    /// screened launch's own `create` , so callers must state
     /// it.
     async fn screen_dev(&self, dev: &str, self_mint: &str) -> Result<DevVerdict, ScreenError>;
     /// Dev verdict that must not ride a cached pass. Confirm-time
     /// re-screening uses this: fresh history between intake and quorum
-    /// must be observed, not the intake-time verdict (AUD-004).
+    /// must be observed, not the intake-time verdict .
     /// Default defers to `screen_dev` so screens with no cache (or no
     /// history-walk) keep one path.
     async fn screen_dev_fresh(
@@ -390,11 +390,11 @@ pub trait Screener {
     /// Called on every confirm to arm the concentration cap and feed
     /// the risk model context. `curve_ata` is the launch's associated
     /// bonding-curve token account; the reader excludes it from the
-    /// holder sum (AUD-004).
+    /// holder sum .
     async fn top_holder_pct(&self, mint: &str, curve_ata: Option<&str>)
     -> Result<f64, ScreenError>;
     /// Migration hunt; `None` when not found. The returned future is
-    /// `Send` explicitly: the background custody cycle (AUD-005) runs
+    /// `Send` explicitly: the background custody cycle  runs
     /// the hunt off the event loop, and an RPC-screener future must
     /// cross a spawn boundary there. The explicit `impl Future + Send`
     /// (not `async fn`) is deliberate; the rustc auto-trait inference
@@ -490,7 +490,7 @@ fn unpriceable_liquidity(liquidity_usd: f64) -> bool {
     !liquidity_usd.is_finite() || liquidity_usd <= 0.0
 }
 
-/// AUD-027: hunt the migration before a complete tick's close only when
+/// Hunt the migration before a complete tick's close only when
 /// a live leg exists to route the exit through the pool. Paper closes
 /// cannot use the pool and must not burn an exit-lane permit on the
 /// bounded RPC hunt; their hunt still runs post-close in `maybe_unwatch`.
@@ -745,7 +745,7 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         (live_extra, live_bags, paper_locked)
     }
 
-    /// Paper ledger overdraft (AUD-010): dispatch costs debited past
+    /// Paper ledger overdraft : dispatch costs debited past
     /// available cash. Reporting only — the book itself refuses new
     /// opens while cash is negative (fail-closed).
     pub async fn paper_overdraft_usd(&self) -> f64 {
@@ -890,7 +890,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// after the live leg settles; unsettled paths return before it.
     pub(crate) async fn settle_close_tail(&self, tick: &PriceTick) {
         // Pending-buy rechecks run on the dedicated supervisor task
-        // (AUD-013) — never here on the tick path.
+        //  — never here on the tick path.
         if self
             .portfolio
             .lock()
@@ -904,7 +904,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Manual check is base-wide: a suffixed parked dup is still
             // held funds, even though only the exact key resurrects.
             // An unresolved pending buy is the same unsettled exposure
-            // (AUD-008): the paper PnL stays deferred until the pending
+            // : the paper PnL stays deferred until the pending
             // recheck resolves it.
             let pending_buy = self
                 .exec
@@ -1049,7 +1049,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let unpriceable = !tick.complete && unpriceable_liquidity(tick.liquidity_usd);
         // Per-mint lock.
         let _serial = self.mint_serial(&tick.mint).await;
-        // AUD-002/AUD-001: a complete tick for a mint with custody
+        // A complete tick for a mint with custody
         // must resolve the migration BEFORE the first sell attempt.
         // `maybe_unwatch` used to be the only hunt caller, but it
         // returns early while a bag is tracked — so the pool leg was
@@ -1057,7 +1057,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Hunt here (deduped, None/Err retry on later ticks), then the
         // same tick's close routes through the fresh pool leg. Without
         // a resolvable pool the fail-closed curve refusal stands.
-        // AUD-027: only a live leg can route the exit through the pool,
+        // Only a live leg can route the exit through the pool,
         // so paper-only closes must not spend an exit-lane permit on a
         // 15s RPC hunt. Paper mode still hunts after the close in
         // `maybe_unwatch` (already deduped).
@@ -1274,7 +1274,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         if live_settled {
             // Synthetic exclusion and uncovered-paper exclusion live in
-            // the shared recorder (AUD-002).
+            // the shared recorder .
             self.record_breaker_pnls(&tick.mint, closed_pnls, now).await;
         } else {
             warn!(mint = %tick.mint, "paper closed but live still holds; breaker PnL deferred until live settles");

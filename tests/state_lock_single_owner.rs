@@ -1,4 +1,4 @@
-//! AUD-001 regression: two trader processes must never share a state
+//! Two trader processes must never share a state
 //! dir. A second `run` on an owned state dir must refuse before it
 //! reads the config, loads the wallet, or touches the WAL/day-state.
 
@@ -61,8 +61,7 @@ fn second_run_refuses_to_start_while_state_dir_is_owned() {
         "a second trader on the same state dir must exit nonzero"
     );
 
-    // The refusal precedes every state read/write (AUD-001 acceptance:
-    // the second process never reaches wallet/WAL load).
+    // The refusal precedes every state read/write (the second process never reaches wallet/WAL load).
     let mut errbuf = Vec::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_end(&mut errbuf);

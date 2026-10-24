@@ -101,7 +101,7 @@ pub enum WalLine {
         blockhash: Option<String>,
         #[serde(default)]
         ts: Option<u64>,
-        /// AUD-020 planned entry cost basis (USD per display token).
+        /// Planned entry cost basis (USD per display token).
         /// `None` on legacy lines: replay carries 0.0 (unknown) and the
         /// settle point counts such exits as unaccounted.
         #[serde(default)]
@@ -135,7 +135,7 @@ pub enum WalLine {
         bundle: Option<String>,
         #[serde(default)]
         ts: Option<u64>,
-        /// AUD-020 planned entry cost basis (USD per display token).
+        /// Planned entry cost basis (USD per display token).
         /// `None` on legacy lines (unknown; counted at settle).
         #[serde(default)]
         entry_usd: Option<f64>,
@@ -161,7 +161,7 @@ pub enum WalLine {
         note: Option<String>,
         #[serde(default)]
         ts: Option<u64>,
-        /// AUD-020 planned entry cost basis (USD per display token).
+        /// Planned entry cost basis (USD per display token).
         /// `None` on legacy lines (unknown; counted at settle).
         #[serde(default)]
         entry_usd: Option<f64>,
@@ -175,7 +175,7 @@ pub enum WalLine {
     },
     /// Tracked bag handed from the exit path into the manual notes
     /// (park-for-manual). Retires the tracked claim, so every parked
-    /// bag replays with exactly ONE claim (AUD-002): the tracked line
+    /// bag replays with exactly ONE claim : the tracked line
     /// would otherwise stack beside the manual note and read as
     /// double custody. Older binaries skip the unknown tag (counted);
     /// the manual claim keeps the custody whole in both directions.
@@ -204,7 +204,7 @@ pub enum WalLine {
 /// replay must distinguish (missing load-bearing fields stay behind
 /// `#[serde(default)]`, which needs no bump).
 ///
-/// v2 (AUD-020): `entry_usd` on `pending`/`position`/`manual` lines.
+/// v2 : `entry_usd` on `pending`/`position`/`manual` lines.
 /// Old-schema lines replay with `entry_usd_per_token = 0.0` (unknown);
 /// the settle point counts their exits as unaccounted instead of
 /// silently excluding the realized PnL from the breaker.
@@ -214,7 +214,7 @@ pub const WAL_SCHEMA_VERSION: u32 = 2;
 /// the writer only emits canonical base58 or null, so unparseable means
 /// a damaged file — never half-adopted custody.
 ///
-/// `entry_usd` is the AUD-020 per-token cost basis; absent (legacy
+/// `Entry_usd` is the per-token cost basis; absent (legacy
 /// lines) becomes `0.0` = unknown, and the settle point counts and
 /// alerts such exits instead of silently dropping their realized PnL.
 fn position_from(
@@ -376,7 +376,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     continue;
                 };
                 // A confirmed-fill `Position` retires its pending line
-                // (AUD-009): the writer only emits `Position` after the
+                // : the writer only emits `Position` after the
                 // chain confirmed, so a crash between the `Position`
                 // append and the `Settled` tombstone must not resurrect
                 // a phantom custody claim at boot. Legacy/compacted
@@ -453,7 +453,7 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
             WalLine::TakePosition { mint, amount, .. } => {
                 // The parked manual note is the bag's claim now; the
                 // tracked line it replaces must not replay beside it
-                // (AUD-002: one claim per held bag).
+                // (one claim per held bag).
                 if let Some(pos) = positions.get_mut(&mint) {
                     pos.amount_tokens = pos.amount_tokens.saturating_sub(amount);
                     if pos.amount_tokens == 0 {
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn confirmed_fill_position_retires_its_pending_without_a_tombstone() {
-        // AUD-009: the writer appends `Pending` then later `Position`
+        // The writer appends `Pending` then later `Position`
         // then `Settled`. A crash between the `Position` append and the
         // `Settled` tombstone must not resurrect a phantom custody
         // claim at boot: the confirmed fill is the retirement proof.
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn crash_before_the_claim_publishes_replays_the_pending() {
-        // AUD-001: the recheck handoff may die right after a Confirmed
+        // The recheck handoff may die right after a Confirmed
         // verdict, before the `Position` claim is written. The pending
         // is the claim of record until then, so replay must still hold
         // it (boot re-imports and re-resolves) — never an invisible
@@ -802,7 +802,7 @@ mod tests {
 
     #[test]
     fn parked_from_tracked_bags_claim_exactly_once() {
-        // AUD-002, park side: handing a tracked bag into the manual
+        // Park side: handing a tracked bag into the manual
         // notes retires the tracked claim, so a parked bag replays with
         // exactly ONE claim (chains of boots never stack, the custody
         // recheck never reads a double count side).
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(replay.manual.len(), 1);
         assert_eq!(replay.manual[0].position.amount_tokens, 1_000);
 
-        // Resurrection (AUD-002, take side): the durable tracked claim
+        // Resurrection (take side): the durable tracked claim
         // happens BEFORE the manual claim retires — a crash at any
         // point replays the manual bag or the tracked claim, never
         // neither. Then the eventual settled sale clears everything.

@@ -47,7 +47,7 @@ pub const MIGRATED_CAP: usize = 5_000;
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
     /// Announce each migration once. Owned parameters: the background
-    /// custody cycle (AUD-005) spawns this chain off the event loop, so
+    /// custody cycle  spawns this chain off the event loop, so
     /// its future must be a fully owned, provably `Send` state machine.
     pub(crate) async fn report_migration_once(&self, mint: String, curve: String) {
         {
@@ -168,7 +168,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         info!(%mint, amm = %amm, "following migrated pool");
     }
 
-    /// AUD-021: live custody (tracked or parked) that still rides a
+    /// Live custody (tracked or parked) that still rides a
     /// curve with no registered pool leg. After a restart the paper book
     /// is empty and a graduated curve may stop ticking (zero reserves),
     /// so these bags have no guaranteed automated exit feed. Deduped by

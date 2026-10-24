@@ -243,12 +243,12 @@ pub const MAX_BACKFILL_SLOTS: u64 = 64;
 /// stall the resubscribe behind it.
 const BACKFILL_BLOCK_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Overall backfill deadline (AUD-017): one reconnect backfill may not
+/// Overall backfill deadline : one reconnect backfill may not
 /// extend the blind window past this — the live session must resume.
 /// A 64-slot gap at the per-slot cap could previously run ~21 minutes.
 pub const BACKFILL_TOTAL_BUDGET: Duration = Duration::from_secs(30);
 
-/// Effective per-block deadline (AUD-017): the per-slot cap, or what
+/// Effective per-block deadline : the per-slot cap, or what
 /// is left of the total budget — never more than the budget allows.
 /// Pure for unit pinning.
 fn block_timeout(remaining: Duration) -> Duration {
@@ -522,7 +522,7 @@ impl GeyserSubscriber {
         if to == 0 {
             return;
         }
-        // AUD-017: the whole scan is budgeted: a hung/throttled RPC may
+        // The whole scan is budgeted: a hung/throttled RPC may
         // not stretch blindness past the budget — unread slots are
         // shed (counted) and the live session resumes.
         let deadline = Instant::now() + BACKFILL_TOTAL_BUDGET;
@@ -583,7 +583,7 @@ impl GeyserSubscriber {
                 Ok(Ok(block)) => block,
                 // Pruned, missing, or throttled: an unreadable block
                 // is a coverage gap — counted, never silently skipped
-                // (AUD-017).
+                // .
                 Ok(Err(e)) => {
                     self.stats.inc_slot_gaps_shed();
                     debug!(
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn backfill_budget_bounds_per_block_deadline() {
-        // AUD-017: the per-slot timeout can never exceed the total
+        // The per-slot timeout can never exceed the total
         // budget: a hung getBlock times out at (or before) the budget.
         assert_eq!(
             block_timeout(Duration::from_secs(3600)),

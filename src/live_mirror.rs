@@ -542,7 +542,7 @@ pub(crate) fn breaker_headline(net_pnl: f64, dispatch_usd: f64) -> f64 {
 }
 
 /// Live state, split from [`Pipeline`]. Owns the live generic (`L`).
-/// Whether the exit being settled has a paper leg (AUD-020).
+/// Whether the exit being settled has a paper leg .
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SellCover {
     /// A paper position for this mint closed in the same exit; its
@@ -580,11 +580,10 @@ pub struct LiveExecution<L = LiveTrader> {
     pub outcomes: Mutex<FillOutcomeTracker>,
     /// Paper mints whose live leg actually landed (tracked custody).
     /// Uncovered paper PnL never feeds the live day-loss breaker
-    /// (AUD-002): a diverged or bundle-suspect paper open must not
+    /// : a diverged or bundle-suspect paper open must not
     /// simulate a loss/win that trips or loosens a live circuit breaker.
     pub paper_covered: Mutex<std::collections::HashSet<String>>,
-    /// Settled live exits whose entry cost basis was unknown (legacy
-    /// WAL, AUD-020). Their realized PnL could not be booked; the
+    /// Settled live exits whose entry cost basis was unknown (legacy WAL). Their realized PnL could not be booked; the
     /// heartbeat surfaces the count so the tally is never silently
     /// under-counted.
     pub unaccounted_realized: Mutex<u64>,
@@ -733,7 +732,7 @@ impl<L> LiveExecution<L> {
     }
 
     /// Live bag count that pairs against paper positions: one ticket
-    /// per UNPAIRED live bag (AUD-014). Tracked and parked keys count
+    /// per UNPAIRED live bag . Tracked and parked keys count
     /// individually (duplicate fills on one mint are two bags, not
     /// one), pending buys count when that mint holds no other bag,
     /// and at most one bag is paired away per paper mint it covers.
@@ -779,11 +778,11 @@ impl<L> LiveExecution<L> {
             .await
             .insert(mint.to_string(), reason);
         // Any divergence means this open's live leg never landed:
-        // its simulated PnL must not reach the live breaker (AUD-002).
+        // its simulated PnL must not reach the live breaker .
         self.paper_covered.lock().await.remove(mint);
     }
 
-    /// Live custody confirmed for the mint's paper open (AUD-002):
+    /// Live custody confirmed for the mint's paper open :
     /// its simulated closes may reflect the mirrored trade's modeled
     /// PnL to the breaker while the book is covered.
     pub async fn mark_live_covered(&self, mint: &str) {
@@ -814,7 +813,7 @@ impl<L> LiveExecution<L> {
 
     /// True when paper PnL is stashed for this mint while live settles.
     /// A stash proves a paper leg existed for the exit, so the settle
-    /// path must not book realized live PnL on top of it (AUD-020).
+    /// path must not book realized live PnL on top of it .
     pub async fn has_deferred(&self, mint: &str) -> bool {
         self.deferred_pnl.lock().await.contains_key(mint)
     }
@@ -834,7 +833,7 @@ impl<L> LiveExecution<L> {
     }
 
     /// Settled live exits whose realized PnL could not be booked
-    /// because the entry cost basis was unknown (AUD-020).
+    /// because the entry cost basis was unknown .
     pub async fn unaccounted_realized_count(&self) -> u64 {
         *self.unaccounted_realized.lock().await
     }
@@ -1099,7 +1098,7 @@ impl<L> LiveExecution<L> {
     }
 }
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
-    /// Single live-exposure predicate (AUD-007): true when any live
+    /// Single live-exposure predicate : true when any live
     /// bag exists for `mint` — a tracked position, a parked manual bag
     /// (base-wide), or an unresolved pending buy. Settlement (stale-SOL
     /// guard) and the dup guard must not reason over tracked custody
@@ -1272,7 +1271,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.exec.insert_tracked(position).await;
                 self.exec.clear_diverged(mint).await;
                 // Tracked custody proves the live leg: its paper
-                // closes may feed the live breaker (AUD-002).
+                // closes may feed the live breaker .
                 self.exec.mark_live_covered(mint).await;
                 // Entry-gap calibration: paper model vs landed fill.
                 // Skipped when unobservable (late-confirm path never
@@ -1384,7 +1383,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // here crosses a boundary (journal, alert, in-memory
                 // reason) — redact the transport text so an api-key URL
                 // inside the executor error never reaches log, Discord,
-                // or the journal (AUD-005).
+                // or the journal .
                 let redacted = ids::strip_error_url(&e.to_string());
                 warn!(%mint, error = %redacted, "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
                 self.journal_buy_outcome(mint, None, "unknown", Some(redacted.clone()), None)
@@ -1480,7 +1479,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 RecheckOutcome::Confirmed => {
                     // Late confirm never clobbers a newer bag. The pending
                     // being resolved is deliberately still the claim of
-                    // record (AUD-001), so this duplicate test checks only
+                    // record , so this duplicate test checks only
                     // published custody (tracked/manual), never the
                     // pending itself.
                     if self.exec.is_tracked(&mint).await || self.exec.manual_holds_base(&mint).await
@@ -1504,7 +1503,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             )
                             .await;
                         // The manual claim is durable now: retire the
-                        // pending claim of record (AUD-001 order).
+                        // pending claim of record .
                         trader.retire_pending_for(&mint).await;
                         self.emit(format!("late LIVE buy confirm on already-tracked {mint}; MANUAL REVIEW REQUIRED"));
                         continue;
@@ -1513,14 +1512,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     // WAL first, then track. The pending claim of record
                     // stays until the `Position` line is durable and the
                     // bag is published: `retire_pending_for` below runs
-                    // only after `insert_tracked` (AUD-001).
+                    // only after `insert_tracked` .
                     trader
                         .acknowledge_buy(&recheck.position, &recheck.bundle_id)
                         .await;
                     self.exec.insert_tracked(recheck.position).await;
                     trader.retire_pending_for(&mint).await;
                     self.exec.clear_diverged(&mint).await;
-                    // Late confirm establishes live coverage too (AUD-002).
+                    // Late confirm establishes live coverage too .
                     self.exec.mark_live_covered(&mint).await;
                     // Same first-touch cost; stale feed skips.
                     let confirmed_debit = self.sol_feed.price().map(|sol_usd| {
@@ -1599,7 +1598,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         .record_manual(&recheck.position, &recheck.signature)
                         .await;
                     // Manual claim durable: only now retire the pending
-                    // claim of record, then park (AUD-001 order).
+                    // claim of record, then park .
                     trader.retire_pending_for(&mint).await;
                     self.exec.park_manual(mint.clone(), recheck.position).await;
                     self.exec.note_giveup(now_secs()).await;
@@ -1620,7 +1619,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             warn!(mint = %mint, n, "synthetic deferred PnL excluded from day-loss breaker (override price, no market)");
             return;
         }
-        // AUD-002: deferred legs of an uncovered paper open never
+        // Deferred legs of an uncovered paper open never
         // reach the live breaker, however late the settle resolves.
         if !self.exec.breaker_eligible(mint).await {
             warn!(mint = %mint, n,
@@ -1659,7 +1658,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     }
 
     /// Book realized PnL for a settled live exit with no paper leg
-    /// (AUD-020). The basis is the persisted per-display-token entry
+    /// . The basis is the persisted per-display-token entry
     /// cost; proceeds are marked at this tick's USD price, the same
     /// proxy the paper book settles with, so both routes price one
     /// trade alike. Exactly one call per settled bundle; dispatch
@@ -1713,7 +1712,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     {
         self.exec.reset_retry(mint).await;
         if let Some(held) = self.exec.remove_tracked(mint).await {
-            // WAL first (AUD-002 WAL-before-ack): the parked manual
+            // WAL first (WAL-before-ack): the parked manual
             // bag's claim is durable before the tracked claim it
             // replaces retires, so a crash at any point replays either
             // one, never neither — a parked bag claims exactly once.
@@ -1782,7 +1781,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         let probe = {
             let Some(tracked) = self.exec.tracked(mint).await else {
-                // AUD-008: an unresolved pending buy for this mint is
+                // An unresolved pending buy for this mint is
                 // live exposure not yet tracked — the paper close must
                 // stay deferred (PnL stashed) until the recheck confirms
                 // the bag (then it sells) or resolves it dead.
@@ -1916,7 +1915,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 let emptied = self.exec.subtract_fill(mint, probe.amount_tokens).await;
                 // Success resets the budget.
                 self.exec.reset_retry(mint).await;
-                // AUD-020: a settled real sell proves the custody was
+                // A settled real sell proves the custody was
                 // real. Stamp coverage here — the single settle point —
                 // so a bag whose buy outcome was unknown (parked after
                 // GiveUp/UnknownDispatch, later resurrected by `sell`)
@@ -2053,7 +2052,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return true;
         }
         let _serial = self.mint_serial(mint).await;
-        // AUD-007: an unresolved live buy for this mint means exposure may
+        // An unresolved live buy for this mint means exposure may
         // still arrive (dispatch has a receipt but the chain has not
         // confirmed). Keep the request queued: the drain retries after the
         // pending recheck resolves, so forcing a settled verdict here would
@@ -2108,7 +2107,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             warn!(%mint, amount = held.amount_tokens, "manual sell resurrects a parked bag for explicit exit");
             if let Some(trader) = self.exec.live.as_ref() {
-                // WAL before ack (AUD-002): the durable tracked claim
+                // WAL before ack : the durable tracked claim
                 // happens before the parked claim is retired. A crash
                 // at any point replays the manual bag or the tracked
                 // claim (or both, resolved at boot), never neither.
@@ -2221,7 +2220,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // position per mint). Paper PnL feeds the breaker only after
         // everything settles; tracked custody is never replaced.
         if self.exec.live.is_some() {
-            // AUD-020: the first settled bag of this request owns the
+            // The first settled bag of this request owns the
             // paper headline (the book holds at most one position per
             // mint); duplicates drained after it are live-only.
             let mut paper_headline_pending = !closed_pnls.is_empty();
@@ -2241,7 +2240,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     };
                     if let Some(trader) = self.exec.live.as_ref() {
                         // Same WAL-before-ack order as the primary
-                        // resurrection (AUD-002): the tracked claim is
+                        // resurrection : the tracked claim is
                         // durable before the parked claim retires.
                         trader.record_position(&held).await;
                         trader.unrecord_manual(&held).await;
@@ -2260,7 +2259,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 }
             }
         }
-        // Same shared recorder as the tick path (AUD-002).
+        // Same shared recorder as the tick path .
         self.record_breaker_pnls(&tick.mint, closed_pnls, now).await;
         self.settle_close_tail(&tick).await;
         // Bags may remain (GiveUp-parked): keep the request so the
