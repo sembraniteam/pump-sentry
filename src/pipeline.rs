@@ -379,9 +379,12 @@ pub trait Screener {
         creation_slot: u64,
     ) -> Result<BundleAnalysis, ScreenError>;
     /// Top-10 holder share of supply, percent; `Err` drops fail-closed.
-    /// Called only when the concentration cap is armed, so the extra
-    /// reads cost nothing by default.
-    async fn top_holder_pct(&self, mint: &str) -> Result<f64, ScreenError>;
+    /// Called on every confirm to arm the concentration cap and feed
+    /// the risk model context. `curve_ata` is the launch's associated
+    /// bonding-curve token account; the reader excludes it from the
+    /// holder sum (AUD-004).
+    async fn top_holder_pct(&self, mint: &str, curve_ata: Option<&str>)
+    -> Result<f64, ScreenError>;
     /// Migration hunt; `None` when not found.
     async fn detect_migration(
         &self,
@@ -425,9 +428,17 @@ impl Screener for RpcScreener {
         self.bundle_verdict(&curve, creation_slot).await
     }
 
-    async fn top_holder_pct(&self, mint: &str) -> Result<f64, ScreenError> {
+    async fn top_holder_pct(
+        &self,
+        mint: &str,
+        curve_ata: Option<&str>,
+    ) -> Result<f64, ScreenError> {
         let mint = listener::parse_address(mint)?;
-        RpcScreener::top_holder_pct(self, &mint).await
+        let curve_ata = match curve_ata {
+            Some(ata) => Some(listener::parse_address(ata)?),
+            None => None,
+        };
+        RpcScreener::top_holder_pct(self, &mint, curve_ata.as_ref()).await
     }
 
     async fn detect_migration(

@@ -721,6 +721,8 @@ struct StubScreenerInner {
     fresh_rejects: AtomicBool,
     /// Canned top-10 holder share (`None` = RPC failure).
     top_holders: StdMutex<Option<f64>>,
+    /// Last exclude arg the confirm passed (AUD-004 wiring proof).
+    excluded_curve_ata: StdMutex<Option<String>>,
     /// Migration-hunt invocations (AUD-027: paper closes must not hunt).
     migration_hunts: std::sync::atomic::AtomicUsize,
 }
@@ -745,6 +747,7 @@ impl StubScreener {
                 truncated: AtomicBool::new(false),
                 fresh_rejects: AtomicBool::new(false),
                 top_holders: StdMutex::new(None),
+                excluded_curve_ata: StdMutex::new(None),
                 migration_hunts: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
@@ -901,7 +904,12 @@ impl Screener for StubScreener {
         Ok(found)
     }
 
-    async fn top_holder_pct(&self, _mint: &str) -> Result<f64, ScreenError> {
+    async fn top_holder_pct(
+        &self,
+        _mint: &str,
+        curve_ata: Option<&str>,
+    ) -> Result<f64, ScreenError> {
+        *self.inner.excluded_curve_ata.lock().expect("lock") = curve_ata.map(str::to_string);
         self.inner
             .top_holders
             .lock()
@@ -1678,6 +1686,33 @@ async fn entry_bleed_cap_blocks_only_proven_bleeders() {
         pipe.portfolio.lock().await.position_ids().len(),
         1,
         "cap off disables the gate"
+    );
+}
+
+#[tokio::test]
+async fn confirm_excludes_the_curve_ata_in_the_holder_read() {
+    // AUD-004: the confirm must present the launch's associated
+    // bonding-curve token account as the excluded vault, so the cap
+    // measures holder-only concentration.
+    let screener = StubScreener::with_swaps_and_top_holders(
+        MINT,
+        buyer_swaps(MINT, &[11, 12, 13, 14, 15]),
+        Some(30.0),
+    );
+    let probe = screener.clone();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(MINT, 2.0)),
+        funded(),
+        screener,
+        None,
+    );
+    launch_once(&pipe).await;
+    assert_eq!(
+        *probe.inner.excluded_curve_ata.lock().expect("lock"),
+        Some(ASSOC.to_string()),
+        "the confirm excludes the launch's curve ATA from the holder sum"
     );
 }
 

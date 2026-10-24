@@ -669,7 +669,18 @@ impl RpcScreener {
     /// the screening deadline; any unreadable leg fails closed (`Err`).
     /// Base-unit string math (the ratio needs no decimals): unparseable
     /// amounts or a zero supply refuse rather than price a fiction.
-    pub async fn top_holder_pct(&self, mint: &Pubkey) -> Result<f64, ScreenError> {
+    /// `curve_ata` (the launch's associated bonding-curve token
+    /// account, from the launch event) is excluded from the sum
+    /// (AUD-004): that vault holds the unsold real supply and is not a
+    /// holder. The array is filtered before `take(10)`, so the metric
+    /// still reports ten holder accounts when the vault ranks in the
+    /// top ten; the read fails closed if the excluded account's own
+    /// row is unparseable.
+    pub async fn top_holder_pct(
+        &self,
+        mint: &Pubkey,
+        curve_ata: Option<&Pubkey>,
+    ) -> Result<f64, ScreenError> {
         let bad = |what: &str| ScreenError::BadAddress(format!("{what} for {mint}"));
         let (largest, supply) = match with_screen_timeout(async {
             let largest = self.rpc.get_token_largest_accounts(mint).await?;
@@ -688,16 +699,7 @@ impl RpcScreener {
         if supply_units == 0 {
             return Err(bad("zero supply"));
         }
-        let mut top: u128 = 0;
-        for (i, acc) in largest.iter().take(10).enumerate() {
-            let units: u128 = acc
-                .amount
-                .amount
-                .parse()
-                .map_err(|_| bad(&format!("unparseable top-{} balance", i + 1)))?;
-            top = top.saturating_add(units);
-        }
-        Ok(top as f64 / supply_units as f64 * 100.0)
+        holder_share_pct(&largest, supply_units, curve_ata, mint)
     }
 
     /// Hunt the migration tx for a graduated curve.
@@ -1179,6 +1181,36 @@ impl RpcScreener {
     }
 }
 
+/// Sum the ten largest non-vault token accounts as a percent of supply.
+/// Pure so the exclusion semantics (AUD-004) are unit-testable without
+/// a live RPC. Filtering happens before `take(10)`, so an excluded
+/// vault inside the top ten does not shrink the holder count. A row
+/// inside the counted window that is unparseable fails closed.
+fn holder_share_pct(
+    largest: &[RpcTokenAccountBalance],
+    supply_units: u128,
+    curve_ata: Option<&Pubkey>,
+    mint: &Pubkey,
+) -> Result<f64, ScreenError> {
+    let bad = |what: &str| ScreenError::BadAddress(format!("{what} for {mint}"));
+    let exclude = curve_ata.map(|ata| ata.to_string());
+    let mut top: u128 = 0;
+    for (i, acc) in largest
+        .iter()
+        .filter(|acc| Some(&acc.address) != exclude.as_ref())
+        .take(10)
+        .enumerate()
+    {
+        let units: u128 = acc
+            .amount
+            .amount
+            .parse()
+            .map_err(|_| bad(&format!("unparseable top-{} balance", i + 1)))?;
+        top = top.saturating_add(units);
+    }
+    Ok(top as f64 / supply_units as f64 * 100.0)
+}
+
 /// Hunt depth: 3 pages x 10 sigs, 10-fetch budget.
 /// Deeper hits miss (`None`; retried on later ticks).
 pub const HUNT_MAX_PAGES: usize = 3;
@@ -1314,6 +1346,59 @@ fn scan_ata_funding(
 mod tests {
     use super::super::swaps::SwapSide;
     use super::*;
+
+    /// AUD-004 fixture row for the holder-share math. `amount` carries
+    /// base units as the RPC does; the address string is decorative.
+    fn token_row(address: &str, units: u128) -> RpcTokenAccountBalance {
+        RpcTokenAccountBalance {
+            address: address.to_string(),
+            amount: solana_client::rpc_response::UiTokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: units.to_string(),
+                ui_amount_string: String::new(),
+            },
+        }
+    }
+
+    /// AUD-004: the holder-share math excludes the bonding-curve vault
+    /// by address before the top-ten window, so a vault that ranks
+    /// first does not displace a real holder from the metric.
+    #[test]
+    fn holder_share_excludes_the_curve_vault_before_the_top_ten() {
+        let mint = Pubkey::new_unique();
+        let vault = Pubkey::new_unique().to_string();
+        // Vault first (the largest account, as the curve ATA is at
+        // launch), then exactly ten holder rows.
+        let rows: Vec<RpcTokenAccountBalance> = [token_row(&vault, 13_000_000)]
+            .into_iter()
+            .chain((0..10).map(|i| token_row(&format!("holder{i}"), 5_000_000)))
+            .collect();
+        let supply = 100_000_000u128;
+        let share = holder_share_pct(
+            &rows,
+            supply,
+            Some(&Pubkey::from_str(&vault).expect("vault is valid base58")),
+            &mint,
+        )
+        .expect("share");
+        assert_eq!(share, 50.0, "ten holder rows, vault excluded");
+        // Without the exclusion the vault both inflates the sum AND
+        // pushes the tenth real holder out of the window.
+        let raw = holder_share_pct(&rows, supply, None, &mint).expect("raw share");
+        assert!(
+            (raw - 58.0).abs() < 1e-9,
+            "sum is vault + nine holders: {raw}"
+        );
+    }
+
+    #[test]
+    fn holder_share_fails_closed_on_unparseable_counted_row() {
+        let mint = Pubkey::new_unique();
+        let mut row = token_row("row0", 1);
+        row.amount.amount = "not-a-number".to_string();
+        assert!(holder_share_pct(std::slice::from_ref(&row), 1_000_000, None, &mint).is_err());
+    }
 
     fn rec(sig: &str) -> Vec<SwapRecord> {
         vec![

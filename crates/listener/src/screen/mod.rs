@@ -18,6 +18,7 @@ use migration::{
 use solana_client::{
     client_error::ClientError, nonblocking::rpc_client::RpcClient,
     rpc_client::GetConfirmedSignaturesForAddress2Config, rpc_config::RpcTransactionConfig,
+    rpc_response::RpcTokenAccountBalance,
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};

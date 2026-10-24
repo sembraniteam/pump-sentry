@@ -55,7 +55,10 @@ pub struct Settings {
     /// cap). Thin cells (unknown) always allow; exits never block.
     pub max_expected_entry_gap_usd: f64,
     /// Top-10 holder concentration cap in percent of supply (`0` = off):
-    /// refuses an open when the ten largest holders own more than this.
+    /// refuses an open when the ten largest non-curve token accounts
+    /// own more than this. The launch's associated bonding-curve token
+    /// account (which holds the unsold supply, not a holder's stake) is
+    /// excluded from the sum (AUD-004).
     /// Unreadable holdings refuse while armed (fail-closed); exits never
     /// block.
     pub max_top_holder_pct: f64,

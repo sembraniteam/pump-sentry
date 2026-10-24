@@ -858,7 +858,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         // Exits and held bags are untouched either way.
         let holder_cap = self.settings.max_top_holder_pct;
         let armed = holder_cap > 0.0 && holder_cap.is_finite();
-        let top_holder_pct = match self.screener.top_holder_pct(mint).await {
+        let top_holder_pct = match self
+            .screener
+            .top_holder_pct(mint, Some(&signal.assoc_curve))
+            .await
+        {
             Ok(pct) => {
                 if armed && pct > holder_cap {
                     warn!(%mint, top10_pct = format!("{pct:.1}"), cap = holder_cap, "holder concentration over cap; dropping signal");
