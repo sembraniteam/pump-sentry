@@ -439,13 +439,13 @@ fn pid_binary_path(pid: u32) -> Option<PathBuf> {
 
 /// Executable path behind a pid, when the platform exposes it.
 #[cfg(target_os = "linux")]
-fn pid_binary_path(pid: u32) -> Option<std::path::PathBuf> {
+fn pid_binary_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 /// Platforms without a pid→path facility: unprovable.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn pid_binary_path(_pid: u32) -> Option<std::path::PathBuf> {
+fn pid_binary_path(_pid: u32) -> Option<PathBuf> {
     None
 }
 
