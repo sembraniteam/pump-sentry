@@ -198,8 +198,20 @@ Settings that live **outside** the file (env-only, never in `config.toml`):
 | `ALLOW_FALLBACK_CLUSTER_MISMATCH`                                                     | explicit override for cross-cluster read fallbacks             |
 | `DISCORD_BOT_TOKEN`                                                                 | Discord bot token, scrubbed after boot                         |
 | `DISCORD_BOT_TOKEN_FILE`                                                            | preferred: 0600 token file, avoids exporting the token        |
+| `DISCORD_CONFIG_FILE`                                                               | sidecar config path override (default beside `config.toml` as `discord.toml`) |
 | `JITO_ACCEPTANCE`, `MAINNET_LAYOUT`, `RAYDIUM_ACCEPTANCE`                             | live-probe gates, ignored by default                           |
 | `PUMP_ACCEPTANCE_POOL`, `PUMP_ACCEPTANCE_HOLDER`, `MAINNET_RPC_URL`                   | live probes only (executor tests): creatorless-fee target, RPC override; the bot never reads these |
+
+### Discord sidecar config (`discord.toml`)
+
+`~/.pump-sentry/discord.toml` (beside `config.toml`; `DISCORD_CONFIG_FILE` overrides):
+
+```toml
+guild_id = 123456789012345678  # required: server ID (Developer Mode → right-click server → Copy Server ID)
+operator_ids = [111111111111111111]  # Tier 2 allowlist (/sell, /pause, /resume); empty = nobody (fail-closed)
+```
+
+Unknown keys are a boot error; `guild_id = 0` is refused. Token stays in env/file (`DISCORD_BOT_TOKEN[_FILE]`), never in this file.
 
 ## Going live
 
