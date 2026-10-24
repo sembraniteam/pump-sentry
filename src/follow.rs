@@ -46,12 +46,14 @@ pub const MIGRATED_TTL_SECS: u64 = 86_400;
 pub const MIGRATED_CAP: usize = 5_000;
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
-    /// Announce each migration once.
-    pub(crate) async fn report_migration_once(&self, mint: &str, curve: &str) {
+    /// Announce each migration once. Owned parameters: the background
+    /// custody cycle (AUD-005) spawns this chain off the event loop, so
+    /// its future must be a fully owned, provably `Send` state machine.
+    pub(crate) async fn report_migration_once(&self, mint: String, curve: String) {
         {
             let mut migrated = self.migrated.lock().await;
             let now = now_secs();
-            if migrated.insert(mint.to_string(), now).is_some() {
+            if migrated.insert(mint.clone(), now).is_some() {
                 return;
             }
             // Bounded growth: pruning only risks a dup card.
@@ -65,29 +67,29 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 migrated.remove(&oldest);
             }
         }
-        match self.screener.detect_migration(curve, mint).await {
+        match self.screener.detect_migration(&curve, &mint).await {
             Ok(Some(report)) => {
                 info!(mint = %mint, sig = %report.signature, dest = ?report.destination, amm = ?report.amm_id, "migration detected");
                 self.emit(Alerter::format_migration(
                     &self.card_ctx(),
-                    mint,
+                    &mint,
                     &format!("{:?}", report.destination),
                     &report.signature,
                     report.amm_id.as_deref(),
                     report.base_mint.as_deref(),
                     report.quote_mint.as_deref(),
                 ));
-                self.follow_pool(mint, &report).await;
+                self.follow_pool(&mint, &report).await;
             }
             Ok(None) => {
                 info!(mint = %mint, "graduated but no migration tx found yet; will retry on later ticks");
                 // Retry later (tx may not be indexed yet).
-                self.migrated.lock().await.remove(mint);
+                self.migrated.lock().await.remove(&mint);
             }
             Err(e) => {
                 warn!(%mint, error = %ids::strip_error_url(&e.to_string()), "migration hunt failed");
                 // Retry later.
-                self.migrated.lock().await.remove(mint);
+                self.migrated.lock().await.remove(&mint);
             }
         }
     }
@@ -207,7 +209,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// supervision recheck.
     pub async fn refresh_recovered_bag_feeds(&self) -> usize {
         let bags = self.bags_without_pool_leg().await;
-        for (mint, curve) in &bags {
+        for (mint, curve) in bags {
             self.report_migration_once(mint, curve).await;
         }
         self.bags_without_pool_leg().await.len()

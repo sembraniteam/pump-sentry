@@ -1,6 +1,7 @@
 //! Event processing: launches and tick exits.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -385,12 +386,19 @@ pub trait Screener {
     /// holder sum (AUD-004).
     async fn top_holder_pct(&self, mint: &str, curve_ata: Option<&str>)
     -> Result<f64, ScreenError>;
-    /// Migration hunt; `None` when not found.
-    async fn detect_migration(
+    /// Migration hunt; `None` when not found. The returned future is
+    /// `Send` explicitly: the background custody cycle (AUD-005) runs
+    /// the hunt off the event loop, and an RPC-screener future must
+    /// cross a spawn boundary there. The explicit `impl Future + Send`
+    /// (not `async fn`) is deliberate; the rustc auto-trait inference
+    /// across the generic pipeline otherwise reports
+    /// "Send not general enough" at the spawn boundary.
+    #[allow(clippy::manual_async_fn)]
+    fn detect_migration(
         &self,
         curve: &str,
         mint: &str,
-    ) -> Result<Option<MigrationReport>, ScreenError>;
+    ) -> impl Future<Output = Result<Option<MigrationReport>, ScreenError>> + Send;
 }
 
 impl Screener for RpcScreener {
@@ -441,17 +449,22 @@ impl Screener for RpcScreener {
         RpcScreener::top_holder_pct(self, &mint, curve_ata.as_ref()).await
     }
 
-    async fn detect_migration(
+    // Explicit Send future for the Send-requiring trait method (see the
+    // trait for the rationale).
+    #[allow(clippy::manual_async_fn)]
+    fn detect_migration(
         &self,
         curve: &str,
         mint: &str,
-    ) -> Result<Option<MigrationReport>, ScreenError> {
-        let curve = listener::parse_address(curve)?;
-        let mint = listener::parse_address(mint)?;
-        Ok(self
-            .hunt_migration(&curve, &mint)
-            .await?
-            .map(|detected| detected.report()))
+    ) -> impl Future<Output = Result<Option<MigrationReport>, ScreenError>> + Send {
+        async move {
+            let curve = listener::parse_address(curve)?;
+            let mint = listener::parse_address(mint)?;
+            Ok(self
+                .hunt_migration(&curve, &mint)
+                .await?
+                .map(|detected| detected.report()))
+        }
     }
 }
 
@@ -986,7 +999,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         self.tick_locks.lock().await.remove(&tick.mint);
         self.exec.live_sell_locks.lock().await.remove(&tick.mint);
         if tick.complete {
-            self.report_migration_once(&tick.mint, &tick.curve).await;
+            self.report_migration_once(tick.mint.clone(), tick.curve.clone())
+                .await;
         }
     }
 
@@ -1041,7 +1055,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             .is_empty()
             || self.exec.is_tracked(&tick.mint).await;
         if should_hunt_before_close(self.exec.live.is_some(), tick.complete, has_custody) {
-            self.report_migration_once(&tick.mint, &tick.curve).await;
+            self.report_migration_once(tick.mint.clone(), tick.curve.clone())
+                .await;
         }
         // Clone marks before the book guard (never nest locks).
         let card_marks = self.fresh_marks(now_secs()).await;

@@ -894,14 +894,19 @@ impl Screener for StubScreener {
         }
     }
 
-    async fn detect_migration(
+    // Explicit Send future for the Send-requiring trait method (mirror
+    // of `Screener::detect_migration`; see the trait for the rationale).
+    #[allow(clippy::manual_async_fn)]
+    fn detect_migration(
         &self,
         _curve: &str,
         _mint: &str,
-    ) -> Result<Option<MigrationReport>, ScreenError> {
-        self.inner.migration_hunts.fetch_add(1, Ordering::Relaxed);
-        let found = self.inner.migration.lock().expect("lock").clone();
-        Ok(found)
+    ) -> impl Future<Output = Result<Option<MigrationReport>, ScreenError>> + Send {
+        async move {
+            self.inner.migration_hunts.fetch_add(1, Ordering::Relaxed);
+            let found = self.inner.migration.lock().expect("lock").clone();
+            Ok(found)
+        }
     }
 
     async fn top_holder_pct(
@@ -2234,7 +2239,8 @@ async fn migration_hunt_routes_pool_exit_end_to_end() {
     pipe.poll_gates().await;
     assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
     // Hunt (not a hand insert): the stub report becomes the pool leg.
-    pipe.report_migration_once(MINT, CURVE).await;
+    pipe.report_migration_once(MINT.to_string(), CURVE.to_string())
+        .await;
     {
         let followed = pipe.followed.lock().await;
         let leg = followed
@@ -2817,7 +2823,8 @@ async fn follow_pool_stores_leg_and_sweep_keeps_held_bags() {
     pipe.on_pool_tick(&tick).await;
     assert!(pipe.followed.lock().await[&mint].pool.is_none());
     // ...the hunt overwrites it (never `or_insert` past it).
-    pipe.report_migration_once(&mint, CURVE).await;
+    pipe.report_migration_once(mint.to_string(), CURVE.to_string())
+        .await;
     {
         let followed = pipe.followed.lock().await;
         let leg = followed[&mint].pool.clone().expect("leg stored");

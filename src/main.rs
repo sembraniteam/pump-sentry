@@ -22,14 +22,18 @@ mod test_env;
 mod wal;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use alert::Alerter;
 use auditor::RugCheckClient;
 use curve::{CurveTicker, PriceTick};
-use executor::{FundingPrincipal, JitoClient, LiveFundingReport, SwapExecutor, WalletGuard};
+use executor::{
+    ExecutorError, FundingPrincipal, JitoClient, LiveFundingReport, SwapExecutor, WalletGuard,
+};
 use listener::{DevScreenConfig, ListenerConfig, PumpFunListener, RpcScreener};
 use migration::{PoolTick, VaultTicker};
 use risk_engine::RiskEngine;
@@ -532,20 +536,64 @@ struct BootCustodyCounts {
     awaiting_confirm: usize,
 }
 
-/// Boot chain check (live): the replayed WAL holds the claim, the ATA
-/// balance is custody. Per mint, tracked + parked amounts are summed
-/// and read against the chain ONCE:
-/// - claims match: keep both;
-/// - claims exceed: suppress the tracked copy in memory (no auto-exit
-///   at an unverified size) and hand off one manual note at the chain
-///   amount while no note covers the mint yet. The WAL lines stay
-///   untouched — the file is the claim of record and suppression
-///   substitutes nothing for it, so it is idempotent across boots;
-/// - claims fall short: keep (every claim is backed) and warn.
-///
-/// Mints with an unconfirmed buy are skipped (the late-confirm recheck
-/// still owns their claim). An unreadable balance warns and keeps the
-/// claims tracked (dispatch preflights still fail closed).
+/// Single-flight guard for the background custody cycle (AUD-005): at
+/// most one cycle runs at a time; an unfinished one is aborted at
+/// shutdown before the snapshot (the cycle is read-only on custody and
+/// the WAL, so an abort is safe — the next boot re-derives both).
+struct CustodyCycle {
+    running: Arc<AtomicBool>,
+    in_flight: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CustodyCycle {
+    fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            in_flight: None,
+        }
+    }
+
+    /// Spawn `fut` off the event loop unless one cycle is already
+    /// running (never awaited by the event loop). Returns `false` when
+    /// skipped because a cycle is in flight.
+    fn spawn_if_idle(&mut self, fut: impl Future<Output = ()> + Send + 'static) -> bool {
+        if self.running.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        let guard = Arc::clone(&self.running);
+        self.in_flight = Some(tokio::spawn(async move {
+            fut.await;
+            guard.store(false, Ordering::Relaxed);
+        }));
+        true
+    }
+
+    /// Shutdown: abort an unfinished cycle and join it so nothing
+    /// mutates state after the loop. `Err` after abort is expected and
+    /// ignored.
+    async fn shutdown(&mut self) {
+        if let Some(handle) = self.in_flight.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Mid-run custody cycle task (AUD-005, runs OFF the event loop): the
+/// 30-minute claims-vs-chain recheck, then the recovered-bag migration
+/// hunt (AUD-021: a graduated curve can stop ticking, stranding the
+/// only automated exit; riding the recheck bounds the RPC cost — one
+/// hunt may take its full 15s deadline). Reports
+/// `(ledger shorts, unfed bags)` back to the supervisor via `tx`.
+async fn custody_cycle(
+    pipeline: Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
+    tx: mpsc::UnboundedSender<(Vec<String>, usize)>,
+) {
+    let shorts = custody_recheck(&pipeline).await;
+    let unfed = pipeline.refresh_recovered_bag_feeds().await;
+    let _ = tx.send((shorts, unfed));
+}
+
 /// Mid-run custody recheck (live mode, every `CUSTODY_RECHECK_SECS`):
 /// the same claims-vs-chain classifier as the boot reconcile, minus
 /// the WAL surgery. Read-only — a mismatch pages the operator and
@@ -561,7 +609,6 @@ async fn custody_recheck(
     let Some(trader) = pipeline.exec.live.as_ref() else {
         return Vec::new();
     };
-    let mut short = Vec::new();
     // Snapshot per mint under the locks; read the chain without them.
     let mut claims: BTreeMap<Pubkey, MintClaims> = BTreeMap::new();
     for pos in pipeline.exec.live_positions.lock().await.values() {
@@ -572,11 +619,61 @@ async fn custody_recheck(
         let claim = claims.entry(pos.mint).or_default();
         claim.manual = claim.manual.saturating_add(pos.amount_tokens);
     }
+    classify_custody_claims(claims, trader).await
+}
+
+/// Custody reader for the claim classification walk (AUD-005): what a
+/// ledger watcher must expose. `Send` is explicit — the walk runs in a
+/// spawned background task.
+trait CustodyReader {
+    fn has_pending_for(&self, mint: &Pubkey) -> bool;
+    fn observe_token_balance<'s>(
+        &'s self,
+        mint: &'s Pubkey,
+    ) -> impl Future<Output = Result<Option<u64>, ExecutorError>> + Send + 's;
+}
+
+impl CustodyReader for LiveTrader {
+    fn has_pending_for(&self, mint: &Pubkey) -> bool {
+        LiveTrader::has_pending_for(self, &mint.to_string())
+    }
+
+    fn observe_token_balance<'s>(
+        &'s self,
+        mint: &'s Pubkey,
+    ) -> impl Future<Output = Result<Option<u64>, ExecutorError>> + Send + 's {
+        LiveTrader::observe_token_balance(self, mint)
+    }
+}
+
+impl<T: CustodyReader + ?Sized> CustodyReader for &T {
+    fn has_pending_for(&self, mint: &Pubkey) -> bool {
+        (**self).has_pending_for(mint)
+    }
+
+    fn observe_token_balance<'s>(
+        &'s self,
+        mint: &'s Pubkey,
+    ) -> impl Future<Output = Result<Option<u64>, ExecutorError>> + Send + 's {
+        (**self).observe_token_balance(mint)
+    }
+}
+
+/// Custody-claim classification walk (AUD-005): the recheck's per-mint
+/// loop, split from the concrete pipeline so tests can stub a slow or
+/// unreadable ledger. Sequential and read-only — one chain read per
+/// claim at a time; an unreadable balance keeps the claims (fail
+/// closed) and a short ledger is reported to the supervisor's latch.
+async fn classify_custody_claims<R: CustodyReader>(
+    claims: BTreeMap<Pubkey, MintClaims>,
+    reader: R,
+) -> Vec<String> {
+    let mut short = Vec::new();
     for (mint, claim) in claims {
-        if trader.has_pending_for(&mint.to_string()) {
+        if reader.has_pending_for(&mint) {
             continue; // late-confirm recheck owns the pending claim
         }
-        let chain = match trader.observe_token_balance(&mint).await {
+        let chain = match reader.observe_token_balance(&mint).await {
             Ok(chain) => chain.unwrap_or(0),
             Err(e) => {
                 warn!(%mint, error = %ids::strip_error_url(&e.to_string()),
@@ -1453,9 +1550,19 @@ async fn run_pipeline(boot: Boot) {
     // Custody-recheck stamp (live mode): mid-run drift check cadence.
     let mut last_custody_check = settings::now_secs();
     // Latched ledger shorts (live mode): mints whose chain balance
-    // fell short of the claims at the last recheck. Refreshed only by
-    // a passing recheck — the pause outlives the timer by design.
+    // fell short of the claims at the last completed recheck.
+    // Refreshed only by a passing recheck — the pause outlives the
+    // timer by design. Applied via channel (AUD-005), never awaited
+    // inside a `select!` arm.
     let mut ledger_shorts: Vec<String> = Vec::new();
+    // AUD-005: guarded background recheck. The channel carries the
+    // recheck + migration-retry result back to the loop; the flag
+    // prevents overlapping tasks and stale spawns.
+    let (recheck_tx, mut recheck_rx) = mpsc::unbounded_channel::<(Vec<String>, usize)>();
+    // Single-flight guard so overlapping supervision ticks never spawn a
+    // second cycle, and so shutdown can abort the runner before the
+    // snapshot (no post-loop state mutation).
+    let mut custody_cycle_guard = CustodyCycle::new();
     /// SOL-feed boot grace: a feed that never priced since boot pauses
     /// entries only after this (a fresh boot without a price yet is
     /// normal startup, not degradation; losing an HAD price is).
@@ -1577,25 +1684,24 @@ async fn run_pipeline(boot: Boot) {
                 // Custody recheck (live only) at its documented
                 // 30-minute cadence, sampled every supervision tick
                 // (AUD-003: it was only reachable at the 6-hour
-                // heartbeat). A short ledger latches the entry pause
-                // until a later recheck passes — recovery is a passing
-                // re-check, never elapsed time.
+                // heartbeat). AUD-005: the recheck and the recovered-bag
+                // migration hunt are multi-second RPC walks; they run in
+                // one guarded background task so the event loop never
+                // awaits them — a queued exit tick must always be read.
+                // A short ledger still latches the entry pause until a
+                // later recheck passes (recovery is a passing re-check,
+                // never elapsed time); the result rides a channel back
+                // into the loop, so shutdown aborts the unfinished task
+                // (next to the pending-recheck stop) and no state is
+                // mutated post-loop.
                 if live_mode
                     && supervision_due(last_custody_check, settings::now_secs(), CUSTODY_RECHECK_SECS)
                 {
                     last_custody_check = settings::now_secs();
-                    ledger_shorts = custody_recheck(&pipeline).await;
-                    // AUD-021: recovered bags with no pool leg get their
-                    // migration hunt retried here (a graduated curve can
-                    // stop ticking, stranding the only automated exit).
-                    // Riding the 30-minute recheck bounds the RPC cost —
-                    // one hunt may take its full 15s deadline.
-                    let unfed = pipeline.refresh_recovered_bag_feeds().await;
-                    if unfed > 0 {
-                        warn!(
-                            bags = unfed,
-                            "live bag(s) still have no pool exit feed; curve ticks or manual `sell <mint>` are the only exits"
-                        );
+                    if !custody_cycle_guard
+                        .spawn_if_idle(custody_cycle(Arc::clone(&pipeline), recheck_tx.clone()))
+                    {
+                        debug!("custody cycle already in flight; skipping this supervision tick");
                     }
                 }
                 // Positions outliving their OWN timeouts read as stuck
@@ -1633,6 +1739,18 @@ async fn run_pipeline(boot: Boot) {
                     } else {
                         giveup_burst_seen = false;
                     }
+                }
+            }
+            // AUD-005: finished background recheck reports back; the
+            // loop applies the ledger-short latch here instead of
+            // awaiting RPC inline.
+            Some((shorts, unfed)) = recheck_rx.recv() => {
+                ledger_shorts = shorts;
+                if unfed > 0 {
+                    warn!(
+                        bags = unfed,
+                        "live bag(s) still have no pool exit feed; curve ticks or manual `sell <mint>` are the only exits"
+                    );
                 }
             }
             _ = heartbeat.tick() => {
@@ -1996,6 +2114,14 @@ async fn run_pipeline(boot: Boot) {
         }
     }
 
+    // AUD-005: abort the background custody recheck / migration hunt, if
+    // one is still running, BEFORE the snapshot. The task only reads chain
+    // balances and refreshes recovered-bag feeds (no WAL writes), so an
+    // abort is safe: the next boot re-derives both from the WAL and chain.
+    // Aborting keeps the snapshot authoritative — no state is mutated
+    // after the loop.
+    custody_cycle_guard.shutdown().await;
+
     // Snapshot BEFORE the drain.
     let snap_ts = settings::now_secs();
     let paper_open = pipeline.open_position_mints().await;
@@ -2097,10 +2223,18 @@ async fn run_pipeline(boot: Boot) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::{
-        CUSTODY_RECHECK_SECS, EXIT_LANE_PERMITS, HEARTBEAT_SECS, MAX_IN_FLIGHT, SECRET_ENV_VARS,
-        SUPERVISION_SECS, live_mode_from, paper_fee_bps, supervision_due,
+        CUSTODY_RECHECK_SECS, CustodyCycle, CustodyReader, EXIT_LANE_PERMITS, HEARTBEAT_SECS,
+        MAX_IN_FLIGHT, MintClaims, SECRET_ENV_VARS, SUPERVISION_SECS, classify_custody_claims,
+        live_mode_from, paper_fee_bps, supervision_due,
     };
+    use executor::ExecutorError;
+    use solana_pubkey::Pubkey;
+    use tokio::sync::mpsc;
 
     /// AUD-026: the pid record must carry the effective mode. Only
     /// `--live` or the exact `IS_LIVE=true` value is live.
@@ -2319,5 +2453,175 @@ mod tests {
             boot_custody(u64::MAX, u64::MAX, 10),
             SuppressTracked { handoff: None }
         );
+    }
+
+    /// Sleepy ledger stub (AUD-005 tests): counts reads and reports its
+    /// phase through `state` (0 idle, 1 chain read in flight, 2 done).
+    /// `pending_for` marks one mint; every read returns `chain`.
+    struct SleepyReader {
+        reads: AtomicUsize,
+        state: Arc<AtomicUsize>,
+        /// The mint reported as awaiting confirmation (skipped, never
+        /// read on chain).
+        pending_mint: Option<Pubkey>,
+        /// The chain balance each read returns.
+        chain: u64,
+    }
+
+    impl SleepyReader {
+        fn new(state: Arc<AtomicUsize>) -> Self {
+            Self {
+                reads: AtomicUsize::new(0),
+                state,
+                pending_mint: None,
+                chain: 1_000,
+            }
+        }
+    }
+
+    impl CustodyReader for SleepyReader {
+        fn has_pending_for(&self, mint: &Pubkey) -> bool {
+            Some(mint) == self.pending_mint.as_ref()
+        }
+
+        fn observe_token_balance<'s>(
+            &'s self,
+            mint: &'s Pubkey,
+        ) -> impl Future<Output = Result<Option<u64>, ExecutorError>> + Send + 's {
+            let reads = &self.reads;
+            let state = Arc::clone(&self.state);
+            let chain = self.chain;
+            async move {
+                reads.fetch_add(1, Ordering::Relaxed);
+                assert_ne!(
+                    Some(mint),
+                    self.pending_mint.as_ref(),
+                    "a pending claim must be skipped, never read on chain"
+                );
+                state.store(1, Ordering::Relaxed);
+                // A real custody walk is slow on a bad RPC
+                // (RPC_READ_TIMEOUT = 10s per read); 200ms is plenty.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                state.store(2, Ordering::Relaxed);
+                Ok(Some(chain))
+            }
+        }
+    }
+
+    /// The walk's fail-closed semantics (AUD-005, the same rule set as
+    /// the boot reconcile): a pending claim is skipped with no chain
+    /// read, a short ledger is latched for the pause, and a backed
+    /// claim stays silent.
+    #[tokio::test]
+    async fn custody_walk_fails_closed() {
+        let state = Arc::new(AtomicUsize::new(0));
+        let mk_claims = |tracked: u64| MintClaims {
+            tracked,
+            manual: 0,
+            tracked_keys: Vec::new(),
+        };
+        let short_mint = Pubkey::new_unique();
+        let back_mint = Pubkey::new_unique();
+        let pending_mint = Pubkey::new_unique();
+        let mut claims = BTreeMap::new();
+        claims.insert(short_mint, mk_claims(2_000)); // chain 1_000 < 2_000
+        claims.insert(back_mint, mk_claims(1_000));
+        claims.insert(pending_mint, mk_claims(9_999));
+
+        let mut reader = SleepyReader::new(Arc::clone(&state));
+        reader.pending_mint = Some(pending_mint);
+        let shorts = classify_custody_claims(claims, reader).await;
+        assert_eq!(shorts, vec![short_mint.to_string()]);
+    }
+
+    /// Single-flight: while a custody cycle runs, a second supervision
+    /// tick cannot spawn an overlapping one; a finished cycle frees
+    /// the guard.
+    #[tokio::test]
+    async fn custody_cycle_single_flight() {
+        let state = Arc::new(AtomicUsize::new(0));
+        let mirror = Arc::clone(&state);
+        let mut cycle = CustodyCycle::new();
+        assert!(
+            cycle.spawn_if_idle(async move {
+                mirror.store(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                mirror.store(2, Ordering::Relaxed);
+            }),
+            "an idle guard launches the first cycle"
+        );
+        assert!(
+            !cycle.spawn_if_idle(std::future::ready(())),
+            "an in-flight cycle blocks overlapping spawns"
+        );
+        // Join the runner so the next spawn is not flaky.
+        if let Some(handle) = cycle.in_flight.take() {
+            handle.await.expect("cycle joins");
+        }
+        assert!(
+            cycle.spawn_if_idle(std::future::ready(())),
+            "a finished cycle frees the guard"
+        );
+        assert_eq!(state.load(Ordering::Relaxed), 2, "the cycle completed");
+    }
+
+    /// Shutdown aborts an unfinished cycle before the snapshot: its
+    /// body never reaches post-sleep state mutation (no post-loop
+    /// state change).
+    #[tokio::test]
+    async fn custody_cycle_shutdown_aborts_before_mutation() {
+        let mirror = Arc::new(AtomicUsize::new(0));
+        let mut cycle = CustodyCycle::new();
+        let body = Arc::clone(&mirror);
+        cycle.spawn_if_idle(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            body.store(1, Ordering::Relaxed);
+        });
+        cycle.shutdown().await;
+        assert_eq!(
+            mirror.load(Ordering::Relaxed),
+            0,
+            "aborted before the body mutated anything"
+        );
+    }
+
+    /// The watched behavior (AUD-005): a queued exit tick is served
+    /// while the custody walk is still in flight. The spawn shape is
+    /// the supervision arm's own (guard + classify walk); the
+    /// current-thread runtime proves a walk awaited INLINE in a select
+    /// arm would delay the tick to after the walk instead.
+    #[tokio::test]
+    async fn custody_cycle_never_blocks_a_queued_exit_tick() {
+        let state = Arc::new(AtomicUsize::new(0));
+        let mut claims = BTreeMap::new();
+        claims.insert(
+            Pubkey::new_unique(),
+            MintClaims {
+                tracked: 1_000,
+                manual: 0,
+                tracked_keys: Vec::new(),
+            },
+        );
+        // Tick arrives before the supervision tick spawns the cycle.
+        let (tick_tx, mut tick_rx) = mpsc::unbounded_channel::<&'static str>();
+        tick_tx.send("exit").expect("queued");
+        let mut cycle = CustodyCycle::new();
+        let walk_state = Arc::clone(&state);
+        cycle.spawn_if_idle(async move {
+            classify_custody_claims(claims, SleepyReader::new(walk_state)).await;
+        });
+        // The loop's tick arm equivalent: served while the walk sleeps
+        // on its chain read.
+        let tick = tokio::time::timeout(std::time::Duration::from_millis(150), tick_rx.recv())
+            .await
+            .expect("tick served during the walk, never after it")
+            .expect("sender alive");
+        assert_eq!(tick, "exit");
+        assert_ne!(
+            state.load(Ordering::Relaxed),
+            2,
+            "the tick was served DURING the walk (an inline await in the arm would only release the tick after the walk completed)"
+        );
+        cycle.shutdown().await;
     }
 }
