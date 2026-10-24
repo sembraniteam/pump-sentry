@@ -542,7 +542,7 @@ pub(crate) fn breaker_headline(net_pnl: f64, dispatch_usd: f64) -> f64 {
 }
 
 /// Live state, split from [`Pipeline`]. Owns the live generic (`L`).
-/// Whether the exit being settled has a paper leg .
+/// Whether the exit being settled has a paper leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SellCover {
     /// A paper position for this mint closed in the same exit; its
@@ -579,13 +579,13 @@ pub struct LiveExecution<L = LiveTrader> {
     /// Terminal buy outcomes (fill-rate trip signal).
     pub outcomes: Mutex<FillOutcomeTracker>,
     /// Paper mints whose live leg actually landed (tracked custody).
-    /// Uncovered paper PnL never feeds the live day-loss breaker
-    /// : a diverged or bundle-suspect paper open must not
+    /// Uncovered paper PnL never feeds the live day-loss breaker:
+    /// a diverged or bundle-suspect paper open must not
     /// simulate a loss/win that trips or loosens a live circuit breaker.
     pub paper_covered: Mutex<std::collections::HashSet<String>>,
-    /// Settled live exits whose entry cost basis was unknown (legacy WAL). Their realized PnL could not be booked; the
-    /// heartbeat surfaces the count so the tally is never silently
-    /// under-counted.
+    /// Settled live exits whose entry cost basis was unknown (legacy
+    /// WAL). Their realized PnL could not be booked; the heartbeat
+    /// surfaces the count so the tally is never silently under-counted.
     pub unaccounted_realized: Mutex<u64>,
 }
 
@@ -778,11 +778,11 @@ impl<L> LiveExecution<L> {
             .await
             .insert(mint.to_string(), reason);
         // Any divergence means this open's live leg never landed:
-        // its simulated PnL must not reach the live breaker .
+        // its simulated PnL must not reach the live breaker.
         self.paper_covered.lock().await.remove(mint);
     }
 
-    /// Live custody confirmed for the mint's paper open :
+    /// Live custody confirmed for the mint's paper open:
     /// its simulated closes may reflect the mirrored trade's modeled
     /// PnL to the breaker while the book is covered.
     pub async fn mark_live_covered(&self, mint: &str) {
@@ -813,7 +813,7 @@ impl<L> LiveExecution<L> {
 
     /// True when paper PnL is stashed for this mint while live settles.
     /// A stash proves a paper leg existed for the exit, so the settle
-    /// path must not book realized live PnL on top of it .
+    /// path must not book realized live PnL on top of it.
     pub async fn has_deferred(&self, mint: &str) -> bool {
         self.deferred_pnl.lock().await.contains_key(mint)
     }
@@ -833,7 +833,7 @@ impl<L> LiveExecution<L> {
     }
 
     /// Settled live exits whose realized PnL could not be booked
-    /// because the entry cost basis was unknown .
+    /// because the entry cost basis was unknown.
     pub async fn unaccounted_realized_count(&self) -> u64 {
         *self.unaccounted_realized.lock().await
     }
@@ -1098,7 +1098,7 @@ impl<L> LiveExecution<L> {
     }
 }
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
-    /// Single live-exposure predicate : true when any live
+    /// Single live-exposure predicate: true when any live
     /// bag exists for `mint` — a tracked position, a parked manual bag
     /// (base-wide), or an unresolved pending buy. Settlement (stale-SOL
     /// guard) and the dup guard must not reason over tracked custody
@@ -1271,7 +1271,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 self.exec.insert_tracked(position).await;
                 self.exec.clear_diverged(mint).await;
                 // Tracked custody proves the live leg: its paper
-                // closes may feed the live breaker .
+                // closes may feed the live breaker.
                 self.exec.mark_live_covered(mint).await;
                 // Entry-gap calibration: paper model vs landed fill.
                 // Skipped when unobservable (late-confirm path never
@@ -1383,7 +1383,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 // here crosses a boundary (journal, alert, in-memory
                 // reason) — redact the transport text so an api-key URL
                 // inside the executor error never reaches log, Discord,
-                // or the journal .
+                // or the journal.
                 let redacted = ids::strip_error_url(&e.to_string());
                 warn!(%mint, error = %redacted, "LIVE buy FAILED (no fill); paper position still open but DIVERGED");
                 self.journal_buy_outcome(mint, None, "unknown", Some(redacted.clone()), None)
@@ -1503,7 +1503,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                             )
                             .await;
                         // The manual claim is durable now: retire the
-                        // pending claim of record .
+                        // pending claim of record.
                         trader.retire_pending_for(&mint).await;
                         self.emit(format!("late LIVE buy confirm on already-tracked {mint}; MANUAL REVIEW REQUIRED"));
                         continue;
@@ -1512,14 +1512,14 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     // WAL first, then track. The pending claim of record
                     // stays until the `Position` line is durable and the
                     // bag is published: `retire_pending_for` below runs
-                    // only after `insert_tracked` .
+                    // only after `insert_tracked`.
                     trader
                         .acknowledge_buy(&recheck.position, &recheck.bundle_id)
                         .await;
                     self.exec.insert_tracked(recheck.position).await;
                     trader.retire_pending_for(&mint).await;
                     self.exec.clear_diverged(&mint).await;
-                    // Late confirm establishes live coverage too .
+                    // Late confirm establishes live coverage too.
                     self.exec.mark_live_covered(&mint).await;
                     // Same first-touch cost; stale feed skips.
                     let confirmed_debit = self.sol_feed.price().map(|sol_usd| {
@@ -1598,7 +1598,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         .record_manual(&recheck.position, &recheck.signature)
                         .await;
                     // Manual claim durable: only now retire the pending
-                    // claim of record, then park .
+                    // claim of record, then park.
                     trader.retire_pending_for(&mint).await;
                     self.exec.park_manual(mint.clone(), recheck.position).await;
                     self.exec.note_giveup(now_secs()).await;
@@ -2107,7 +2107,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             warn!(%mint, amount = held.amount_tokens, "manual sell resurrects a parked bag for explicit exit");
             if let Some(trader) = self.exec.live.as_ref() {
-                // WAL before ack : the durable tracked claim
+                // WAL before ack: the durable tracked claim
                 // happens before the parked claim is retired. A crash
                 // at any point replays the manual bag or the tracked
                 // claim (or both, resolved at boot), never neither.
@@ -2240,7 +2240,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     };
                     if let Some(trader) = self.exec.live.as_ref() {
                         // Same WAL-before-ack order as the primary
-                        // resurrection : the tracked claim is
+                        // resurrection: the tracked claim is
                         // durable before the parked claim retires.
                         trader.record_position(&held).await;
                         trader.unrecord_manual(&held).await;
@@ -2259,7 +2259,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 }
             }
         }
-        // Same shared recorder as the tick path .
+        // Same shared recorder as the tick path.
         self.record_breaker_pnls(&tick.mint, closed_pnls, now).await;
         self.settle_close_tail(&tick).await;
         // Bags may remain (GiveUp-parked): keep the request so the

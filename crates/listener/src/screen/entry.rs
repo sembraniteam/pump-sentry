@@ -250,7 +250,8 @@ pub struct DevScreenConfig {
     pub max_prior_launches: usize,
     /// Txs sampled for the launch count.
     ///
-    /// Obsolete for the count (removed the slice: a truncated history fails closed, so the count walks the whole history);
+    /// Obsolete for the count (the slice was removed: a truncated
+    /// history fails closed, so the count walks the whole history);
     /// kept parsed for config compatibility. `sig_limit` now bounds
     /// one page of the walk and is kept at or above this value.
     pub sample_txs: usize,

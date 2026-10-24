@@ -1,4 +1,4 @@
-//! Test-only process-global environment/CWD guard .
+//! Test-only process-global environment/CWD guard.
 //!
 //! Process-global environment variables and the working directory are
 //! shared by every test thread in this binary. All mutations from `src/`

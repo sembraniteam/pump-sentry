@@ -30,7 +30,9 @@ pub const ENTRIES_PAUSED_FILE: &str = "entries-paused";
 /// returns `Some("")` there, so that case maps to `.` explicitly —
 /// every state artifact (WAL, day-state, sell requests, lock files)
 /// must agree on one directory for a given `LOG_FILE`, including the
-/// relative form (`pending_sell_requests` used to see no directory at all for `LOG_FILE=bot.log`, silently dropping every queued manual sell).
+/// relative form (`pending_sell_requests` used to see no directory at
+/// all for `LOG_FILE=bot.log`, silently dropping every queued manual
+/// sell).
 pub fn state_dir_for_log(log_file: &Path) -> PathBuf {
     match log_file.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
@@ -339,7 +341,7 @@ pub fn start_lock_path(pid_file: &Path) -> PathBuf {
 /// State-dir process lock path: beside the log, one per state dir.
 /// Every trader process (foreground `run` or daemon child) holds an
 /// exclusive `flock` on it for its whole lifetime, so two processes
-/// can never share a state dir / wallet / WAL .
+/// can never share a state dir / wallet / WAL.
 pub fn state_lock_path(log_file: &Path) -> PathBuf {
     state_dir_for_log(log_file).join("bot.lock")
 }
@@ -811,7 +813,7 @@ pub fn stop_daemon() -> i32 {
     // Pid reuse guard: a recycled pid must never take a SIGKILL meant
     // for the trader. Where the platform can resolve the binary we
     // refuse on mismatch; where it cannot, the residual risk is named
-    // instead of silently assumed away .
+    // instead of silently assumed away.
     match pid_is_our_binary(info.pid) {
         Some(false) => {
             eprintln!(
@@ -1068,7 +1070,7 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> std::io::Result<()>
 /// (nothing written yet); any other read failure is loud — a broken
 /// path must never look like "no requests". The dir comes from
 /// [`state_dir_for_log`], so a bare relative `LOG_FILE` (parent `""`)
-/// reads the CWD exactly where `cmd_sell` writes .
+/// reads the CWD exactly where `cmd_sell` writes.
 pub fn pending_sell_requests(log_file: &Path) -> Vec<(String, PathBuf)> {
     let dir = state_dir_for_log(log_file);
     let entries = match std::fs::read_dir(&dir) {
@@ -1526,7 +1528,9 @@ fn replace_binary(staged: &Path, exe: &Path) -> std::io::Result<()> {
 
 /// SHA-256 hex of a file via system tooling (`sha256sum`, else
 /// `shasum`), mirroring `install.sh`. `None` when neither exists.
-/// A missing tool skips to the next candidate (the old `?`-propagation made the `shasum` fallback unreachable whenever `sha256sum` was absent, pushing operators toward `--allow-unverified` on stock macOS).
+/// A missing tool skips to the next candidate (the old `?`-propagation
+/// made the `shasum` fallback unreachable whenever `sha256sum` was
+/// absent, pushing operators toward `--allow-unverified` on stock macOS).
 fn sha256_of_file(path: &Path) -> Option<String> {
     let path = path.to_path_buf();
     sha256_via_tools(move |tool, args| {
@@ -2009,7 +2013,7 @@ mod tests {
     fn state_lock_sits_beside_the_log() {
         // The lock is keyed on the STATE dir (the log's directory), so
         // a second process with an overridden PID_FILE but the same
-        // LOG_FILE still collides .
+        // LOG_FILE still collides.
         assert_eq!(
             state_lock_path(Path::new("/tmp/ps/bot.log")),
             PathBuf::from("/tmp/ps/bot.lock")
@@ -2073,7 +2077,7 @@ mod tests {
         // `LOG_FILE=bot.log` has parent Some(""), which used
         // to make the drain see no directory at all. Request path and
         // drain dir must agree on the CWD. Chdir is process-global:
-        // serialized like the env-mutating tests .
+        // serialized like the env-mutating tests.
         let _guard = crate::test_env::lock();
         assert_eq!(
             sell_request_path(Path::new("bot.log"), "MINT"),

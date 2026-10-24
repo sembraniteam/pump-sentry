@@ -167,7 +167,7 @@ impl JitoClient {
             base,
             tips: std::sync::Arc::new(std::sync::Mutex::new((
                 JITO_TIP_ACCOUNTS.iter().map(|s| s.to_string()).collect(),
-                // Seeded fresh : the initial dispatch reads the
+                // Seeded fresh: the initial dispatch reads the
                 // official list from cache. No tip fetch ever sits on
                 // the dispatch path; a background refresher keeps the
                 // cache current.
@@ -247,7 +247,7 @@ impl JitoClient {
         parse_inflight_status(&body, bundle_id)
     }
 
-    /// Landed-tip floor in lamports: LIVE-cache read only  —
+    /// Landed-tip floor in lamports: LIVE-cache read only —
     /// no network I/O on the dispatch path. A stalled oracle leaves the
     /// last cached floor in place (0 before the first refresh, meaning
     /// the configured base tip rules unmodified). Freshness is owned by
@@ -278,7 +278,7 @@ impl JitoClient {
         }
     }
 
-    /// Test-only floor-cache seed : `TIP_FLOOR_URL` is a
+    /// Test-only floor-cache seed: `TIP_FLOOR_URL` is a
     /// hardcoded upstream oracle, so tests can never inject a floor
     /// through [`Self::refresh_tip_floor`]; dispatch reads are proven
     /// cache-only against this seeded cache instead.
@@ -418,7 +418,7 @@ pub fn select_tip_account(seed: u64) -> Pubkey {
 }
 
 impl JitoClient {
-    /// Tip account for this dispatch: LIVE-cache read only  —
+    /// Tip account for this dispatch: LIVE-cache read only —
     /// no network I/O between the decision and bundle submission. An
     /// empty cache falls back to the official constants. Freshness is
     /// owned by [`Self::refresh_tips`] driven from a background task.

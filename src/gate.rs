@@ -239,7 +239,8 @@ pub struct PendingSignal {
     pub intake_secs: u64,
     /// Previous round's tape point (observe time + buy records) for
     /// microstructure velocity. Written back to the map on every
-    /// observed waiting round (a local-only write here left `velocity_delta` null forever); the confirm reads the stored
+    /// observed waiting round (a local-only write here left
+    /// `velocity_delta` null forever); the confirm reads the stored
     /// point, never a re-stamped audit time. A defer rewatch inserts
     /// the confirmed round's local point as the fresh window's start.
     pub prev_tape: Option<TapePoint>,
@@ -1250,7 +1251,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Heat stays mint-based (`held_base_mints`): positions are
             // counted per mint, so a duplicate bag must not consume
             // slots. `live_unpaired_bag_count` is for the exposure
-            // dollar cap only .
+            // dollar cap only.
             let live_extra = self
                 .exec
                 .held_base_mints()

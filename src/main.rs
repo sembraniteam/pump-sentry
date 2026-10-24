@@ -52,7 +52,7 @@ fn main() {
     match cli::parse_cli(&argv) {
         // The trader runs through the synchronous boot phase first:
         // lock, settings, and secret capture happen before any thread
-        // exists .
+        // exists.
         cli::CliAction::Run { live } => run_binary(live),
         cli::CliAction::Start { live } => cli::cmd_start(live, "start"),
         cli::CliAction::Restart { live } => cli::cmd_restart(live),
@@ -122,7 +122,7 @@ fn aux_runtime() -> tokio::runtime::Runtime {
 /// exists. Secrets and env-derived settings cross into the async world
 /// as owned data; nothing re-reads (or mutates) the environment after
 /// boot . The state-dir lock is acquired here too — before
-/// the config file, secrets, WAL, or day-state are touched .
+/// the config file, secrets, WAL, or day-state are touched.
 struct Boot {
     live: bool,
     live_via: &'static str,
@@ -135,7 +135,7 @@ struct Boot {
 }
 
 /// Secret-bearing environment variables scrubbed in the sync boot
-/// phase  once Settings/captured values own the data: RPC
+/// phase once Settings/captured values own the data: RPC
 /// URLs carry `?api-key=`/path keys. Nothing re-reads them after boot;
 /// later children (upgrade checks) inherit a clean env.
 /// `_FILE` variants are NOT here (paths, not secrets);
@@ -160,12 +160,12 @@ fn scrub_secret_env() {
 }
 
 /// Effective live mode: `--live` or the exact `IS_LIVE=true` value.
-/// Pure so the pid-record identity is testable .
+/// Pure so the pid-record identity is testable.
 fn live_mode_from(live_arg: bool, is_live: Option<&str>) -> bool {
     live_arg || is_live == Some("true")
 }
 
-/// Paper-ledger commission from the typed fee : an invalid
+/// Paper-ledger commission from the typed fee: an invalid
 /// raw value contributes 0 bps, never an impossible 100%/side fee.
 fn paper_fee_bps(settings: &Settings) -> f64 {
     settings.fee().map_or(0.0, |bps| f64::from(bps.get()))
@@ -210,7 +210,7 @@ fn run_binary(live_arg: bool) {
     // Paper unless explicitly live. Only exact `true` enables live;
     // attribute the source (a lingering IS_LIVE=true in the shell is
     // the sharpest mode footgun). Resolved BEFORE the pid record so
-    // `status` reports the mode the process actually runs .
+    // `status` reports the mode the process actually runs.
     let is_live_env = std::env::var("IS_LIVE").ok();
     let live_mode = live_mode_from(live_arg, is_live_env.as_deref());
     let live_via: &'static str = if live_arg { "--live" } else { "IS_LIVE=true" };
@@ -536,7 +536,7 @@ struct BootCustodyCounts {
     awaiting_confirm: usize,
 }
 
-/// Single-flight guard for the background custody cycle : at
+/// Single-flight guard for the background custody cycle: at
 /// most one cycle runs at a time; an unfinished one is aborted at
 /// shutdown before the snapshot (the cycle is read-only on custody and
 /// the WAL, so an abort is safe — the next boot re-derives both).
@@ -581,7 +581,9 @@ impl CustodyCycle {
 
 /// Mid-run custody cycle task (runs OFF the event loop): the
 /// 30-minute claims-vs-chain recheck, then the recovered-bag migration
-/// hunt (a graduated curve can stop ticking, stranding the only automated exit; riding the recheck bounds the RPC cost — one hunt may take its full 15s deadline). Reports
+/// hunt (a graduated curve can stop ticking, stranding the only
+/// automated exit; riding the recheck bounds the RPC cost — one hunt
+/// may take its full 15s deadline). Reports
 /// `(ledger shorts, unfed bags)` back to the supervisor via `tx`.
 async fn custody_cycle(
     pipeline: Arc<Pipeline<RugCheckClient, CurveTicker, LiveTrader, RpcScreener, Alerter>>,
@@ -620,7 +622,7 @@ async fn custody_recheck(
     classify_custody_claims(claims, trader).await
 }
 
-/// Custody reader for the claim classification walk : what a
+/// Custody reader for the claim classification walk: what a
 /// ledger watcher must expose. `Send` is explicit — the walk runs in a
 /// spawned background task.
 trait CustodyReader {
@@ -657,7 +659,7 @@ impl<T: CustodyReader + ?Sized> CustodyReader for &T {
     }
 }
 
-/// Custody-claim classification walk : the recheck's per-mint
+/// Custody-claim classification walk: the recheck's per-mint
 /// loop, split from the concrete pipeline so tests can stub a slow or
 /// unreadable ledger. Sequential and read-only — one chain read per
 /// claim at a time; an unreadable balance keeps the claims (fail
@@ -783,7 +785,7 @@ async fn reconcile_boot_custody(
 const HEARTBEAT_SECS: u64 = 6 * 3_600;
 
 /// Supervision cadence: the custody recheck, GiveUp burst monitor,
-/// and overdue-exit warning are sampled this often .
+/// and overdue-exit warning are sampled this often.
 const SUPERVISION_SECS: u64 = 60;
 
 /// Mid-run custody drift check cadence in seconds (30 minutes, the
@@ -797,7 +799,7 @@ const STALE_OPEN_WARN_SECS: u64 = 3_600;
 /// GiveUp window surfaced in the heartbeat (trailing giveups card).
 const GIVEUP_HEARTBEAT_WINDOW_SECS: u64 = 3_600;
 
-/// Exit-lane reserve : curve ticks, pool ticks, and manual
+/// Exit-lane reserve: curve ticks, pool ticks, and manual
 /// sells dispatch from their own permit budget, so a launch flood
 /// (audits, dev screens, forensics burning every launch permit) can
 /// never consume the lanes exits dispatch on. The two lanes together
@@ -807,7 +809,7 @@ pub(crate) const EXIT_LANE_PERMITS: usize = 8;
 /// Concurrent-unit bound across both lanes plus the in-flight JoinSet.
 pub(crate) const MAX_IN_FLIGHT: usize = 32;
 
-/// Time-injected cadence check for the supervision timers :
+/// Time-injected cadence check for the supervision timers:
 /// `true` once at least `interval_secs` have elapsed since `last`.
 /// Pure so the supervision cadences are testable without running the
 /// event loop.
@@ -913,7 +915,7 @@ async fn run_pipeline(boot: Boot) {
         yellowstone_token,
         discord_token,
         // Held until this function returns: this process owns the
-        // state dir for its whole lifetime .
+        // state dir for its whole lifetime.
         _state_lock,
     } = boot;
 
@@ -990,7 +992,7 @@ async fn run_pipeline(boot: Boot) {
     }
     // Live gates: real funds never run on defaults.
     if live_mode {
-        // Day-tally writability BEFORE the funding gate : the
+        // Day-tally writability BEFORE the funding gate: the
         // restart-persistent loss breaker is mandatory in live, and a
         // tally the process cannot write would read back as a fresh
         // day across a restart.
@@ -1208,7 +1210,7 @@ async fn run_pipeline(boot: Boot) {
         // the wallet holds more, so a leaked key or an un-swept wallet
         // can only lose what the operator allows to sit there. Exits
         // never consult it. The wallet was loaded (and the key env
-        // scrubbed) in the sync boot phase .
+        // scrubbed) in the sync boot phase.
         let hot_cap = settings.hot_wallet_cap_lamports();
         let wallet = match wallet.take() {
             Some(wallet) => wallet.with_hot_wallet_cap(hot_cap),
@@ -1244,7 +1246,7 @@ async fn run_pipeline(boot: Boot) {
                 settings.priority_fee_micro_lamports,
             )
             .with_strict_sim(settings.sim_strict);
-        // Background tip refresher : the tip-list cache lives so
+        // Background tip refresher: the tip-list cache lives so
         // dispatch never waits on `getTipAccounts` — the refresher owns
         // the fetch, and dispatch reads the cache (fallback: official
         // constants). A half-TTL cadence repairs past a blip faster than
@@ -1261,7 +1263,7 @@ async fn run_pipeline(boot: Boot) {
                 ticker.tick().await;
             }
         });
-        // Background tip-floor refresher : same contract for
+        // Background tip-floor refresher: same contract for
         // the landed-tip floor — `tip_floor_lamports` is a cache read on
         // the dispatch path; a stalled oracle costs freshness, never
         // dispatch latency. Half-TTL (30s) cadence.
@@ -1462,7 +1464,7 @@ async fn run_pipeline(boot: Boot) {
         replay_live_wal(&pipeline, &ticker).await;
     }
 
-    // Pending-buy rechecks : a dedicated supervisor task, NOT
+    // Pending-buy rechecks: a dedicated supervisor task, NOT
     // the tick path — a recheck round runs a 60-second confirm deadline
     // per entry, and a tick that waits behind it can starve its own
     // exit for a minute. The existing `recheck_busy` still bounds
@@ -1508,12 +1510,13 @@ async fn run_pipeline(boot: Boot) {
     let mut gate_timer = tokio::time::interval(gate_interval);
     gate_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Heartbeat cadence (mode/status card only; the supervision monitors live on `SUPERVISION_SECS`).
+    // Heartbeat cadence (mode/status card only; the supervision
+    // monitors live on `SUPERVISION_SECS`).
     let boot_ts = settings::now_secs();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Supervision cadence : the short timer that runs the
+    // Supervision cadence: the short timer that runs the
     // execution-quality/custody monitors — the custody recheck at its
     // documented 30-minute cadence, the GiveUp burst monitor on its own
     // configured window, and the overdue-exit warning. Sampling these
@@ -1535,7 +1538,7 @@ async fn run_pipeline(boot: Boot) {
     let mut ingestion_banned_seen = false;
     // Data-degrade card mirror (rising-edge card, same policy).
     let mut data_degraded_seen = false;
-    // Rising-edge mirrors for the supervision monitors : a
+    // Rising-edge mirrors for the supervision monitors: a
     // warn fires when the condition starts and clears when it ends —
     // a 60-second sampler must not spam every tick.
     let mut overdue_warned = false;
@@ -1679,11 +1682,11 @@ async fn run_pipeline(boot: Boot) {
             }
             _ = supervision.tick() => {
                 // Custody recheck (live only) at its documented
-                // 30-minute cadence, sampled every supervision tick
-                // (It was only reachable at the 6-hour heartbeat).: the recheck and the recovered-bag
-                // migration hunt are multi-second RPC walks; they run in
-                // one guarded background task so the event loop never
-                // awaits them — a queued exit tick must always be read.
+                // 30-minute cadence, sampled every supervision tick.
+                // Both the recheck and the recovered-bag migration hunt
+                // are multi-second RPC walks; they run in one guarded
+                // background task so the event loop never awaits them —
+                // a queued exit tick must always be read.
                 // A short ledger still latches the entry pause until a
                 // later recheck passes (recovery is a passing re-check,
                 // never elapsed time); the result rides a channel back
@@ -1717,8 +1720,8 @@ async fn run_pipeline(boot: Boot) {
                     overdue_warned = false;
                 }
                 // GiveUp burst monitor on its configured trailing
-                // window, sampled every supervision tick (a burst was only visible if it fell just before a 6-hour heartbeat). Rising edge, like the other
-                // supervision latches.
+                // window, sampled every supervision tick. Rising edge,
+                // like the other supervision latches.
                 if pipeline.settings.alert_giveup_burst_n > 0 {
                     let now = settings::now_secs();
                     let burst = pipeline
@@ -1811,7 +1814,7 @@ async fn run_pipeline(boot: Boot) {
                 if tick_dropped > 0 || pool_dropped > 0 {
                     warn!("saturation drops: curve_ticks={tick_dropped} pool_ticks={pool_dropped} (delayed exits are slippage paper never pays)");
                 }
-                // Paper-ledger overdraft : dispatch costs past
+                // Paper-ledger overdraft: dispatch costs past
                 // available cash surface as a warning instead of being
                 // absorbed at a zero cash floor.
                 let overdraft_usd = pipeline.paper_overdraft_usd().await;
@@ -2032,7 +2035,7 @@ async fn run_pipeline(boot: Boot) {
                     data_degraded_seen = false;
                     pipeline.emit("Data sources healthy again: entries resume.".to_string());
                 }
-                // Manual-sell drain every 15th round : each sell
+                // Manual-sell drain every 15th round: each sell
                 // dispatches from the exit lane inside the bounded
                 // JoinSet — the event loop never awaits a sell, so a
                 // slow dispatch+confirm cannot stall ticks/launches.
@@ -2091,7 +2094,7 @@ async fn run_pipeline(boot: Boot) {
     sol_handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), listener_handle).await;
     // Pending rechecks stop between rounds and join BEFORE the
-    // snapshot : a trailing round may still park resolved
+    // snapshot: a trailing round may still park resolved
     // confirmations, which the snapshot must see. A round that
     // outlives the stop window is aborted loudly; WAL replay
     // recovers its pending state on the next boot.
@@ -2332,7 +2335,7 @@ mod tests {
             (alert::DISCORD_BOT_TOKEN_ENV, "test-token-fixture-5"),
             ("SOLANA_PRIVATE_KEY", "test-mint-fixture-6"),
         ];
-        // Restored on drop even while unwinding .
+        // Restored on drop even while unwinding.
         let _guard = {
             let vars: Vec<(&str, Option<&str>)> =
                 secrets.iter().map(|(k, v)| (*k, Some(*v))).collect();
@@ -2449,7 +2452,7 @@ mod tests {
         );
     }
 
-    /// Sleepy ledger stub : counts reads and reports its
+    /// Sleepy ledger stub: counts reads and reports its
     /// phase through `state` (0 idle, 1 chain read in flight, 2 done).
     /// `pending_for` marks one mint; every read returns `chain`.
     struct SleepyReader {
@@ -2502,9 +2505,10 @@ mod tests {
         }
     }
 
-    /// The walk's fail-closed semantics (the same rule set as the boot reconcile): a pending claim is skipped with no chain
-    /// read, a short ledger is latched for the pause, and a backed
-    /// claim stays silent.
+    /// The walk's fail-closed semantics (the same rule set as the boot
+    /// reconcile): a pending claim is skipped with no chain read, a
+    /// short ledger is latched for the pause, and a backed claim stays
+    /// silent.
     #[tokio::test]
     async fn custody_walk_fails_closed() {
         let state = Arc::new(AtomicUsize::new(0));
@@ -2578,7 +2582,7 @@ mod tests {
         );
     }
 
-    /// The watched behavior : a queued exit tick is served
+    /// The watched behavior: a queued exit tick is served
     /// while the custody walk is still in flight. The spawn shape is
     /// the supervision arm's own (guard + classify walk); the
     /// current-thread runtime proves a walk awaited INLINE in a select

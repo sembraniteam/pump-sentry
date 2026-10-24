@@ -243,12 +243,12 @@ pub const MAX_BACKFILL_SLOTS: u64 = 64;
 /// stall the resubscribe behind it.
 const BACKFILL_BLOCK_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Overall backfill deadline : one reconnect backfill may not
+/// Overall backfill deadline: one reconnect backfill may not
 /// extend the blind window past this — the live session must resume.
 /// A 64-slot gap at the per-slot cap could previously run ~21 minutes.
 pub const BACKFILL_TOTAL_BUDGET: Duration = Duration::from_secs(30);
 
-/// Effective per-block deadline : the per-slot cap, or what
+/// Effective per-block deadline: the per-slot cap, or what
 /// is left of the total budget — never more than the budget allows.
 /// Pure for unit pinning.
 fn block_timeout(remaining: Duration) -> Duration {
@@ -582,8 +582,7 @@ impl GeyserSubscriber {
             {
                 Ok(Ok(block)) => block,
                 // Pruned, missing, or throttled: an unreadable block
-                // is a coverage gap — counted, never silently skipped
-                // .
+                // is a coverage gap — counted, never silently skipped.
                 Ok(Err(e)) => {
                     self.stats.inc_slot_gaps_shed();
                     debug!(

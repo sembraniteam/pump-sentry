@@ -206,7 +206,7 @@ pub struct LivePosition {
     /// replay stay exact. Feeds the day-loss breaker's realized-PnL
     /// input for exits with no paper leg: for a bag with no paper leg
     /// at all, `sold_display * (exit_price - entry_price)` books the
-    /// realized PnL that would otherwise be invisible .
+    /// realized PnL that would otherwise be invisible.
     ///
     /// `0.0` = unknown: custody carried over from a legacy WAL line
     /// written before this field existed (its paper leg never traveled
@@ -1143,9 +1143,9 @@ impl LiveTrader {
                 // Manual) is not yet durable, so the pending claim stays
                 // live in the WAL and in memory. The handoff in
                 // `recheck_live_pending` publishes the claim first and
-                // only then calls `retire_pending_for` (WAL-before-ack): a crash at any point replays the
-                // pending (boot re-imports it) or the published claim,
-                // never neither.
+                // only then calls `retire_pending_for` (WAL-before-ack):
+                // a crash at any point replays the pending (boot
+                // re-imports it) or the published claim, never neither.
                 _ => {}
             }
             out.push(PendingRecheck {
@@ -1297,7 +1297,7 @@ impl LiveTrader {
         // Planned entry cost basis (USD per display token): the same
         // notional the paper book opens against, so a live-only exit's
         // realized PnL and a covered trade's paper headline price the
-        // same trade on the same day-book .
+        // same trade on the same day-book.
         let display_tokens = plan.amount_tokens as f64 / 10f64.powi(req.decimals as i32);
         let entry_usd_per_token = if display_tokens.is_finite() && display_tokens > 0.0 {
             notional_usd / display_tokens
@@ -1628,7 +1628,7 @@ impl LiveTrader {
     /// in-memory entry. WAL-before-ack: call only after
     /// `acknowledge_buy`/`record_manual` wrote the replacement claim
     /// (`Position`/`Manual`) — a crash earlier replays the pending
-    /// and re-imports it at boot, never invisible custody .
+    /// and re-imports it at boot, never invisible custody.
     /// On a degraded WAL the tombstone is skipped (a failed write must
     /// never retire a claim); the entry still leaves memory so exits
     /// keep working while boot recovery keeps the file-side claim.
@@ -1671,7 +1671,8 @@ impl LiveTrader {
     }
 
     /// Record a durable tracked claim without a bundle attribution: a
-    /// parked manual bag being resurrected for a tracked exit (WAL-before-ack). Call BEFORE `unrecord_manual`: a crash at any
+    /// parked manual bag being resurrected for a tracked exit
+    /// (WAL-before-ack). Call BEFORE `unrecord_manual`: a crash at any
     /// point replays the manual bag or this claim, never neither.
     pub async fn record_position(&self, position: &LivePosition) {
         self.wal_record(&wal::WalLine::Position {

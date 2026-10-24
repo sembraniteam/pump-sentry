@@ -105,7 +105,7 @@ struct StubLiveInner {
     /// parks for manual review with no resend.
     fail_sells_unknown: AtomicBool,
     /// Deterministic Jito rejection (HTTP 429 rate limit): retryable,
-    /// never unknown custody .
+    /// never unknown custody.
     fail_sells_rate_limited: AtomicBool,
     /// Overlap-test hook: sells of `block_mint` wait on `unblock`.
     block_mint: StdMutex<Option<String>>,
@@ -115,7 +115,7 @@ struct StubLiveInner {
     pending: StdMutex<Vec<String>>,
     /// Deterministic recheck hang: `std::future::pending` forever —
     /// any code path that awaits a recheck must not be on the tick
-    /// path .
+    /// path.
     hang_recheck: AtomicBool,
     /// Pending entries resolve as `Confirmed` on the next recheck.
     recheck_confirms: AtomicBool,
@@ -127,7 +127,9 @@ struct StubLiveInner {
     recheck_gives_up: AtomicBool,
     /// Simulated WAL write failure (entries must halt).
     wal_degraded: AtomicBool,
-    /// Recorded custody WAL-event order (assertions: `ack` writes position-then-settled; give-up writes manual-then-settled; pending retirement trails them).
+    /// Recorded custody WAL-event order (assertions: `ack` writes
+    /// position-then-settled; give-up writes manual-then-settled;
+    /// pending retirement trails them).
     wal_events: StdMutex<Vec<&'static str>>,
 }
 
@@ -273,7 +275,7 @@ impl SellSink for StubLive {
         if self.inner.fail_sells_rate_limited.load(Ordering::Relaxed) {
             // Deterministic Jito refusal (429): the engine answered
             // without accepting, so this is a retryable failure and
-            // never unknown custody .
+            // never unknown custody.
             return Err(LiveError::Dispatch(ExecutorError::Jito(
                 JitoError::RateLimited,
             )));
@@ -402,7 +404,7 @@ impl PendingStore for StubLive {
         }
         if self.inner.recheck_confirms.load(Ordering::Relaxed) {
             // Peek, never drain: the pending claim of record stays
-            // visible until `retire_pending_for`  retires it
+            // visible until `retire_pending_for` retires it
             // after the durable `Position` claim is published.
             let mints = self.inner.pending.lock().expect("lock").clone();
             return mints
@@ -714,11 +716,12 @@ struct StubScreenerInner {
     bundle: StdMutex<BundleOutcome>,
     migration: StdMutex<Option<MigrationReport>>,
     truncated: AtomicBool,
-    /// Confirm-time fresh screens reject (serial-launcher detected between intake and quorum; wiring proof).
+    /// Confirm-time fresh screens reject (serial-launcher detected
+    /// between intake and quorum; wiring proof).
     fresh_rejects: AtomicBool,
     /// Canned top-10 holder share (`None` = RPC failure).
     top_holders: StdMutex<Option<f64>>,
-    /// Last exclude arg the confirm passed .
+    /// Last exclude arg the confirm passed.
     excluded_curve_ata: StdMutex<Option<String>>,
     /// Migration-hunt invocations (paper closes must not hunt).
     migration_hunts: std::sync::atomic::AtomicUsize,
@@ -3953,7 +3956,7 @@ async fn tick_never_waits_behind_a_slow_pending_recheck() {
     .await;
     assert!(
         result.is_ok(),
-        "a hanging pending recheck must not delay the tick's TP/SL path "
+        "a hanging pending recheck must not delay the tick's TP/SL path"
     );
 }
 

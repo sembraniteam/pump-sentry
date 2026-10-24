@@ -2013,7 +2013,7 @@ impl SwapExecutor {
                 )))
             }
             Err(e) => {
-                // Classify before wrapping : only an ambiguous
+                // Classify before wrapping: only an ambiguous
                 // transport failure may claim "may still land". A 429
                 // rate limit or a JSON-RPC error is the engine answering
                 // WITHOUT accepting — deterministic, retryable, and it

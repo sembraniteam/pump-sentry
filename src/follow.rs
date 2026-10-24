@@ -47,7 +47,7 @@ pub const MIGRATED_CAP: usize = 5_000;
 
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
     /// Announce each migration once. Owned parameters: the background
-    /// custody cycle  spawns this chain off the event loop, so
+    /// custody cycle spawns this chain off the event loop, so
     /// its future must be a fully owned, provably `Send` state machine.
     pub(crate) async fn report_migration_once(&self, mint: String, curve: String) {
         {

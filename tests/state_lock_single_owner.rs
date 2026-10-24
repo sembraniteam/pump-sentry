@@ -61,7 +61,8 @@ fn second_run_refuses_to_start_while_state_dir_is_owned() {
         "a second trader on the same state dir must exit nonzero"
     );
 
-    // The refusal precedes every state read/write (the second process never reaches wallet/WAL load).
+    // The refusal precedes every state read/write (the second process
+    // never reaches wallet/WAL load).
     let mut errbuf = Vec::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_end(&mut errbuf);

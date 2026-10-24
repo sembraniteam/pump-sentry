@@ -77,7 +77,7 @@ pub fn save(path: &Path, state: &DayState) -> std::io::Result<()> {
     crate::cli::atomic_write_private(path, &json)
 }
 
-/// Live-boot writability probe for the day-state path : a
+/// Live-boot writability probe for the day-state path: a
 /// state dir that cannot take a write today is the exact hazard the
 /// restart-persistent tally exists for, so live refuses to fund
 /// against a tally it cannot record. Probe = short write + delete of
@@ -133,7 +133,7 @@ pub fn ensure_writable(path: &Path) -> Result<(), String> {
 /// in-memory only (never persisted: a -inf tally is not JSON) and
 /// clears on the next UTC day or when the operator deletes the file.
 ///
-/// A failed persist latches `persist_failed` the same way :
+/// A failed persist latches `persist_failed` the same way:
 /// the in-memory tally stays correct for the run, but the file no
 /// longer backs it, so a restart would silently read a missing or
 /// older tally as a fresh day and loosen the live breaker. While the
@@ -154,7 +154,7 @@ pub struct DayBook {
     /// day clears the poison; `breaker.day` alone cannot tell (open
     /// stamps it to today).
     poisoned_day: u64,
-    /// A `save` failed this run : the file may be missing or
+    /// A `save` failed this run: the file may be missing or
     /// stale, so a restart must not read this tally as trustworthy —
     /// the book halts until a successful write lands.
     persist_failed: bool,
@@ -223,7 +223,7 @@ impl DayBook {
     /// Fold one closed trade in and persist it (write runs on the
     /// blocking pool: a slow fsync never pins a Tokio worker holding
     /// [`crate::pipeline::Pipeline`]'s day-state lock). A failed write
-    /// latches halt : the in-memory tally stays authoritative
+    /// latches halt: the in-memory tally stays authoritative
     /// for the run, but the file no longer backs it, so the breaker
     /// must not keep allowing entries it could not survive a restart
     /// with.
@@ -287,7 +287,7 @@ impl DayBook {
     /// Best-effort write of the current scalars. Skipped while
     /// poisoned (a -inf tally is not JSON-serializable; the poison is
     /// in-memory only and clears on UTC rollover). A write failure
-    /// latches `persist_failed` : the book halts until a
+    /// latches `persist_failed`: the book halts until a
     /// later write succeeds — a recovered write clears the latch and
     /// the next persistence keeps the breaker honest across restarts.
     /// The open+write+fsync+rename runs on the blocking pool: the

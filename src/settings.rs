@@ -58,7 +58,7 @@ pub struct Settings {
     /// refuses an open when the ten largest non-curve token accounts
     /// own more than this. The launch's associated bonding-curve token
     /// account (which holds the unsold supply, not a holder's stake) is
-    /// excluded from the sum .
+    /// excluded from the sum.
     /// Unreadable holdings refuse while armed (fail-closed); exits never
     /// block.
     pub max_top_holder_pct: f64,
@@ -388,7 +388,7 @@ impl Settings {
     }
 
     /// Warnings for bad values. Empty when sane.
-    /// Endpoint-trust findings : `(fatals, warns)`. Fatals
+    /// Endpoint-trust findings: `(fatals, warns)`. Fatals
     /// refuse a live boot; warns surface in every mode. Remote
     /// plain-http endpoints (RPC, fallbacks, Jito, geyser) carry
     /// traffic/credentials in cleartext, and a wrong-cluster fallback
@@ -740,7 +740,7 @@ impl Settings {
         out
     }
 
-    /// Live boot gate : true when the primary RPC is the
+    /// Live boot gate: true when the primary RPC is the
     /// shipped public default, documented as unfit for live reads
     /// (drops candidates, truncates quorum, rate limits).
     pub fn on_public_rpc_default(&self) -> bool {
@@ -1136,7 +1136,7 @@ pub(crate) fn is_plaintext_remote(endpoint: &str) -> bool {
         || host == "::1")
 }
 
-/// Cluster identity of a Solana endpoint URL : the first
+/// Cluster identity of a Solana endpoint URL: the first
 /// recognizable cluster marker. `None` = unidentifiable (a warning,
 /// never a refusal on its own — many providers use opaque domains).
 /// Whole-URL match keeps the existing split-brain check's semantics.
@@ -1168,7 +1168,7 @@ pub(crate) fn is_ws_url(url: &str) -> bool {
 /// Endpoint equality that ignores spelling: scheme (http/https/ws/wss
 /// and case), explicit-vs-default ports, and a trailing slash. Used by
 /// the public-RPC live gate so `https://HOST/`, `HTTP://HOST`, and
-/// `https://HOST:443` all match the shipped default .
+/// `https://HOST:443` all match the shipped default.
 fn same_endpoint(a: &str, b: &str) -> bool {
     fn normalized(raw: &str) -> Option<(String, String)> {
         let parsed = url::Url::parse(raw.trim()).ok()?;
@@ -1251,7 +1251,7 @@ mod tests {
         assert!(s.fallback_rpc_urls.is_empty());
     }
 
-    /// Live-boot endpoint-trust predicate .
+    /// Live-boot endpoint-trust predicate.
     #[test]
     fn endpoint_trust_refuses_remote_plain_http_endpoints() {
         // Remote plain-http RPC is a fatal (keyed reads in cleartext).

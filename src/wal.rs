@@ -175,7 +175,7 @@ pub enum WalLine {
     },
     /// Tracked bag handed from the exit path into the manual notes
     /// (park-for-manual). Retires the tracked claim, so every parked
-    /// bag replays with exactly ONE claim : the tracked line
+    /// bag replays with exactly ONE claim: the tracked line
     /// would otherwise stack beside the manual note and read as
     /// double custody. Older binaries skip the unknown tag (counted);
     /// the manual claim keeps the custody whole in both directions.
@@ -204,7 +204,7 @@ pub enum WalLine {
 /// replay must distinguish (missing load-bearing fields stay behind
 /// `#[serde(default)]`, which needs no bump).
 ///
-/// v2 : `entry_usd` on `pending`/`position`/`manual` lines.
+/// v2: `entry_usd` on `pending`/`position`/`manual` lines.
 /// Old-schema lines replay with `entry_usd_per_token = 0.0` (unknown);
 /// the settle point counts their exits as unaccounted instead of
 /// silently excluding the realized PnL from the breaker.
@@ -375,8 +375,8 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                     skipped += 1;
                     continue;
                 };
-                // A confirmed-fill `Position` retires its pending line
-                // : the writer only emits `Position` after the
+                // A confirmed-fill `Position` retires its pending line:
+                // the writer only emits `Position` after the
                 // chain confirmed, so a crash between the `Position`
                 // append and the `Settled` tombstone must not resurrect
                 // a phantom custody claim at boot. Legacy/compacted

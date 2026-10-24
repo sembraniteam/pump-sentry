@@ -159,7 +159,7 @@ pub trait PendingStore {
     /// published: append the `Settled` tombstone and drop the
     /// in-memory entry. Call only AFTER the replacement claim
     /// (`Position`/`Manual`) is durable — WAL-before-ack keeps the
-    /// pending claim of record until then .
+    /// pending claim of record until then.
     async fn retire_pending_for(&self, mint: &str);
 }
 
@@ -361,7 +361,7 @@ pub trait Screener {
     async fn screen_dev(&self, dev: &str, self_mint: &str) -> Result<DevVerdict, ScreenError>;
     /// Dev verdict that must not ride a cached pass. Confirm-time
     /// re-screening uses this: fresh history between intake and quorum
-    /// must be observed, not the intake-time verdict .
+    /// must be observed, not the intake-time verdict.
     /// Default defers to `screen_dev` so screens with no cache (or no
     /// history-walk) keep one path.
     async fn screen_dev_fresh(
@@ -390,11 +390,11 @@ pub trait Screener {
     /// Called on every confirm to arm the concentration cap and feed
     /// the risk model context. `curve_ata` is the launch's associated
     /// bonding-curve token account; the reader excludes it from the
-    /// holder sum .
+    /// holder sum.
     async fn top_holder_pct(&self, mint: &str, curve_ata: Option<&str>)
     -> Result<f64, ScreenError>;
     /// Migration hunt; `None` when not found. The returned future is
-    /// `Send` explicitly: the background custody cycle  runs
+    /// `Send` explicitly: the background custody cycle runs
     /// the hunt off the event loop, and an RPC-screener future must
     /// cross a spawn boundary there. The explicit `impl Future + Send`
     /// (not `async fn`) is deliberate; the rustc auto-trait inference
@@ -745,7 +745,7 @@ impl<A, R, L, S, T> Pipeline<A, R, L, S, T> {
         (live_extra, live_bags, paper_locked)
     }
 
-    /// Paper ledger overdraft : dispatch costs debited past
+    /// Paper ledger overdraft: dispatch costs debited past
     /// available cash. Reporting only — the book itself refuses new
     /// opens while cash is negative (fail-closed).
     pub async fn paper_overdraft_usd(&self) -> f64 {
@@ -889,8 +889,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// clear, then unwatch. Both the tick path and manual sell run it
     /// after the live leg settles; unsettled paths return before it.
     pub(crate) async fn settle_close_tail(&self, tick: &PriceTick) {
-        // Pending-buy rechecks run on the dedicated supervisor task
-        //  — never here on the tick path.
+        // Pending-buy rechecks run on the dedicated supervisor task,
+        // never here on the tick path.
         if self
             .portfolio
             .lock()
@@ -903,8 +903,8 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             // Settle deferred PnL only when no live exposure remains.
             // Manual check is base-wide: a suffixed parked dup is still
             // held funds, even though only the exact key resurrects.
-            // An unresolved pending buy is the same unsettled exposure
-            // : the paper PnL stays deferred until the pending
+            // An unresolved pending buy is the same unsettled exposure:
+            // the paper PnL stays deferred until the pending
             // recheck resolves it.
             let pending_buy = self
                 .exec
@@ -1274,7 +1274,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         if live_settled {
             // Synthetic exclusion and uncovered-paper exclusion live in
-            // the shared recorder .
+            // the shared recorder.
             self.record_breaker_pnls(&tick.mint, closed_pnls, now).await;
         } else {
             warn!(mint = %tick.mint, "paper closed but live still holds; breaker PnL deferred until live settles");
