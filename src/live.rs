@@ -1126,14 +1126,28 @@ impl LiveTrader {
         for (entry, outcome) in results {
             match outcome {
                 RecheckOutcome::StillUnknown => {}
-                // Terminal verdicts retire the WAL line.
-                _ => {
-                    self.write_wal_settled(&entry.bundle_id).await;
+                RecheckOutcome::Dead(_) => {
+                    // A proven no-fill has no custody to preserve: retire
+                    // the claim here. On a degraded WAL skip the tombstone
+                    // (a failed write must never retire a claim); the
+                    // pending stays in the file and re-imports at boot.
+                    if !self.wal_degraded() {
+                        self.write_wal_settled(&entry.bundle_id).await;
+                    }
                     let mint = entry.position.mint.to_string();
                     self.with_pending("recheck-settle", (), |guard| {
                         guard.remove(mint.as_str());
                     });
                 }
+                // Confirmed/GiveUp: the replacement claim (Position /
+                // Manual) is not yet durable, so the pending claim stays
+                // live in the WAL and in memory. The handoff in
+                // `recheck_live_pending` publishes the claim first and
+                // only then calls `retire_pending_for` (AUD-001,
+                // WAL-before-ack): a crash at any point replays the
+                // pending (boot re-imports it) or the published claim,
+                // never neither.
+                _ => {}
             }
             out.push(PendingRecheck {
                 position: entry.position,
@@ -1608,6 +1622,26 @@ impl LiveTrader {
         })
         .await;
         self.write_wal_settled(bundle_id).await;
+    }
+
+    /// Retire a pending buy whose resolved claim is now durable and
+    /// published: append the settled tombstone, then drop the
+    /// in-memory entry. WAL-before-ack: call only after
+    /// `acknowledge_buy`/`record_manual` wrote the replacement claim
+    /// (`Position`/`Manual`) — a crash earlier replays the pending
+    /// and re-imports it at boot, never invisible custody (AUD-001).
+    /// On a degraded WAL the tombstone is skipped (a failed write must
+    /// never retire a claim); the entry still leaves memory so exits
+    /// keep working while boot recovery keeps the file-side claim.
+    pub async fn retire_pending_for(&self, mint: &str) {
+        let bundle = self.with_pending("retire-pending", None, |guard| {
+            guard.remove(mint).map(|e| e.bundle_id)
+        });
+        if let Some(bundle) = bundle
+            && !self.wal_degraded()
+        {
+            self.write_wal_settled(&bundle).await;
+        }
     }
 
     /// Record a human-exit bag. `note` is a lookup id (bundle,

@@ -1474,8 +1474,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             let mint = recheck.position.mint.to_string();
             match recheck.outcome {
                 RecheckOutcome::Confirmed => {
-                    // Late confirm never clobbers a newer bag.
-                    if self.is_live_tracked(trader, &mint).await {
+                    // Late confirm never clobbers a newer bag. The pending
+                    // being resolved is deliberately still the claim of
+                    // record (AUD-001), so this duplicate test checks only
+                    // published custody (tracked/manual), never the
+                    // pending itself.
+                    if self.exec.is_tracked(&mint).await || self.exec.manual_holds_base(&mint).await
+                    {
                         warn!(mint = %mint, bundle = %recheck.bundle_id, amount = recheck.position.amount_tokens, "late LIVE buy confirm for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
                         self.journal_buy_outcome(
                             &mint,
@@ -1494,15 +1499,22 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                                 recheck.position,
                             )
                             .await;
+                        // The manual claim is durable now: retire the
+                        // pending claim of record (AUD-001 order).
+                        trader.retire_pending_for(&mint).await;
                         self.emit(format!("late LIVE buy confirm on already-tracked {mint}; MANUAL REVIEW REQUIRED"));
                         continue;
                     }
                     let amount = recheck.position.amount_tokens;
-                    // WAL first, then track.
+                    // WAL first, then track. The pending claim of record
+                    // stays until the `Position` line is durable and the
+                    // bag is published: `retire_pending_for` below runs
+                    // only after `insert_tracked` (AUD-001).
                     trader
                         .acknowledge_buy(&recheck.position, &recheck.bundle_id)
                         .await;
                     self.exec.insert_tracked(recheck.position).await;
+                    trader.retire_pending_for(&mint).await;
                     self.exec.clear_diverged(&mint).await;
                     // Late confirm establishes live coverage too (AUD-002).
                     self.exec.mark_live_covered(&mint).await;
@@ -1582,6 +1594,9 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     trader
                         .record_manual(&recheck.position, &recheck.signature)
                         .await;
+                    // Manual claim durable: only now retire the pending
+                    // claim of record, then park (AUD-001 order).
+                    trader.retire_pending_for(&mint).await;
                     self.exec.park_manual(mint.clone(), recheck.position).await;
                     self.exec.note_giveup(now_secs()).await;
                     self.emit(format!("LIVE buy unconfirmed on {mint} (sig {}); MANUAL REVIEW REQUIRED (may hold)", recheck.signature));

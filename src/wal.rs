@@ -763,6 +763,21 @@ mod tests {
     }
 
     #[test]
+    fn crash_before_the_claim_publishes_replays_the_pending() {
+        // AUD-001: the recheck handoff may die right after a Confirmed
+        // verdict, before the `Position` claim is written. The pending
+        // is the claim of record until then, so replay must still hold
+        // it (boot re-imports and re-resolves) — never an invisible
+        // confirmed fill.
+        let pending = format!(
+            r#"{{"t":"pending","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":1000,"creator":null,"sig":"SIG1","bundle":"B1","ts":1}}"#
+        );
+        let replay = replay_lines([pending.as_str()].iter().copied());
+        assert_eq!(replay.pending.len(), 1, "claim of record survives");
+        assert!(replay.positions.is_empty() && replay.manual.is_empty());
+    }
+
+    #[test]
     fn compaction_preserves_meta_history() {
         // Compaction rewrites custody but keeps every stamp: the file
         // always names all its writers, not just the last session.

@@ -93,6 +93,9 @@ struct StubLiveInner {
     /// accounting assertions keep holding.
     dispatch_lamports: StdMutex<u64>,
     fail_buys: AtomicBool,
+    /// Pending-buy hook: the dispatch times out with the bundle
+    /// unresolved (`LiveError::Unconfirmed`) — the real pending path.
+    fail_buys_unconfirmed: AtomicBool,
     /// Simulated dead-buy verdict (dispatch proven dead before landing).
     dead_buys: StdMutex<Option<DeadReason>>,
     fail_sells: AtomicBool,
@@ -119,8 +122,15 @@ struct StubLiveInner {
     /// Pending entries resolve as provably `Dead` on the next recheck
     /// (AUD-003: divergence marking on the recheck path).
     recheck_dies: AtomicBool,
+    /// Pending entries resolve as `GiveUp` on the next recheck:
+    /// unresolved past the retry budget, parked for manual review.
+    recheck_gives_up: AtomicBool,
     /// Simulated WAL write failure (entries must halt).
     wal_degraded: AtomicBool,
+    /// Recorded custody WAL-event order (AUD-001/002 regression
+    /// assertions: `ack` writes position-then-settled; give-up writes
+    /// manual-then-settled; pending retirement trails them).
+    wal_events: StdMutex<Vec<&'static str>>,
 }
 
 impl StubLive {
@@ -135,6 +145,7 @@ impl StubLive {
                 tip_lamports: 100_000,
                 dispatch_lamports: StdMutex::new(0),
                 fail_buys: AtomicBool::new(false),
+                fail_buys_unconfirmed: AtomicBool::new(false),
                 dead_buys: StdMutex::new(None),
                 fail_sells: AtomicBool::new(false),
                 fail_sells_transient: AtomicBool::new(false),
@@ -147,7 +158,9 @@ impl StubLive {
                 hang_recheck: AtomicBool::new(false),
                 recheck_confirms: AtomicBool::new(false),
                 recheck_dies: AtomicBool::new(false),
+                recheck_gives_up: AtomicBool::new(false),
                 wal_degraded: AtomicBool::new(false),
+                wal_events: StdMutex::new(vec![]),
             }),
         }
     }
@@ -176,6 +189,11 @@ impl StubLive {
     fn charge_lamports(&self) -> u64 {
         *self.inner.dispatch_lamports.lock().expect("lock")
     }
+
+    /// Recorded custody WAL-event order.
+    fn wal_events(&self) -> Vec<&'static str> {
+        self.inner.wal_events.lock().expect("lock").clone()
+    }
 }
 
 impl BuySink for StubLive {
@@ -189,6 +207,20 @@ impl BuySink for StubLive {
         let notional_usd = req.notional_usd;
         if self.inner.fail_buys.load(Ordering::Relaxed) {
             return Err(LiveError::BadOrder("stubbed failure".to_string()));
+        }
+        if self.inner.fail_buys_unconfirmed.load(Ordering::Relaxed) {
+            // Model the real trader: the unresolved dispatch stays the
+            // pending claim of record until the recheck settles it.
+            self.inner
+                .pending
+                .lock()
+                .expect("lock")
+                .push(mint.to_string());
+            // Dispatch unresolved: the real pending path — the paper
+            // opens, the live buy stays pending for the recheck task.
+            return Err(LiveError::Unconfirmed(
+                "stubbed unconfirmed buy dispatch".to_string(),
+            ));
         }
         if let Some(reason) = *self.inner.dead_buys.lock().expect("lock") {
             return Err(LiveError::Dead {
@@ -371,31 +403,32 @@ impl PendingStore for StubLive {
             return Vec::new();
         }
         if self.inner.recheck_confirms.load(Ordering::Relaxed) {
-            return self
-                .inner
-                .pending
-                .lock()
-                .expect("lock")
-                .drain(..)
-                .map(|mint| {
-                    let mint = mint.clone();
-                    PendingRecheck {
-                        position: LivePosition {
-                            mint: pk(&mint),
-                            curve: pk(CURVE),
-                            assoc_curve: pk(ASSOC),
-                            amount_tokens: 1_000,
-                            creator: None,
-                            entry_usd_per_token: 0.0,
-                        },
-                        bundle_id: format!("bundle-{mint}"),
-                        signature: format!("sig-{mint}"),
-                        outcome: RecheckOutcome::Confirmed,
-                    }
+            // Peek, never drain: the pending claim of record stays
+            // visible until `retire_pending_for` (AUD-001) retires it
+            // after the durable `Position` claim is published.
+            let mints = self.inner.pending.lock().expect("lock").clone();
+            return mints
+                .into_iter()
+                .map(|mint| PendingRecheck {
+                    position: LivePosition {
+                        mint: pk(&mint),
+                        curve: pk(CURVE),
+                        assoc_curve: pk(ASSOC),
+                        amount_tokens: 1_000,
+                        creator: None,
+                        entry_usd_per_token: 0.0,
+                    },
+                    bundle_id: format!("bundle-{mint}"),
+                    signature: format!("sig-{mint}"),
+                    outcome: RecheckOutcome::Confirmed,
                 })
                 .collect();
         }
         if self.inner.recheck_dies.load(Ordering::Relaxed) {
+            // Dead is proven no-fill: retirement is the recheck's own
+            // final word (the replaced claim it would wait for does
+            // not exist).
+            self.inner.wal_events.lock().expect("lock").push("settled");
             return self
                 .inner
                 .pending
@@ -420,7 +453,38 @@ impl PendingStore for StubLive {
                 })
                 .collect();
         }
+        if self.inner.recheck_gives_up.load(Ordering::Relaxed) {
+            let mints = self.inner.pending.lock().expect("lock").clone();
+            return mints
+                .into_iter()
+                .map(|mint| PendingRecheck {
+                    position: LivePosition {
+                        mint: pk(&mint),
+                        curve: pk(CURVE),
+                        assoc_curve: pk(ASSOC),
+                        amount_tokens: 1_000,
+                        creator: None,
+                        entry_usd_per_token: 0.0,
+                    },
+                    bundle_id: format!("bundle-{mint}"),
+                    signature: format!("sig-{mint}"),
+                    outcome: RecheckOutcome::GiveUp,
+                })
+                .collect();
+        }
         Vec::new()
+    }
+
+    async fn retire_pending_for(&self, mint: &str) {
+        // AUD-001: the retirement is an explicit post-publication step;
+        // the real writer appends the `Settled` tombstone first.
+        self.inner.wal_events.lock().expect("lock").push("settled");
+        self.inner.wal_events.lock().expect("lock").push("retire");
+        self.inner
+            .pending
+            .lock()
+            .expect("lock")
+            .retain(|m| m != mint);
     }
 }
 
@@ -449,14 +513,31 @@ impl CostLedger for StubLive {
 }
 
 impl WalSink for StubLive {
-    // No durability: stub custody lives in test memory.
-    async fn acknowledge_buy(&self, _position: &LivePosition, _bundle_id: &str) {}
+    // Stubs record the custody WAL-event ORDER for AUD-001/002
+    // assertions; no durability: stub custody lives in test memory.
+    async fn acknowledge_buy(&self, _position: &LivePosition, _bundle_id: &str) {
+        let mut events = self.inner.wal_events.lock().expect("lock");
+        // The real writer appends `Position` then the `Settled`
+        // tombstone — order is the regression under test.
+        events.push("position");
+        events.push("settled");
+    }
 
-    async fn record_manual(&self, _position: &LivePosition, _note: &str) {}
+    async fn record_manual(&self, _position: &LivePosition, _note: &str) {
+        self.inner.wal_events.lock().expect("lock").push("manual");
+    }
 
-    async fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {}
+    async fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {
+        self.inner.wal_events.lock().expect("lock").push("sell");
+    }
 
-    async fn unrecord_manual(&self, _position: &LivePosition) {}
+    async fn unrecord_manual(&self, _position: &LivePosition) {
+        self.inner
+            .wal_events
+            .lock()
+            .expect("lock")
+            .push("take-manual");
+    }
 
     fn wal_degraded(&self) -> bool {
         self.inner.wal_degraded.load(Ordering::Relaxed)
@@ -3759,6 +3840,249 @@ async fn recheck_resolves_confirmed_buys_without_a_tick() {
     assert!(
         pipe.exec.live_pending_mints().is_empty(),
         "stub recheck consumed the pending entry on confirm"
+    );
+}
+
+#[tokio::test]
+async fn recheck_confirm_writes_the_claim_before_retiring_the_pending() {
+    // AUD-001: a `Confirmed` recheck handoff must publish the durable
+    // claim (`Position`, then the settled tombstone) and only then
+    // retire the pending claim of record. The stub records the custody
+    // WAL-event order; replay of that order must yield custody at
+    // every crash point.
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 2.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    live.inner
+        .pending
+        .lock()
+        .expect("lock")
+        .push(sys.to_string());
+    live.inner.recheck_confirms.store(true, Ordering::Relaxed);
+    pipe.recheck_live_pending().await;
+    let events = live.wal_events();
+    assert_eq!(
+        (events[0], events.last().copied()),
+        ("position", Some("retire")),
+        "the confirmed claim is written first and the pending claim of record retires last: {events:?}"
+    );
+    assert!(
+        live.wal_events().contains(&"settled"),
+        "tombstone written: {events:?}"
+    );
+    assert!(
+        !pipe.exec.live_positions.lock().await.is_empty(),
+        "the confirmed bag stays tracked"
+    );
+}
+
+#[tokio::test]
+async fn recheck_pending_stays_claimed_until_the_handoff_publishes() {
+    // AUD-001 crash window: a resolution verdict alone must not retire
+    // the pending claim (WAL or memory) — stopping right after the
+    // recheck verdict leaves the claim of record intact, so a replay
+    // still sees live custody (pending re-imported at boot).
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 2.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    live.inner
+        .pending
+        .lock()
+        .expect("lock")
+        .push(sys.to_string());
+    live.inner.recheck_confirms.store(true, Ordering::Relaxed);
+    // The stub trader models the real recheck: Confirmed does NOT
+    // retire the pending of record (see PendingStore::recheck_pending).
+    PendingStore::recheck_pending(pipe.exec.live.as_ref().expect("live")).await;
+    assert!(
+        pipe.exec.live.as_ref().expect("live").has_pending_for(sys),
+        "a resolved-but-unpublished pending must stay the claim of record"
+    );
+    assert!(
+        live.wal_events().is_empty(),
+        "no WAL terminal line may precede the published claim (crash point): {:?}",
+        live.wal_events()
+    );
+}
+
+#[tokio::test]
+async fn recheck_giveup_writes_the_manual_claim_before_retiring() {
+    // AUD-001: a `GiveUp` (may-hold) park must write the durable
+    // `Manual` claim and park the bag BEFORE the pending claim is
+    // retired — a crash in between replays either claim, never
+    // neither.
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 2.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    live.inner
+        .pending
+        .lock()
+        .expect("lock")
+        .push(sys.to_string());
+    live.inner.recheck_gives_up.store(true, Ordering::Relaxed);
+    pipe.recheck_live_pending().await;
+    let events = live.wal_events();
+    assert_eq!(
+        events.first().copied(),
+        Some("manual"),
+        "the may-hold claim is written first: {events:?}"
+    );
+    assert!(
+        events.contains(&"settled"),
+        "tombstone trails the claim: {events:?}"
+    );
+    assert_eq!(
+        events.last().copied(),
+        Some("retire"),
+        "the pending of record retires only after the manual claim: {events:?}"
+    );
+    assert!(
+        pipe.exec.manual_holds_base(sys).await,
+        "the bag is parked as still-held"
+    );
+    assert!(
+        !live.has_pending_for(sys),
+        "the pending is resolved and retired"
+    );
+}
+
+#[tokio::test]
+async fn recheck_dead_retires_from_the_recheck_without_a_claim() {
+    // AUD-001: a provably-dead buy has no replacement claim; the
+    // recheck itself appends the settled tombstone and drops the
+    // pending (unchanged order, now the ONLY inline retirement).
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 2.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    live.inner
+        .pending
+        .lock()
+        .expect("lock")
+        .push(sys.to_string());
+    live.inner.recheck_dies.store(true, Ordering::Relaxed);
+    pipe.recheck_live_pending().await;
+    let events = live.wal_events();
+    assert_eq!(
+        events,
+        vec!["settled"],
+        "the dead tombstone is the only WAL line: {events:?}"
+    );
+    assert!(!live.has_pending_for(sys));
+}
+
+#[tokio::test]
+async fn paper_close_full_window_waits_until_the_pending_confirms() {
+    // AUD-001 concurrent-exit window: with the pending still the claim
+    // of record (no tracked bag yet), a full paper close must defer
+    // (no live sell, no breaker booking, watch retained). Publishing
+    // the confirmed bag afterwards restores the managed tracked state.
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    live.inner
+        .fail_buys_unconfirmed
+        .store(true, Ordering::Relaxed);
+    let t = tick(sys, 2.0);
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(t),
+        funded(),
+        StubScreener::with_swaps(sys, buyer_swaps(sys, &[11, 12, 13, 14, 15])),
+        Some(live.clone()),
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: sys,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    assert_eq!(pipe.portfolio.lock().await.position_ids().len(), 1);
+    assert!(
+        pipe.exec.live.as_ref().expect("live").has_pending_for(sys),
+        "the live buy is pending"
+    );
+    // Full paper close on a spike while the buy is unresolved.
+    pipe.on_tick(&tick(sys, 3.0)).await;
+    assert!(
+        pipe.portfolio.lock().await.position_ids().is_empty(),
+        "paper closed"
+    );
+    assert!(
+        live.sells().is_empty(),
+        "no live sell may ride the unresolved-pending window"
+    );
+    assert!(
+        pipe.exec.live_positions.lock().await.is_empty(),
+        "nothing tracked before the handoff publishes"
+    );
+    assert!(
+        !pipe
+            .reserves
+            .unwatched
+            .lock()
+            .expect("lock")
+            .contains(&sys.to_string()),
+        "the pendings watch is pinned through the handoff window"
+    );
+    assert!(
+        pipe.exec.live.as_ref().expect("live").has_pending_for(sys),
+        "the pending claim of record survives the close"
+    );
+    // Now the recheck resolves the pending: the bag publishes as
+    // tracked with an exit feed (the watch survives the whole window).
+    live.inner.recheck_confirms.store(true, Ordering::Relaxed);
+    pipe.recheck_live_pending().await;
+    assert!(
+        !pipe.exec.live_positions.lock().await.is_empty(),
+        "the confirmed bag is tracked and will sell on the next tick"
+    );
+    assert_eq!(
+        pipe.exec.live_pending_mints(),
+        Vec::<String>::new(),
+        "the pending claim is retired after publication"
+    );
+    assert!(
+        !pipe
+            .reserves
+            .unwatched
+            .lock()
+            .expect("lock")
+            .contains(&sys.to_string()),
+        "the tracked bag keeps its exit feed"
     );
 }
 

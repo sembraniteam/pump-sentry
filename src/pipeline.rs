@@ -153,6 +153,13 @@ pub trait PendingStore {
 
     /// Re-poll pending buys once.
     async fn recheck_pending(&self) -> Vec<PendingRecheck>;
+
+    /// Retire a pending buy whose resolved claim is durable and
+    /// published: append the `Settled` tombstone and drop the
+    /// in-memory entry. Call only AFTER the replacement claim
+    /// (`Position`/`Manual`) is durable — WAL-before-ack keeps the
+    /// pending claim of record until then (AUD-001).
+    async fn retire_pending_for(&self, mint: &str);
 }
 
 /// Tip escalation plus dispatch cost accounting. Live lifts tips to
@@ -255,6 +262,10 @@ impl PendingStore for LiveTrader {
 
     async fn recheck_pending(&self) -> Vec<PendingRecheck> {
         LiveTrader::recheck_pending(self).await
+    }
+
+    async fn retire_pending_for(&self, mint: &str) {
+        LiveTrader::retire_pending_for(self, mint).await
     }
 }
 
