@@ -239,7 +239,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         let mut stale = Vec::new();
         for mint in candidates {
             let held = match &self.exec.live {
-                Some(trader) => self.is_live_tracked(trader, &mint).await,
+                Some(trader) => self.has_live_exposure(trader, &mint).await,
                 None => false,
             };
             if !held {
@@ -307,7 +307,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             ));
             // Release unless live still needs the leg.
             let keep_for_exit = match &self.exec.live {
-                Some(trader) => self.is_live_tracked(trader, &mint).await,
+                Some(trader) => self.has_live_exposure(trader, &mint).await,
                 None => false,
             };
             if keep_for_exit {
@@ -332,7 +332,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             return;
         }
         let reap = match &self.exec.live {
-            Some(trader) => !self.is_live_tracked(trader, mint).await,
+            Some(trader) => !self.has_live_exposure(trader, mint).await,
             None => true,
         };
         if reap {

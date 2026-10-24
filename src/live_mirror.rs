@@ -1099,8 +1099,12 @@ impl<L> LiveExecution<L> {
     }
 }
 impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipeline<A, R, L, S, T> {
-    /// True when any live bag exists for `mint`.
-    pub(crate) async fn is_live_tracked(&self, trader: &L, mint: &str) -> bool {
+    /// Single live-exposure predicate (AUD-007): true when any live
+    /// bag exists for `mint` — a tracked position, a parked manual bag
+    /// (base-wide), or an unresolved pending buy. Settlement (stale-SOL
+    /// guard) and the dup guard must not reason over tracked custody
+    /// alone.
+    pub(crate) async fn has_live_exposure(&self, trader: &L, mint: &str) -> bool {
         if self.exec.is_tracked(mint).await {
             return true;
         }
@@ -1158,7 +1162,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             }
         }
         // Pre-dispatch dup guard (post check stays as backup).
-        if self.is_live_tracked(trader, mint).await {
+        if self.has_live_exposure(trader, mint).await {
             warn!(%mint, "LIVE buy skipped: mint already tracked/manual/pending; no dispatch (paper stays open, no new funds)");
             self.journal_buy_skip(mint, "already tracked");
             self.emit(format!(
@@ -1251,7 +1255,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             Ok((position, bundle, entry_fill)) => {
                 // Second fill is real custody: park it.
-                if self.is_live_tracked(trader, mint).await {
+                if self.has_live_exposure(trader, mint).await {
                     warn!(%mint, %bundle, amount = position.amount_tokens, "LIVE buy landed for already-tracked mint; parked as manual (still HELD), MANUAL REVIEW REQUIRED");
                     trader.record_manual(&position, &bundle).await;
                     self.exec
@@ -1744,7 +1748,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             self.emit(format!(
                 "stale SOL/USD — live sell stalled on {mint}; exits resume when feed recovers"
             ));
-            return !self.is_live_tracked(trader, mint).await;
+            return !self.has_live_exposure(trader, mint).await;
         };
         // Per-mint lock; other mints exit freely.
         let serial = Self::lock_for(&self.exec.live_sell_locks, mint).await;

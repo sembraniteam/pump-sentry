@@ -939,6 +939,17 @@ fn pipeline_screened(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn harness_vaults() -> VaultTicker {
+    VaultTicker::new(
+        listener::types::DEFAULT_HTTP_RPC_URL,
+        CurveTicker::parse_commitment("confirmed").expect("known commitment"),
+        std::time::Duration::from_millis(500),
+        SolUsdFeed::new_for_test(150.0),
+    )
+    .expect("vault ticker")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pipeline_engined(
     settings: Settings,
     outcome: AuditOutcome,
@@ -949,13 +960,7 @@ fn pipeline_engined(
     alerts: Option<StubAlerts>,
     engine: Option<RiskEngine>,
 ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
-    let vaults = VaultTicker::new(
-        listener::types::DEFAULT_HTTP_RPC_URL,
-        CurveTicker::parse_commitment("confirmed").expect("known commitment"),
-        std::time::Duration::from_millis(500),
-        SolUsdFeed::new_for_test(150.0),
-    )
-    .expect("vault ticker");
+    let vaults = harness_vaults();
     Pipeline::shared(
         settings,
         StubAuditor { outcome },
@@ -967,6 +972,32 @@ fn pipeline_engined(
         alerts,
         vaults,
         SolUsdFeed::new_for_test(150.0),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pipeline_with_sol_feed(
+    settings: Settings,
+    outcome: AuditOutcome,
+    reserves: StubReserves,
+    portfolio: PaperPortfolio,
+    screener: StubScreener,
+    live: Option<StubLive>,
+    alerts: Option<StubAlerts>,
+    sol_price: Option<f64>,
+) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
+    Pipeline::shared(
+        settings,
+        StubAuditor { outcome },
+        None,
+        reserves,
+        portfolio,
+        live,
+        screener,
+        alerts,
+        harness_vaults(),
+        SolUsdFeed::new_for_test(sol_price.unwrap_or(0.0)),
         None,
     )
 }
@@ -1109,13 +1140,7 @@ fn pipeline_alerted(
     live: Option<StubLive>,
     alerts: Option<StubAlerts>,
 ) -> Arc<Pipeline<StubAuditor, StubReserves, StubLive, StubScreener, StubAlerts>> {
-    let vaults = VaultTicker::new(
-        listener::types::DEFAULT_HTTP_RPC_URL,
-        CurveTicker::parse_commitment("confirmed").expect("known commitment"),
-        std::time::Duration::from_millis(500),
-        SolUsdFeed::new_for_test(150.0),
-    )
-    .expect("vault ticker");
+    let vaults = harness_vaults();
     Pipeline::shared(
         settings,
         StubAuditor { outcome },
@@ -4534,6 +4559,97 @@ async fn paper_close_stays_deferred_while_a_live_buy_is_pending() {
     assert!(
         pipe.exec.deferred_pnl.lock().await.contains_key(MINT),
         "paper PnL remains stashed, never flushed as settled"
+    );
+}
+
+#[tokio::test]
+async fn stale_sol_feed_with_a_parked_manual_bag_stays_deferred() {
+    // AUD-007: the stale-SOL early return must apply the same
+    // settlement contract as the fresh path. A parked manual bag (the
+    // give-up shape: no tracked bag, manual claim only) is live
+    // exposure, so the paper close reports unsettled and its PnL stays
+    // stashed instead of feeding the breaker; once the manual bag
+    // clears, the same mint settles and the stash flushes exactly once.
+    let live = StubLive::working();
+    let screener = StubScreener::with_swaps(MINT, buyer_swaps(MINT, &[11, 12, 13, 14, 15]));
+    let reserves = StubReserves::with_tick(tick(MINT, 2.0));
+    let pipe = pipeline_with_sol_feed(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        funded(),
+        screener,
+        Some(live.clone()),
+        None,
+        // Stale feed: `SolUsdFeed` seeds only a positive price, so 0.0
+        // leaves the feed empty (`price() == None`).
+        None,
+    );
+    pipe.on_launch(&LaunchRequest {
+        mint: MINT,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    assert!(
+        !pipe.portfolio.lock().await.position_ids().is_empty(),
+        "paper position opened for the close"
+    );
+    // Give-up shape: tracked custody gone, a manual-only parked bag
+    // remains (aud-002 origins: unknown dispatch / recheck give-up).
+    pipe.exec.live_positions.lock().await.clear();
+    pipe.exec.live_manual.lock().await.insert(
+        MINT.to_string(),
+        LivePosition {
+            mint: pk(MINT),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000,
+            creator: None,
+            entry_usd_per_token: 2.0,
+        },
+    );
+    // The stale-feed guard itself: unsettled while exposure remains.
+    assert!(
+        !pipe
+            .live_sell(MINT, &Mark::new(3.0, 30_000.0), 1.0, SellCover::LiveOnly)
+            .await,
+        "stale feed must not settle a mint with a parked manual bag"
+    );
+    // The tick path agrees: a `complete` tick bypasses the upstream
+    // paper-exit deferral (`!tick.complete && sol-stale`), so the close
+    // reaches the stale-SOL guard mid-mirror — PnL stashed, no order.
+    let mut tick = tick(MINT, 3.0);
+    tick.complete = true;
+    pipe.on_tick(&tick).await;
+    assert!(live.sells().is_empty(), "no order under a stale feed");
+    assert!(
+        pipe.exec.deferred_pnl.lock().await.contains_key(MINT),
+        "paper PnL remains stashed, never breaker-fed as settled"
+    );
+    // The stale-feed path must agree with the fresh path on
+    // eligibility for the same custody state: empty custody settles
+    // even under the stale feed.
+    pipe.exec.live_manual.lock().await.clear();
+    assert!(
+        pipe.live_sell(MINT, &Mark::new(3.0, 30_000.0), 1.0, SellCover::LiveOnly)
+            .await,
+        "empty custody settles under the stale feed too"
+    );
+    // The stash survives settlement-free attempts untouched: the
+    // refused close deferred exactly one leg and nothing ever settled
+    // or breaker-fed it.
+    let stash = pipe.exec.take_deferred(MINT).await.expect("stash held");
+    assert_eq!(stash.1, 1, "exactly one deferred leg, one stash entry");
+    assert!(
+        pipe.exec.take_deferred(MINT).await.is_none(),
+        "no duplicate stash: the refused close defers exactly once"
     );
 }
 
