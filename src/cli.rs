@@ -367,11 +367,19 @@ impl StateDirLock {
         {
             use std::os::unix::fs::OpenOptionsExt;
             use std::os::unix::io::AsRawFd;
+            // A pre-created symlink on the lock path would redirect
+            // `flock` to a foreign inode and dissolve the whole
+            // single-owner guarantee. Creation must refuse to traverse
+            // a final symlink (`O_NOFOLLOW`): the honest failure mode
+            // is "acquire fails", never "exclusive lock held on
+            // someone else's file". TOCTOU-proof: the open itself
+            // refuses a symlink planted between any check and here.
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
                 .mode(0o600)
                 .open(path)?;
             // SAFETY: `flock` on an owned fd; EWOULDBLOCK means the
@@ -397,22 +405,29 @@ impl StateDirLock {
 }
 
 /// Which process a pid belongs to, as far as the platform can tell.
-/// `Some(false)` proves the pid is NOT our binary (pid reuse — refuse
-/// to signal it). `None` means the platform gives no answer (residual
-/// pid-reuse risk, reported by the caller).
+/// `Some(false)` proves the pid is NOT positively identifiably our
+/// binary (path mismatch — possibly a recycled pid — refuse to signal
+/// it). `None` means the platform gives no answer (residual pid-reuse
+/// risk, reported by the caller).
 pub fn pid_is_our_binary(pid: u32) -> Option<bool> {
     if pid == 0 || pid > i32::MAX as u32 {
         return None;
     }
     let path = pid_binary_path(pid)?;
     let our = std::env::current_exe().ok()?;
-    if path == our {
-        return Some(true);
-    }
-    // A different path can still be our binary (copied/upgraded);
-    // compare the file name as a fallback.
-    let same_name = path.file_name().is_some() && path.file_name() == our.file_name();
-    Some(same_name)
+    Some(pid_binary_identity(&our, &path))
+}
+
+/// Identity core (pure, test-pinned): only executable-path equality
+/// proves the pid is our binary. A shared file name is not identity
+/// evidence — a recycled pid may run an unrelated binary that happens
+/// to carry the same name, and a name match used to return
+/// `Some(true)` here, silently green-lighting a SIGTERM/SIGKILL meant
+/// for the trader. A path mismatch now refuses instead; operators who
+/// genuinely moved their binary re-point the pid file (`status` shows
+/// the mismatch) beside the new path.
+fn pid_binary_identity(our: &Path, pid_path: &Path) -> bool {
+    pid_path == our
 }
 
 /// Executable path behind a pid, when the platform exposes it.
@@ -817,7 +832,7 @@ pub fn stop_daemon() -> i32 {
     match pid_is_our_binary(info.pid) {
         Some(false) => {
             eprintln!(
-                "refusing to signal pid {}: it is not pump-sentry (binary path mismatch; possible pid reuse). Check `status` and the pid file.",
+                "refusing to signal pid {}: it is not positively this binary (executable path mismatch; possible pid reuse). If you moved or copied your binary, re-run from the same path or adjust the pid file manually.",
                 info.pid
             );
             return 1;
@@ -1340,6 +1355,55 @@ fn curl_fetch(url: &str) -> std::io::Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Tar-slip guard core (pure, mirrors `install.sh`): members must stay
+/// relative and free of `..`, and every member must be a plain file or
+/// directory — the first letter of the `-tzv` mode field rejects
+/// symlinks (l), hardlinks (h), and fifos/devices (b, c) alike, with
+/// `p`/`M`/`?` style oddities refused the same way. Returns the reason
+/// for the first offending member so the caller can refuse to extract.
+fn member_slip_check(member_names: &str, member_verbose: &str) -> Option<&'static str> {
+    for name in member_names.lines() {
+        if name.is_empty() {
+            continue;
+        }
+        if name.starts_with('/') {
+            return Some("absolute path");
+        }
+        if name.split('/').any(|segment| segment == "..") {
+            return Some("parent traversal (..)");
+        }
+    }
+    for line in member_verbose.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mode = line.chars().next().unwrap_or('?');
+        if mode != '-' && mode != 'd' {
+            return Some("non-plain member (symlink/hardlink/fifo/device)");
+        }
+    }
+    None
+}
+
+/// Tar-slip guard: list archive members through system `tar` before any
+/// extraction (same commands as the `install.sh` path). `None` means
+/// `tar` is missing or the archive is unreadable.
+fn archive_member_listings(tgz: &Path) -> Option<(String, String)> {
+    let listing = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("tar")
+            .args(args)
+            .arg(tgz.as_os_str())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let names = listing(&["-tzf"])?;
+    let verbose = listing(&["-tzvf"])?;
+    Some((names, verbose))
+}
+
 /// `upgrade`: install the newest release over this binary, else say so.
 /// Refuses while the daemon runs (replacing a live trader's binary is
 /// never safe) and on unsupported platforms.
@@ -1459,6 +1523,18 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
     }
     if !verified {
         eprintln!("warning: installing UNVERIFIED binary (--allow-unverified)");
+    }
+    // Tar-slip guard (same checks `install.sh` runs before extracting):
+    // a malicious archive must not write outside the staging directory.
+    let Some((member_names, member_verbose)) = archive_member_listings(&tgz) else {
+        eprintln!("archive unreadable (need 'tar');");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::process::exit(1);
+    };
+    if let Some(reason) = member_slip_check(&member_names, &member_verbose) {
+        eprintln!("archive has unsafe members ({reason}); refusing to install");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::process::exit(1);
     }
     match std::process::Command::new("tar")
         .args(["-xzf"])
@@ -2010,6 +2086,48 @@ mod tests {
     }
 
     #[test]
+    fn state_lock_refuses_a_symlinked_lock_file() {
+        // Regression: acquire used to open bot.lock plainly, so a
+        // pre-planted symlink granted an "exclusive" lock on some
+        // foreign inode — two state dirs could each hold it at once.
+        // O_NOFOLLOW must refuse with an error instead.
+        static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CTR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "cli-state-symlink-test-{}-{:?}-{n}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let benign = dir.join("innocent-target");
+        std::fs::write(&benign, b"").expect("target");
+        // Symlink target is in a different directory from the lock
+        // path so the foreign-inode redirect is explicit.
+        let other = std::env::temp_dir().join(format!(
+            "cli-state-symlink-target-{}-{:?}-{n}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&other).expect("mkdir other");
+        let foreign = other.join("foreign.lock");
+        std::fs::write(&foreign, b"").expect("foreign");
+        let lock_path = benign.with_file_name("bot.lock");
+        std::os::unix::fs::symlink(&foreign, &lock_path).expect("symlink");
+        let acquired = StateDirLock::try_acquire(&lock_path);
+        assert!(
+            acquired.is_err(),
+            "symlinked lock path must refuse to acquire"
+        );
+        // Plain path in the same dir still acquires (no collateral).
+        std::fs::remove_file(&lock_path).expect("remove symlink");
+        let plain = StateDirLock::try_acquire(&benign);
+        assert!(plain.is_ok(), "regular file still locks");
+        drop(plain);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
     fn state_lock_sits_beside_the_log() {
         // The lock is keyed on the STATE dir (the log's directory), so
         // a second process with an overridden PID_FILE but the same
@@ -2073,6 +2191,28 @@ mod tests {
     }
 
     #[test]
+    fn pid_identity_never_blesses_a_matching_sibling_name() {
+        // Regression: a different binary path used to pass on equal
+        // file name (`copied/upgraded` fallback), silently granting
+        // stop permission over a possibly recycled pid. Only exact
+        // executable-path equality is positive identity.
+        let dir = std::env::temp_dir().join(format!(
+            "cli-pid-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ours = dir.join("a/pump-sentry");
+        let theirs = dir.join("b/pump-sentry");
+        assert!(pid_binary_identity(&ours, &ours), "same path = ours");
+        assert!(
+            !pid_binary_identity(&ours, &theirs),
+            "same file name in another directory is NOT identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn bare_log_paths_deliver_sell_requests() {
         // `LOG_FILE=bot.log` has parent Some(""), which used
         // to make the drain see no directory at all. Request path and
@@ -2111,6 +2251,101 @@ mod tests {
             found.iter().any(|(m, _)| m == "MINTA"),
             "bare-path request stays discoverable"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tar_slip_core_accepts_release_shape() {
+        // GNU and BSD tar -tzvf lines: every member plain file or directory.
+        let names = "pump-sentry\nsub/\nsub/README.md\n";
+        let verbose = concat!(
+            "-rw-r--r--  0 dilapid staff  1048576 Oct 24 12:00 pump-sentry\n",
+            "drwxr-xr-x  0 dilapid staff       0  Oct 24 12:00 sub/\n",
+            "-rw-r--r--  0 dilapid staff     1024 Oct 24 12:00 sub/README.md\n",
+        );
+        assert_eq!(member_slip_check(names, verbose), None);
+        // An empty names column with a valid verbose listing stays allowed.
+        assert_eq!(member_slip_check("", verbose), None);
+    }
+
+    #[test]
+    fn tar_slip_core_rejects_absolute_and_traversal_members() {
+        assert_eq!(
+            member_slip_check(
+                "/tmp/evil\npump-sentry\n",
+                "-rw-r--r--  0 u g 1 x /tmp/evil\n"
+            ),
+            Some("absolute path")
+        );
+        assert_eq!(
+            member_slip_check("pump-sentry\n../evil\n", "-rw-r--r--  0 u g 1 x ../evil\n"),
+            Some("parent traversal (..)")
+        );
+        // A single `..` path segment, GNU lines with backtick quoting, and
+        // pass-through oddities all count as traversal.
+        assert_eq!(
+            member_slip_check(
+                "sub/../../evil\n",
+                "lrwxrwxrwx  0 u g 1 x sub/../../evil -> /tmp/evil\n"
+            ),
+            Some("parent traversal (..)")
+        );
+        // Relative absolute-hidden prefix (GNU quotes in `-N` mode) is
+        // refused by the raw filename guard the same way install.sh's
+        // `grep '^/'` handles name-only listings.
+        assert_eq!(
+            member_slip_check("./evil\n", "-rw-r--r--  0 u g 1 x ./evil\n"),
+            None,
+            "leading `./` is relative and contains no `..` segment"
+        );
+    }
+
+    #[test]
+    fn tar_slip_core_rejects_non_plain_members() {
+        let bad_line = |mode: &str| format!("{mode}  0 u g 1 x member\n");
+        for mode in [
+            "lrwxrwxrwx",
+            "hrw-r--r--",
+            "crw-r--r--",
+            "brw-r--r--",
+            "prw-r--r--",
+            "Mrw-r--r--",
+            "?rw-r--r--",
+        ] {
+            assert_eq!(
+                member_slip_check("member\n", &bad_line(mode)),
+                Some("non-plain member (symlink/hardlink/fifo/device)"),
+                "mode {mode} must be refused"
+            );
+        }
+        // A directory member is still allowed.
+        assert_eq!(
+            member_slip_check("sub/\n", "drwxr-xr-x  0 u g 1 x sub/\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn tar_slip_core_prefers_name_reason_over_mode_reason() {
+        // If both violations exist, whichever appears first wins.
+        let reason = member_slip_check("../evil\n", "lrwxrwxrwx  0 u g 1 x member\n");
+        assert_eq!(reason, Some("parent traversal (..)"));
+    }
+
+    #[test]
+    fn archive_member_listings_refuses_corrupt_archive() {
+        // Not a gzip archive: listing must be None so the caller refuses
+        // to install even before running the slip check.
+        let dir = std::env::temp_dir().join(format!(
+            "cli-tgz-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let fake = dir.join("pump-sentry-evil.tar.gz");
+        std::fs::write(&fake, b"definitely not a gzip archive").expect("write");
+        let listing = archive_member_listings(&fake);
+        assert!(listing.is_none(), "corrupt archive must list as None");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

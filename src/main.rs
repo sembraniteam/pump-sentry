@@ -1962,6 +1962,15 @@ async fn run_pipeline(boot: Boot) {
                 if pool.degraded() {
                     reasons.push("rpc pool has no healthy endpoint".to_string());
                 }
+                // Split-brain reads: a failover endpoint disagrees with
+                // the primary on the chain view (probe_round marks it).
+                // Pricing from a disagreeing pair is blind bisected
+                // from real state. The flag is re-probed every sweep,
+                // so endpoints agreeing again clears the reason by
+                // construction.
+                if pool.snapshot().inconsistent {
+                    reasons.push("rpc endpoints disagree (inconsistent chain view)".to_string());
+                }
                 // Feed grace: a boot that never priced yet is startup,
                 // not degradation; losing a HAD price pauses immediately.
                 if sol_feed_view.is_stale()

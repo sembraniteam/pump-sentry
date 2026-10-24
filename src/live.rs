@@ -118,15 +118,15 @@ impl Drop for SlowWalWrite {
 pub const SELL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 /// Failed sells before manual exit.
 pub const SELL_MAX_ATTEMPTS: u32 = 5;
-/// Max age of a resend-guard entry: a bundle that is still
-/// unresolved after this long is either lying status API or ancient
-/// history — holding resends forever strands the bag, so the guard
-/// expires loudly (warn) instead. Every earlier release goes through
-/// the shared resolver (chain evidence first) and is refused without
-/// proof; only this last resort is deliberately evidence-free, sized
-/// well past blockhash validity (~60-90s), so the bundle cannot land
-/// under any normal condition. Jito bundles resolve in minutes; an
-/// hour is pure outage margin.
+/// Alarm threshold of a resend-guard entry: a bundle still
+/// unresolved after this long warrants a loud, once-per-entry
+/// warning — the status API may be lying about it, or it is ancient
+/// history. Time alone never releases the hold: every release goes
+/// through the shared resolver (chain evidence only, `Landed` or
+/// `Dead`), and an entry that cannot resolve holds resends until the
+/// restart re-resolves it via [`LiveTrader::seed_sell_guard`] on
+/// fresh queries. Sized well past blockhash validity (~60-90s), so a
+/// normal resolution needs no alarm at all.
 pub const SELL_GUARD_TTL_SECS: u64 = 3_600;
 /// Resolver poll deadline for guard checks: one-shot, so a guard
 /// check never blocks the exit path waiting for votes.
@@ -650,9 +650,9 @@ pub struct LiveTrader {
     vol_extra_cap_bps: u64,
     /// Last sell bundle per mint (resend guard: never compete with an
     /// inflight prior bundle for the same bag). Entries are resolved by
-    /// [`LiveTrader::prior_sell_state`] before every release; only the
-    /// [`SELL_GUARD_TTL_SECS`] bound releases without proof, so a lying
-    /// status API cannot hold resends forever.
+    /// [`LiveTrader::prior_sell_state`] before every release;
+    /// [`SELL_GUARD_TTL_SECS`] only triggers a warn-once alarm — time
+    /// alone never releases a hold, chain evidence does.
     last_sell_bundle: std::sync::Arc<std::sync::Mutex<HashMap<String, SellGuard>>>,
     /// One recheck round at a time.
     recheck_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -670,8 +670,11 @@ struct SellGuard {
     /// Dispatch blockhash (base58) for the expiry proof. `None` on
     /// legacy traces, same caveat as `signature`.
     blockhash: Option<String>,
-    /// Dispatch stamp for the TTL release.
+    /// Dispatch stamp (alarm threshold origin).
     noted_at: u64,
+    /// Set when the TTL alarm has already warned: the next urgent
+    /// warning would be nursemaid noise, so it warns once per entry.
+    expiry_warned: bool,
 }
 
 /// Prior-sell resolution for the resend guard (policy vocabulary).
@@ -894,6 +897,7 @@ impl LiveTrader {
                         signature: Some(receipt.signature.clone()),
                         blockhash: Some(receipt.blockhash.to_string()),
                         noted_at: now_secs(),
+                        expiry_warned: false,
                     },
                 );
             } else {
@@ -925,7 +929,8 @@ impl LiveTrader {
         }
     }
 
-    /// True when a guard entry outlived its TTL (pure, unit-pinned).
+    /// True when a guard entry passed its TTL alarm threshold (pure,
+    /// unit-pinned). An alarm trigger warns once; it never releases.
     fn sell_guard_expired(noted_at_secs: u64, now_secs: u64) -> bool {
         now_secs.saturating_sub(noted_at_secs) >= SELL_GUARD_TTL_SECS
     }
@@ -962,8 +967,8 @@ impl LiveTrader {
     /// Seed the resend guard from WAL-replayed sell traces. A landed
     /// prior is surfaced loudly and NOT seeded (the bag may already be
     /// sold: a hold would only strand the exit); an unresolved one
-    /// holds until it resolves. The TTL runs from the dispatch stamp,
-    /// not from boot. Returns the kept count.
+    /// holds until it resolves. The alarm threshold runs from the
+    /// dispatch stamp, not from boot. Returns the kept count.
     pub async fn seed_sell_guard(&self, items: Vec<wal::WalSellPending>) -> usize {
         let mut kept = 0usize;
         for item in items {
@@ -972,6 +977,7 @@ impl LiveTrader {
                 signature: item.signature.clone(),
                 blockhash: item.blockhash.clone(),
                 noted_at: item.ts,
+                expiry_warned: false,
             };
             let (mint, bundle_id) = (item.mint.clone(), item.bundle_id.clone());
             match self.prior_sell_state(&entry).await {
@@ -991,23 +997,30 @@ impl LiveTrader {
         kept
     }
 
-    /// True when the last sell bundle for `mint` may still land:
-    /// resends must wait under the same cooldown, never compete with it.
-    /// [`prior_sell_state`] carries the evidence rules; the TTL is the
-    /// only evidence-free release, and it is loud.
+    /// True while the last sell bundle for `mint` may still land:
+    /// resends must wait under the same cooldown, never compete with
+    /// it. [`prior_sell_state`] carries the evidence rules; the only
+    /// releases are its terminal verdicts (`Landed` or `Dead`) — an
+    /// unresolvable entry holds until restart re-resolves it, and the
+    /// TTL threshold only adds a loud warn-once alarm on the way.
     pub(crate) async fn prior_sell_pending(&self, mint: &str) -> bool {
         let entry = match self.last_sell_bundle.lock() {
             Ok(guard) => guard.get(mint).cloned(),
             Err(_) => None,
         };
         let Some(entry) = entry else { return false };
-        if Self::sell_guard_expired(entry.noted_at, now_secs()) {
-            if let Ok(mut guard) = self.last_sell_bundle.lock() {
-                guard.remove(mint);
+        // TTL alarm: past the threshold an hour of silence means the
+        // status API may be lying (or the entry is ancient history).
+        // Warn once per entry — time is not evidence, so the hold
+        // itself stays until chain proof or a restart re-resolution.
+        if Self::sell_guard_expired(entry.noted_at, now_secs()) && !entry.expiry_warned {
+            if let Ok(mut guard) = self.last_sell_bundle.lock()
+                && let Some(live) = guard.get_mut(mint)
+            {
+                live.expiry_warned = true;
             }
             tracing::warn!(%mint, bundle = %entry.bundle_id, signature = ?entry.signature,
-                "resend guard expired (TTL); prior sell unresolved for an hour — releasing resend, inspect the bundle on explorer");
-            return false;
+                "resend guard silent past TTL; prior sell still unresolved after an hour — status API may be lying; hold continues until chain proof (inspect the bundle on explorer)");
         }
         match self.prior_sell_state(&entry).await {
             PriorSell::Hold => true,
@@ -2136,6 +2149,7 @@ mod tests {
                 signature: Some("sig".to_string()),
                 blockhash: Some("bh".to_string()),
                 noted_at: 1_000,
+                expiry_warned: false,
             },
         );
         assert!(

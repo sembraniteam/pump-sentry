@@ -232,6 +232,28 @@ fn no_status_text(reason: &str) -> String {
     )
 }
 
+/// Shared `/sell` gate core (pure, test-pinned): the rejection text for
+/// a stale book or a stopped daemon, `None` when the gate passes. The
+/// stale check comes first so callers can classify outcomes by whether
+/// the text contains "Status is": a stale book means "control refuses
+/// a stale state", a stopped daemon means "noting would consume the
+/// request". Both directions fail closed (doc §6).
+fn sell_gate_text(ts: u64, now: u64, daemon_alive: bool) -> Option<String> {
+    let age = now.saturating_sub(ts);
+    if age > STALE_WARN_SECS {
+        return Some(format!(
+            "⚠ Status is {age}s old (limit {STALE_WARN_SECS}s) — the bot may be down. Control refuses a stale book: no action taken."
+        ));
+    }
+    if !daemon_alive {
+        return Some(
+            "No daemon running — a sell request would sit unread. Start the bot first. No action taken."
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Full `/heartbeat` answer: the exact production card (text fallback
 /// + embed) with the trailing-file freshness note.
 ///
@@ -1332,23 +1354,30 @@ impl Sidecar {
         })
     }
 
-    /// Fresh trailing file or refusal: control acts on the book, so a
-    /// stale book is a hard stop (doc §6 fail closed). `/pause` skips
-    /// this (safe direction, marker semantics need no book). Boxed
-    /// error: the message payload is large (clippy `result_large_err`).
-    fn fresh_report(&self) -> Result<StatusReport, Box<Answer>> {
-        match status::read(&status::status_path()) {
-            Ok(report) if now_secs().saturating_sub(report.ts) <= STALE_WARN_SECS => Ok(report),
-            Ok(report) => Err(Box::new(Answer {
-                message: CreateInteractionResponseMessage::new()
-                    .ephemeral(true)
-                    .content(truncate_content(&format!(
-                        "⚠ Status is {}s old (limit {STALE_WARN_SECS}s) — the bot may be down. Control refuses a stale book: no action taken.",
-                        now_secs().saturating_sub(report.ts)
-                    ))),
-            })),
-            Err(re) => Err(Box::new(self.no_data(&re))),
+    /// Shared `/sell` gate: fresh book, running daemon, and a known
+    /// mint. Runs at arm time AND again at Confirm time — up to
+    /// `CONFIRM_TTL_SECS` elapse between the two, and arm validation
+    /// is not execution (TOCTOU): the click re-checks the same facts
+    /// before anything is queued. The error carries the operator text
+    /// plus an audit outcome tag.
+    fn sell_gate(&self) -> Result<StatusReport, (String, &'static str)> {
+        let report = match status::read(&status::status_path()) {
+            Ok(report) => report,
+            Err(re) => {
+                return Err((no_status_text(&re.to_string()), "denied_no_status"));
+            }
+        };
+        let (pid_file, _) = crate::cli::resolve_paths();
+        let daemon = crate::cli::running_daemon(&pid_file).is_some();
+        if let Some(text) = sell_gate_text(report.ts, now_secs(), daemon) {
+            let tag = if text.contains("Status is") {
+                "denied_stale_status"
+            } else {
+                "denied_no_daemon"
+            };
+            return Err((text, tag));
         }
+        Ok(report)
     }
 
     /// Reap expired confirm entries (every issue and every click use
@@ -1445,36 +1474,24 @@ impl Sidecar {
                     .content(format!("`{mint}` is not a base58 pubkey. No action taken.")),
             };
         }
-        let report = match self.fresh_report() {
-            Ok(r) => r,
-            Err(answer) => {
+        let report = match self.sell_gate() {
+            Ok(report) => report,
+            Err((text, tag)) => {
                 audit(
                     user_id,
                     &user_name,
                     self.guild_id.get(),
                     SELL_COMMAND,
                     &mint,
-                    "denied_stale_status",
+                    tag,
                 );
-                return *answer;
+                return Answer {
+                    message: CreateInteractionResponseMessage::new()
+                        .ephemeral(true)
+                        .content(truncate_content(&text)),
+                };
             }
         };
-        let (pid_file, _) = crate::cli::resolve_paths();
-        if crate::cli::running_daemon(&pid_file).is_none() {
-            audit(
-                user_id,
-                &user_name,
-                self.guild_id.get(),
-                SELL_COMMAND,
-                &mint,
-                "denied_no_daemon",
-            );
-            return Answer {
-                message: CreateInteractionResponseMessage::new()
-                    .ephemeral(true)
-                    .content("No daemon running — a sell request would sit unread. Start the bot first. No action taken."),
-            };
-        }
         let detail = match find_mint(&report, &mint) {
             MintRef::Open(i) => {
                 let p = &report.positions[i];
@@ -1729,6 +1746,41 @@ impl Sidecar {
     ) -> String {
         match action {
             PendingAction::Sell { mint } => {
+                // Click-time re-validation: up to CONFIRM_TTL_SECS
+                // (5 min) elapse between arm and confirm. The book may
+                // have gone stale, the daemon may have stopped, and
+                // the mint may have left the lists in that window.
+                // Arm validation is not execution (TOCTOU) — re-run
+                // the same gate before queuing anything.
+                let report = match self.sell_gate() {
+                    Ok(report) => report,
+                    Err((text, tag)) => {
+                        let confirm_tag = tag.replacen("denied_", "confirm_denied_", 1);
+                        audit(
+                            user_id,
+                            user_name,
+                            guild_id,
+                            SELL_COMMAND,
+                            &mint,
+                            &confirm_tag,
+                        );
+                        return format!("Sell confirm lapsed: {text}");
+                    }
+                };
+                if matches!(find_mint(&report, &mint), MintRef::Unknown) {
+                    audit(
+                        user_id,
+                        user_name,
+                        guild_id,
+                        SELL_COMMAND,
+                        &mint,
+                        "denied_unknown_mint",
+                    );
+                    return format!(
+                        "`{}` is in no book list (open, bags, diverged, pending). Unknown mint: no action taken.",
+                        short_mint(&mint)
+                    );
+                }
                 let (_, log_file) = crate::cli::resolve_paths();
                 match crate::cli::queue_sell_request_at(&log_file, &mint) {
                     Ok(path) => {
@@ -2353,6 +2405,35 @@ mod tests {
         let text = no_status_text("No such file or directory");
         assert!(text.contains("No readable on-disk status"));
         assert!(text.contains("Nothing to report, no action taken."));
+    }
+
+    #[test]
+    fn sell_gate_text_passes_fresh_with_daemon() {
+        let now = 1_000_000;
+        assert_eq!(sell_gate_text(now - 5, now, true), None);
+        // The stale limit is inclusive: exactly STALE_WARN_SECS passes.
+        assert_eq!(sell_gate_text(now - STALE_WARN_SECS, now, true), None);
+    }
+
+    #[test]
+    fn sell_gate_text_refuses_stale_book_first() {
+        let now = 1_000_000;
+        let text = sell_gate_text(now - STALE_WARN_SECS - 1, now, true).expect("stale refusal");
+        assert!(text.contains("Status is "), "reporter age code: {text}");
+        assert!(text.contains("no action taken."));
+        // Stale takes precedence over the daemon check: the message
+        // must be the stale one even when the daemon is also gone.
+        let both = sell_gate_text(now - STALE_WARN_SECS - 1, now, false).expect("stale refusal");
+        assert!(both.contains("Status is "), "stale wins: {both}");
+        assert!(!both.contains("daemon"));
+    }
+
+    #[test]
+    fn sell_gate_text_refuses_daemon_down() {
+        let now = 1_000_000;
+        let text = sell_gate_text(now - 5, now, false).expect("daemon refusal");
+        assert!(text.contains("No daemon running"));
+        assert!(text.contains("No action taken."));
     }
 
     #[test]
@@ -3247,11 +3328,36 @@ mod tests {
     impl AuditScenario {
         fn new(_tag: &str) -> Self {
             let dir = tempfile::tempdir().expect("tmpdir");
-            let env = crate::test_env::scoped(&[(
-                "LOG_FILE",
-                Some(dir.path().join("bot.log").to_str().expect("utf8")),
-            )]);
+            let env = crate::test_env::scoped(&[
+                (
+                    "LOG_FILE",
+                    Some(dir.path().join("bot.log").to_str().expect("utf8")),
+                ),
+                (
+                    "PID_FILE",
+                    Some(dir.path().join("bot.pid").to_str().expect("utf8")),
+                ),
+            ]);
             Self { _env: env, dir }
+        }
+
+        /// A fresh status file plus a running-daemon pid entry (the
+        /// test process itself is alive), so the shared `/sell` gate
+        /// passes end-to-end. `manual_mint`, when given, lands in the
+        /// book's bag list so `find_mint` knows it.
+        fn seed_gate(&self, manual_mint: Option<&str>) {
+            let mut report = fixture_report(now_secs());
+            if let Some(m) = manual_mint {
+                report.manual_mints = vec![m.to_string()];
+            }
+            status::write(&status::status_path(), &report).expect("status");
+            let (pid_file, _) = crate::cli::resolve_paths();
+            let info = crate::cli::PidInfo {
+                pid: std::process::id(),
+                live: true,
+                started_at: now_secs(),
+            };
+            crate::cli::write_private_file(&pid_file, info.to_json().as_bytes()).expect("pid file");
         }
 
         fn audit_file(&self) -> std::path::PathBuf {
@@ -3328,6 +3434,7 @@ mod tests {
         // writable audit file. The reply names the gap loudly.
         let sc = AuditScenario::new("sell-audit-fail");
         sc.block_audit();
+        sc.seed_gate(Some("11111111111111111111111111111111"));
         let sidecar = sidecar();
         let text = sidecar
             .execute_confirmed(
