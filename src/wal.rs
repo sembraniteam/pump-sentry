@@ -173,6 +173,18 @@ pub enum WalLine {
         #[serde(default)]
         ts: Option<u64>,
     },
+    /// Tracked bag handed from the exit path into the manual notes
+    /// (park-for-manual). Retires the tracked claim, so every parked
+    /// bag replays with exactly ONE claim (AUD-002): the tracked line
+    /// would otherwise stack beside the manual note and read as
+    /// double custody. Older binaries skip the unknown tag (counted);
+    /// the manual claim keeps the custody whole in both directions.
+    TakePosition {
+        mint: String,
+        amount: u64,
+        #[serde(default)]
+        ts: Option<u64>,
+    },
     /// Schema stamp, written once per boot. Carries NO custody: it is
     /// provenance for versioning/forensics. Old binaries skip unknown
     /// tags (counted in `skipped`, never half-adopted) so the stamp is
@@ -435,6 +447,17 @@ pub fn replay_lines<'a>(lines: impl Iterator<Item = &'a str>) -> WalReplay {
                         entry.position.amount_tokens.saturating_sub(amount);
                     if entry.position.amount_tokens == 0 {
                         manual.remove(&mint);
+                    }
+                }
+            }
+            WalLine::TakePosition { mint, amount, .. } => {
+                // The parked manual note is the bag's claim now; the
+                // tracked line it replaces must not replay beside it
+                // (AUD-002: one claim per held bag).
+                if let Some(pos) = positions.get_mut(&mint) {
+                    pos.amount_tokens = pos.amount_tokens.saturating_sub(amount);
+                    if pos.amount_tokens == 0 {
+                        positions.remove(&mint);
                     }
                 }
             }
@@ -775,6 +798,84 @@ mod tests {
         let replay = replay_lines([pending.as_str()].iter().copied());
         assert_eq!(replay.pending.len(), 1, "claim of record survives");
         assert!(replay.positions.is_empty() && replay.manual.is_empty());
+    }
+
+    #[test]
+    fn parked_from_tracked_bags_claim_exactly_once() {
+        // AUD-002, park side: handing a tracked bag into the manual
+        // notes retires the tracked claim, so a parked bag replays with
+        // exactly ONE claim (chains of boots never stack, the custody
+        // recheck never reads a double count side).
+        let park = vec![
+            format!(
+                r#"{{"t":"position","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":1000,"creator":null,"bundle":"B1","ts":1}}"#
+            ),
+            manual_line(1_000, "sell-retries-exhausted"),
+            format!(r#"{{"t":"take_position","mint":"{TMINT}","amount":1000,"ts":3}}"#),
+        ];
+        let replay = replay_lines(park.iter().map(String::as_str));
+        assert!(replay.positions.is_empty(), "tracked claim retired at park");
+        assert_eq!(replay.manual.len(), 1);
+        assert_eq!(replay.manual[0].position.amount_tokens, 1_000);
+
+        // Resurrection (AUD-002, take side): the durable tracked claim
+        // happens BEFORE the manual claim retires — a crash at any
+        // point replays the manual bag or the tracked claim, never
+        // neither. Then the eventual settled sale clears everything.
+        let resurrect = [
+            park.clone(),
+            vec![
+                format!(
+                    r#"{{"t":"position","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":1000,"creator":null,"bundle":null,"ts":4}}"#
+                ),
+                format!(r#"{{"t":"take_manual","mint":"{TMINT}","amount":1000,"ts":5}}"#),
+            ],
+        ]
+        .concat();
+        let crash_windows = (
+            &resurrect[..1 + park.len()],
+            &resurrect[..2 + park.len()],
+            &resurrect[..],
+        );
+        let (before_position, before_take_manual, all) = crash_windows;
+        let replay = replay_lines(before_position.iter().map(|s| s.as_str()));
+        assert_eq!(replay.manual.len(), 1, "crash pre-claim: manual bag kept");
+        let replay = replay_lines(before_take_manual.iter().map(|s| s.as_str()));
+        assert_eq!(
+            replay.positions.len(),
+            1,
+            "crash mid-claim: tracked bag kept"
+        );
+        let replay = replay_lines(all.iter().map(String::as_str));
+        assert_eq!(replay.positions.len(), 1, "settled claim: tracked bag");
+        assert!(replay.manual.is_empty(), "settled claim: manual retired");
+        // And the eventual sell clears the tracked claim exactly once.
+        let mut sold = all.to_vec();
+        sold.push(sell_line(TMINT, 1_000, "B2"));
+        let replay = replay_lines(sold.iter().map(String::as_str));
+        assert!(
+            replay.positions.is_empty() && replay.manual.is_empty(),
+            "one claim, one sale, zero ghosts"
+        );
+    }
+
+    #[test]
+    fn legacy_parked_double_claim_still_nets_clean() {
+        // Legacy files carry both the tracked claim and the manual note
+        // for the same bag (the old park order). TakeManual clears the
+        // manual side; the eventual Sell clears the tracked side — one
+        // custody, zero ghosts, across any crash point.
+        let lines = [
+            format!(
+                r#"{{"t":"position","mint":"{TMINT}","curve":"{TCURVE}","assoc":"{TASSOC}","amount":1000,"creator":null,"bundle":"B1","ts":1}}"#
+            ),
+            manual_line(1_000, "sell-retries-exhausted"),
+            format!(r#"{{"t":"take_manual","mint":"{TMINT}","amount":1000,"ts":3}}"#),
+            sell_line(TMINT, 1_000, "B2"),
+        ];
+        let replay = replay_lines(lines.iter().map(String::as_str));
+        assert!(replay.positions.is_empty());
+        assert!(replay.manual.is_empty());
     }
 
     #[test]

@@ -527,6 +527,18 @@ impl WalSink for StubLive {
         self.inner.wal_events.lock().expect("lock").push("manual");
     }
 
+    async fn record_position(&self, _position: &LivePosition) {
+        self.inner.wal_events.lock().expect("lock").push("position");
+    }
+
+    async fn take_position(&self, _position: &LivePosition) {
+        self.inner
+            .wal_events
+            .lock()
+            .expect("lock")
+            .push("take-position");
+    }
+
     async fn record_sell(&self, _mint: &str, _amount_tokens: u64, _bundle_id: &str) {
         self.inner.wal_events.lock().expect("lock").push("sell");
     }
@@ -4845,6 +4857,54 @@ async fn manual_sell_exits_parked_manual_bag() {
     assert_eq!(live.sells(), vec![(sys.to_string(), 1_000)]);
     assert!(pipe.exec.live_manual.lock().await.is_empty());
     assert!(pipe.exec.live_positions.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn manual_sell_resurrection_writes_the_new_claim_before_retiring_the_old() {
+    // AUD-002: resurrecting a parked bag appends the durable tracked
+    // claim (`record_position`) BEFORE `unrecord_manual` retires the
+    // parked claim of record, and inserts the tracked bag last. A
+    // crash at any point replays the manual bag or the tracked claim
+    // (or both, resolved at boot), never neither.
+    let sys = "11111111111111111111111111111111";
+    let live = StubLive::working();
+    live.inner.fail_sells.store(true, Ordering::Relaxed);
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        StubReserves::with_tick(tick(sys, 2.0)),
+        funded(),
+        StubScreener::passing(),
+        Some(live.clone()),
+    );
+    pipe.exec.live_manual.lock().await.insert(
+        sys.to_string(),
+        LivePosition {
+            mint: pk(sys),
+            curve: pk(CURVE),
+            assoc_curve: pk(ASSOC),
+            amount_tokens: 1_000,
+            creator: None,
+            entry_usd_per_token: 0.0,
+        },
+    );
+    assert!(
+        !pipe.manual_sell(sys).await,
+        "the failing sell keeps the request (custody still held)"
+    );
+    let events = live.wal_events();
+    assert!(
+        events
+            .iter()
+            .position(|e| *e == "position")
+            .zip(events.iter().position(|e| *e == "take-manual"))
+            .is_some_and(|(p, t)| p < t),
+        "the tracked claim is durable before the parked claim retires: {events:?}"
+    );
+    assert!(
+        !pipe.exec.live_positions.lock().await.is_empty(),
+        "the bag stays tracked after the failed sell"
+    );
 }
 
 #[tokio::test]

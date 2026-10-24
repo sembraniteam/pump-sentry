@@ -1708,10 +1708,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         L: LiveSink,
     {
         self.exec.reset_retry(mint).await;
-        if let Some(held) = self.exec.tracked(mint).await {
-            trader.record_manual(&held, "sell-retries-exhausted").await;
-        }
         if let Some(held) = self.exec.remove_tracked(mint).await {
+            // WAL first (AUD-002 WAL-before-ack): the parked manual
+            // bag's claim is durable before the tracked claim it
+            // replaces retires, so a crash at any point replays either
+            // one, never neither — a parked bag claims exactly once.
+            trader.record_manual(&held, "sell-retries-exhausted").await;
+            trader.take_position(&held).await;
             self.exec.park_manual(mint.to_string(), held).await;
         }
         self.exec.note_giveup(now).await;
@@ -2101,6 +2104,11 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             warn!(%mint, amount = held.amount_tokens, "manual sell resurrects a parked bag for explicit exit");
             if let Some(trader) = self.exec.live.as_ref() {
+                // WAL before ack (AUD-002): the durable tracked claim
+                // happens before the parked claim is retired. A crash
+                // at any point replays the manual bag or the tracked
+                // claim (or both, resolved at boot), never neither.
+                trader.record_position(&held).await;
                 trader.unrecord_manual(&held).await;
             }
             self.exec.insert_tracked(held).await;
@@ -2228,6 +2236,10 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                         break;
                     };
                     if let Some(trader) = self.exec.live.as_ref() {
+                        // Same WAL-before-ack order as the primary
+                        // resurrection (AUD-002): the tracked claim is
+                        // durable before the parked claim retires.
+                        trader.record_position(&held).await;
                         trader.unrecord_manual(&held).await;
                     }
                     self.exec.insert_tracked(held).await;

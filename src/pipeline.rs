@@ -195,6 +195,16 @@ pub trait WalSink {
     /// Record a manual bag (call BEFORE parking).
     async fn record_manual(&self, position: &LivePosition, note: &str);
 
+    /// Record a durable tracked claim with no bundle attribution: a
+    /// parked manual bag being resurrected for a tracked exit. Call
+    /// BEFORE `unrecord_manual` (AUD-002, WAL-before-ack).
+    async fn record_position(&self, position: &LivePosition);
+
+    /// Retire the tracked claim of a bag handed from the exit path into
+    /// the manual notes, so every parked bag replays with one claim
+    /// (AUD-002). Call AFTER the manual claim is durable.
+    async fn take_position(&self, position: &LivePosition);
+
     /// Record a sell (call BEFORE subtracting).
     async fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str);
 
@@ -294,6 +304,14 @@ impl WalSink for LiveTrader {
 
     async fn record_manual(&self, position: &LivePosition, note: &str) {
         LiveTrader::record_manual(self, position, note).await
+    }
+
+    async fn record_position(&self, position: &LivePosition) {
+        LiveTrader::record_position(self, position).await
+    }
+
+    async fn take_position(&self, position: &LivePosition) {
+        LiveTrader::take_position(self, position).await
     }
 
     async fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {

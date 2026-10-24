@@ -1671,6 +1671,41 @@ impl LiveTrader {
         .await;
     }
 
+    /// Record a durable tracked claim without a bundle attribution: a
+    /// parked manual bag being resurrected for a tracked exit (AUD-002,
+    /// WAL-before-ack). Call BEFORE `unrecord_manual`: a crash at any
+    /// point replays the manual bag or this claim, never neither.
+    pub async fn record_position(&self, position: &LivePosition) {
+        self.wal_record(&wal::WalLine::Position {
+            mint: position.mint.to_string(),
+            curve: position.curve.to_string(),
+            assoc: position.assoc_curve.to_string(),
+            amount: position.amount_tokens,
+            creator: position.creator.as_ref().map(|c| c.to_string()),
+            bundle: None,
+            ts: Some(now_secs()),
+            entry_usd: option_entry_usd(position.entry_usd_per_token),
+        })
+        .await;
+    }
+
+    /// Retire the tracked claim of a bag handed from the exit path into
+    /// the manual notes (park-for-manual) so every parked bag replays
+    /// with exactly ONE claim (AUD-002). Call AFTER the manual claim is
+    /// durable; skipped on a degraded WAL — a failed write must never
+    /// retire a claim (the double claim is resolved at boot instead).
+    pub async fn take_position(&self, position: &LivePosition) {
+        if self.wal_degraded() {
+            return;
+        }
+        self.wal_record(&wal::WalLine::TakePosition {
+            mint: position.mint.to_string(),
+            amount: position.amount_tokens,
+            ts: Some(now_secs()),
+        })
+        .await;
+    }
+
     /// Record a confirmed sell.
     pub async fn record_sell(&self, mint: &str, amount_tokens: u64, bundle_id: &str) {
         self.wal_record(&wal::WalLine::Sell {
