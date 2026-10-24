@@ -965,6 +965,92 @@ fn dead_engine() -> Option<RiskEngine> {
 }
 
 #[tokio::test]
+async fn second_gate_round_carries_a_live_tape_velocity() {
+    // AUD-003: the stored tape point must persist across observed
+    // rounds. Round 1 sees two distinct buyers (Wait); its point is
+    // written back to the map; the confirm round's velocity_delta is
+    // then `Some`, computed against round 1 (never a permanent null).
+    // The journal Open snapshot carries the same non-null velocity.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let journal_path = dir.path().join("journal.jsonl");
+    let sys = "11111111111111111111111111111111";
+    let screener = StubScreener::with_swaps(sys, buyer_swaps(sys, &[11, 12]));
+    let reserves = StubReserves::with_tick(tick(sys, 2.0));
+    let pipe = pipeline_screened(
+        Settings::from_map(&HashMap::new()),
+        AuditOutcome::Allow(100),
+        reserves,
+        funded(),
+        screener.clone(),
+        None,
+    );
+    pipe.with_journal(Arc::new(JournalSink::open(&journal_path).expect("journal")));
+    pipe.on_launch(&LaunchRequest {
+        mint: sys,
+        curve: CURVE,
+        assoc_curve: ASSOC,
+        dev: &dev_wallet(),
+        creator: None,
+        name: "TestToken",
+        symbol: "TEST",
+        slot: 5000,
+    })
+    .await;
+    pipe.poll_gates().await;
+    let point = pipe
+        .gate_state
+        .lock()
+        .await
+        .meta
+        .get(sys)
+        .and_then(|s| s.prev_tape)
+        .expect("round 1 persists its tape point");
+    assert_eq!(
+        point.buys, 2,
+        "the stored point is round 1's own observed set"
+    );
+    // Round 2: three more distinct buyers (11 already in the cohort),
+    // crossing the 5-buyer quorum. The window swap set differs, so the
+    // confirm's velocity compares the two rounds.
+    let round2 = buyer_swaps(sys, &[11, 13, 14, 15]);
+    *screener
+        .inner
+        .swaps
+        .lock()
+        .expect("lock")
+        .get_mut(sys)
+        .expect("round 2 swaps") = round2;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    pipe.poll_gates().await;
+    assert_eq!(
+        pipe.portfolio.lock().await.position_ids().len(),
+        1,
+        "confirmed"
+    );
+    let raw = std::fs::read_to_string(&journal_path).expect("journal");
+    let velocity = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<JournalLine>(l).ok())
+        .filter_map(|line| match line {
+            JournalLine::Open { micro, .. } => micro,
+            _ => None,
+        })
+        .next()
+        .and_then(|m| m.velocity_delta);
+    assert!(
+        velocity.is_some_and(|v| v > 0.0 && v < 4.0),
+        "the confirm's velocity is computed from round 1's persisted point: {velocity:?}"
+    );
+    // A confirmed round's entry leaves the map (the defer rewatch path
+    // inserts its own); nothing to double-count here.
+    let confirm_left_the_map = !pipe.gate_state.lock().await.meta.contains_key(sys);
+    assert!(
+        confirm_left_the_map,
+        "the confirm removes the map entry; a defer rewatch would reinsert one"
+    );
+}
+
+#[tokio::test]
 async fn engined_fallback_still_opens() {
     // Engine present but down: confirm falls back to heuristic and
     // opens — entries must not halt when the model does. Default

@@ -238,8 +238,11 @@ pub struct PendingSignal {
     /// first; audit retries never re-stamp it.
     pub intake_secs: u64,
     /// Previous round's tape point (observe time + buy records) for
-    /// microstructure velocity. Updated every observed round; the
-    /// confirm reads it, never a re-stamped audit time.
+    /// microstructure velocity. Written back to the map on every
+    /// observed waiting round (AUD-003: a local-only write here left
+    /// `velocity_delta` null forever); the confirm reads the stored
+    /// point, never a re-stamped audit time. A defer rewatch inserts
+    /// the confirmed round's local point as the fresh window's start.
     pub prev_tape: Option<TapePoint>,
     /// Confirm-level risk defers taken under the `defer` policy
     /// (inference failed and the decision was postponed). Counts on
@@ -693,7 +696,19 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                                 state.meta.remove(&mint);
                                 GateStep::Aborted(reason)
                             }
-                            GateOutcome::Wait => GateStep::Waiting,
+                            GateOutcome::Wait => {
+                                // AUD-003: persist this round's tape point
+                                // so the NEXT round's velocity compares
+                                // against it. Field-level write only (no
+                                // insert): a concurrently-advanced
+                                // watermark is not clobbered and a
+                                // removed/relaunched entry is never
+                                // resurrected here.
+                                if let Some(entry) = state.meta.get_mut(&mint) {
+                                    entry.prev_tape = signal.prev_tape;
+                                }
+                                GateStep::Waiting
+                            }
                         }
                     }
                 }
