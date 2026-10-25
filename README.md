@@ -40,7 +40,7 @@ Pipeline: `logsSubscribe` → RugCheck audit → dev screen → buyer quorum →
 | `pump-sentry init-config`  | write the default `config.toml` (`CONFIG_FILE` overrides path) |
 | `pump-sentry replay [file]` | re-derive recorded decisions offline from `journal.jsonl`; exit 1 on any mismatch/unverifiable step |
 | `pump-sentry research [file]` | offline loss-pattern analysis over the journal: loss clusters plus ranked filter proposals with avoided-vs-foregone math and halves; read-only by construction |
-| `pump-sentry discord` | run the Discord sidecar (separate process): Tier 1 read-only slash commands (`/status`, `/heartbeat`, `/positions`, `/pnl`, `/watchlist`, `/config`), Tier 3 read-only analysis (`/research`, `/risk`, `/token`) plus Tier 2 allowlisted control (`/sell`, `/pause` direct, `/resume` with button confirm); writes only the existing control files, never trades itself; needs `DISCORD_BOT_TOKEN` and a `discord.toml` (`guild_id` + `operator_ids`), takes no lock |
+| `pump-sentry discord` | run the Discord sidecar (separate process): detached with its own `discord.log` by default (`--foreground` attaches; `--stop` stops it; `--status` reports). Tier 1 read-only slash commands (`/status`, `/heartbeat`, `/positions`, `/pnl`, `/watchlist`, `/config`), Tier 3 read-only analysis (`/research`, `/risk`, `/token`) plus Tier 2 allowlisted control (`/sell`, `/pause` direct, `/resume` with button confirm); writes only the existing control files, never trades itself; every reply renders embed-only; needs `DISCORD_BOT_TOKEN` and a `discord.toml` (`guild_id` + `operator_ids`), takes no lock |
 
 State lives in `~/.pump-sentry/` (`bot.log`, `bot.pid`, `bot.lock`, sell requests, WAL, day-state, kill-switch marker, snapshots); `LOG_FILE`/`PID_FILE` override it, and the exclusive `bot.lock` (flock) refuses a second process on the same state dir before it reads config or custody. Long runs need `ops/logrotate/pump-sentry`.
 
@@ -212,6 +212,16 @@ operator_ids = [111111111111111111]  # Tier 2 allowlist (/sell, /pause, /resume)
 ```
 
 Unknown keys are a boot error; `guild_id = 0` is refused. Token stays in env/file (`DISCORD_BOT_TOKEN[_FILE]`), never in this file.
+
+`pump-sentry discord` backgrounds itself by default: detached, pid record at
+`~/.pump-sentry/discord.pid`, gateway log appended to `~/.pump-sentry/discord.log`
+(owner-only, separate from `bot.log`; the audit file stays
+`discord-audit.jsonl`). `--foreground` runs attached for debugging,
+`--stop` SIGTERMs the background instance (SIGKILL after the grace),
+`--status` reports liveness. Every Discord message — panel, refusal,
+confirm prompt, trading card — renders as an embed only (no plain-text
+fallback on the wire; oversized embeds degrade to a description-only
+embed preserving the full text, truncated at Discord's limits).
 
 ## Going live
 

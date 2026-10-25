@@ -499,7 +499,17 @@ impl Settings {
                         "{label} identifies cluster '{c}' while MAINNET_RPC_URL is unidentifiable; verify it serves the same cluster as the primary",
                     ));
                 }
-                _ => {} // same cluster, or neither end identifies (warned below)
+                (Some(_), None) => {
+                    warns.push(format!(
+                        "{label} does not identify a cluster while MAINNET_RPC_URL does: a read failover could silently switch data sources (cross-cluster state breaks pricing/decisions); verify it serves the same cluster as the primary",
+                    ));
+                }
+                (None, None) => {
+                    warns.push(format!(
+                        "{label} and MAINNET_RPC_URL are both cluster-unidentifiable: a cross-cluster fallback would pass with no signal; verify both serve the same cluster",
+                    ));
+                }
+                _ => {} // same cluster
             }
         }
 
@@ -745,6 +755,18 @@ impl Settings {
     /// (drops candidates, truncates quorum, rate limits).
     pub fn on_public_rpc_default(&self) -> bool {
         same_endpoint(&self.http_url, listener::types::DEFAULT_HTTP_RPC_URL)
+    }
+
+    /// Live boot gate: fallback entries spelling the shipped public
+    /// default (same spelling tolerance as the primary check). A paid
+    /// primary must not silently shed live reads onto the refused
+    /// default after an attempt failure.
+    pub fn public_default_fallbacks(&self) -> Vec<String> {
+        self.fallback_rpc_urls
+            .iter()
+            .filter(|url| same_endpoint(url, listener::types::DEFAULT_HTTP_RPC_URL))
+            .cloned()
+            .collect()
     }
 
     /// Typed slippage guard (`None` when >=100% or unrepresentable).
@@ -1367,6 +1389,60 @@ mod tests {
         ]));
         let (fatals, _) = s.endpoint_trust(false);
         assert!(fatals.is_empty(), "{fatals:?}");
+    }
+
+    #[test]
+    fn opaque_fallback_arms_warn_instead_of_silence() {
+        // (Some(mainnet), opaque): the arm used to be fully silent.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            ("MAINNET_RPC_URLS_FALLBACK", "https://reads.example.com"),
+        ]));
+        let (fatals, warns) = s.endpoint_trust(false);
+        assert!(fatals.is_empty(), "{fatals:?}");
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("MAINNET_RPC_URLS_FALLBACK[0]")
+                    && w.contains("does not identify a cluster")),
+            "an opaque fallback beside an identified primary must warn: {warns:?}"
+        );
+        // (None, None): both ends unidentifiable — still a warn, never
+        // a refusal on its own.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://reads.example.com"),
+            ("MAINNET_RPC_URLS_FALLBACK", "https://more.example.com"),
+        ]));
+        let (fatals, warns) = s.endpoint_trust(false);
+        assert!(fatals.is_empty(), "{fatals:?}");
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("both cluster-unidentifiable")),
+            "a fully opaque pair must warn: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn public_default_fallback_detection_matches_spellings() {
+        // Spelling tolerance: trailing slash / case / default port.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://paid.example.com/v1"),
+            (
+                "MAINNET_RPC_URLS_FALLBACK",
+                "https://paid2.example.com,HTTPS://api.mainnet-beta.solana.com:443/",
+            ),
+        ]));
+        assert!(!s.on_public_rpc_default());
+        let hits = s.public_default_fallbacks();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].contains("api.mainnet-beta.solana.com"));
+        // Clean fallbacks: no hits.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "https://paid.example.com/v1"),
+            ("MAINNET_RPC_URLS_FALLBACK", "https://paid2.example.com"),
+        ]));
+        assert!(s.public_default_fallbacks().is_empty());
     }
 
     #[test]

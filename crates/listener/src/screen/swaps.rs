@@ -115,8 +115,12 @@ pub fn extract_pump_swaps(
             // Exact-spend buys carry (spend, min_out). Use min_out.
             (SwapSide::Buy, IDX_SWAP_V3_USER, 16)
         } else {
-            // Unmapped ix: `create`/`migrate` ignored.
-            // Rest recorded on first account for the dev rule.
+            // Unmapped ix: `create`/`migrate` ignored. The rest is
+            // recorded once per account: the gate aborts when ANY
+            // record names a watched insider, so first-account-only
+            // attribution must not hide a dev at a deep trader slot.
+            // Stranger records never count toward quorum and never
+            // abort, so per-account emission adds no false confirms.
             if raw.starts_with(&PUMP_CREATE_DISCRIMINATOR)
                 || raw.starts_with(&PUMP_CREATE_V2_DISCRIMINATOR)
                 || raw.starts_with(&PUMP_MIGRATE_DISCRIMINATOR)
@@ -124,19 +128,23 @@ pub fn extract_pump_swaps(
             {
                 return;
             }
-            let Some(wallet) = accounts
-                .first()
-                .and_then(|idx| keys.get(usize::from(*idx)).copied())
-            else {
+            let mut emitted = false;
+            for idx in accounts.iter() {
+                let Some(wallet) = keys.get(usize::from(*idx)).copied() else {
+                    continue;
+                };
+                out.push(SwapRecord {
+                    signature: sig.to_string(),
+                    slot: fetched.slot,
+                    wallet,
+                    side: SwapSide::Unknown,
+                    amount_base_units: 0,
+                });
+                emitted = true;
+            }
+            if !emitted {
                 return;
-            };
-            out.push(SwapRecord {
-                signature: sig.to_string(),
-                slot: fetched.slot,
-                wallet,
-                side: SwapSide::Unknown,
-                amount_base_units: 0,
-            });
+            }
             return;
         };
         let Some(account) = accounts.get(user_idx) else {

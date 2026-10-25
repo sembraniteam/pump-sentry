@@ -1,6 +1,7 @@
 //! Supervisor CLI. Every call needs a subcommand; else usage plus nonzero exit.
 
 use std::io::Write;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 /// State dir. `None` when `HOME` is unset.
@@ -96,7 +97,10 @@ Commands:
   sell <mint>             Queue a manual full exit for one mint now
   pause                   Kill switch: halt new entries (open positions keep managing)
   resume                  Clear the kill switch (entries may open again)
-  discord                 Run the Discord sidecar (read-only slash commands; needs DISCORD_BOT_TOKEN)
+  discord [flags]         Run the Discord sidecar detached (default) with its
+                          own discord.log + pid record; --foreground attaches
+                          to the terminal, --stop stops it, --status reports.
+                          Needs DISCORD_BOT_TOKEN.
   replay [file]           Re-derive recorded decisions offline + paper/live metrics
                           (default journal: journal.jsonl next to the log)
   research [file]         Offline loss-pattern analysis + filter proposals (read-only)
@@ -153,10 +157,13 @@ pub enum CliAction {
     Pause,
     /// Clear the kill switch.
     Resume,
-    /// Run the Discord sidecar (foreground; Ctrl-C stops it).
+    /// Run the Discord sidecar. Default (`Detach`): spawn detached
+    /// with its own `discord.log` + pid record. `--foreground` runs
+    /// attached to the terminal; `--stop` stops the detached sidecar
+    /// (SIGTERM then SIGKILL); `--status` reports liveness.
     /// Read-only gateway process: answers slash commands from on-disk
     /// state; never trades and never holds custody.
-    Discord,
+    Discord { mode: DiscordMode },
     /// Re-derive recorded decisions offline; paper vs live metrics.
     Replay { file: Option<String> },
     /// Offline loss-pattern analysis over the journal (read-only).
@@ -168,6 +175,20 @@ pub enum CliAction {
 /// True when `--live` or `IS_LIVE=true` is set.
 pub fn live_flag(args: &[String]) -> bool {
     args.iter().any(|a| a == "--live") || std::env::var("IS_LIVE").is_ok_and(|v| v == "true")
+}
+
+/// Sidecar foreground/background selection.
+/// `Detach` is the default: background + separate `discord.log`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordMode {
+    /// Spawn detached with its own log/pid (default).
+    Detach,
+    /// Foreground execution (also the sidecar child's own action).
+    Foreground,
+    /// Stop the detached sidecar.
+    Stop,
+    /// Report sidecar liveness.
+    Status,
 }
 
 /// Parse argv. Unknown or missing becomes `Help` with a cause.
@@ -203,7 +224,32 @@ pub fn parse_cli(args: &[String]) -> CliAction {
         },
         "pause" => CliAction::Pause,
         "resume" => CliAction::Resume,
-        "discord" => CliAction::Discord,
+        "discord" => {
+            let mut mode: Option<DiscordMode> = None;
+            for flag in &args[2..] {
+                let next = match flag.as_str() {
+                    "--foreground" | "--fg" => DiscordMode::Foreground,
+                    "--stop" => DiscordMode::Stop,
+                    "--status" => DiscordMode::Status,
+                    _ => {
+                        return CliAction::Help {
+                            error: Some(format!(
+                                "unknown option '{flag}' for `discord` (expected --foreground/--stop/--status)."
+                            )),
+                        };
+                    }
+                };
+                if mode.is_some_and(|m| m != next) {
+                    return CliAction::Help {
+                        error: Some("`discord` takes at most one lifecycle flag.".to_string()),
+                    };
+                }
+                mode = Some(next);
+            }
+            CliAction::Discord {
+                mode: mode.unwrap_or(DiscordMode::Detach),
+            }
+        }
         "replay" => CliAction::Replay {
             file: args.get(2).cloned().filter(|f| !f.is_empty() && f != "-"),
         },
@@ -265,6 +311,24 @@ pub fn resolve_paths() -> (PathBuf, PathBuf) {
     (pid, log)
 }
 
+/// Sidecar log file name (beside the trader's log, never `bot.log`):
+/// a detached sidecar owns this file's stdout, nothing else writes it.
+pub const DISCORD_LOG_FILE: &str = "discord.log";
+/// Sidecar pid record (beside the trader's pid, same PidInfo shape).
+pub const DISCORD_PID_FILE: &str = "discord.pid";
+
+/// Sidecar log path: beside the trader's log (`discord.log`).
+pub fn discord_log_path() -> PathBuf {
+    let (_, log_file) = resolve_paths();
+    state_file_beside_log(&log_file, DISCORD_LOG_FILE)
+}
+
+/// Sidecar pid path: beside the trader's pid (`discord.pid`).
+pub fn discord_pid_path() -> PathBuf {
+    let (_, log_file) = resolve_paths();
+    state_file_beside_log(&log_file, DISCORD_PID_FILE)
+}
+
 /// Expand leading `~/` against `HOME`.
 fn expand_tilde(s: &str) -> PathBuf {
     let rest = s.strip_prefix("~/").or_else(|| (s == "~").then_some(""));
@@ -321,10 +385,81 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// Recorded daemon, if still alive.
+/// Recorded daemon, if still alive. A live pid behind a stale
+/// record (kernel start time differs from the recorded `started_at`)
+/// reads as no daemon: every caller then follows its stale-record
+/// cleanup path instead of wedging on a recycled pid.
 pub fn running_daemon(pid_file: &Path) -> Option<PidInfo> {
     let info = read_pid_file(pid_file)?;
-    process_alive(info.pid).then_some(info)
+    (process_alive(info.pid) && pid_record_fresh(&info)).then_some(info)
+}
+
+/// Max skew tolerated between the recorded `started_at` and the kernel
+/// process start time: registration runs in the same second as spawn,
+/// but a slow boot must not self-invalidate. A recycled pid lands
+/// minutes-to-days away, so seconds of slack cost nothing.
+pub const PID_START_SKEW_SECS: u64 = 5;
+
+/// True when the record plausibly names this pid: the kernel start
+/// time matches the recorded `started_at`, or the platform cannot tell
+/// (residual pid-reuse risk, reported by the caller).
+pub fn pid_record_fresh(info: &PidInfo) -> bool {
+    match pid_started_at(info.pid) {
+        Some(t) => t.abs_diff(info.started_at) <= PID_START_SKEW_SECS,
+        None => true,
+    }
+}
+
+/// Kernel-reported start time of `pid` (unix seconds), when the
+/// platform exposes it.
+#[cfg(target_os = "macos")]
+fn pid_started_at(pid: u32) -> Option<u64> {
+    // SAFETY: proc_pidinfo fills a caller-owned buffer and returns
+    // bytes written (0 on failure). No pointers outlive the call.
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let n = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        );
+        if n <= 0 {
+            return None;
+        }
+        (info.pbi_start_tvsec != 0).then_some(info.pbi_start_tvsec)
+    }
+}
+
+/// Kernel-reported start time of `pid` (unix seconds): boot time plus
+/// the process age in clock ticks.
+#[cfg(target_os = "linux")]
+fn pid_started_at(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm may contain spaces/parens: fields start after the last ')'.
+    let after = stat.rsplit(')').next()?;
+    // Field 22 (starttime, ticks since boot) is the 20th token here:
+    // state ppid pgrp session tty tpgid flags minflt cminflt majflt
+    // cmajflt utime stime cutime cstime priority nice threads
+    // itrealvalue starttime.
+    let start_ticks: u64 = after.split_whitespace().nth(19)?.parse().ok()?;
+    let btime: u64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime ").and_then(|v| v.trim().parse().ok()))?;
+    // SAFETY: sysconf with _SC_CLK_TCK only reads a constant.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 {
+        return None;
+    }
+    Some(btime.saturating_add(start_ticks / ticks as u64))
+}
+
+/// Platforms without a pid→start-time facility: unprovable.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn pid_started_at(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Start-lock path (serializes `start`). Distinct from the
@@ -735,20 +870,18 @@ pub fn cmd_start(live: bool, invocation: &str) -> ! {
     // Rotate a huge log before the child inherits the fd.
     rotate_log_if_huge(&log_file);
     // Owner-only log from the first byte.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if std::fs::metadata(&log_file).is_ok() {
-            let _ = std::fs::set_permissions(&log_file, std::fs::Permissions::from_mode(0o600));
-        } else {
-            if let Some(parent) = log_file.parent().filter(|d| !d.as_os_str().is_empty()) {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = write_private_file(&log_file, b"");
-        }
-    }
+    prepare_private_log(&log_file);
     let first_run = !log_file.metadata().is_ok_and(|m| m.len() > 0);
-    match spawn_background(&log_file, live, invocation, first_run) {
+    let mut child_args = vec!["run".to_string()];
+    if live {
+        child_args.push("--live".to_string());
+    }
+    let env_kv = format!(
+        "BOT_DAEMON=1 BOT_INVOCATION={} BOT_FIRST_RUN={}",
+        sh_quote(invocation),
+        if first_run { "1" } else { "0" },
+    );
+    match spawn_background(&log_file, &child_args, &env_kv) {
         Ok(pid) => {
             let info = PidInfo {
                 pid,
@@ -821,6 +954,18 @@ pub fn stop_daemon() -> i32 {
         let _ = std::fs::remove_file(&pid_file);
         println!(
             "bot is not running (pid {} is dead; pid file cleaned).",
+            info.pid
+        );
+        return 0;
+    }
+    // Stale-record guard: a live pid whose kernel start time does not
+    // match the recorded `started_at` is a recycled pid, not the
+    // daemon. Clean it the same way a dead pid is cleaned — signaling
+    // it would hit an unrelated process.
+    if !pid_record_fresh(&info) {
+        let _ = std::fs::remove_file(&pid_file);
+        eprintln!(
+            "bot is not running (pid {} is a recycled pid: kernel start time differs from the recorded daemon; pid file cleaned).",
             info.pid
         );
         return 0;
@@ -902,6 +1047,190 @@ pub fn cmd_restart(live: bool) -> ! {
     }
     std::thread::sleep(std::time::Duration::from_millis(RESTART_PAUSE_MS));
     cmd_start(live, "restart");
+}
+
+/// `discord` (default): refuse a second sidecar, then spawn detached
+/// `discord --foreground` with its own `discord.log` and pid record,
+/// health-gated exactly like `start` (a bad `discord.toml` must die
+/// loudly at boot, not phantom-run). No state-dir lock and no pid-file
+/// coupling with the trader: the sidecar takes no lock and the two
+/// processes live and die independently.
+pub fn cmd_discord_detach() -> ! {
+    let pid_file = discord_pid_path();
+    let log = discord_log_path();
+    if let Some(info) = running_daemon(&pid_file) {
+        eprintln!(
+            "discord sidecar is already running (pid {}). Use `discord --stop` first.",
+            info.pid
+        );
+        std::process::exit(1);
+    }
+    // Clear stale pid files for a clean `--status`.
+    if pid_file.exists() {
+        let _ = std::fs::remove_file(&pid_file);
+    }
+    rotate_log_if_huge(&log);
+    prepare_private_log(&log);
+    let child_args = vec!["discord".to_string(), "--foreground".to_string()];
+    match spawn_background(&log, &child_args, "BOT_DAEMON=1") {
+        Ok(pid) => {
+            let info = PidInfo {
+                pid,
+                live: false,
+                started_at: unix_secs(),
+            };
+            if let Err(e) = write_private_file(&pid_file, info.to_json().as_bytes()) {
+                eprintln!("warning: pid recorded but pid file write failed: {e}");
+            }
+            // Health gate: bad configs exit within seconds.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            if !process_alive(pid) {
+                let _ = std::fs::remove_file(&pid_file);
+                eprintln!(
+                    "discord sidecar died within 3s (token, config, or network). Last log lines:"
+                );
+                match tail_lines(&log, 15) {
+                    Ok(tail) => {
+                        for line in tail {
+                            eprintln!("  {line}");
+                        }
+                    }
+                    Err(e) => eprintln!("  (log unreadable: {e})"),
+                }
+                std::process::exit(1);
+            }
+            println!(
+                "discord sidecar started in the background (pid {pid}, log {})",
+                log.display()
+            );
+            println!("stop with `discord --stop`; status with `discord --status`.");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("failed to start discord sidecar: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `discord --stop`: SIGTERM, wait, SIGKILL on timeout. No drain: the
+/// gateway has nothing to flush (state files are the other process's;
+/// the audit file is append-per-line).
+pub fn cmd_discord_stop() -> i32 {
+    let pid_file = discord_pid_path();
+    let Some(info) = read_pid_file(&pid_file) else {
+        println!("discord sidecar is not running (no pid file).");
+        return 0;
+    };
+    if !process_alive(info.pid) {
+        let _ = std::fs::remove_file(&pid_file);
+        println!(
+            "discord sidecar is not running (pid {} is dead; pid file cleaned).",
+            info.pid
+        );
+        return 0;
+    }
+    // Same stale-record guard as `stop`: a recycled pid is cleaned,
+    // never signalled.
+    if !pid_record_fresh(&info) {
+        let _ = std::fs::remove_file(&pid_file);
+        eprintln!(
+            "discord sidecar is not running (pid {} is a recycled pid: kernel start time differs from the recorded sidecar; pid file cleaned).",
+            info.pid
+        );
+        return 0;
+    }
+    // Same pid-reuse guard as `stop`: a recycled pid must never take a
+    // signal meant for the sidecar.
+    match pid_is_our_binary(info.pid) {
+        Some(false) => {
+            eprintln!(
+                "refusing to signal pid {}: it is not positively this binary (executable path mismatch; possible pid reuse).",
+                info.pid
+            );
+            return 1;
+        }
+        Some(true) => {}
+        None => {
+            eprintln!(
+                "warning: cannot verify pid {} is pump-sentry on this platform; a reused pid could be signalled instead (residual risk)",
+                info.pid
+            );
+        }
+    }
+    println!("stopping discord sidecar (pid {})...", info.pid);
+    #[cfg(unix)]
+    {
+        // SAFETY: plain signal send; absence handled by the poll loop.
+        unsafe {
+            libc::kill(info.pid as libc::pid_t, libc::SIGTERM);
+        }
+        let rounds = STOP_GRACE_SECS * 1000 / STOP_POLL_MS;
+        for _ in 0..rounds {
+            if !process_alive(info.pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(STOP_POLL_MS));
+        }
+        if process_alive(info.pid) {
+            eprintln!("discord sidecar did not stop within {STOP_GRACE_SECS}s; SIGKILL...");
+            unsafe {
+                libc::kill(info.pid as libc::pid_t, libc::SIGKILL);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(SIGKILL_SETTLE_MS));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        eprintln!("stop is only fully supported on unix; remove the pid file manually.");
+    }
+    let stopped = !process_alive(info.pid);
+    if stopped {
+        let _ = std::fs::remove_file(&pid_file);
+        append_log_line(
+            &discord_log_path(),
+            &format!(
+                "=== discord sidecar stopped at unix_ts={} (pid {}) ===",
+                unix_secs(),
+                info.pid
+            ),
+        );
+        println!("discord sidecar stopped.");
+        0
+    } else {
+        eprintln!("failed to stop pid {}; inspect manually.", info.pid);
+        1
+    }
+}
+
+/// `discord --status`: one line on sidecar liveness.
+pub fn cmd_discord_status() -> ! {
+    let pid_file = discord_pid_path();
+    let log = discord_log_path();
+    match running_daemon(&pid_file) {
+        Some(info) => {
+            println!(
+                "discord sidecar running (pid {}, started unix_ts={}, log {})",
+                info.pid,
+                info.started_at,
+                log.display()
+            );
+            std::process::exit(0);
+        }
+        None => {
+            if let Some(stale) = read_pid_file(&pid_file) {
+                let _ = std::fs::remove_file(&pid_file);
+                println!(
+                    "discord sidecar stopped (stale pid {} cleaned; log {})",
+                    stale.pid,
+                    log.display()
+                );
+            } else {
+                println!("discord sidecar stopped (log {})", log.display());
+            }
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `status`: one line on liveness.
@@ -1472,19 +1801,39 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
     };
     let sha = curl_fetch(&format!("{base}/{asset}.sha256")).ok();
     let dir = std::env::temp_dir().join(format!("pump-upgrade-{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("cannot stage upgrade: {e}");
+    // Exclusive, owner-only staging: `create_dir` (not `create_dir_all`)
+    // refuses a pre-existing directory, so another local user on a
+    // shared $TMPDIR cannot plant the path ahead of us and swap bytes
+    // after verification. Adopting a foreign directory would make the
+    // checksum gate below meaningless.
+    if let Err(e) = std::fs::create_dir(&dir) {
+        eprintln!(
+            "refusing to stage upgrade: staging path {} pre-exists or cannot be created ({e}); refusing to install into a directory we did not exclusively create",
+            dir.display()
+        );
         std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+            eprintln!("cannot lock staging dir to 0700: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::process::exit(1);
+        }
     }
     let tgz = dir.join(&asset);
     if let Err(e) = std::fs::write(&tgz, &bytes) {
         eprintln!("cannot stage upgrade: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
         std::process::exit(1);
     }
     // Verified installs only by default: an unverified binary
     // replaces the running bot, so `--allow-unverified` must be an
-    // explicit operator override, never silent acceptance.
-    let verified = match sha.as_deref() {
+    // explicit operator override, never silent acceptance. `want` keeps
+    // the verified digest so the staged bytes can be re-checked
+    // immediately before install.
+    let want: Option<String> = match sha.as_deref() {
         Some(body) => {
             let want = String::from_utf8_lossy(body)
                 .split_whitespace()
@@ -1493,7 +1842,7 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
                 .to_ascii_lowercase();
             if want.len() != 64 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
                 eprintln!("checksum file malformed; cannot verify");
-                false
+                None
             } else {
                 match sha256_of_file(&tgz) {
                     Some(have) if have != want => {
@@ -1501,19 +1850,20 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
                         let _ = std::fs::remove_dir_all(&dir);
                         std::process::exit(1);
                     }
-                    Some(_) => true,
+                    Some(_) => Some(want),
                     None => {
                         eprintln!("no sha256 tool; cannot verify");
-                        false
+                        None
                     }
                 }
             }
         }
         None => {
             eprintln!("no checksum file published; cannot verify");
-            false
+            None
         }
     };
+    let verified = want.is_some();
     if !verified && !allow_unverified {
         eprintln!(
             "refusing to install unverified binary (retry with --allow-unverified to override)"
@@ -1555,6 +1905,19 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
         eprintln!("archive has no pump-sentry binary");
         let _ = std::fs::remove_dir_all(&dir);
         std::process::exit(1);
+    }
+    // Re-verify the staged bytes immediately before install: anything
+    // swapped into the staging dir after the first verification
+    // refuses instead of installing.
+    if let Some(want) = &want {
+        match sha256_of_file(&tgz) {
+            Some(have) if have == *want => {}
+            _ => {
+                eprintln!("staged archive changed after verification; refusing to install");
+                let _ = std::fs::remove_dir_all(&dir);
+                std::process::exit(1);
+            }
+        }
     }
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -1643,29 +2006,41 @@ fn sha256_via_tools(
     None
 }
 
-/// Spawn detached `run`, returning the daemon pid.
-fn spawn_background(
-    log: &Path,
-    live: bool,
-    invocation: &str,
-    first_run: bool,
-) -> std::io::Result<u32> {
+/// Owner-only log file from the first byte: mkdir parent, then chmod
+/// an existing file or create an empty 0600 one.
+fn prepare_private_log(log: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(log).is_ok() {
+            let _ = std::fs::set_permissions(log, std::fs::Permissions::from_mode(0o600));
+        } else {
+            if let Some(parent) = log.parent().filter(|d| !d.as_os_str().is_empty()) {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = write_private_file(log, b"");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = log;
+    }
+}
+
+/// Spawn detached `child_args` with `env_kv` as the sh `VAR=v` prelude
+/// (`BOT_DAEMON=1` and friends), stdout+stderr appended to `log`.
+/// Returns the detached child's pid.
+fn spawn_background(log: &Path, child_args: &[String], env_kv: &str) -> std::io::Result<u32> {
     if let Some(parent) = log.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
     let exe = std::env::current_exe()?;
-    let mut child_args = vec!["run".to_string()];
-    if live {
-        child_args.push("--live".to_string());
-    }
     #[cfg(unix)]
     {
         let script = format!(
-            "BOT_DAEMON=1 BOT_INVOCATION={} BOT_FIRST_RUN={} nohup {} {} >> {} 2>&1 & echo $!",
-            sh_quote(invocation),
-            if first_run { "1" } else { "0" },
+            "{env_kv} nohup {} {} >> {} 2>&1 & echo $!",
             sh_quote(&exe.to_string_lossy()),
             child_args
                 .iter()
@@ -1758,6 +2133,46 @@ mod tests {
                 follow: true
             }
         );
+        // `discord` defaults to Detach; one lifecycle flag each; two
+        // conflicting flags or an unknown option refuse with a Help.
+        assert_eq!(
+            parse_cli(&argv(&["bot", "discord"])),
+            CliAction::Discord {
+                mode: DiscordMode::Detach
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["bot", "discord", "--foreground"])),
+            CliAction::Discord {
+                mode: DiscordMode::Foreground
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["bot", "discord", "--fg"])),
+            CliAction::Discord {
+                mode: DiscordMode::Foreground
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["bot", "discord", "--stop"])),
+            CliAction::Discord {
+                mode: DiscordMode::Stop
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["bot", "discord", "--status"])),
+            CliAction::Discord {
+                mode: DiscordMode::Status
+            }
+        );
+        assert!(matches!(
+            parse_cli(&argv(&["bot", "discord", "--stop", "--fg"])),
+            CliAction::Help { error: Some(_) }
+        ));
+        assert!(matches!(
+            parse_cli(&argv(&["bot", "discord", "--daemon"])),
+            CliAction::Help { error: Some(_) }
+        ));
         assert_eq!(
             parse_cli(&argv(&["bot", "help"])),
             CliAction::Help { error: None }
@@ -2188,6 +2603,60 @@ mod tests {
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn pid_record_fresh_matches_this_process_and_rejects_ancient_record() {
+        // Kernel start-time check: our own fresh record passes; an
+        // ancient record naming our live pid fails (the recycled-pid
+        // wedge). Skipped where the platform exposes no start time.
+        let me = std::process::id();
+        if pid_started_at(me).is_none() {
+            return;
+        }
+        assert!(pid_record_fresh(&PidInfo {
+            pid: me,
+            live: false,
+            started_at: unix_secs()
+        }));
+        assert!(!pid_record_fresh(&PidInfo {
+            pid: me,
+            live: false,
+            started_at: 1
+        }));
+    }
+
+    #[test]
+    fn running_daemon_ignores_a_stale_live_pid_record() {
+        // A live pid behind a mismatched started_at reads as no daemon,
+        // so start/status/upgrade follow stale-cleanup instead of
+        // wedging. Skipped where the platform exposes no start time.
+        if pid_started_at(std::process::id()).is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "cli-pid-fresh-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pid_file = dir.join("bot.pid");
+        let stale = PidInfo {
+            pid: std::process::id(),
+            live: false,
+            started_at: 1,
+        };
+        std::fs::write(&pid_file, stale.to_json()).expect("stale record");
+        assert!(
+            running_daemon(&pid_file).is_none(),
+            "stale live-pid record must not read as a daemon"
+        );
+        register_running(false, &pid_file);
+        assert!(
+            running_daemon(&pid_file).is_some(),
+            "fresh record for this process reads as a daemon"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

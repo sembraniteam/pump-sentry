@@ -69,21 +69,49 @@ fn main() {
         // The sidecar needs the token captured in this sync phase
         // (before any thread), then its own runtime: a gateway
         // connection, unlike the aux commands below, runs forever.
-        cli::CliAction::Discord => {
-            let Some(token) = alert::capture_bot_token() else {
-                eprintln!(
-                    "Discord sidecar refusing to start: {} (or {}_FILE) is not set — the sidecar owns the Discord connection, so it cannot run tokenless",
-                    alert::DISCORD_BOT_TOKEN_ENV,
-                    alert::DISCORD_BOT_TOKEN_ENV
-                );
-                std::process::exit(1);
-            };
-            // Indirect to keep the failure exit code the caller's.
-            if let Err(e) = discord_sidecar::run(token) {
-                eprintln!("Discord sidecar stopping: {e}");
-                std::process::exit(1);
+        cli::CliAction::Discord { mode } => match mode {
+            cli::DiscordMode::Detach => {
+                // Refuse BEFORE detaching: a backgrounding attempt must
+                // fail fast in the caller's terminal, not via the
+                // child's health-gate tail alone.
+                if alert::capture_bot_token().is_none() {
+                    eprintln!(
+                        "Discord sidecar refusing to start: {} (or {}_FILE) is not set — the sidecar owns the Discord connection, so it cannot run tokenless",
+                        alert::DISCORD_BOT_TOKEN_ENV,
+                        alert::DISCORD_BOT_TOKEN_ENV
+                    );
+                    std::process::exit(1);
+                }
+                // Indirect to keep the failure exit code the caller's.
+                cli::cmd_discord_detach();
             }
-        }
+            cli::DiscordMode::Stop => std::process::exit(cli::cmd_discord_stop()),
+            cli::DiscordMode::Status => cli::cmd_discord_status(),
+            cli::DiscordMode::Foreground => {
+                let Some(token) = alert::capture_bot_token() else {
+                    eprintln!(
+                        "Discord sidecar refusing to start: {} (or {}_FILE) is not set — the sidecar owns the Discord connection, so it cannot run tokenless",
+                        alert::DISCORD_BOT_TOKEN_ENV,
+                        alert::DISCORD_BOT_TOKEN_ENV
+                    );
+                    std::process::exit(1);
+                };
+                // Scrub the rest of the secret environment now that the
+                // token is captured: the sidecar is a long-lived
+                // gateway process and must not carry SOLANA_PRIVATE_KEY,
+                // INFERENCE_API_KEY, api-key RPC URLs, or
+                // YELLOWSTONE_TOKEN in its environment for its whole
+                // lifetime (same rule as the trader sync boot below).
+                // Still pre-thread: nothing has spawned yet.
+                scrub_secret_env();
+                init_logging();
+                // Indirect to keep the failure exit code the caller's.
+                if let Err(e) = discord_sidecar::run(token) {
+                    eprintln!("Discord sidecar stopping: {e}");
+                    std::process::exit(1);
+                }
+            }
+        },
         cli::CliAction::Replay { file } => aux_runtime().block_on(replay::cmd_replay(file)),
         cli::CliAction::Research { file } => aux_runtime().block_on(research::cmd_research(file)),
         cli::CliAction::Upgrade { allow_unverified } => cli::cmd_upgrade(allow_unverified),
@@ -171,17 +199,11 @@ fn paper_fee_bps(settings: &Settings) -> f64 {
     settings.fee().map_or(0.0, |bps| f64::from(bps.get()))
 }
 
-/// Synchronous boot phase, then the async pipeline. Every environment
-/// read-and-scrub, the config load, and the wallet load happen here —
-/// before the Tokio runtime spawns worker threads (env is process-
-/// global and not thread-safe; `remove_var` after thread spawn is UB
-/// territory under Rust 2024) and before any state file is read (two
-/// processes must never share a state dir). Returns normally on a
-/// clean shutdown so destructors run (the journal flushes its queue).
-fn run_binary(live_arg: bool) {
-    // Must run before TLS: dual providers panic on auto-detect.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
+/// Tracing init shared by every long-running path (`run`, the daemon
+/// child, and the sidecar child): stdout, ANSI only on an attached
+/// terminal (detached children carry `BOT_DAEMON=1`, so the
+/// redirected log file stays escape-free).
+fn init_logging() {
     let daemon = std::env::var("BOT_DAEMON").is_ok_and(|v| v == "1");
     tracing_subscriber::fmt()
         .with_target(false)
@@ -191,6 +213,20 @@ fn run_binary(live_arg: bool) {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,pump_sentry=debug")),
         )
         .init();
+}
+
+/// Synchronous boot phase, then the async pipeline. Every environment
+/// read-and-scrub, the config load, and the wallet load happen here —
+/// before the Tokio runtime spawns worker threads (env is process-
+/// global and not thread-safe; `remove_var` after thread spawn is UB
+/// territory under Rust 2024) and before any state file is read (two
+/// processes must never share a state dir). Stops the process on a
+/// clean shutdown so destructors run (the journal flushes its queue).
+fn run_binary(live_arg: bool) {
+    // Must run before TLS: dual providers panic on auto-detect.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    init_logging();
 
     // One process per state dir, before anything else reads state
     // (config, secrets, WAL, day-state). A second `run`/daemon on the
@@ -1049,9 +1085,12 @@ async fn run_pipeline(boot: Boot) {
         // Endpoint trust — remote cleartext endpoints and
         // cross-cluster fallbacks never back live reads/dispatch (the
         // override, set + logged, downgrades a flagged fallback).
-        let (fatals, _) = settings.endpoint_trust(
+        let (fatals, override_warns) = settings.endpoint_trust(
             std::env::var("ALLOW_FALLBACK_CLUSTER_MISMATCH").is_ok_and(|v| v == "1" || v == "true"),
         );
+        for warn in &override_warns {
+            warn!("{warn}");
+        }
         for fatal in &fatals {
             eprintln!("live mode refuses to start: {fatal}");
         }
@@ -1073,6 +1112,22 @@ async fn run_pipeline(boot: Boot) {
         if settings.on_public_rpc_default() {
             warn!(
                 "ALLOW_PUBLIC_RPC_LIVE: live mode boots on the public RPC default; unreliable reads (missed candidates, truncated quorum, rate limits) are operator-acknowledged"
+            );
+        }
+        // The primary check above is not enough: a paid primary with
+        // the refused default hiding in the fallback list would serve
+        // live reads from it after any primary attempt failure.
+        let public_fallbacks = settings.public_default_fallbacks();
+        if !public_fallbacks.is_empty() && !public_rpc_optin {
+            eprintln!(
+                "live mode refuses a public RPC default fallback ({}): documented unfit for live reads (drops candidates, truncates quorum, rate limits). Set MAINNET_RPC_URLS_FALLBACK to paid endpoints, or ALLOW_PUBLIC_RPC_LIVE=1 to override explicitly",
+                ids::redact_endpoint(&public_fallbacks[0])
+            );
+            std::process::exit(1);
+        }
+        if !public_fallbacks.is_empty() {
+            warn!(
+                "ALLOW_PUBLIC_RPC_LIVE: live mode boots with a public RPC default fallback; unreliable failover reads (missed candidates, truncated quorum, rate limits) are operator-acknowledged"
             );
         }
         if settings.priority_fee_micro_lamports == 0 {

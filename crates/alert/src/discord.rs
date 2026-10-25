@@ -6,10 +6,11 @@
 //! (env-only, scrubbed after capture like the other bearer secrets)
 //! and never logged.
 //!
-//! Cards are the unit of delivery (docs/discord-sidecar.md §5): the
-//! plain-text rendering always rides in `content` (fallback for
-//! clients that hide embeds), and structured cards add one embed that
-//! mirrors the same fields.
+//! Cards are the unit of delivery (docs/discord-sidecar.md §5):
+//! every message is embed-only. A structured card renders in one embed
+//! that mirrors its fields; when the embed would overflow Discord's
+//! limits, the card degrades to a description-only embed carrying the
+//! same text — embed-style is the wire format, never dual text+embed.
 
 use serde::Serialize;
 use std::sync::Arc;
@@ -28,6 +29,9 @@ pub const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_INFLIGHT_ALERTS: usize = 4;
 /// Discord `content` length cap: longer cards are truncated, never split.
 pub const MAX_CONTENT_LEN: usize = 2000;
+/// Discord embed-description cap: the embed-only degradation path
+/// carries the card's text here, truncated with the same marker.
+pub const EMBED_DESCRIPTION_MAX: usize = 4096;
 
 /// Explorer deep-link roots (single source; cards reference these).
 pub const EXPLORER_ADDRESS: &str = "https://explorer.solana.com/address";
@@ -163,48 +167,74 @@ pub struct EmbedFooter {
 /// Structured embed for one card. Serialized straight into the
 /// message payload's `embeds` array (always a single element here);
 /// the sidecar re-renders it with serenity, hence public fields.
+/// Text-shaped payloads (pipeline warnings, degraded cards) ride
+/// `description` instead of the placeholder-free `content` fallback:
+/// embed-only in, embed-only out.
 #[derive(Debug, Clone, Serialize)]
 pub struct Embed {
+    /// Structured cards always carry a title; text-shaped embeds leave
+    /// it empty (skipped — Discord refuses an empty-string title).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub title: String,
     pub color: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub footer: Option<EmbedFooter>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<EmbedField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl Embed {
     /// Approximate rendered size against Discord's 6000-char total.
-    /// `false` means the card ships text-only — the `content` fallback
-    /// always delivers, the embed never breaks the send.
+    /// `false` means the card degrades to a description-only embed
+    /// (description carries the truncated text; the send never fails
+    /// on limits).
     fn fits(&self) -> bool {
         let fields: usize = self
             .fields
             .iter()
             .map(|f| f.name.len() + f.value.len() + 20)
             .sum();
-        let total = self.title.len() + self.footer.as_ref().map_or(0, |f| f.text.len()) + fields;
+        let total = self.title.len()
+            + self.footer.as_ref().map_or(0, |f| f.text.len())
+            + fields
+            + self.description.as_ref().map_or(0, |d| d.len());
         total <= EMBED_TOTAL_MAX
     }
 }
 
-/// The alert payload: plain text alone, or text plus one embed
-/// rendering the same fields. Plain strings flow through `From` and
-/// keep the pre-embed behavior.
+/// Description-only embed for text payloads (grey by convention).
+fn text_embed(description: String) -> Embed {
+    Embed {
+        title: String::new(),
+        color: COLOR_GREY,
+        url: None,
+        footer: None,
+        fields: Vec::new(),
+        description: Some(description),
+    }
+}
+
+/// The alert payload: one authored text rendering plus the single
+/// embed the wire receives (embed-only delivery). Plain strings flow
+/// through `From` and keep the plain-warning shape as an embed.
 #[derive(Debug, Clone)]
 pub struct Card {
-    /// Markdown text fallback (always sent, 2000-char capped).
+    /// The card's markdown text (logged/debug view and the degraded
+    /// embed's source text; not a wire field anymore).
     pub content: String,
-    /// Structured embed. Dropped when the payload overflows limits.
-    pub embed: Option<Embed>,
+    /// The single embed the message payload actually ships.
+    pub embed: Embed,
 }
 
 impl From<String> for Card {
     fn from(content: String) -> Self {
         Card {
-            content,
-            embed: None,
+            content: content.clone(),
+            embed: text_embed(truncate_description(&content)),
         }
     }
 }
@@ -272,7 +302,9 @@ impl CardBuilder {
         self
     }
 
-    /// Render the text fallback and clamp-checked embed.
+    /// Render the text view and the embed-only wire payload: a fitting
+    /// structured embed, or a description-only degradation carrying the
+    /// same text (never a wire failure, never a dual send).
     pub fn finish(self) -> Card {
         let content = self
             .fields
@@ -281,16 +313,26 @@ impl CardBuilder {
             .collect::<Vec<_>>()
             .join("\n");
         let content = format!("{} **[{}]**\n{content}", self.icon, self.tag);
-        let embed = {
-            let footer = self.footer.map(|text| EmbedFooter { text });
-            let embed = Embed {
-                title: self.title,
+        let footer = self.footer.map(|text| EmbedFooter { text });
+        let structured = Embed {
+            title: self.title,
+            color: self.color,
+            url: self.url,
+            footer,
+            fields: self.fields,
+            description: None,
+        };
+        let embed = if structured.fits() {
+            structured
+        } else {
+            Embed {
+                title: String::new(),
                 color: self.color,
-                url: self.url,
-                footer,
-                fields: self.fields,
-            };
-            if embed.fits() { Some(embed) } else { None }
+                url: None,
+                footer: None,
+                fields: Vec::new(),
+                description: Some(truncate_description(&content)),
+            }
         };
         Card { content, embed }
     }
@@ -341,19 +383,33 @@ fn send_url(api_base: &str, channel: &str) -> String {
     )
 }
 
-/// Truncate a card to Discord's `content` cap (pure). Truncation keeps
-/// char boundaries and marks the cut; formatters sanitize fields
-/// already, so the marker text is safe to append. Public because the
-/// sidecar applies the same cap to interaction replies.
-pub fn truncate_content(message: &str) -> String {
-    if message.len() <= MAX_CONTENT_LEN {
+/// Truncate a message at `max` chars (pure): reserve the honest
+/// `…[truncated]` marker inside the cap first (char-boundary walk on
+/// the shortened cut), so the output never exceeds `max`. Callers own
+/// sanitization, so the marker is safe to append.
+fn truncate_at(message: &str, max: usize) -> String {
+    const MARKER: &str = "…[truncated]";
+    if message.len() <= max {
         return message.to_string();
     }
-    let mut end = MAX_CONTENT_LEN;
+    let mut end = max.saturating_sub(MARKER.len());
     while !message.is_char_boundary(end) {
-        end -= 1;
+        end = end.saturating_sub(1);
     }
-    format!("{}…[truncated]", &message[..end])
+    format!("{}{}", &message[..end], MARKER)
+}
+
+/// Truncate a card/reply to Discord's `content` cap (pure). Public
+/// because callers still shape content strings with it.
+pub fn truncate_content(message: &str) -> String {
+    truncate_at(message, MAX_CONTENT_LEN)
+}
+
+/// Truncate an embed description to Discord's cap (pure). Public
+/// because the sidecar shapes interaction replies into the same
+/// embed-only shape with it.
+pub fn truncate_description(message: &str) -> String {
+    truncate_at(message, EMBED_DESCRIPTION_MAX)
 }
 
 impl Alerter {
@@ -409,20 +465,22 @@ impl Alerter {
 
     /// Send plain text as a detached task. Never blocks the caller.
     /// No token or no channel means no-op (boot logs the reason).
-    /// Excess load drops with a counter.
+    /// Excess load drops with a counter. Embed-only: the text becomes
+    /// a grey description embed, the same shape as every other send.
     pub fn send_text(&self, message: String) {
-        self.dispatch(truncate_content(&message), None);
+        self.dispatch(text_embed(truncate_description(&message)));
     }
 
-    /// Send a card as a detached task: the text fallback in `content`
-    /// plus its single embed in one POST. No token or no channel means
-    /// no-op (boot logs the reason). Excess load drops with a counter.
+    /// Send a card as a detached task: one embed, no text fallback in
+    /// the payload. No token or no channel means no-op (boot logs the
+    /// reason). Excess load drops with a counter.
     pub fn send_card(&self, card: Card) {
-        self.dispatch(truncate_content(&card.content), card.embed);
+        self.dispatch(card.embed);
     }
 
-    /// Shared delivery path: acquire a permit, POST, log-only failures.
-    fn dispatch(&self, content: String, embed: Option<Embed>) {
+    /// Shared delivery path: acquire a permit, POST one embed-only
+    /// payload, log-only failures.
+    fn dispatch(&self, embed: Embed) {
         let (Some(token), Some(channel)) = (self.token.clone(), self.channel.clone()) else {
             return;
         };
@@ -441,15 +499,16 @@ impl Alerter {
         let timeout = self.timeout;
         tokio::spawn(async move {
             let _permit = permit;
-            let mut body = serde_json::json!({ "content": content });
-            if let Some(embed) = embed {
-                // Plain serde structs: serialization cannot fail, but a
-                // defensive fallback only loses the embed, never the
-                // content.
-                if let Ok(value) = serde_json::to_value(&embed) {
-                    body["embeds"] = serde_json::Value::Array(vec![value]);
+            // Plain serde structs: serialization cannot fail, but a
+            // defensive fallback drops the card, never sends a broken
+            // payload. Embed-only: `content` never rides the wire.
+            let body = match serde_json::to_value(&embed) {
+                Ok(value) => serde_json::json!({ "embeds": [value] }),
+                Err(e) => {
+                    warn!(target: "alerting", error = %e, "embed serialization failed; card dropped");
+                    return;
                 }
-            }
+            };
             let client = reqwest::Client::new();
             let run = client
                 .post(&url)
@@ -814,7 +873,7 @@ mod tests {
         assert!(card.content.contains("-10.0%"));
         assert!(card.content.contains("explorer.solana.com/address/MINT"));
         assert!(card.content.contains("`paper · adaptive`"));
-        let embed = card.embed.expect("entry embed");
+        let embed = &card.embed;
         assert_eq!(embed.title, "Trade Opened — MINT");
         assert_eq!(embed.color, COLOR_GREEN);
         assert_eq!(
@@ -844,20 +903,14 @@ mod tests {
         assert!(win.content.contains("🎯"));
         assert!(win.content.contains("POSITION CLOSED"));
         assert!(win.content.contains("$+4.20"));
-        assert_eq!(win.embed.as_ref().expect("win").color, COLOR_GREEN);
-        assert_eq!(
-            win.embed.as_ref().expect("win").title,
-            "Position Closed — M"
-        );
+        assert_eq!(win.embed.color, COLOR_GREEN);
+        assert_eq!(win.embed.title, "Position Closed — M");
         let loss = Alerter::format_exit(&PAPER, "M", "StopLoss", -1.5, -15.0, 98.5, false);
         assert!(loss.content.contains("🛑"));
-        assert_eq!(loss.embed.as_ref().expect("loss").color, COLOR_RED);
+        assert_eq!(loss.embed.color, COLOR_RED);
         let moon = Alerter::format_exit(&PAPER, "M", "Manual", 0.0, 0.0, 100.0, true);
         assert!(moon.content.contains("MOONBAG PARTIAL EXIT"));
-        assert_eq!(
-            moon.embed.as_ref().expect("moon").title,
-            "Moonbag Partial Exit — M"
-        );
+        assert_eq!(moon.embed.title, "Moonbag Partial Exit — M");
     }
 
     #[test]
@@ -866,7 +919,7 @@ mod tests {
         assert!(card.content.contains("[POST-MIGRATION SPIKE]"));
         assert!(card.content.contains("2.0x"));
         assert!(card.content.contains("explorer.solana.com/address/M"));
-        let embed = card.embed.expect("spike embed");
+        let embed = &card.embed;
         assert_eq!(embed.color, COLOR_YELLOW);
         assert_eq!(embed.title, "Post-Migration Spike — M");
     }
@@ -917,7 +970,7 @@ mod tests {
         );
         assert!(card.content.contains("**GiveUps:** `1` in window"));
         // 19 fields: within the 25-field cap, and under the total cap.
-        let embed = card.embed.expect("heartbeat embed");
+        let embed = &card.embed;
         assert_eq!(embed.fields.len(), 19);
         assert_eq!(embed.color, COLOR_GREY);
         assert!(embed.footer.is_none());
@@ -955,7 +1008,7 @@ mod tests {
         assert!(card.content.contains("RaydiumV4"));
         assert!(card.content.contains("`AMM`"));
         assert!(card.content.contains("explorer.solana.com/tx/sig"));
-        let embed = card.embed.expect("migration embed");
+        let embed = &card.embed;
         assert_eq!(embed.color, COLOR_GREY);
         assert_eq!(
             embed.url.as_deref(),
@@ -988,7 +1041,7 @@ mod tests {
         assert!(tricky.content.contains("`AMM`"));
         // The embed carries the same sanitized values — no side channel
         // for mentions or link syntax (same predicates as the content).
-        let embed = mig.embed.expect("mig embed");
+        let embed = &mig.embed;
         assert!(
             !embed
                 .fields
@@ -1017,18 +1070,25 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_card_has_no_embed() {
+    fn plain_text_card_rides_a_description_embed() {
         let card = Card::from("raw pipeline warning".to_string());
         assert_eq!(card.content, "raw pipeline warning");
-        assert!(card.embed.is_none());
+        let embed = card.embed;
+        assert_eq!(embed.title, "");
+        assert_eq!(embed.color, COLOR_GREY);
+        assert!(embed.fields.is_empty());
+        assert_eq!(embed.description.as_deref(), Some("raw pipeline warning"));
+        // Embed-only wire: empty title must not serialize at all.
+        let value = serde_json::to_value(&embed).expect("embed serializes");
+        assert!(value.get("title").is_none());
+        assert_eq!(value["description"], "raw pipeline warning");
     }
 
     #[test]
     fn embed_serializes_into_message_shape() {
-        // The dispatch body: `content` + `embeds[0]` with plain fields.
+        // The dispatch body: exactly one `embeds` entry, no `content`.
         let card = Alerter::format_halt(&PAPER, 10.0, -12.34);
-        let embed = card.embed.expect("halt embed");
-        let value = serde_json::to_value(&embed).expect("plain struct serializes");
+        let value = serde_json::to_value(&card.embed).expect("plain struct serializes");
         assert_eq!(value["title"], "Day-Loss Halt");
         assert_eq!(value["color"], COLOR_RED);
         assert_eq!(value["footer"]["text"], "paper · adaptive");
@@ -1036,6 +1096,8 @@ mod tests {
         assert_eq!(value["fields"][0]["inline"], true);
         // No url on halt cards: the key is omitted entirely.
         assert!(value.get("url").is_none());
+        // Structured cards carry no description body.
+        assert!(value.get("description").is_none());
     }
 
     #[test]
@@ -1045,7 +1107,7 @@ mod tests {
             .field("N", "v".repeat(EMBED_FIELD_VALUE_MAX + 50))
             .field("n".repeat(EMBED_FIELD_NAME_MAX + 50), "x")
             .finish();
-        let embed = card.embed.expect("clamped embed");
+        let embed = &card.embed;
         assert_eq!(embed.fields[0].value.len(), EMBED_FIELD_VALUE_MAX); // incl. ellipsis
         assert!(embed.fields[0].value.ends_with('…'));
         assert_eq!(embed.fields[1].name.len(), EMBED_FIELD_NAME_MAX);
@@ -1054,18 +1116,25 @@ mod tests {
         for i in 0..MAX_EMBED_FIELDS + 5 {
             many = many.field(format!("f{i}"), "v");
         }
-        assert_eq!(
-            many.clone().finish().embed.expect("e").fields.len(),
-            MAX_EMBED_FIELDS
-        );
-        // Overflowing totals ship text-only: the fallback never breaks.
+        assert_eq!(many.clone().finish().embed.fields.len(), MAX_EMBED_FIELDS);
+        // Overflowing totals degrade to a description-only embed:
+        // embed-only wire, never broken sends.
         // (The title self-clamps, so drive the total through fields.)
         let mut huge = CardBuilder::new("🧪", "TEST", "Test", COLOR_GREY);
         for _ in 0..MAX_EMBED_FIELDS {
             huge = huge.field("field", "v".repeat(240));
         }
         let huge = huge.finish();
-        assert!(huge.embed.is_none());
+        // Embed-only degradation: an overflowing structured embed
+        // degrades to a description-only embed with the same palette —
+        // never removed, never sent dual.
+        assert!(huge.embed.fields.is_empty());
+        assert!(huge.embed.title.is_empty());
+        assert_eq!(huge.embed.color, COLOR_GREY);
+        let description = huge.embed.description.expect("degraded description");
+        assert!(description.contains("[TEST]"));
+        assert!(description.ends_with("…[truncated]"));
+        assert!(description.len() <= EMBED_DESCRIPTION_MAX);
         assert!(huge.content.contains("[TEST]"));
     }
 
@@ -1131,7 +1200,7 @@ mod tests {
         let long = "a".repeat(MAX_CONTENT_LEN + 10);
         let cut = truncate_content(&long);
         assert!(cut.ends_with("[truncated]"));
-        assert!(cut.len() <= MAX_CONTENT_LEN + "…[truncated]".len());
+        assert!(cut.len() <= MAX_CONTENT_LEN);
         // Multibyte boundary: never splits a char.
         let emoji = "é".repeat(MAX_CONTENT_LEN);
         let cut = truncate_content(&format!("{emoji}x"));

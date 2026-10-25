@@ -274,9 +274,13 @@ fn heartbeat_card(report: &StatusReport, now: u64) -> Card {
 }
 
 /// Turn the alert crate's embed view into a serenity embed (1:1 by
-/// intent: same title/palette/url/footer/fields).
+/// intent: same title/palette/url/footer/fields). An empty title is
+/// skipped entirely (nothing sends `title: ""`; unused in a card).
 fn embed_from(embed: &alert::discord::Embed) -> CreateEmbed {
-    let mut out = CreateEmbed::new().title(&embed.title).colour(embed.color);
+    let mut out = CreateEmbed::new().colour(embed.color);
+    if !embed.title.is_empty() {
+        out = out.title(&embed.title);
+    }
     if let Some(url) = &embed.url {
         out = out.url(url);
     }
@@ -289,6 +293,16 @@ fn embed_from(embed: &alert::discord::Embed) -> CreateEmbed {
             .iter()
             .map(|f| (f.name.as_str(), f.value.as_str(), f.inline)),
     )
+}
+
+/// Interaction-reply embed (embed-only wire, module-wide contract):
+/// the reply text rides the description at Discord's description cap,
+/// grey palette. Every answer — panel, refusal, prompt, outcome edit —
+/// renders exactly one embed and never a bare `content` string.
+fn reply_embed(body: &str) -> CreateEmbed {
+    CreateEmbed::new()
+        .colour(alert::discord::COLOR_GREY)
+        .description(alert::discord::truncate_description(body))
 }
 
 /// Money for ledger text: `$10.75`.
@@ -1346,11 +1360,11 @@ impl Sidecar {
             "denied_not_operator",
         );
         Some(Answer {
-            message: CreateInteractionResponseMessage::new()
-                .ephemeral(true)
-                .content(
+            message: CreateInteractionResponseMessage::new().ephemeral(true).embeds(vec![
+                reply_embed(
                     "Tier 2 control is allowlisted: your Discord user ID is not in `operator_ids` (`discord.toml`). No action taken.",
                 ),
+            ]),
         })
     }
 
@@ -1408,11 +1422,11 @@ impl Sidecar {
                     "confirm button refused: outstanding-confirm cap reached"
                 );
                 return Answer {
-                    message: CreateInteractionResponseMessage::new()
-                        .ephemeral(true)
-                        .content(truncate_content(&format!(
+                    message: CreateInteractionResponseMessage::new().ephemeral(true).embeds(
+                        vec![reply_embed(&format!(
                             "{detail}\n⚠ Confirm queue is full ({PENDING_CONFIRM_CAP} outstanding) — cancel or wait out an outstanding confirm first. No action armed."
-                        ))),
+                        ))],
+                    ),
                 };
             }
             map.insert(
@@ -1428,10 +1442,10 @@ impl Sidecar {
         Answer {
             message: CreateInteractionResponseMessage::new()
                 .ephemeral(true)
-                .content(truncate_content(&format!(
+                .embeds(vec![reply_embed(&format!(
                     "{detail}\nConfirm within {}m — no confirm = no-op.",
                     CONFIRM_TTL_SECS / 60
-                )))
+                ))])
                 .components(confirm_row(&nonce)),
         }
     }
@@ -1453,7 +1467,9 @@ impl Sidecar {
             return Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content("`/sell` needs a mint: `/sell mint:<address>`. No action taken."),
+                    .embeds(vec![reply_embed(
+                        "`/sell` needs a mint: `/sell mint:<address>`. No action taken.",
+                    )]),
             };
         };
         if let Some(deny) = self.operator_check(user_id, &user_name, SELL_COMMAND, &mint) {
@@ -1471,7 +1487,9 @@ impl Sidecar {
             return Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content(format!("`{mint}` is not a base58 pubkey. No action taken.")),
+                    .embeds(vec![reply_embed(&format!(
+                        "`{mint}` is not a base58 pubkey. No action taken."
+                    ))]),
             };
         }
         let report = match self.sell_gate() {
@@ -1488,7 +1506,7 @@ impl Sidecar {
                 return Answer {
                     message: CreateInteractionResponseMessage::new()
                         .ephemeral(true)
-                        .content(truncate_content(&text)),
+                        .embeds(vec![reply_embed(&text)]),
                 };
             }
         };
@@ -1534,12 +1552,12 @@ impl Sidecar {
                     "denied_unknown_mint",
                 );
                 return Answer {
-                    message: CreateInteractionResponseMessage::new()
-                        .ephemeral(true)
-                        .content(format!(
+                    message: CreateInteractionResponseMessage::new().ephemeral(true).embeds(
+                        vec![reply_embed(&format!(
                             "`{}` is in no book list (open, bags, diverged, pending). Unknown mint: no action taken.",
                             short_mint(&mint)
-                        )),
+                        ))],
+                    ),
                 };
             }
         };
@@ -1566,7 +1584,7 @@ impl Sidecar {
         Answer {
             message: CreateInteractionResponseMessage::new()
                 .ephemeral(true)
-                .content(text),
+                .embeds(vec![reply_embed(&text)]),
         }
     }
 
@@ -1631,7 +1649,9 @@ impl Sidecar {
             return Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content("Entries were not paused; nothing to resume."),
+                    .embeds(vec![reply_embed(
+                        "Entries were not paused; nothing to resume.",
+                    )]),
             };
         }
         audit(
@@ -1726,7 +1746,7 @@ impl Sidecar {
         };
         let response = CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new()
-                .content(truncate_content(&outcome_text))
+                .embeds(vec![reply_embed(&outcome_text)])
                 .components(vec![]),
         );
         if let Err(e) = comp.create_response(&ctx.http, response).await {
@@ -1886,9 +1906,9 @@ impl Sidecar {
             return Some(Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content(
+                    .embeds(vec![reply_embed(
                         "This sidecar answers only in its configured server. Nothing disclosed.",
-                    ),
+                    )]),
             });
         }
         None
@@ -1902,26 +1922,26 @@ impl Sidecar {
         let fresh = |report: &StatusReport| now.saturating_sub(report.ts) <= STALE_WARN_SECS;
         match status::read(&status::status_path()) {
             Ok(report) if fresh(&report) => Answer {
-                message: CreateInteractionResponseMessage::new()
+                message: CreateInteractionResponseMessage::new().ephemeral(true).embeds(
                     // Operator-only: the halted-breaker line can name
                     // the day figure, which the project keeps out of
                     // public channels (see the `/pnl` rule).
-                    .ephemeral(true)
-                    .content(truncate_content(&status_compact_text(&report, now))),
+                    vec![reply_embed(&status_compact_text(&report, now))],
+                ),
             },
             Ok(report) => Answer {
-                message: CreateInteractionResponseMessage::new()
-                    .ephemeral(true)
-                    .content(truncate_content(&format!(
+                message: CreateInteractionResponseMessage::new().ephemeral(true).embeds(
+                    vec![reply_embed(&format!(
                         "⚠ Status is {}s old (limit {STALE_WARN_SECS}s) — bot may be down. Last readings:\n\n{}",
                         now.saturating_sub(report.ts),
                         status_compact_text(&report, now)
-                    ))),
+                    ))],
+                ),
             },
             Err(re) => Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content(truncate_content(&no_status_text(&re.to_string()))),
+                    .embeds(vec![reply_embed(&no_status_text(&re.to_string()))]),
             },
         }
     }
@@ -1934,23 +1954,22 @@ impl Sidecar {
         let inner = status::read(&status::status_path()).map(|r| heartbeat_card(&r, now));
         match inner {
             Ok(card) => {
-                let message = match &card.embed {
-                    Some(embed) => CreateInteractionResponseMessage::new()
+                // Embed-only: the production card's structured embed
+                // carries the reply, with the content view (freshness
+                // line, staleness banner, tally caveat) riding the
+                // description instead of a bare `content` string.
+                let mut embed = embed_from(&card.embed);
+                embed = embed.description(alert::discord::truncate_description(&card.content));
+                Answer {
+                    message: CreateInteractionResponseMessage::new()
                         .ephemeral(true)
-                        .content(&card.content)
-                        .embeds(vec![embed_from(embed)]),
-                    // Reachable only if the card someday overflows its
-                    // own limits: the text fallback is the answer.
-                    None => CreateInteractionResponseMessage::new()
-                        .ephemeral(true)
-                        .content(&card.content),
-                };
-                Answer { message }
+                        .embeds(vec![embed]),
+                }
             }
             Err(re) => Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content(truncate_content(&no_status_text(&re.to_string()))),
+                    .embeds(vec![reply_embed(&no_status_text(&re.to_string()))]),
             },
         }
     }
@@ -1966,7 +1985,7 @@ impl Sidecar {
         Answer {
             message: CreateInteractionResponseMessage::new()
                 .ephemeral(true)
-                .content(truncate_content(&no_status_text(&re.to_string()))),
+                .embeds(vec![reply_embed(&no_status_text(&re.to_string()))]),
         }
     }
 
@@ -1977,7 +1996,11 @@ impl Sidecar {
             Ok(report) => Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content(with_freshness(positions_text(&report, now), &report, now)),
+                    .embeds(vec![reply_embed(&with_freshness(
+                        positions_text(&report, now),
+                        &report,
+                        now,
+                    ))]),
             },
             Err(re) => self.no_data(&re),
         }
@@ -1990,7 +2013,11 @@ impl Sidecar {
             Ok(report) => Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content(with_freshness(pnl_text(&report), &report, now)),
+                    .embeds(vec![reply_embed(&with_freshness(
+                        pnl_text(&report),
+                        &report,
+                        now,
+                    ))]),
             },
             Err(re) => self.no_data(&re),
         }
@@ -2001,7 +2028,7 @@ impl Sidecar {
         match self.read_report() {
             Ok(report) => Answer {
                 message: CreateInteractionResponseMessage::new()
-                    .content(truncate_content(&watchlist_text(&report, now))),
+                    .embeds(vec![reply_embed(&watchlist_text(&report, now))]),
             },
             Err(re) => self.no_data(&re),
         }
@@ -2011,7 +2038,7 @@ impl Sidecar {
     fn render_config(&self) -> Answer {
         Answer {
             message: CreateInteractionResponseMessage::new()
-                .content(truncate_content(&config_text())),
+                .embeds(vec![reply_embed(&config_text())]),
         }
     }
 
@@ -2046,7 +2073,7 @@ impl Sidecar {
         Answer {
             message: CreateInteractionResponseMessage::new()
                 .ephemeral(true)
-                .content(truncate_content(&text)),
+                .embeds(vec![reply_embed(&text)]),
         }
     }
 
@@ -2061,7 +2088,7 @@ impl Sidecar {
                 return Answer {
                     message: CreateInteractionResponseMessage::new()
                         .ephemeral(true)
-                        .content(truncate_content(&config_refusal(&path, &e.to_string()))),
+                        .embeds(vec![reply_embed(&config_refusal(&path, &e.to_string()))]),
                 };
             }
         };
@@ -2069,7 +2096,11 @@ impl Sidecar {
             Ok(report) => Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content(with_freshness(risk_text(&settings, &report), &report, now)),
+                    .embeds(vec![reply_embed(&with_freshness(
+                        risk_text(&settings, &report),
+                        &report,
+                        now,
+                    ))]),
             },
             Err(re) => self.no_data(&re),
         }
@@ -2084,14 +2115,18 @@ impl Sidecar {
             return Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content("`/token` needs a mint: `/token mint:<address>`. No action taken."),
+                    .embeds(vec![reply_embed(
+                        "`/token` needs a mint: `/token mint:<address>`. No action taken.",
+                    )]),
             };
         };
         if executor::parse_pubkey(&mint).is_err() {
             return Answer {
                 message: CreateInteractionResponseMessage::new()
                     .ephemeral(true)
-                    .content(format!("`{mint}` is not a base58 pubkey. No action taken.")),
+                    .embeds(vec![reply_embed(&format!(
+                        "`{mint}` is not a base58 pubkey. No action taken."
+                    ))]),
             };
         }
         match self.read_report() {
@@ -2110,7 +2145,7 @@ impl Sidecar {
                 Answer {
                     message: CreateInteractionResponseMessage::new()
                         .ephemeral(true)
-                        .content(with_freshness(text, &report, now)),
+                        .embeds(vec![reply_embed(&with_freshness(text, &report, now))]),
                 }
             }
             Err(re) => self.no_data(&re),
@@ -2444,9 +2479,8 @@ mod tests {
         // Same content the 6h alert card renders, plus freshness...
         assert!(card.content.starts_with(plain.content.as_str()));
         assert!(card.content.contains("(status age: 4s)"));
-        // ...and the same embed.
-        assert!(card.embed.is_some());
-        let embed = card.embed.expect("embed");
+        // ...and the same embed (embed-only wire: never an Option).
+        let embed = &card.embed;
         assert_eq!(embed.title, "Bot Heartbeat");
         assert_eq!(embed.fields.len(), 19);
     }
@@ -2465,9 +2499,8 @@ mod tests {
             10.0,
             "model",
         );
-        let embed = card.embed.expect("entry embed");
         // CreateEmbed serializes to the exact wire shape — assert there.
-        let shape = serde_json::to_value(embed_from(&embed)).expect("embed serializes");
+        let shape = serde_json::to_value(embed_from(&card.embed)).expect("embed serializes");
         assert_eq!(shape["title"], "Trade Opened — MINT");
         assert_eq!(shape["color"], alert::discord::COLOR_GREEN);
         assert_eq!(shape["url"], "https://explorer.solana.com/address/MINT");
@@ -3309,6 +3342,19 @@ mod tests {
 
     // ---- Tier 2 audit-failure contracts + confirm-map bounds ----
 
+    /// The embedded answer's description as text (embed-only wire:
+    /// every reply is exactly one embed; this reads its body back the
+    /// same way a client would render it).
+    fn reply_description(message: &CreateInteractionResponseMessage) -> Option<String> {
+        serde_json::to_value(message)
+            .ok()?
+            .get("embeds")?
+            .get(0)?
+            .get("description")?
+            .as_str()
+            .map(str::to_string)
+    }
+
     fn sidecar() -> Sidecar {
         Sidecar {
             guild_id: GuildId::new(1),
@@ -3511,13 +3557,10 @@ mod tests {
             }
         }
         let answer = sidecar.issue_confirm(PendingAction::Resume, "detail".to_string(), 2);
-        let content = serde_json::to_value(&answer.message)
-            .expect("message serializes")
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        assert!(content.contains("queue is full"), "{content}");
+        // Embed-only replies: the refusal text rides the description.
+        let description =
+            reply_description(&answer.message).expect("service refusal carries an embed");
+        assert!(description.contains("queue is full"), "{description}");
         assert_eq!(
             sidecar.pending.lock().expect("pending lock").len(),
             PENDING_CONFIRM_CAP,
@@ -3548,13 +3591,9 @@ mod tests {
         }
         let answer = sidecar.issue_confirm(PendingAction::Resume, "detail".to_string(), 2);
         // Only the expired entry fell out of the map before the insert.
-        let content = serde_json::to_value(&answer.message)
-            .expect("message serializes")
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        assert!(!content.contains("queue is full"), "{content}");
+        let description =
+            reply_description(&answer.message).expect("successful arm carries an embed");
+        assert!(!description.contains("queue is full"), "{description}");
         let map = sidecar.pending.lock().expect("pending lock");
         assert_eq!(map.len(), PENDING_CONFIRM_CAP, "one reaped, one inserted");
         assert!(

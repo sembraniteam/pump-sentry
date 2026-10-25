@@ -61,10 +61,14 @@ pub const POOL_HEAVY_TIMEOUT: Duration = Duration::from_secs(7);
 /// Endpoint cooldown after a failed attempt; a successful sampler
 /// probe clears it earlier.
 const EP_COOLDOWN_MS: u64 = 30_000;
-/// Allowed slot lag behind the freshest peer before an endpoint reads
-/// as stale (~20s of slots at ~400ms/slot).
+/// Allowed slot lag behind the corroborated median before an
+/// endpoint reads as stale (~20s of slots at ~400ms/slot). Staleness
+/// is median-anchored, never max-anchored: a single inflated slot must
+/// not demote every honest peer.
 const STALE_SLOT_LAG: u64 = 50;
 /// Freshest-to-stalest slot spread that reads as inconsistent views.
+/// Computed over corroborated (seconded) slots only: a lone outlier
+/// is quarantined, never allowed to set the spread by itself.
 const INCONSISTENT_SLOT_SPREAD: u64 = 2 * STALE_SLOT_LAG;
 
 /// One endpoint: its sender plus mutable view state.
@@ -73,8 +77,14 @@ struct Endpoint {
     sender: BoxSender,
     /// Cooldown deadline (monotonic ms); 0 = eligible now.
     cooldown_until_ms: AtomicU64,
-    /// Sampler-set: slot lags the freshest peer past [`STALE_SLOT_LAG`].
+    /// Sampler-set: slot lags the corroborated median past
+    /// [`STALE_SLOT_LAG`].
     stale: AtomicBool,
+    /// Sampler-set: no other probed endpoint reports a slot within
+    /// [`STALE_SLOT_LAG`]. Quarantined endpoints are ineligible for
+    /// read routing (no steering to an uncorroborated view) but are
+    /// not stale: disagreement alone never degrades the pool.
+    quarantined: AtomicBool,
     /// SMA(α=1/2) of successful latencies, µs; 0 = unknown.
     ewma_us: AtomicU64,
     /// Sampler-observed slot; 0 = never probed.
@@ -91,6 +101,7 @@ impl Endpoint {
     fn eligible(&self, start: Instant) -> bool {
         mono_ms(start) >= self.cooldown_until_ms.load(Ordering::Relaxed)
             && !self.stale.load(Ordering::Relaxed)
+            && !self.quarantined.load(Ordering::Relaxed)
     }
     fn record_ok(&self, elapsed: Duration) {
         self.failing.store(false, Ordering::Relaxed);
@@ -173,6 +184,7 @@ impl RpcPool {
                 url,
                 cooldown_until_ms: AtomicU64::new(0),
                 stale: AtomicBool::new(false),
+                quarantined: AtomicBool::new(false),
                 ewma_us: AtomicU64::new(0),
                 last_slot: AtomicU64::new(0),
                 failing: AtomicBool::new(false),
@@ -197,6 +209,7 @@ impl RpcPool {
                 url,
                 cooldown_until_ms: AtomicU64::new(0),
                 stale: AtomicBool::new(false),
+                quarantined: AtomicBool::new(false),
                 ewma_us: AtomicU64::new(0),
                 last_slot: AtomicU64::new(0),
                 failing: AtomicBool::new(false),
@@ -291,11 +304,41 @@ impl RpcPool {
                 }
             }
         }
+        // Corroborated freshness (computed even for one endpoint;
+        // the solo case can never be unseconded). The median anchors
+        // staleness (an ahead-of-median endpoint is never stale), and
+        // only slots seconded by another peer within STALE_SLOT_LAG
+        // define the disagreement spread — a lone inflated slot can
+        // neither demote the majority nor trip the inconsistency flag.
+        let mut ordered: Vec<u64> = slots.iter().map(|(_, s)| *s).collect();
+        ordered.sort_unstable();
+        let median = match ordered.len() {
+            0 => 0,
+            n if n % 2 == 1 => ordered[n / 2],
+            n => {
+                let (lo, hi) = (ordered[n / 2 - 1], ordered[n / 2]);
+                lo / 2 + hi / 2 + (lo % 2 + hi % 2) / 2
+            }
+        };
+        let seconded = |slot: u64| {
+            slots
+                .iter()
+                .filter(|(_, s)| slot.abs_diff(*s) <= STALE_SLOT_LAG)
+                .count()
+                >= 2
+        };
         if slots.len() > 1 {
-            let freshest = slots.iter().map(|(_, s)| *s).max().unwrap_or(0);
-            let stalest = slots.iter().map(|(_, s)| *s).min().unwrap_or(0);
-            let spread = freshest.saturating_sub(stalest);
-            let inconsistent = spread > INCONSISTENT_SLOT_SPREAD;
+            let mut agree: Vec<u64> = slots
+                .iter()
+                .map(|(_, s)| *s)
+                .filter(|s| seconded(*s))
+                .collect();
+            agree.sort_unstable();
+            let spread = agree
+                .last()
+                .unwrap_or(&0)
+                .saturating_sub(*agree.first().unwrap_or(&0));
+            let inconsistent = agree.len() >= 2 && spread > INCONSISTENT_SLOT_SPREAD;
             if inconsistent
                 != self
                     .counters
@@ -311,14 +354,23 @@ impl RpcPool {
             let Some((_, slot)) = slots.iter().find(|(idx, _)| *idx == i) else {
                 continue; // probe failed: staleness undetermined this round
             };
-            let freshest = slots.iter().map(|(_, s)| *s).max().unwrap_or(0);
-            let stale = (*slot).saturating_add(STALE_SLOT_LAG) < freshest;
+            let stale = median.saturating_sub(*slot) > STALE_SLOT_LAG;
             if stale != node.stale.swap(stale, Ordering::Relaxed) {
                 if stale {
-                    warn!(url = %ids::redact_endpoint(&node.url), slot, freshest, lag_cap = STALE_SLOT_LAG, "rpc endpoint STALE (slot lag beyond cap); reads prefer fresher peers");
+                    warn!(url = %ids::redact_endpoint(&node.url), slot, median, lag_cap = STALE_SLOT_LAG, "rpc endpoint STALE (slot lag beyond corroborated median); reads prefer corroborated peers");
                 } else if i == 0 {
                     info!(url = %ids::redact_endpoint(&node.url), slot, "primary rpc endpoint no longer stale");
                 }
+            }
+            // Quarantine lone outliers (never the solo-endpoint case:
+            // one view is the configured trust, nothing to corroborate
+            // against). A quarantined endpoint is ineligible for read
+            // routing but is not stale: disagreement alone never
+            // degrades the pool, and reads fall back to node order
+            // (primary first) instead of steering to the outlier.
+            let quarantine = slots.len() >= 2 && !seconded(*slot);
+            if quarantine != node.quarantined.swap(quarantine, Ordering::Relaxed) && quarantine {
+                warn!(url = %ids::redact_endpoint(&node.url), slot, "rpc endpoint unseconded (no peer within lag cap); quarantined, reads prefer corroborated peers");
             }
         }
         self.counters
@@ -604,16 +656,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_marks_stale_primary_and_flags_inconsistency() {
-        // Primary sits 500 slots behind the fallback: beyond both the
-        // staleness lag and the inconsistency spread.
+    async fn probe_quarantines_unseconded_pair_without_pausing() {
+        // Primary sits 500 slots behind the fallback: no peer seconds
+        // either view, so both are quarantined (ineligible) instead of
+        // handing reads to the outlier — and with no corroborated
+        // spread the pool does NOT flag inconsistency or pause entries.
+        // Reads fall back to node order (primary first).
         let (pool, primary, _fallback) = script_pool(false, [1_500, 2_000]);
         pool.probe_round().await;
         let snap = pool.snapshot();
-        assert!(snap.primary_stale);
-        assert!(snap.inconsistent);
-        assert_eq!(snap.healthy, 1, "stale primary is not eligible");
-        assert!(!pool.degraded(), "the fallback still carries a live view");
+        assert!(snap.primary_stale, "lagging primary is stale vs median");
+        assert!(!snap.inconsistent, "no corroborated spread, no flag");
+        assert_eq!(snap.healthy, 0, "both endpoints quarantined");
+        assert!(!pool.degraded(), "disagreement alone never degrades");
 
         // Parity on the next round clears both marks.
         primary.set_slot(2_000);
@@ -622,6 +677,51 @@ mod tests {
         assert!(!snap.primary_stale);
         assert!(!snap.inconsistent);
         assert_eq!(snap.healthy, 2);
+    }
+
+    #[tokio::test]
+    async fn probe_lone_liar_does_not_demote_majority() {
+        // Two honest endpoints at 1500, one liar at 2500: the liar is
+        // quarantined, the majority stays healthy, no inconsistency.
+        let (n0, c0) = ScriptSender::new();
+        let (n1, c1) = ScriptSender::new();
+        let (n2, c2) = ScriptSender::new();
+        c0.set_slot(1_500);
+        c1.set_slot(1_500);
+        c2.set_slot(2_500);
+        let pool = RpcPool::build_with(vec![
+            ("a".to_string(), Box::new(n0) as BoxSender),
+            ("b".to_string(), Box::new(n1) as BoxSender),
+            ("c".to_string(), Box::new(n2) as BoxSender),
+        ]);
+        pool.probe_round().await;
+        let snap = pool.snapshot();
+        assert!(!snap.primary_stale, "median-anchored primary is fresh");
+        assert!(!snap.inconsistent, "lone outlier sets no spread");
+        assert_eq!(snap.healthy, 2, "liar quarantined, majority serves");
+        assert!(!pool.degraded());
+    }
+
+    #[tokio::test]
+    async fn probe_genuine_split_still_flags_inconsistency() {
+        // Two corroborated camps 500 apart: a real split-brain, still
+        // flagged so the supervisor pauses entries.
+        let makers: Vec<(ScriptSender, Arc<ScriptCount>)> =
+            (0..4).map(|_| ScriptSender::new()).collect();
+        let slots = [1_500, 1_500, 2_000, 2_000];
+        for ((_, count), slot) in makers.iter().zip(slots) {
+            count.set_slot(slot);
+        }
+        let pool = RpcPool::build_with(
+            makers
+                .into_iter()
+                .enumerate()
+                .map(|(i, (sender, _))| (format!("e{i}"), Box::new(sender) as BoxSender))
+                .collect(),
+        );
+        pool.probe_round().await;
+        let snap = pool.snapshot();
+        assert!(snap.inconsistent, "corroborated split still flags");
     }
 
     #[tokio::test]
@@ -718,14 +818,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_stale_with_healthy_fallback_is_not_degraded() {
-        // Primary lags but the fallback carries a live view: failover
-        // is working as designed, entries keep running on it.
+    async fn probe_unseconded_gap_quarantines_both_without_degrading() {
+        // Primary lags 1000 behind the fallback: with no peer
+        // seconding either view, both are quarantined (the fallback no
+        // longer "carries a live view" on its uncorroborated word) —
+        // but disagreement alone never degrades, so entries keep
+        // running while reads fall back to node order (primary first).
         let (pool, _primary, _fallback) = script_pool(false, [1_000, 2_000]);
         pool.probe_round().await;
         let snap = pool.snapshot();
         assert!(snap.primary_stale);
-        assert_eq!(snap.healthy, 1);
+        assert!(!snap.inconsistent);
+        assert_eq!(snap.healthy, 0);
         assert!(!pool.degraded());
     }
 

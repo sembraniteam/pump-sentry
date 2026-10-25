@@ -398,17 +398,41 @@ mod tests {
 
     #[test]
     fn unknown_pump_ix_is_recorded_but_never_counts() {
-        // Unmapped discriminators surface as `Unknown` against the ix's
-        // first listed account — never quorum-counted, amount always 0.
+        // Unmapped discriminators surface as `Unknown` once per ix
+        // account — never quorum-counted, amount always 0. Per-account
+        // emission (not first-account-only) so a dev at a deep trader
+        // slot cannot hide behind a stranger at index 0.
         let mut unknown = buy_ix(0, 6);
         unknown.data = bs58::encode([0u8; 24]).into_string();
         let tx = swap_tx(vec![unknown]);
         let records = extract_pump_swaps(&tx, "sig");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].side, SwapSide::Unknown);
-        // buy_ix lists account 20 first → key(20) in the fabricated tx.
-        assert_eq!(records[0].wallet, Pubkey::new_from_array([20; 32]));
-        assert_eq!(records[0].amount_base_units, 0);
+        // buy_ix lists [20,21,22,23,24,25,6,27]: all resolve.
+        assert_eq!(records.len(), 8);
+        for record in &records {
+            assert_eq!(record.side, SwapSide::Unknown);
+            assert_eq!(record.amount_base_units, 0);
+        }
+        let wallets: Vec<Pubkey> = records.iter().map(|r| r.wallet).collect();
+        // The dev at the v1 trader slot (position 6) is named.
+        assert!(wallets.contains(&Pubkey::new_from_array([6; 32])));
+    }
+
+    #[test]
+    fn unknown_pump_ix_with_dev_away_from_first_aborts() {
+        // Regression: an unmapped ix naming the dev anywhere but first
+        // used to be blamed on a stranger (first account) and never
+        // abort. Now the per-account record carrying the dev aborts.
+        let mut gate = EntryGate::new(60, 2);
+        let dev = Pubkey::new_from_array([6; 32]);
+        assert!(gate.submit("MINT", &dev.to_string(), 1000));
+        let mut unknown = buy_ix(0, 6);
+        unknown.data = bs58::encode([0xABu8; 24]).into_string();
+        let records = extract_pump_swaps(&swap_tx(vec![unknown]), "sig");
+        match gate.observe("MINT", &records, 1001) {
+            GateOutcome::Abort { reason } => assert!(reason.contains("unknown pump ix")),
+            other => panic!("expected abort, got {other:?}"),
+        }
+        assert_eq!(gate.pending_count(), 0);
     }
 
     #[test]

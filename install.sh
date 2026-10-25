@@ -169,6 +169,10 @@ if [ -x "$DEST/$APP" ] && "$DEST/$APP" status >/dev/null 2>&1; then
 fi
 mkdir -p "$DEST" || die "cannot create $DEST"
 STAGE="$DEST/.$APP.tmp.$$"
+# Refuse a pre-existing stage path: in a shared INSTALL_DIR another
+# local user could have planted a symlink/file at the pid-predicted
+# name and captured the install. `noclobber` makes the claim atomic.
+( set -o noclobber; : > "$STAGE" ) 2>/dev/null || die "stage path $STAGE already exists; refusing to install into a directory entry we did not claim"
 cp "$BIN" "$STAGE" || die "copy to $DEST failed (permissions?)"
 chmod 755 "$STAGE" || { rm -f "$STAGE"; die "chmod failed"; }
 mv -f "$STAGE" "$DEST/$APP" || { rm -f "$STAGE"; die "replace at $DEST failed"; }
