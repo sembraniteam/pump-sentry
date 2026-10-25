@@ -338,16 +338,29 @@ impl RpcPool {
                 .last()
                 .unwrap_or(&0)
                 .saturating_sub(*agree.first().unwrap_or(&0));
-            let inconsistent = agree.len() >= 2 && spread > INCONSISTENT_SLOT_SPREAD;
+            // No corroborated view at all is itself disagreement: with
+            // two endpoints a >lag split leaves both unseconded, and
+            // that is exactly the cross-cluster hazard the pause exists
+            // for. A lone liar still leaves the honest majority
+            // seconded, so it does not pause.
+            let uncorroborated = agree.is_empty();
+            let inconsistent =
+                (agree.len() >= 2 && spread > INCONSISTENT_SLOT_SPREAD) || uncorroborated;
             if inconsistent
                 != self
                     .counters
                     .inconsistent
                     .swap(inconsistent, Ordering::Relaxed)
             {
-                warn!(
-                    "rpc endpoints disagree on slot by {spread} (spread cap {INCONSISTENT_SLOT_SPREAD}); cross-endpoint views inconsistent — balance/custody checks need operator suspicion"
-                );
+                if uncorroborated {
+                    warn!(
+                        "rpc endpoints share no corroborated slot view (lag cap {STALE_SLOT_LAG}); cross-endpoint views inconsistent — balance/custody checks need operator suspicion"
+                    );
+                } else {
+                    warn!(
+                        "rpc endpoints disagree on slot by {spread} (spread cap {INCONSISTENT_SLOT_SPREAD}); cross-endpoint views inconsistent — balance/custody checks need operator suspicion"
+                    );
+                }
             }
         }
         for (i, node) in self.nodes.iter().enumerate() {
@@ -460,10 +473,19 @@ impl RpcSender for FailoverSender {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
         // Eligible endpoints first (stable order keeps the primary
-        // preferred among equals); ineligible ones still get tried
-        // behind them rather than failing an available read outright.
+        // preferred among equals); when nothing is eligible, prefer
+        // non-stale over stale and corroborated over quarantined, so a
+        // failover read never lands on the lagging endpoint the sampler
+        // just demoted. Ineligible ones are still tried (behind), never
+        // failing a read that an available endpoint could serve.
         let mut order: Vec<&Endpoint> = self.pool.nodes.iter().collect();
-        order.sort_by_key(|n| usize::from(!n.eligible(self.pool.start)));
+        order.sort_by_key(|n| {
+            (
+                usize::from(!n.eligible(self.pool.start)),
+                usize::from(n.stale.load(Ordering::Relaxed)),
+                usize::from(n.quarantined.load(Ordering::Relaxed)),
+            )
+        });
         let mut last_err: Option<ClientError> = None;
         for (idx, node) in order.iter().enumerate() {
             let started = Instant::now();
@@ -656,19 +678,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_quarantines_unseconded_pair_without_pausing() {
-        // Primary sits 500 slots behind the fallback: no peer seconds
-        // either view, so both are quarantined (ineligible) instead of
-        // handing reads to the outlier — and with no corroborated
-        // spread the pool does NOT flag inconsistency or pause entries.
-        // Reads fall back to node order (primary first).
+    async fn probe_unseconded_pair_flags_inconsistent_and_serves_fresh_reads() {
+        // Primary sits 500 slots behind the fallback: neither view is
+        // seconded, so there is no corroborated view at all — that must
+        // flag inconsistency (the supervisor pauses entries) instead of
+        // silently proceeding, and a failover read must prefer the
+        // fresh endpoint over the one the sampler just demoted.
         let (pool, primary, _fallback) = script_pool(false, [1_500, 2_000]);
         pool.probe_round().await;
         let snap = pool.snapshot();
         assert!(snap.primary_stale, "lagging primary is stale vs median");
-        assert!(!snap.inconsistent, "no corroborated spread, no flag");
+        assert!(snap.inconsistent, "no corroborated view is disagreement");
         assert_eq!(snap.healthy, 0, "both endpoints quarantined");
-        assert!(!pool.degraded(), "disagreement alone never degrades");
+        assert!(!pool.degraded(), "disagreement is not an outage");
+
+        let sender = FailoverSender { pool: pool.clone() };
+        let primary_calls_before = primary.calls();
+        let served = sender
+            .send(RpcRequest::GetVersion, serde_json::Value::Array(vec![]))
+            .await
+            .expect("a read is served");
+        assert_eq!(
+            served,
+            serde_json::Value::from(2_000u64),
+            "the fresh endpoint must serve, not the stale primary"
+        );
+        assert_eq!(
+            primary.calls(),
+            primary_calls_before,
+            "stale primary is not tried first"
+        );
 
         // Parity on the next round clears both marks.
         primary.set_slot(2_000);
@@ -818,19 +857,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_unseconded_gap_quarantines_both_without_degrading() {
-        // Primary lags 1000 behind the fallback: with no peer
-        // seconding either view, both are quarantined (the fallback no
-        // longer "carries a live view" on its uncorroborated word) —
-        // but disagreement alone never degrades, so entries keep
-        // running while reads fall back to node order (primary first).
+    async fn probe_unseconded_gap_quarantines_both_and_flags_inconsistent() {
+        // Primary lags 1000 behind the fallback: neither view is
+        // seconded, so both are quarantined and the missing
+        // corroboration flags inconsistent — the supervisor pauses
+        // entries on a two-endpoint split rather than trading through
+        // it. Reads still prefer the fresh endpoint (see the pair test).
         let (pool, _primary, _fallback) = script_pool(false, [1_000, 2_000]);
         pool.probe_round().await;
         let snap = pool.snapshot();
         assert!(snap.primary_stale);
-        assert!(!snap.inconsistent);
+        assert!(snap.inconsistent);
         assert_eq!(snap.healthy, 0);
-        assert!(!pool.degraded());
+        assert!(!pool.degraded(), "disagreement is not an outage");
     }
 
     #[tokio::test]

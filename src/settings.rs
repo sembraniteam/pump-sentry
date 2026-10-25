@@ -531,7 +531,21 @@ impl Settings {
         (fatals, warns)
     }
 
+    /// Configuration warnings for the boot log. Endpoint-trust fatals
+    /// are included (paper mode warns-but-runs); the live gate uses
+    /// [`Self::warnings_without_endpoint_fatals`] so a refusal is not
+    /// first printed as a warning.
     pub fn warnings(&self) -> Vec<String> {
+        self.warnings_inner(true)
+    }
+
+    /// Same as [`Self::warnings`] minus the endpoint-trust fatal items,
+    /// which the live gate prints once as `live mode refuses to start`.
+    pub fn warnings_without_endpoint_fatals(&self) -> Vec<String> {
+        self.warnings_inner(false)
+    }
+
+    fn warnings_inner(&self, include_endpoint_fatals: bool) -> Vec<String> {
         let mut out = self.parse_notes.clone();
         if self.slippage().is_none() {
             out.push(format!(
@@ -585,10 +599,12 @@ impl Settings {
             );
         }
         // Endpoint trust — paper keeps warnings (the live gate
-        // refuses the fatal items).
+        // refuses the fatal items and prints them exactly once).
         let (endpoint_fatals, endpoint_warns) = self.endpoint_trust(false);
         out.extend(endpoint_warns);
-        out.extend(endpoint_fatals);
+        if include_endpoint_fatals {
+            out.extend(endpoint_fatals);
+        }
         if self.runner_moonbag().is_none() {
             out.push(format!(
                 "RUNNER_MOONBAG_PERCENT={} outside 0–100; clamped at resolve time",
@@ -1460,6 +1476,28 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("OVERRIDDEN by ALLOW_FALLBACK_CLUSTER_MISMATCH")),
             "the override must be logged: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn live_warnings_omit_endpoint_fatals_but_keep_warns() {
+        // The live gate prints fatals once as refusals; the boot log
+        // must not repeat them as warnings. Non-fatal endpoint advice
+        // still surfaces.
+        let s = Settings::from_map(&vars(&[
+            ("MAINNET_RPC_URL", "http://rpc.example.com"),
+            ("MAINNET_RPC_URLS_FALLBACK", "https://reads.example.com"),
+        ]));
+        let full = s.warnings().join("\n");
+        let live = s.warnings_without_endpoint_fatals().join("\n");
+        assert!(full.contains("plaintext"), "paper keeps the fatal: {full}");
+        assert!(
+            !live.contains("plaintext"),
+            "live omits the fatal text (gate prints it): {live}"
+        );
+        assert!(
+            live.contains("cluster-unidentifiable"),
+            "non-fatal endpoint warnings stay in the live boot log: {live}"
         );
     }
 

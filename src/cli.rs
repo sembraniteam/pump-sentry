@@ -331,6 +331,62 @@ pub fn discord_pid_path() -> PathBuf {
     state_file_beside_log(&log_file, DISCORD_PID_FILE)
 }
 
+/// Sidecar instance lock path (`discord.lock`): one gateway per state
+/// dir, whether it started detached or `--foreground`.
+pub fn discord_lock_path() -> PathBuf {
+    discord_pid_path().with_file_name("discord.lock")
+}
+
+/// Held sidecar instance lock. The pid file alone is written after
+/// spawn (and not at all by `--foreground`), so it cannot serialize
+/// instances; this `flock` does. Dropping it releases.
+#[derive(Debug)]
+pub struct DiscordInstanceLock {
+    _file: std::fs::File,
+}
+
+impl DiscordInstanceLock {
+    /// Try to take the exclusive sidecar lock at `path`.
+    pub fn try_acquire(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600)
+                .open(path)?;
+            // SAFETY: `flock` on an owned fd; EWOULDBLOCK means another
+            // sidecar holds it.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    format!("another discord sidecar already owns this state dir ({err})"),
+                ));
+            }
+            Ok(Self { _file: file })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(std::io::Error::other(
+                "discord instance locking requires unix",
+            ))
+        }
+    }
+}
+
 /// Expand leading `~/` against `HOME`.
 fn expand_tilde(s: &str) -> PathBuf {
     let rest = s.strip_prefix("~/").or_else(|| (s == "~").then_some(""));
@@ -387,13 +443,20 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// Recorded daemon, if still alive. A live pid behind a stale
-/// record (kernel start time differs from the recorded `started_at`)
-/// reads as no daemon: every caller then follows its stale-record
-/// cleanup path instead of wedging on a recycled pid.
+/// Recorded daemon, if still alive and positively ours. A recycled pid
+/// (path proves another binary) reads as no daemon so callers clean the
+/// record; a start-time mismatch alone never does — that can be clock
+/// skew after registration, and disarming `stop`/`sell` for a live
+/// trader is worse than a stale record.
 pub fn running_daemon(pid_file: &Path) -> Option<PidInfo> {
     let info = read_pid_file(pid_file)?;
-    (process_alive(info.pid) && pid_record_fresh(&info)).then_some(info)
+    if !process_alive(info.pid) {
+        return None;
+    }
+    match pid_is_our_binary(info.pid) {
+        Some(false) => None,
+        _ => Some(info),
+    }
 }
 
 /// Max skew tolerated between the recorded `started_at` and the kernel
@@ -960,17 +1023,24 @@ pub fn stop_daemon() -> i32 {
         );
         return 0;
     }
-    // Stale-record guard: a live pid whose kernel start time does not
-    // match the recorded `started_at` is a recycled pid, not the
-    // daemon. Clean it the same way a dead pid is cleaned — signaling
-    // it would hit an unrelated process.
-    if !pid_record_fresh(&info) {
+    // Stale-record guard: a live pid that provably belongs to another
+    // binary is a recycled pid — clean the record without signaling.
+    // A start-time mismatch alone is NOT enough to clean or refuse
+    // (wall-clock steps would disarm a live trader's control plane);
+    // it only downgrades to a warning below.
+    if pid_is_our_binary(info.pid) == Some(false) {
         let _ = std::fs::remove_file(&pid_file);
         eprintln!(
-            "bot is not running (pid {} is a recycled pid: kernel start time differs from the recorded daemon; pid file cleaned).",
+            "bot is not running (pid {} belongs to another binary: recycled pid; pid file cleaned).",
             info.pid
         );
         return 0;
+    }
+    if !pid_record_fresh(&info) {
+        eprintln!(
+            "warning: pid {} start time differs from the recorded daemon (clock adjusted?); signaling anyway because it is this binary",
+            info.pid
+        );
     }
     // Pid reuse guard: a recycled pid must never take a SIGKILL meant
     // for the trader. Where the platform can resolve the binary we
@@ -1132,15 +1202,21 @@ pub fn cmd_discord_stop() -> i32 {
         );
         return 0;
     }
-    // Same stale-record guard as `stop`: a recycled pid is cleaned,
-    // never signalled.
-    if !pid_record_fresh(&info) {
+    // Same stale-record guard as `stop`: only a provably foreign
+    // binary is cleaned; a start-time mismatch alone is a warning.
+    if pid_is_our_binary(info.pid) == Some(false) {
         let _ = std::fs::remove_file(&pid_file);
         eprintln!(
-            "discord sidecar is not running (pid {} is a recycled pid: kernel start time differs from the recorded sidecar; pid file cleaned).",
+            "discord sidecar is not running (pid {} belongs to another binary: recycled pid; pid file cleaned).",
             info.pid
         );
         return 0;
+    }
+    if !pid_record_fresh(&info) {
+        eprintln!(
+            "warning: pid {} start time differs from the recorded sidecar (clock adjusted?); signaling anyway because it is this binary",
+            info.pid
+        );
     }
     // Same pid-reuse guard as `stop`: a recycled pid must never take a
     // signal meant for the sidecar.
@@ -1850,29 +1926,39 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
         curl_fetch(&format!("{base}/{asset}.sha256")).ok()
     });
     let dir = std::env::temp_dir().join(format!("pump-upgrade-{}", std::process::id()));
-    // Exclusive, owner-only staging: `create_dir` (not `create_dir_all`)
-    // refuses a pre-existing directory, so another local user on a
-    // shared $TMPDIR cannot plant the path ahead of us and swap bytes
-    // after verification. Adopting a foreign directory would make the
-    // checksum gate below meaningless.
-    if let Err(e) = std::fs::create_dir(&dir) {
+    // Exclusive, owner-only staging requested atomically: `create_dir`
+    // (not `create_dir_all`) refuses a pre-existing path, and the mode
+    // is applied at creation so a permissive umask never leaves a
+    // window where another local user can plant an entry inside.
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if let Err(e) = builder.create(&dir) {
         eprintln!(
             "refusing to stage upgrade: staging path {} pre-exists or cannot be created ({e}); refusing to install into a directory we did not exclusively create",
             dir.display()
         );
         std::process::exit(1);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
-            eprintln!("cannot lock staging dir to 0700: {e}");
-            let _ = std::fs::remove_dir_all(&dir);
-            std::process::exit(1);
-        }
-    }
     let tgz = dir.join(&asset);
-    if let Err(e) = std::fs::write(&tgz, &bytes) {
+    // `create_new` refuses an existing entry (including a planted
+    // symlink), and O_NOFOLLOW closes the remaining path race.
+    let staged_write = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        }
+        let mut f = opts.open(&tgz)?;
+        f.write_all(&bytes)
+    })();
+    if let Err(e) = staged_write {
         eprintln!("cannot stage upgrade: {e}");
         let _ = std::fs::remove_dir_all(&dir);
         std::process::exit(1);
@@ -2659,6 +2745,30 @@ mod tests {
     }
 
     #[test]
+    fn discord_instance_lock_refuses_a_second_sidecar() {
+        // One gateway per state dir: the pid file cannot serialize
+        // (foreground never writes it), so the flock must.
+        let dir = std::env::temp_dir().join(format!(
+            "discord-lock-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("discord.lock");
+        let first = DiscordInstanceLock::try_acquire(&path).expect("first lock");
+        assert!(
+            DiscordInstanceLock::try_acquire(&path).is_err(),
+            "a second sidecar must be refused while the lock is held"
+        );
+        drop(first);
+        assert!(
+            DiscordInstanceLock::try_acquire(&path).is_ok(),
+            "dropping the lock releases the state dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pid_record_fresh_matches_this_process_and_rejects_ancient_record() {
         // Kernel start-time check: our own fresh record passes; an
         // ancient record naming our live pid fails (the recycled-pid
@@ -2680,10 +2790,11 @@ mod tests {
     }
 
     #[test]
-    fn running_daemon_ignores_a_stale_live_pid_record() {
-        // A live pid behind a mismatched started_at reads as no daemon,
-        // so start/status/upgrade follow stale-cleanup instead of
-        // wedging. Skipped where the platform exposes no start time.
+    fn running_daemon_ignores_a_recycled_pid_but_not_clock_skew() {
+        // A live pid that is provably another binary reads as no
+        // daemon (recycled pid → cleanup path). A start-time mismatch
+        // on OUR binary must NOT disarm the record: clock steps are
+        // recoverable, losing live `stop`/`sell` is not.
         if pid_started_at(std::process::id()).is_none() {
             return;
         }
@@ -2694,21 +2805,36 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let pid_file = dir.join("bot.pid");
-        let stale = PidInfo {
+        // Skewed record naming THIS process: still a daemon.
+        let skewed = PidInfo {
             pid: std::process::id(),
             live: false,
             started_at: 1,
         };
-        std::fs::write(&pid_file, stale.to_json()).expect("stale record");
-        assert!(
-            running_daemon(&pid_file).is_none(),
-            "stale live-pid record must not read as a daemon"
-        );
-        register_running(false, &pid_file);
+        std::fs::write(&pid_file, skewed.to_json()).expect("skewed record");
         assert!(
             running_daemon(&pid_file).is_some(),
-            "fresh record for this process reads as a daemon"
+            "clock skew must not hide a live trader"
         );
+        // Foreign live pid: not our daemon.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        let foreign = PidInfo {
+            pid: child.id(),
+            live: false,
+            started_at: unix_secs(),
+        };
+        std::fs::write(&pid_file, foreign.to_json()).expect("foreign record");
+        if pid_binary_path(child.id()).is_some() {
+            assert!(
+                running_daemon(&pid_file).is_none(),
+                "a recycled pid from another binary is not a daemon"
+            );
+        }
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

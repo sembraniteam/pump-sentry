@@ -71,9 +71,10 @@ async fn dead_primary_fails_over_to_real_rpc() {
 ///
 /// NOTE: a devnet URL as "fallback" is an operator misconfiguration in
 /// production; here it is the instrument that proves the detector sees
-/// real divergence. The pool is cluster-blind by design: it flags the
-/// disagreement (so the heartbeat/operator sees it) while the eligible
-/// freshest peer keeps serving.
+/// real divergence. The pool is cluster-blind by design: with two
+/// endpoints there is no corroborated view, so the disagreement flags
+/// inconsistent (the supervisor pauses entries) while reads still
+/// prefer the non-stale endpoint over the lagging one.
 #[tokio::test]
 #[ignore]
 async fn cross_cluster_divergence_flags_inconsistent() {
@@ -102,19 +103,19 @@ async fn cross_cluster_divergence_flags_inconsistent() {
     assert_eq!(snap.endpoints, 2);
     assert!(
         snap.inconsistent,
-        "mainnet/devnet slots differ by millions: views must flag inconsistent"
+        "mainnet/devnet slots differ by millions: no corroborated view is disagreement"
     );
     assert!(
         snap.primary_stale,
         "mainnet tip sits far below the freshest peer: primary must read stale"
     );
     assert_eq!(
-        snap.healthy, 1,
-        "exactly one peer eligible (the stale one steps aside)"
+        snap.healthy, 0,
+        "neither disputed view is corroborated, so neither is eligible"
     );
     assert!(
         !pool.degraded(),
-        "disagreement with an eligible peer is flagged, not a full outage"
+        "quarantine is flagged disagreement, not a full outage"
     );
 }
 /// The background sampler end-to-end: spawned as in `main`, it must

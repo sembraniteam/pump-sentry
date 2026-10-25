@@ -53,11 +53,12 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         {
             let mut migrated = self.migrated.lock().await;
             let now = now_secs();
+            // Prune first: an expired entry must not swallow the retry.
+            // Bounded growth: pruning only risks a dup card.
+            migrated.retain(|_, at| now.saturating_sub(*at) <= MIGRATED_TTL_SECS);
             if migrated.insert(mint.clone(), now).is_some() {
                 return;
             }
-            // Bounded growth: pruning only risks a dup card.
-            migrated.retain(|_, at| now.saturating_sub(*at) <= MIGRATED_TTL_SECS);
             if migrated.len() > MIGRATED_CAP
                 && let Some(oldest) = migrated
                     .iter()
@@ -79,7 +80,13 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                     report.base_mint.as_deref(),
                     report.quote_mint.as_deref(),
                 ));
-                self.follow_pool(&mint, &report).await;
+                // Retry contract: the dedupe entry is only a claim while
+                // a pool leg exists. Registering failed (missing or
+                // unwatchable legs) must re-arm the supervision retry
+                // instead of leaving the bag permanently un-followed.
+                if !self.follow_pool(&mint, &report).await {
+                    self.migrated.lock().await.remove(&mint);
+                }
             }
             Ok(None) => {
                 info!(mint = %mint, "graduated but no migration tx found yet; will retry on later ticks");
@@ -97,7 +104,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
     /// Register a migrated pool for tracking and exits.
     /// PumpSwap legs watch the pool account too (effective-quote
     /// pricing); on both venues BASE-side is WSOL by report contract.
-    async fn follow_pool(&self, mint: &str, report: &MigrationReport) {
+    async fn follow_pool(&self, mint: &str, report: &MigrationReport) -> bool {
         let (Some(amm), Some(base_vault), Some(quote_vault)) = (
             report.amm_id.clone(),
             report.base_vault.clone(),
@@ -105,7 +112,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         ) else {
             // Loud, so a missing follow is never silent.
             warn!(mint = %mint, amm = ?report.amm_id, "migration without resolvable pool; not following");
-            return;
+            return false;
         };
         let watched = if report.destination == MigrationDestination::PumpSwap {
             // amm_id IS the pool on this venue.
@@ -119,7 +126,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
         };
         if let Err(e) = watched {
             warn!(amm = %amm, error = %ids::strip_error_url(&e.to_string()), "pool watch failed");
-            return;
+            return false;
         }
         // Seed now: pools that never tick still expire. Keeps raced baseline.
         // A tick-first entry carries pool None: overwrite the leg when
@@ -143,7 +150,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
             parse("base_vault", &base_vault),
             parse("quote_vault", &quote_vault),
         ) else {
-            return;
+            return false;
         };
         let pool = Some(crate::live::PoolLeg {
             mint: mint_key,
@@ -166,6 +173,7 @@ impl<A: Auditor, R: ReserveFeed, L: LiveSink, S: Screener, T: AlertSink> Pipelin
                 pool,
             });
         info!(%mint, amm = %amm, "following migrated pool");
+        true
     }
 
     /// Live custody (tracked or parked) that still rides a

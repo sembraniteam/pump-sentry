@@ -98,10 +98,11 @@ or hung attempt retries on the next healthy endpoint (6s light / 25s
 block-weight budgets, under the callers' 10s outers so a hung primary
 actually fails over), latency is tracked per endpoint, and a 10s sampler
 doubles as health check plus staleness detector (a primary lagging the
-freshest peer goes stale; disagreeing views flag inconsistent). One
-logical read hits exactly one endpoint at a time — never an all-endpoints
-broadcast — and dispatch never rides the pool: one decision, one Jito
-bundle, one endpoint.
+corroborated median goes stale; a lone liar is quarantined; views with no
+corroborated slot agreement flag inconsistent). One logical read hits
+exactly one endpoint at a time — never an all-endpoints broadcast — and
+dispatch never rides the pool: one decision, one Jito bundle, one
+endpoint.
 
 When a critical source is unhealthy the bot stops deciding instead of
 deciding on stale data. A supervisor pauses entries through the same

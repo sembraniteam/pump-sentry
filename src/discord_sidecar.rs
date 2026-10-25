@@ -2293,6 +2293,25 @@ async fn sweep_pending_confirms(pending: Arc<Mutex<HashMap<String, PendingConfir
 /// Boot errors are fail-stop: an operator wants the sidecar refusing
 /// to half-run, not a phantom gateway connection.
 pub fn run(token: String) -> Result<(), String> {
+    // One gateway per state dir, in both modes: the pid file is written
+    // after spawn by the detaching parent (and never by `--foreground`),
+    // so it cannot serialize instances. The lock refuses a second
+    // sidecar before any gateway connection or confirm-map state exists.
+    let lock_path = crate::cli::discord_lock_path();
+    let _lock = crate::cli::DiscordInstanceLock::try_acquire(&lock_path)
+        .map_err(|e| format!("refusing to start a second discord sidecar: {e}"))?;
+    // Register this process so `--status`/`--stop` see a foreground
+    // sidecar too; the detaching parent writes the same pid afterwards.
+    let pid_file = crate::cli::discord_pid_path();
+    crate::cli::register_running(false, &pid_file);
+    let result = run_gateway(token);
+    crate::cli::unregister_running(&pid_file);
+    result
+}
+
+/// Connect and serve. Never call directly: [`run`] owns the instance
+/// lock and the pid registration.
+fn run_gateway(token: String) -> Result<(), String> {
     let (config_path, cfg) = load_config()?;
     let guild_id = GuildId::new(cfg.guild_id);
     let pending = Arc::new(Mutex::new(HashMap::new()));

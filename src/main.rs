@@ -1017,8 +1017,15 @@ async fn run_pipeline(boot: Boot) {
         }
     }
 
-    // Surface bad config (typos fall back silently).
-    for warning in settings.warnings() {
+    // Surface bad config (typos fall back silently). In live mode the
+    // endpoint-trust fatals are omitted here: the gate below prints
+    // them once as refusals instead of a warning followed by a refusal.
+    let boot_warnings = if live_mode {
+        settings.warnings_without_endpoint_fatals()
+    } else {
+        settings.warnings()
+    };
+    for warning in boot_warnings {
         warn!("config: {warning}");
     }
     // Fatal misconfig refuses in every mode (not just live).
@@ -1084,12 +1091,16 @@ async fn run_pipeline(boot: Boot) {
         }
         // Endpoint trust — remote cleartext endpoints and
         // cross-cluster fallbacks never back live reads/dispatch (the
-        // override, set + logged, downgrades a flagged fallback).
-        let (fatals, override_warns) = settings.endpoint_trust(
-            std::env::var("ALLOW_FALLBACK_CLUSTER_MISMATCH").is_ok_and(|v| v == "1" || v == "true"),
-        );
-        for warn in &override_warns {
-            warn!("{warn}");
+        // override, set + logged, downgrades a flagged fallback). Other
+        // endpoint warnings were already surfaced by the boot log, so
+        // only the override acknowledgments are logged here.
+        let allow_fallback_override =
+            std::env::var("ALLOW_FALLBACK_CLUSTER_MISMATCH").is_ok_and(|v| v == "1" || v == "true");
+        let (fatals, gate_warns) = settings.endpoint_trust(allow_fallback_override);
+        if allow_fallback_override {
+            for warn in gate_warns.iter().filter(|w| w.contains("OVERRIDDEN")) {
+                warn!("config: {warn}");
+            }
         }
         for fatal in &fatals {
             eprintln!("live mode refuses to start: {fatal}");

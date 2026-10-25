@@ -1207,6 +1207,21 @@ mod tests {
         assert!(cut.ends_with("[truncated]"));
     }
 
+    #[test]
+    fn truncate_description_reserves_the_marker() {
+        // The marker counts against the cap: a degraded embed must be
+        // sendable, not 14 bytes over Discord's limit.
+        let long = "a".repeat(EMBED_DESCRIPTION_MAX + 100);
+        let cut = truncate_description(&long);
+        assert!(cut.ends_with("…[truncated]"));
+        assert_eq!(cut.len(), EMBED_DESCRIPTION_MAX);
+        // Multibyte boundary: never splits a char, never over the cap.
+        let emoji = "é".repeat(EMBED_DESCRIPTION_MAX);
+        let cut = truncate_description(&format!("{emoji}x"));
+        assert!(cut.len() <= EMBED_DESCRIPTION_MAX);
+        assert!(cut.is_char_boundary(cut.len()));
+    }
+
     #[tokio::test]
     async fn disabled_never_sends() {
         // No token/channel: early return, nothing spawned.
