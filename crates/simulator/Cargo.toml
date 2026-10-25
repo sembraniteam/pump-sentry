@@ -1,6 +1,6 @@
 [package]
 name = "simulator"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.99.0"
 description = "Paper-trading simulator: virtual balances, position tracking, PnL"
