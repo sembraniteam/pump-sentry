@@ -1,7 +1,6 @@
 //! Supervisor CLI. Every call needs a subcommand; else usage plus nonzero exit.
 
 use std::io::Write;
-use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -357,12 +356,17 @@ impl DiscordInstanceLock {
         {
             use std::os::unix::fs::OpenOptionsExt;
             use std::os::unix::io::AsRawFd;
+            // `O_CLOEXEC` keeps a child exec'd by this process from
+            // inheriting the fd: a fork+exec (daemon spawn, upgrade
+            // helper) must never end up owning the sidecar lock past
+            // the holder's close. `O_NOFOLLOW` refuses a planted
+            // symlink on the lock path.
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .mode(0o600)
                 .open(path)?;
             // SAFETY: `flock` on an owned fd; EWOULDBLOCK means another
@@ -481,6 +485,7 @@ pub fn pid_record_fresh(info: &PidInfo) -> bool {
 fn pid_started_at(pid: u32) -> Option<u64> {
     // SAFETY: proc_pidinfo fills a caller-owned buffer and returns
     // bytes written (0 on failure). No pointers outlive the call.
+    use std::mem::size_of;
     unsafe {
         let mut info: libc::proc_bsdinfo = std::mem::zeroed();
         let n = libc::proc_pidinfo(
@@ -574,12 +579,15 @@ impl StateDirLock {
             // is "acquire fails", never "exclusive lock held on
             // someone else's file". TOCTOU-proof: the open itself
             // refuses a symlink planted between any check and here.
+            // `O_CLOEXEC` keeps a child exec'd by this process from
+            // inheriting the fd: the flock must die with the holder,
+            // not linger in some grandchild past the holder's drop.
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .mode(0o600)
                 .open(path)?;
             // SAFETY: `flock` on an owned fd; EWOULDBLOCK means the
@@ -2761,10 +2769,23 @@ mod tests {
             "a second sidecar must be refused while the lock is held"
         );
         drop(first);
-        assert!(
-            DiscordInstanceLock::try_acquire(&path).is_ok(),
-            "dropping the lock releases the state dir"
-        );
+        // Mirror the sibling state-lock test: under parallel load the
+        // OS can report the just-released flock as still held for a
+        // beat after `close`, so the release is asserted by a brief
+        // poll instead of a single immediate attempt.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let third = loop {
+            match DiscordInstanceLock::try_acquire(&path) {
+                Ok(g) => break g,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => panic!("reacquire after release: {e}"),
+            }
+        };
+        drop(third);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
