@@ -3,6 +3,8 @@
 use std::io::Write;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// State dir. `None` when `HOME` is unset.
 pub fn default_state_dir() -> Option<PathBuf> {
@@ -1665,6 +1667,47 @@ pub fn latest_tag_from_json(body: &str) -> Option<String> {
     serde_json::from_str::<ReleaseLatest>(body).ok()?.tag_name
 }
 
+/// Number of user-visible phases in [`cmd_upgrade`].
+const UPGRADE_STEPS: u8 = 6;
+
+/// Run one upgrade phase with a progress indicator. On a terminal the
+/// step animates in place on stderr (so piped stdout stays byte-clean);
+/// otherwise a single step line is logged. Timed probes, downloads,
+/// archive passes, extraction and the final copy are the slow parts.
+fn upgrade_progress<T>(step: u8, label: &str, f: impl FnOnce() -> T) -> T {
+    use std::io::IsTerminal;
+    let line = format!("[{step}/{UPGRADE_STEPS}] {label}");
+    if !std::io::stderr().is_terminal() {
+        eprintln!("{line}");
+        return f();
+    }
+    // Animate on one line; the frame width is constant so `\r` alone
+    // suffices (no cursor-up escapes needed).
+    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let stop = Arc::clone(&stop);
+        let line = line.clone();
+        std::thread::spawn(move || {
+            let mut i = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                eprint!("\r{} {line}", FRAMES[i % FRAMES.len()]);
+                let _ = std::io::stderr().flush();
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    };
+    let out = f();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = handle.join();
+    // Clear the animated row, then leave the completed step visible.
+    let width = line.chars().count() + 2;
+    eprint!("\r{}\r{line}\n", " ".repeat(width));
+    let _ = std::io::stderr().flush();
+    out
+}
+
 /// GET bytes via `curl` (same dependency `install.sh` requires).
 fn curl_fetch(url: &str) -> std::io::Result<Vec<u8>> {
     let out = std::process::Command::new("curl")
@@ -1738,7 +1781,9 @@ fn archive_member_listings(tgz: &Path) -> Option<(String, String)> {
 /// never safe) and on unsupported platforms.
 pub fn cmd_upgrade(allow_unverified: bool) -> ! {
     let current = ReleaseVersion::current();
-    let body = match curl_fetch(RELEASE_API_URL) {
+    let body = match upgrade_progress(1, "checking the latest release", || {
+        curl_fetch(RELEASE_API_URL)
+    }) {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(_) => {
             eprintln!("cannot reach release info (network/API down?)");
@@ -1792,14 +1837,18 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
     };
     let base = format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}");
     println!("upgrading {} → {} ...", current.tag(), latest.tag());
-    let bytes = match curl_fetch(&format!("{base}/{asset}")) {
+    let bytes = match upgrade_progress(2, &format!("downloading {asset}"), || {
+        curl_fetch(&format!("{base}/{asset}"))
+    }) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("download failed: {e} (no asset for this platform yet?)");
             std::process::exit(1);
         }
     };
-    let sha = curl_fetch(&format!("{base}/{asset}.sha256")).ok();
+    let sha = upgrade_progress(3, "fetching checksum", || {
+        curl_fetch(&format!("{base}/{asset}.sha256")).ok()
+    });
     let dir = std::env::temp_dir().join(format!("pump-upgrade-{}", std::process::id()));
     // Exclusive, owner-only staging: `create_dir` (not `create_dir_all`)
     // refuses a pre-existing directory, so another local user on a
@@ -1876,7 +1925,8 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
     }
     // Tar-slip guard (same checks `install.sh` runs before extracting):
     // a malicious archive must not write outside the staging directory.
-    let Some((member_names, member_verbose)) = archive_member_listings(&tgz) else {
+    let listings = upgrade_progress(4, "validating archive", || archive_member_listings(&tgz));
+    let Some((member_names, member_verbose)) = listings else {
         eprintln!("archive unreadable (need 'tar');");
         let _ = std::fs::remove_dir_all(&dir);
         std::process::exit(1);
@@ -1886,13 +1936,15 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
         let _ = std::fs::remove_dir_all(&dir);
         std::process::exit(1);
     }
-    match std::process::Command::new("tar")
-        .args(["-xzf"])
-        .arg(&tgz)
-        .arg("-C")
-        .arg(&dir)
-        .status()
-    {
+    let extract = upgrade_progress(5, "extracting archive", || {
+        std::process::Command::new("tar")
+            .args(["-xzf"])
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&dir)
+            .status()
+    });
+    match extract {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("extract failed (need 'tar')");
@@ -1927,7 +1979,8 @@ pub fn cmd_upgrade(allow_unverified: bool) -> ! {
             std::process::exit(1);
         }
     };
-    if let Err(e) = replace_binary(&staged, &exe) {
+    let installed = upgrade_progress(6, "installing", || replace_binary(&staged, &exe));
+    if let Err(e) = installed {
         eprintln!("cannot replace {}: {e}", exe.display());
         let _ = std::fs::remove_dir_all(&dir);
         std::process::exit(1);
