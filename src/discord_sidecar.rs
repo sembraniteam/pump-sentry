@@ -173,11 +173,6 @@ fn status_compact_text(report: &StatusReport, now: u64) -> String {
     let uptime_m = (r.uptime_secs % 3_600) / 60;
     let oldest_h = r.oldest_open_age_secs / 3_600;
     let oldest_m = (r.oldest_open_age_secs % 3_600) / 60;
-    let stale = if age > STALE_WARN_SECS {
-        " ⚠ STALE — bot may be down"
-    } else {
-        ""
-    };
     let brk = if report.day_tally_damaged {
         "HALTED (tally damaged)".to_string()
     } else {
@@ -200,7 +195,7 @@ fn status_compact_text(report: &StatusReport, now: u64) -> String {
         },
     );
     format!(
-        "**Status** — `{m}·{s}` · up {h}h {mm}m{stale}\n\
+        "**Status** — `{m}·{s}` · up {h}h {mm}m\n\
              Breaker: {brk} · Data: {data} · RPC: `{rpc}`\n\
              Open {o} · bags {b} · diverged {d} · pending buys {p} · watchlist {w}\n\
              Oldest open: {oh}h {om}m\n\
@@ -209,7 +204,6 @@ fn status_compact_text(report: &StatusReport, now: u64) -> String {
         s = r.strategy,
         h = uptime_h,
         mm = uptime_m,
-        stale = stale,
         brk = brk,
         data = data,
         rpc = rpc,
@@ -271,6 +265,21 @@ fn heartbeat_card(report: &StatusReport, now: u64) -> Card {
         ));
     }
     card
+}
+
+/// `/heartbeat` answer description: only the lines that ADD to the
+/// production card's structured embed — reading freshness plus the
+/// damaged-tally caveat. The full text view would mirror every embed
+/// field inside the same message.
+fn heartbeat_notes(report: &StatusReport, now: u64) -> String {
+    let age = now.saturating_sub(report.ts);
+    let mut notes = format!("status age: {age}s");
+    if report.day_tally_damaged {
+        notes.push_str(
+            "\n⚠ Day-loss tally damaged — day figures unknown, breaker fail-closed HALTED",
+        );
+    }
+    notes
 }
 
 /// Turn the alert crate's embed view into a serenity embed (1:1 by
@@ -500,8 +509,17 @@ fn pnl_text(report: &StatusReport) -> String {
     } else {
         format!("Cash {} · equity {}", usd(r.cash_usd), usd(r.equity_usd))
     };
+    // Breaker marker, figure-free: the day net already rides the day
+    // line beside it, so a halting breaker must not print it again.
+    let brk = if report.day_tally_damaged {
+        "HALTED (tally damaged)".to_string()
+    } else if r.breaker_halted {
+        "`HALTED`".to_string()
+    } else {
+        "`armed`".to_string()
+    };
     format!(
-        "**PnL** — day {} · breaker {}\n\
+        "**PnL** — day {} · breaker {brk}\n\
          Book lifetime: realized {} over {} closed · win rate {win}\n\
          Open book: unrealized {} (realizable basis) · mark {} → would net {} closing full size (exit-discount {})\n\
          {cash_line}",
@@ -510,18 +528,12 @@ fn pnl_text(report: &StatusReport) -> String {
         } else {
             signed_usd(r.day_net)
         },
-        if report.day_tally_damaged {
-            "HALTED (tally damaged)".to_string()
-        } else {
-            Alerter::breaker_line(r.breaker_halted, r.day_net)
-        },
         signed_usd(pnl.realized_pnl),
         pnl.closed_count,
         signed_usd(pnl.unrealized_pnl),
         usd(pnl.mark_value),
         usd(pnl.realizable_value),
         usd(exit_discount),
-        cash_line = cash_line,
     )
 }
 
@@ -702,20 +714,13 @@ fn risk_text(s: &Settings, report: &StatusReport) -> String {
         )
     };
     // Breaker attribution: damage halts regardless of the cap (never
-    // blame the loss cap for it); otherwise the halt means the cap
-    // tripped, and `armed` only renders for a real cap.
+    // blame the loss cap for it). Unhalted, `armed` only renders for a
+    // real cap; an undamaged halt prints figure-free — day and cap
+    // already ride the utilization line above, never printed twice.
     let breaker_line = if report.day_tally_damaged {
         "HALTED — tally damaged (fail-closed), not the loss cap".to_string()
     } else if r.breaker_halted {
-        format!(
-            "`HALTED (day {} vs cap {})`",
-            signed_usd(r.day_net),
-            if cap.is_finite() && cap > 0.0 {
-                usd(cap)
-            } else {
-                "off".to_string()
-            }
-        )
+        "`HALTED`".to_string()
     } else if cap.is_finite() && cap > 0.0 {
         "`armed`".to_string()
     } else {
@@ -1951,15 +1956,17 @@ impl Sidecar {
     /// the halted breaker's day figure), which stays operator-only
     /// exactly like `/pnl`.
     fn render_heartbeat(&self, now: u64) -> Answer {
-        let inner = status::read(&status::status_path()).map(|r| heartbeat_card(&r, now));
-        match inner {
-            Ok(card) => {
-                // Embed-only: the production card's structured embed
-                // carries the reply, with the content view (freshness
-                // line, staleness banner, tally caveat) riding the
-                // description instead of a bare `content` string.
+        match self.read_report() {
+            Ok(report) => {
+                // Embed-only, data lives in the structured fields: the
+                // card's text view is a full mirror of those fields, so
+                // the description carries only the additive notes
+                // (freshness line, tally caveat), never the mirror.
+                let card = heartbeat_card(&report, now);
                 let mut embed = embed_from(&card.embed);
-                embed = embed.description(alert::discord::truncate_description(&card.content));
+                embed = embed.description(alert::discord::truncate_description(&heartbeat_notes(
+                    &report, now,
+                )));
                 Answer {
                     message: CreateInteractionResponseMessage::new()
                         .ephemeral(true)
@@ -2449,8 +2456,13 @@ mod tests {
         assert!(text.contains("status age: 3s"));
         assert!(!text.contains("STALE"));
         assert!(!text.contains("90.5"), "compact status hides money figures");
+        // The outage warning rides the render banner once (render_status
+        // formats "bot may be down" ahead of this body); the body keeps
+        // only the honest age line.
         let stale = status_compact_text(&fixture_report(now - 500), now);
-        assert!(stale.contains("STALE — bot may be down"));
+        assert!(!stale.contains("STALE — bot may be down"));
+        assert!(!stale.contains("bot may be down"));
+        assert!(stale.contains("status age: 500s"));
         assert!(!stale.contains("102"), "no equity in the compact view");
     }
 
@@ -2502,6 +2514,29 @@ mod tests {
         let embed = &card.embed;
         assert_eq!(embed.title, "Bot Heartbeat");
         assert_eq!(embed.fields.len(), 19);
+    }
+
+    #[test]
+    fn heartbeat_notes_add_to_the_embed_never_mirror_it() {
+        let now = 1_000_000;
+        let report = fixture_report(now - 4);
+        let card = heartbeat_card(&report, now);
+        let notes = heartbeat_notes(&report, now);
+        // Additive only: the freshness line rides the description.
+        assert!(notes.contains("status age: 4s"));
+        // The card's text view mirrors every embed field ("• **Mode:**");
+        // the description must not repeat the same data.
+        assert!(
+            !notes.contains("• **"),
+            "description must not mirror the structured fields"
+        );
+        assert!(card.content.contains("• **"), "the text view does mirror");
+        // A damaged tally keeps its caveat in the additive notes.
+        let damaged = StatusReport {
+            day_tally_damaged: true,
+            ..fixture_report(now - 4)
+        };
+        assert!(heartbeat_notes(&damaged, now).contains("tally damaged"));
     }
 
     #[test]
@@ -3105,19 +3140,25 @@ mod tests {
         );
         assert!(!text.contains("$0.00 vs cap"), "{text}");
         assert!(!text.contains("`armed`"), "{text}");
-        // Undamaged over-cap halt still carries the numbers.
+        // Undamaged over-cap halt: day and cap print once in the
+        // utilization line; the breaker marker stays figure-free.
         report.day_tally_damaged = false;
         report.report.day_net = -51.0;
         let text = risk_text(&s, &report);
-        assert!(
-            text.contains("`HALTED (day -$51.00 vs cap $50.00)`"),
-            "{text}"
+        assert!(text.contains("day -$51.00 vs cap $50.00"), "{text}");
+        assert!(text.contains("Breaker: `HALTED`"), "{text}");
+        assert_eq!(
+            text.matches("day -$51.00").count(),
+            1,
+            "day figure prints once: {text}"
         );
-        // Halted with the cap off and no damage: cap named, not blamed.
+        // Halted with the cap off and no damage: the utilization line
+        // names the cap state; the breaker marker adds nothing twice.
         s.max_daily_loss_usd = 0.0;
         report.report.day_net = -4.0;
         let text = risk_text(&s, &report);
-        assert!(text.contains("`HALTED (day -$4.00 vs cap off)`"), "{text}");
+        assert!(text.contains("day -$4.00 vs cap off"), "{text}");
+        assert!(text.contains("Breaker: `HALTED`"), "{text}");
     }
 
     #[test]
@@ -3130,6 +3171,22 @@ mod tests {
         assert!(text.contains("day UNKNOWN (tally damaged)"), "{text}");
         assert!(text.contains("HALTED (tally damaged)"), "{text}");
         assert!(!text.contains("day +$0.00"), "{text}");
+    }
+
+    #[test]
+    fn pnl_text_halt_never_repeats_the_day_figure() {
+        let now = 1_000_000;
+        let mut report = positions_fixture(now);
+        report.report.breaker_halted = true;
+        let text = pnl_text(&report);
+        // Day net rides the day line exactly once; the breaker marker
+        // is figure-free.
+        assert!(text.contains("day +$3.25 · breaker `HALTED`"), "{text}");
+        assert_eq!(
+            text.matches("+$3.25").count(),
+            1,
+            "day figure prints once: {text}"
+        );
     }
 
     #[test]
