@@ -1,6 +1,6 @@
 [package]
 name = "listener"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2024"
 rust-version = "1.99.0"
 description = "Pump.fun new-token event listener via WebSocket RPC logsSubscribe"
