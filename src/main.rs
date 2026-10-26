@@ -199,6 +199,25 @@ fn paper_fee_bps(settings: &Settings) -> f64 {
     settings.fee().map_or(0.0, |bps| f64::from(bps.get()))
 }
 
+/// True when the endpoint host is local. A co-hosted server can meet a
+/// very short entry budget; a hosted API cannot (network round trip
+/// alone eats it). Prefix match on scheme+host only — never a path or
+/// key comparison (endpoints may carry keys in the query).
+fn is_local_endpoint(endpoint: &str) -> bool {
+    let lower = endpoint.to_ascii_lowercase();
+    [
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+        "http://localhost",
+        "https://localhost",
+        "http://[::1]",
+        "https://[::1]",
+        "http://0.0.0.0",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
 /// Tracing init shared by every long-running path (`run`, the daemon
 /// child, and the sidecar child): stdout, ANSI only on an attached
 /// terminal (detached children carry `BOT_DAEMON=1`, so the
@@ -1262,6 +1281,20 @@ async fn run_pipeline(boot: Boot) {
             None
         }
     };
+    // Boot-time budget sanity: a hosted (non-local) endpoint cannot
+    // answer an entry-budget call (audit 2026-10-25: 100% timeouts at
+    // 300ms for ~40h). The engine's breaker now contains the cost, but
+    // entries still run heuristic-only until the budget fits the model.
+    if engine.is_some()
+        && settings.inference_timeout_ms < 1000
+        && !is_local_endpoint(&settings.inference_endpoint)
+    {
+        warn!(
+            timeout_ms = settings.inference_timeout_ms,
+            endpoint = %ids::redact_endpoint(&settings.inference_endpoint),
+            "short inference budget for a remote endpoint: every decision will fall back to the heuristic; raise INFERENCE_TIMEOUT_MS knowing each confirm waits that long (entry price)"
+        );
+    }
 
     let start_balance = settings.start_balance;
     // The paper ledger consumes the same typed commission as
@@ -1454,10 +1487,21 @@ async fn run_pipeline(boot: Boot) {
     let alerts = settings.discord_alerts.then(|| {
         let mut alerter = Alerter::new();
         match &settings.discord_channel {
-            Some(channel) => {
+            // Discord channel ids are decimal Snowflake integers. A
+            // non-numeric value would 400 every send forever (observed:
+            // an automation placeholder rode the env in), so refuse it
+            // exactly like a missing id — and say why.
+            Some(channel)
+                if !channel.is_empty()
+                    && channel.chars().all(|c| c.is_ascii_digit()) =>
+            {
                 info!(%channel, "discord alerts routed to channel");
                 alerter = alerter.with_channel(channel);
             }
+            Some(channel) => warn!(
+                %channel,
+                "discord channel id is not a numeric Snowflake; refusing to route alerts (sends stay disabled) — set DISCORD_CHANNEL_ID to the decimal channel id"
+            ),
             None => info!("discord alerts lack a channel id; sends stay disabled"),
         }
         match discord_token {

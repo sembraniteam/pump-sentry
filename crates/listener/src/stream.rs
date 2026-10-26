@@ -37,10 +37,21 @@ const SEEN_SIG_CAP: usize = 4_000;
 /// fetches stay bounded downstream. Past the cap with no seen boundary
 /// the remainder is counted lost (`backfill_pages_capped`), not paged
 /// forever: an unbounded catch-up would replay ancient launches the
-/// gate must not act on.
-const BACKFILL_MAX_PAGES: usize = 3;
+/// gate must not act on. Ten pages (~1000 signatures, roughly an hour
+/// of launches) covers any gap the 2-minute message-gap watchdog can
+/// produce, with headroom for reconnect backoff.
+const BACKFILL_MAX_PAGES: usize = 10;
 /// Handshake deadline. A hung handshake must reconnect, not stall.
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Message-gap deadline. Pump.fun logs are constant (trade volume, not
+/// launch volume), so a 2-minute silence with no stream error is a
+/// zombie subscription: the server keeps the socket open but serves
+/// nothing (observed: the watchdog in the bin's gate loop flagged
+/// `listener stalled (no logs)` for ~10h on a session that never
+/// closed and never delivered). Hosts now orient here themselves:
+/// end the session and let the reconnect loop subscribe fresh — the
+/// gap backfill then recovers the missing launches.
+const WS_MESSAGE_GAP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Launch log markers (matched case-insensitively).
 const CREATE_LOG_MARKERS: [&str; 2] = ["instruction: create", "instruction: createv2"];
@@ -490,7 +501,26 @@ impl PumpFunListener {
             "subscribed to pump.fun logs"
         );
 
-        while let Some(response) = sub.next().await {
+        loop {
+            // Parenthesized macro scrutinee: a brace-terminated select!
+            // cannot precede `else` in a let-else without it.
+            let Some(response) = (tokio::select! {
+                response = sub.next() => response,
+                _ = tokio::time::sleep(WS_MESSAGE_GAP_TIMEOUT) => {
+                    // Zombie subscription: TCP open, zero messages, no
+                    // error to detect. End the session so `run()`'s
+                    // reconnect loop (with its gap backfill) takes over.
+                    warn!(
+                        gap_secs = WS_MESSAGE_GAP_TIMEOUT.as_secs(),
+                        ws = %ids::redact_endpoint(&self.config.ws_url),
+                        "no log message within the gap deadline; treating the subscription as dead and reconnecting"
+                    );
+                    break;
+                }
+            }) else {
+                // Stream ended without an error (server closed): reconnect.
+                break;
+            };
             // Stop spawning workers for a dead channel.
             if tx.is_closed() || self.is_shutdown() {
                 info!("downstream closed mid-session; ending subscription");

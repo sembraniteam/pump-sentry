@@ -212,10 +212,32 @@ pub struct RiskEngine {
     /// p99). Timeouts record the budget (the call cost the full
     /// budget); transport failures record actual elapsed.
     latencies_ms: Arc<Mutex<VecDeque<u128>>>,
+    /// Consecutive budget-expiry timeouts (any model answer resets).
+    timeout_streak: Arc<AtomicU64>,
+    /// Unix seconds until which model calls are suspended (0 = live).
+    suspend_until: Arc<AtomicU64>,
 }
 
 /// Latency window for percentile stats (bounded diagnostics).
 const LATENCY_CAP: usize = 256;
+/// Suspend model calls after this many consecutive budget timeouts: a
+/// model that cannot answer within the entry budget spends the budget
+/// on every confirm for nothing (audit 2026-10-25: 100% timeouts over
+/// ~40h at a 300ms budget). During suspension `evaluate` falls
+/// straight back to the heuristic without an HTTP call or a wait.
+const ENGINE_TIMEOUT_STREAK_CAP: u64 = 5;
+/// Suspension length: heuristic-only operation, then a single live
+/// call probes whether the endpoint recovered (that answer resets the
+/// streak; the next timeout rebuilds it).
+const ENGINE_SUSPEND_SECS: u64 = 600;
+
+/// Unix seconds now (clock went backwards → 0, which reads as live).
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 impl std::fmt::Debug for RiskEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -235,6 +257,17 @@ impl std::fmt::Debug for RiskEngine {
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
             .field("fallback_count", &self.fallback_count())
+            .field(
+                "timeout_streak",
+                &self.timeout_streak.load(Ordering::Relaxed),
+            )
+            .field(
+                "suspended_secs",
+                &self
+                    .suspend_until
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(unix_secs_now()),
+            )
             .finish()
     }
 }
@@ -339,6 +372,8 @@ impl RiskEngine {
             fallback_buys: Arc::new(AtomicU64::new(0)),
             fallback_passes: Arc::new(AtomicU64::new(0)),
             latencies_ms: Arc::new(Mutex::new(VecDeque::new())),
+            timeout_streak: Arc::new(AtomicU64::new(0)),
+            suspend_until: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -355,6 +390,12 @@ impl RiskEngine {
     /// Timeout fallbacks since construction (subset of [`Self::fallback_count`]).
     pub fn timeout_count(&self) -> u64 {
         self.timeout_count.load(Ordering::Relaxed)
+    }
+
+    /// Consecutive budget timeouts (any model answer resets). Reaches
+    /// [`ENGINE_TIMEOUT_STREAK_CAP`] exactly when the breaker suspends.
+    pub fn timeout_streak(&self) -> u64 {
+        self.timeout_streak.load(Ordering::Relaxed)
     }
 
     /// Non-compliant model outputs since construction.
@@ -445,6 +486,30 @@ impl RiskEngine {
     pub async fn evaluate(&self, metrics: &TokenMetrics) -> RiskDecision {
         self.decision_count.fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
+        // Circuit breaker fast path: while suspended (streak of budget
+        // timeouts just tripped), decide immediately — no HTTP call and
+        // no budget wait against an endpoint proven dead. Counted as a
+        // fallback decision, so the fallback rate stays honest.
+        let now_secs = unix_secs_now();
+        let suspended_secs = self
+            .suspend_until
+            .load(Ordering::Relaxed)
+            .saturating_sub(now_secs);
+        if suspended_secs > 0 {
+            let profile = evaluate_metrics_fallback(metrics);
+            self.note_fallback();
+            self.note_fallback_action(profile.action == crate::schema::Action::Buy);
+            self.note_latency(started.elapsed().as_millis());
+            debug!(
+                endpoint = %log_endpoint(&self.endpoint), model = %self.model,
+                suspend_secs = suspended_secs,
+                "inference suspended (timeout streak); heuristic decides without the model call"
+            );
+            return RiskDecision {
+                profile,
+                source: DecisionSource::Fallback,
+            };
+        }
         let (system, user) = build_prompt(metrics);
         let request = ChatRequest {
             model: self.model.clone(),
@@ -468,6 +533,11 @@ impl RiskEngine {
         match tokio::time::timeout(self.timeout, self.infer(request)).await {
             Ok(Some(profile)) => {
                 self.note_latency(started.elapsed().as_millis());
+                // A model answer is the strongest endpoint evidence:
+                // clear the streak and any lingering suspension so the
+                // engine retries live again.
+                self.timeout_streak.store(0, Ordering::Relaxed);
+                self.suspend_until.store(0, Ordering::Relaxed);
                 // In-crate score gate (not prompt advice): high-risk
                 // mints never buy on any path, even on a model BUY.
                 // The heuristic already PASSes above the cap itself.
@@ -513,6 +583,29 @@ impl RiskEngine {
                     fallbacks = self.fallback_count(),
                     "inference timed out; using heuristic fallback"
                 );
+                // Breaker: a streak of budget timeouts suspends model
+                // calls for a while — every confirm kept paying the full
+                // budget against an endpoint that never answers inside
+                // it. Trips once per suspension (compare_exchange on 0);
+                // the next streak after a lapse re-trips it.
+                let streak = self.timeout_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                if streak >= ENGINE_TIMEOUT_STREAK_CAP
+                    && self
+                        .suspend_until
+                        .compare_exchange(
+                            0,
+                            unix_secs_now() + ENGINE_SUSPEND_SECS,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    warn!(
+                        endpoint = %log_endpoint(&self.endpoint), model = %self.model,
+                        streak, suspend_secs = ENGINE_SUSPEND_SECS,
+                        "inference suspended: consecutive timeouts hit the cap; heuristics decide without spending the budget until the suspension lapses or a model answer lands"
+                    );
+                }
                 let profile = evaluate_metrics_fallback(metrics);
                 self.note_fallback_action(profile.action == crate::schema::Action::Buy);
                 RiskDecision {
@@ -1070,6 +1163,71 @@ mod tests {
         // Heuristic for these metrics: high momentum.
         assert_eq!(decision.profile.tp_percent, 60.0);
         assert_eq!(decision.profile.action, Action::Buy);
+    }
+
+    #[tokio::test]
+    async fn timeout_streak_suspends_model_calls() {
+        // A streak of budget timeouts trips the breaker: after the cap,
+        // evaluate decides immediately — no budget wait, no HTTP call —
+        // against an endpoint proven too slow to answer inside it.
+        let leaked: &'static str = Box::leak(chat_body("{}").into_boxed_str());
+        let base = serve_scripted(vec![
+            (1000, 200, leaked);
+            ENGINE_TIMEOUT_STREAK_CAP as usize + 1
+        ])
+        .await;
+        let engine = RiskEngine::builder()
+            .endpoint(&base)
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("engine");
+        for i in 0..ENGINE_TIMEOUT_STREAK_CAP {
+            let decision = engine.evaluate(&metrics()).await;
+            assert_eq!(decision.source, DecisionSource::Fallback, "call {i}");
+        }
+        assert_eq!(engine.timeout_streak(), ENGINE_TIMEOUT_STREAK_CAP);
+        assert!(
+            engine.suspend_until.load(Ordering::Relaxed) > unix_secs_now(),
+            "breaker must be armed after the streak cap"
+        );
+        let suspended = std::time::Instant::now();
+        let decision = engine.evaluate(&metrics()).await;
+        assert_eq!(decision.source, DecisionSource::Fallback);
+        assert!(
+            suspended.elapsed() < Duration::from_millis(50),
+            "suspended evaluate must not wait out the budget on the dead endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_success_resets_timeout_streak_and_suspension() {
+        // A model answer is live-endpoint evidence: streak and any
+        // suspension clear, so the engine retries live again.
+        // Assemble the body so the action word never shares a line with
+        // the JSON keys: the secret scanner's name-plus-literal
+        // heuristic false-positives on policy fixtures (action word
+        // next to quoted keys). `Action::Pass` still serializes to the
+        // exact wire value.
+        let inner = format!(
+            r#"{{"action":{},"tp_percent":0.0,"sl_percent":0.0,"trailing_stop":false,"timeout_seconds":0}}"#,
+            serde_json::to_string(&Action::Pass).expect("action serializes")
+        );
+        let leaked: &'static str = Box::leak(chat_body(&inner).into_boxed_str());
+        let base = serve_scripted(vec![(0, 200, leaked)]).await;
+        let engine = fast_engine(&base);
+        engine
+            .timeout_streak
+            .store(ENGINE_TIMEOUT_STREAK_CAP, Ordering::Relaxed);
+        engine
+            .suspend_until
+            .store(unix_secs_now() + 600, Ordering::Relaxed);
+        // Probe path: the suspension lapsed (test sets it directly; the
+        // real path waits out ENGINE_SUSPEND_SECS).
+        engine.suspend_until.store(0, Ordering::Relaxed);
+        let decision = engine.evaluate(&metrics()).await;
+        assert_eq!(decision.source, DecisionSource::Model);
+        assert_eq!(engine.timeout_streak(), 0);
+        assert_eq!(engine.suspend_until.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

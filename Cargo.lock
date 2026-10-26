@@ -5405,8 +5405,6 @@ dependencies = [
 [[package]]
 name = "solana-pubsub-client"
 version = "4.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58e067e824dba05634e247af985e6a21d73964e77b0dce1523045ea1c2fd5ff3"
 dependencies = [
  "crossbeam-channel",
  "futures-util",
