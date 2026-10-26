@@ -1032,7 +1032,8 @@ async fn second_gate_round_carries_a_live_tape_velocity() {
         screener.clone(),
         None,
     );
-    pipe.with_journal(Arc::new(JournalSink::open(&journal_path).expect("journal")));
+    let journal = Arc::new(JournalSink::open(&journal_path).expect("journal"));
+    pipe.with_journal(journal.clone());
     pipe.on_launch(&LaunchRequest {
         mint: sys,
         curve: CURVE,
@@ -1075,6 +1076,10 @@ async fn second_gate_round_carries_a_live_tape_velocity() {
         1,
         "confirmed"
     );
+    // The sink writes on its own thread (bounded queue): drain it before
+    // reading the file, or a loaded runner reads before the Open line
+    // lands and the micro snapshot looks absent.
+    assert!(journal.flush(), "journal flush before the read");
     let raw = std::fs::read_to_string(&journal_path).expect("journal");
     let velocity = raw
         .lines()
